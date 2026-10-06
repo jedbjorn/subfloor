@@ -346,12 +346,6 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "(report_id,sprint_id,report_kind,author_shell_id,body,idempotency_key) "
         "VALUES (1,1,'conformance',2,'Representative finding','report-1')"
     )
-    con.execute(
-        "INSERT INTO sprint_followups "
-        "(followup_id,sprint_id,source_report_id,severity,title,body,"
-        "spec_document_id,work_unit_id,idempotency_key) "
-        "VALUES (1,1,1,'Medium','Follow-up','Inspect after close',56,1,'followup-1')"
-    )
     recovery_event_id = int(
         con.execute(
             "INSERT INTO sprint_events "

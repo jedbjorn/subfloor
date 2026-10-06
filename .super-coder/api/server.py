@@ -4170,14 +4170,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._require_sprint_planner(con, sprint_id, shell_id)
                 return self._send(200, sprint_monitor_response(con, sprint_id))
             if path == "/_sc/sprint/conformance":
-                findings = body.get("findings")
-                if not isinstance(findings, list):
-                    raise ValueError("findings must be a JSON array")
                 receipt = sprint_close.SprintCloseStore(con).record_conformance(
                     sprint_id,
                     shell_id,
                     body=body.get("body") or "",
-                    findings=findings,
                     final_report=body.get("final_report") or "",
                     reason=body.get("reason") or "",
                     terminal_outcome=body.get("terminal_outcome") or "",
@@ -4188,7 +4184,6 @@ class Handler(BaseHTTPRequestHandler):
                 ).project(sprint_id)
                 return self._send(201 if receipt.created else 200, {
                     "report_id": receipt.report_id,
-                    "followup_ids": list(receipt.followup_ids),
                     "final_report_id": receipt.final_report_id,
                     "planner_message_id": receipt.planner_message_id,
                     "planner_wake_id": receipt.planner_wake_id,
@@ -4198,15 +4193,6 @@ class Handler(BaseHTTPRequestHandler):
                         cleanup_projection
                     ),
                 })
-            if path == "/_sc/sprint/followup-disposition":
-                changed = sprint_close.SprintCloseStore(con).disposition_followup(
-                    sprint_id,
-                    self._sprint_integer(body, "followup_id"),
-                    shell_id,
-                    disposition=body.get("disposition") or "",
-                    resolution=body.get("resolution"),
-                )
-                return self._send(200, {"changed": changed})
             return self._send(404, {"error": "not found"})
         except Exception as exc:
             return self._sprint_error(exc)

@@ -72,6 +72,13 @@ class SprintCliDispatcherTest(unittest.TestCase):
         self.assertIn("cleanup", completed.stdout)
         self.assertIn("rebind-spec", completed.stdout)
 
+    def test_followup_command_is_removed(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            sprint_cli.build_parser().parse_args([
+                "disposition-followup", "--sprint", "1", "--followup", "1",
+                "--disposition", "accepted",
+            ])
+
     def test_rebind_spec_posts_expected_revision_and_reason_idempotently(self):
         output = io.StringIO()
         response = {
@@ -408,6 +415,15 @@ class SprintCliApiTest(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             self.assertEqual(0, pr_cli.main(list(argv)))
         return json.loads(output.getvalue())
+
+    def test_followup_endpoint_is_removed(self):
+        mem.SC_API_TOKEN = TOKENS["admin"]
+        with self.assertRaisesRegex(SystemExit, "HTTP 404"):
+            mem._api("POST", "/_sc/sprint/followup-disposition", {
+                "sprint_id": self.sprint_id,
+                "followup_id": 1,
+                "disposition": "accepted",
+            })
 
     def test_spec_revision_reads_exact_body_and_rejects_nonparticipant(self):
         response = self.run_cli(
@@ -2348,12 +2364,6 @@ class SprintCliApiTest(unittest.TestCase):
             str(sprint_id),
             "--body-file",
             self.write("Conformance complete"),
-            "--findings-file",
-            self.write(
-                json.dumps(
-                    [{"severity": "Low", "title": "Note", "body": "Track it"}]
-                )
-            ),
             "--final-report-file",
             self.write("Final Sprint report"),
             "--reason",
@@ -2365,29 +2375,7 @@ class SprintCliApiTest(unittest.TestCase):
         )
         self.assertTrue(conformance["completed"])
         self.assertIsInstance(conformance["final_report_id"], int)
-        followup_id = conformance["followup_ids"][0]
-        with self.assertRaisesRegex(SystemExit, "HTTP 403.*only FnB"):
-            self.run_cli(
-                TOKENS["planner"],
-                "disposition-followup",
-                "--sprint",
-                str(sprint_id),
-                "--followup",
-                str(followup_id),
-                "--disposition",
-                "accepted",
-            )
-        disposition = self.run_cli(
-            TOKENS["admin"],
-            "disposition-followup",
-            "--sprint",
-            str(sprint_id),
-            "--followup",
-            str(followup_id),
-            "--disposition",
-            "accepted",
-        )
-        self.assertTrue(disposition["changed"])
+        self.assertNotIn("followup_ids", conformance)
 
         con = sqlite3.connect(self.db)
         try:
@@ -2414,13 +2402,6 @@ class SprintCliApiTest(unittest.TestCase):
                     "AND report_kind='final'",
                     (sprint_id,),
                 ).fetchall(),
-            )
-            self.assertEqual(
-                "accepted",
-                con.execute(
-                    "SELECT disposition FROM sprint_followups WHERE followup_id=?",
-                    (followup_id,),
-                ).fetchone()[0],
             )
         finally:
             con.close()
@@ -2947,17 +2928,6 @@ class SprintCliApiTest(unittest.TestCase):
         finally:
             con.close()
 
-        findings = self.write(
-            json.dumps(
-                [
-                    {
-                        "severity": "Low",
-                        "title": "Follow-up",
-                        "body": "Disposition after the Sprint.",
-                    }
-                ]
-            )
-        )
         conformance = self.run_cli(
             TOKENS["reviewer"],
             "record-conformance",
@@ -2965,8 +2935,6 @@ class SprintCliApiTest(unittest.TestCase):
             str(self.sprint_id),
             "--body-file",
             self.write("Integrated conformance complete."),
-            "--findings-file",
-            findings,
             "--final-report-file",
             self.write("Reviewer-authored final Sprint report."),
             "--reason",
@@ -2976,7 +2944,7 @@ class SprintCliApiTest(unittest.TestCase):
             "--key",
             "cli-conformance",
         )
-        self.assertEqual(1, len(conformance["followup_ids"]))
+        self.assertNotIn("followup_ids", conformance)
         self.assertTrue(conformance["completed"])
         report = self.run_cli(
             TOKENS["planner"],
@@ -2987,9 +2955,8 @@ class SprintCliApiTest(unittest.TestCase):
             "10",
         )
         self.assertEqual(self.sprint_id, report["scope"]["sprint_id"])
-        self.assertEqual(
-            "Low", report["unresolved_work"]["followups"]["items"][0]["severity"]
-        )
+        self.assertNotIn("followups", report["unresolved_work"])
+        self.assertNotIn("followups", report["conformance"])
 
     def test_token_identity_blocks_cross_role_dispatch(self):
         mem.SC_API_TOKEN = TOKENS["developer"]

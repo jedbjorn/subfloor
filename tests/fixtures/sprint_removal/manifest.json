@@ -175,7 +175,8 @@
     "tests/test_runs.py",
     ".super-coder/migrations/0275_runs_ledger.sql",
     ".super-coder/migrations/0276_devkit_run_receipts.sql",
-    ".super-coder/migrations/0279_run_receipt_attachments.sql"
+    ".super-coder/migrations/0279_run_receipt_attachments.sql",
+    ".super-coder/migrations/0280_remove_sprint_followups.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,

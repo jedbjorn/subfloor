@@ -149,7 +149,7 @@ Choose one branch:
   capacity rationale. State independent lanes, expected review overlap, useful
   reserve, and critical-path effect. After three re-entry episodes, escalate
   non-convergence to FnB.
-- **Clean or post-Sprint-only findings.** Prepare conformance report, findings,
+- **Clean or post-Sprint-only findings.** Prepare conformance report,
   final report, reason, and outcome; submit the atomic close below. Send no
   conclude message.
 
@@ -160,10 +160,8 @@ Review the integrated system, not unit diffs. Classify every requirement
 `deviated-silently`, or `unimplemented`; the last two are findings. Include
 spec document + work-unit ids when known.
 
-For the clean branch, write a conformance report and JSON findings array with
-`severity`, `title`, `body`, `spec_document_id`, and `work_unit_id`. Keep the
-report and each body near 6,000 and below 8,000 characters; run
-`wc -m < <report>` and validate each body.
+For the clean branch, write findings directly in the conformance report.
+Keep the report near 6,000 and below 8,000 characters; run `wc -m < <report>`.
 
 Before recording conformance, author the final Sprint report. Name yourself as
 author and cover governing scope/revisions, shipped units/PRs, judgments +
@@ -175,12 +173,12 @@ Record one atomic final write:
 
 ```text
 sc sprint record-conformance \
-  --sprint <id> --body-file <report> --findings-file <json> \
+  --sprint <id> --body-file <report> \
   --final-report-file <final-report> --reason <reason> --outcome <outcome> \
   --key <stable-pass-key>
 ```
 
-Require the receipt: conformance report id, final report id, follow-up ids,
+Require the receipt: conformance report id, final report id,
 completed state, Planner message id, and Planner wake id. Closing ends the
 Developer chats and schedules deletion of the Sprint artifact directory; your
 chat persists and no worktree is reset. Do not poll cleanup, wait before

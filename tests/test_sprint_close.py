@@ -1,4 +1,4 @@
-"""Stage 9 gates for conformance follow-ups and report compilation."""
+"""Stage 9 gates for conformance closeout and report compilation."""
 from __future__ import annotations
 
 import hashlib
@@ -24,14 +24,12 @@ def rendered_notification(
     sprint_id: int,
     report_id: int,
     final_report_id: int,
-    followup_ids: tuple[int, ...],
     closed_developer_chats: int,
 ) -> str:
-    followups = ",".join(str(value) for value in followup_ids) or "none"
     return (
         f"Sprint {sprint_id} completed by Reviewer conformance. "
         f"conformance_report_id={report_id}; final_report_id={final_report_id}; "
-        f"followup_ids={followups}; outcome={TERMINAL_OUTCOME}; "
+        f"outcome={TERMINAL_OUTCOME}; "
         f"closed_developer_chats={closed_developer_chats}. Planner and Reviewer "
         f"chats persist; the engine deletes shared/sprints/sprint-{sprint_id} "
         "and reports only if that fails.\n\n"
@@ -63,17 +61,6 @@ class SprintCloseCase(SprintDomainCase):
                 (self.sprint_id,),
             ).fetchone()[0]
         )
-
-    def finding(self, **overrides):
-        finding = {
-            "severity": "Major",
-            "title": "Integrated seam diverges",
-            "body": "The delivered seam does not preserve the bound contract.",
-            "spec_document_id": self.document_id,
-            "work_unit_id": self.unit_id,
-        }
-        finding.update(overrides)
-        return finding
 
     def record_conformance(self, *args, **kwargs):
         kwargs.setdefault("reason", COMPLETION_REASON)
@@ -139,7 +126,7 @@ class SprintCloseCase(SprintDomainCase):
 
 
 class SprintCloseMigrationTest(unittest.TestCase):
-    def test_forward_migration_adds_followups_without_rewriting_reports(self):
+    def test_removal_drops_populated_followup_queue_and_preserves_reports(self):
         with closing(sqlite3.connect(":memory:")) as con:
             apply_schema(con, through="0149_sprint_liveness_monitor.sql")
             con.execute(
@@ -185,6 +172,26 @@ class SprintCloseMigrationTest(unittest.TestCase):
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
                     "AND name='sprint_followups'"
                 ).fetchone()
+            )
+            con.execute(
+                "INSERT INTO sprint_followups "
+                "(sprint_id,source_report_id,severity,title,body,idempotency_key) "
+                "VALUES (?,?,'Low','Old finding','Disposable','old-finding')",
+                (sprint_id, report_id),
+            )
+            removal = (MIGRATIONS / "0280_remove_sprint_followups.sql").read_text()
+            con.executescript(removal)
+            con.executescript(removal)
+            self.assertEqual(
+                [],
+                con.execute(
+                    "SELECT name FROM sqlite_master WHERE "
+                    "name LIKE '%sprint_followups%'"
+                ).fetchall(),
+            )
+            self.assertEqual(
+                [(report_id, "existing")],
+                con.execute("SELECT report_id,body FROM sprint_reports").fetchall(),
             )
             self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
 
@@ -256,7 +263,7 @@ class SprintCloseMigrationTest(unittest.TestCase):
                 )
 
 
-class ConformanceFollowupTest(SprintCloseCase):
+class ConformanceTest(SprintCloseCase):
     def test_nonterminal_conformance_rolls_back_every_closeout_write(self):
         self.con.execute(
             "UPDATE sprint_work_units SET disposition='active',completed_at=NULL "
@@ -270,7 +277,6 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 2,
                 body="Must roll back",
-                findings=[self.finding()],
                 final_report=FINAL_REPORT,
                 idempotency_key="nonterminal-conformance",
             )
@@ -288,14 +294,12 @@ class ConformanceFollowupTest(SprintCloseCase):
             caught.exception.details,
         )
         self.assertEqual(
-            ("armed", 0, 0, 0, 0, 0),
+            ("armed", 0, 0, 0, 0),
             tuple(
                 self.con.execute(
                     "SELECT sprint.lifecycle,"
                     "(SELECT COUNT(*) FROM sprint_reports report "
                     " WHERE report.sprint_id=sprint.sprint_id),"
-                    "(SELECT COUNT(*) FROM sprint_followups followup "
-                    " WHERE followup.sprint_id=sprint.sprint_id),"
                     "(SELECT COUNT(*) FROM wake_message message "
                     " WHERE message.idempotency_key="
                     " 'nonterminal-conformance:planner-completed'),"
@@ -441,28 +445,14 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 2,
                 body="x" * 8001,
-                findings=[],
                 final_report=FINAL_REPORT,
                 idempotency_key="oversize-conformance",
-            )
-        with self.assertRaisesRegex(
-            ValueError,
-            "finding body is 8001 characters; maximum is 8000",
-        ):
-            self.record_conformance(
-                self.sprint_id,
-                2,
-                body="bounded",
-                findings=[self.finding(body="x" * 8001)],
-                final_report=FINAL_REPORT,
-                idempotency_key="oversize-finding",
             )
         with self.assertRaisesRegex(ValueError, "final report body is required"):
             self.record_conformance(
                 self.sprint_id,
                 2,
                 body="bounded",
-                findings=[],
                 final_report=" ",
                 idempotency_key="empty-final-report",
             )
@@ -474,7 +464,6 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 2,
                 body="bounded",
-                findings=[],
                 final_report="x" * 8001,
                 idempotency_key="oversize-final-report",
             )
@@ -484,7 +473,6 @@ class ConformanceFollowupTest(SprintCloseCase):
         ):
             kwargs = {
                 "body": "bounded",
-                "findings": [],
                 "final_report": FINAL_REPORT,
                 "reason": COMPLETION_REASON,
                 "terminal_outcome": TERMINAL_OUTCOME,
@@ -494,62 +482,21 @@ class ConformanceFollowupTest(SprintCloseCase):
             with self.assertRaisesRegex(ValueError, error):
                 self.close.record_conformance(self.sprint_id, 2, **kwargs)
         self.assertEqual(
-            (0, 0),
-            tuple(
-                self.con.execute(
-                    "SELECT (SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?),"
-                    "(SELECT COUNT(*) FROM sprint_followups WHERE sprint_id=?)",
-                    (self.sprint_id, self.sprint_id),
-                ).fetchone()
-            ),
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
         )
 
         conformance = self.record_conformance(
             self.sprint_id,
             2,
             body="x" * 8000,
-            findings=[self.finding(body="x" * 8000)],
-                final_report=FINAL_REPORT,
+            final_report=FINAL_REPORT,
             idempotency_key="bounded-conformance",
         )
         self.assertTrue(conformance.created)
-        self.con.execute(
-            "INSERT INTO shells "
-            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
-            "VALUES (5,'FnB','FNB','admin','prompt',1)"
-        )
-        self.con.commit()
-        with self.assertRaisesRegex(
-            ValueError,
-            "follow-up resolution is 8001 characters; maximum is 8000",
-        ):
-            self.close.disposition_followup(
-                self.sprint_id,
-                conformance.followup_ids[0],
-                5,
-                disposition="resolved",
-                resolution="x" * 8001,
-            )
-        self.assertEqual(
-            ("pending", None),
-            tuple(
-                self.con.execute(
-                    "SELECT disposition,resolution FROM sprint_followups "
-                    "WHERE followup_id=?",
-                    (conformance.followup_ids[0],),
-                ).fetchone()
-            ),
-        )
-        self.assertTrue(
-            self.close.disposition_followup(
-                self.sprint_id,
-                conformance.followup_ids[0],
-                5,
-                disposition="resolved",
-                resolution="x" * 8000,
-            )
-        )
-
         self.assertEqual(
             (1, FINAL_REPORT),
             tuple(
@@ -561,32 +508,7 @@ class ConformanceFollowupTest(SprintCloseCase):
             ),
         )
 
-    def test_database_rejects_cross_sprint_report_and_spec_links(self):
-        other_sprint_id, _ = self.create_sprint()
-        other_report_id = int(
-            self.con.execute(
-                "INSERT INTO sprint_reports (sprint_id,report_kind,body) "
-                "VALUES (?,'pause','other Sprint')",
-                (other_sprint_id,),
-            ).lastrowid
-        )
-        with self.assertRaisesRegex(sqlite3.IntegrityError, "another Sprint"):
-            self.con.execute(
-                "INSERT INTO sprint_followups "
-                "(sprint_id,source_report_id,severity,title,body,idempotency_key) "
-                "VALUES (?,?,'Low','Cross report','Bad link','cross-report')",
-                (self.sprint_id, other_report_id),
-            )
-        with self.assertRaisesRegex(sqlite3.IntegrityError, "not bound"):
-            self.con.execute(
-                "INSERT INTO sprint_followups "
-                "(sprint_id,source_report_id,severity,title,body,"
-                "spec_document_id,idempotency_key) "
-                "VALUES (?,?,'Low','Cross spec','Bad link',?,'cross-spec')",
-                (other_sprint_id, other_report_id, self.document_id),
-            )
-
-    def test_findings_become_followups_without_creating_fix_work(self):
+    def test_report_findings_complete_without_creating_fix_work(self):
         before_units = [
             tuple(row)
             for row in self.con.execute(
@@ -600,31 +522,17 @@ class ConformanceFollowupTest(SprintCloseCase):
             self.sprint_id,
             2,
             body="Conformance found one integrated departure.",
-            findings=[self.finding()],
             final_report=FINAL_REPORT,
             idempotency_key="conformance-pass-1",
         )
 
         self.assertTrue(receipt.created)
-        self.assertEqual(1, len(receipt.followup_ids))
-        followup = self.con.execute(
-            "SELECT sprint_id,source_report_id,severity,title,body,"
-            "spec_document_id,work_unit_id,disposition "
-            "FROM sprint_followups WHERE followup_id=?",
-            (receipt.followup_ids[0],),
-        ).fetchone()
+        packet = self.close.compile_evidence_packet(self.sprint_id, 3)
+        self.assertNotIn("followups", packet["conformance"])
+        self.assertNotIn("followups", packet["unresolved_work"])
         self.assertEqual(
-            (
-                self.sprint_id,
-                receipt.report_id,
-                "Major",
-                "Integrated seam diverges",
-                "The delivered seam does not preserve the bound contract.",
-                self.document_id,
-                self.unit_id,
-                "pending",
-            ),
-            tuple(followup),
+            "Conformance found one integrated departure.",
+            packet["conformance"]["reports"]["items"][0]["body"],
         )
         self.assertEqual(
             before_units,
@@ -643,9 +551,6 @@ class ConformanceFollowupTest(SprintCloseCase):
             "AND event_type='conformance.recorded'",
             (self.sprint_id,),
         ).fetchone()
-        self.assertEqual(
-            [receipt.followup_ids[0]], json.loads(event["payload"])["followup_ids"]
-        )
         payload = json.loads(event["payload"])
         self.assertEqual(receipt.planner_message_id, payload["planner_message_id"])
         self.assertEqual(receipt.planner_wake_id, payload["planner_wake_id"])
@@ -686,7 +591,6 @@ class ConformanceFollowupTest(SprintCloseCase):
                     self.sprint_id,
                     receipt.report_id,
                     receipt.final_report_id,
-                    receipt.followup_ids,
                     0,
                 ),
                 "re-enter",
@@ -767,7 +671,6 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 2,
                 body="Close only this Sprint's Developer chats.",
-                findings=[],
                 final_report=FINAL_REPORT,
                 idempotency_key="chat-cleanup",
             )
@@ -860,7 +763,6 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 first.report_id,
                 first.final_report_id,
-                first.followup_ids,
                 1,
             ),
             receipt_body,
@@ -874,7 +776,6 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 2,
                 body="Close only this Sprint's Developer chats.",
-                findings=[],
                 final_report=FINAL_REPORT,
                 idempotency_key="chat-cleanup",
             )
@@ -904,7 +805,6 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 2,
                 body="Divergent replay body.",
-                findings=[],
                 final_report=FINAL_REPORT,
                 idempotency_key="chat-cleanup",
             )
@@ -1064,7 +964,6 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 2,
                 body="This transaction must roll back.",
-                findings=[self.finding()],
                 final_report=FINAL_REPORT,
                 idempotency_key="chat-cleanup-rollback",
             )
@@ -1072,12 +971,11 @@ class ConformanceFollowupTest(SprintCloseCase):
         notify.assert_not_called()
         self.assertEqual(2, close_calls)
         self.assertEqual(
-            ("armed", None, 0, 0, 0, 0, 0),
+            ("armed", None, 0, 0, 0, 0),
             tuple(
                 self.con.execute(
                     "SELECT sprint.lifecycle,sprint.terminal_outcome,"
                     "(SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?),"
-                    "(SELECT COUNT(*) FROM sprint_followups WHERE sprint_id=?),"
                     "(SELECT COUNT(*) FROM wake_message "
                     " WHERE idempotency_key='chat-cleanup-rollback:planner-completed'),"
                     "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
@@ -1086,7 +984,7 @@ class ConformanceFollowupTest(SprintCloseCase):
                     " WHERE event_type='conversation.closed' "
                     " AND json_extract(payload,'$.reason')='sprint_completed') "
                     "FROM sprints sprint WHERE sprint.sprint_id=?",
-                    (self.sprint_id,) * 4,
+                    (self.sprint_id,) * 3,
                 ).fetchone()
             ),
         )
@@ -1134,7 +1032,6 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 2,
                 body="Rejected while paused.",
-                findings=[],
                 final_report=FINAL_REPORT,
                 idempotency_key="paused-conformance",
             )
@@ -1164,7 +1061,6 @@ class ConformanceFollowupTest(SprintCloseCase):
             self.sprint_id,
             2,
             body="Integrated conformance is complete.",
-            findings=[],
             final_report=FINAL_REPORT,
             idempotency_key="liveness-pass",
         )
@@ -1217,24 +1113,22 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 2,
                 body="This report must roll back.",
-                findings=[self.finding()],
                 final_report=FINAL_REPORT,
                 idempotency_key="rollback-pass",
             )
 
         self.assertEqual(
-            (0, 0, 0, 0, "armed", None),
+            (0, 0, 0, "armed", None),
             tuple(
                 self.con.execute(
                     "SELECT "
                     "(SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?),"
-                    "(SELECT COUNT(*) FROM sprint_followups WHERE sprint_id=?),"
                     "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
                     " AND event_type='conformance.recorded'),"
                     "(SELECT COUNT(*) FROM wake_message "
                     " WHERE idempotency_key='rollback-pass:planner-completed'),"
                     "lifecycle,terminal_outcome FROM sprints WHERE sprint_id=?",
-                    (self.sprint_id,) * 4,
+                    (self.sprint_id,) * 3,
                 ).fetchone()
             ),
         )
@@ -1244,7 +1138,6 @@ class ConformanceFollowupTest(SprintCloseCase):
             self.sprint_id,
             2,
             body="Review body",
-            findings=[self.finding(severity="Low")],
             final_report=FINAL_REPORT,
             idempotency_key="same-pass",
         )
@@ -1252,26 +1145,23 @@ class ConformanceFollowupTest(SprintCloseCase):
             self.sprint_id,
             2,
             body="Review body",
-            findings=[self.finding(severity="Low")],
             final_report=FINAL_REPORT,
             idempotency_key="same-pass",
         )
         self.assertFalse(replay.created)
         self.assertEqual(first.report_id, replay.report_id)
-        self.assertEqual(first.followup_ids, replay.followup_ids)
         self.assertEqual(first.final_report_id, replay.final_report_id)
         self.assertEqual(first.planner_message_id, replay.planner_message_id)
         self.assertEqual(first.planner_wake_id, replay.planner_wake_id)
         self.assertTrue(replay.completed)
 
         with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError, "different findings"
+            sprint_domain.SprintInvariantError, "different input"
         ):
             self.record_conformance(
                 self.sprint_id,
                 2,
-                body="Review body",
-                findings=[self.finding(severity="Critical")],
+                body="Changed review body",
                 final_report=FINAL_REPORT,
                 idempotency_key="same-pass",
             )
@@ -1283,7 +1173,6 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 2,
                 body="Review body",
-                findings=[self.finding(severity="Low")],
                 final_report="Changed final report.",
                 idempotency_key="same-pass",
             )
@@ -1293,7 +1182,6 @@ class ConformanceFollowupTest(SprintCloseCase):
         ):
             kwargs = {
                 "body": "Review body",
-                "findings": [self.finding(severity="Low")],
                 "final_report": FINAL_REPORT,
                 "idempotency_key": "same-pass",
                 field: value,
@@ -1303,41 +1191,21 @@ class ConformanceFollowupTest(SprintCloseCase):
             ):
                 self.record_conformance(self.sprint_id, 2, **kwargs)
         self.assertEqual(
-            (2, 1, 1, 1),
+            (2, 1, 1),
             tuple(
                 self.con.execute(
                     "SELECT "
                     "(SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?),"
-                    "(SELECT COUNT(*) FROM sprint_followups WHERE sprint_id=?),"
                     "(SELECT COUNT(*) FROM wake_message "
                     " WHERE idempotency_key='same-pass:planner-completed'),"
                     "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
                     " AND event_type='lifecycle.completed')",
-                    (self.sprint_id,) * 3,
+                    (self.sprint_id,) * 2,
                 ).fetchone()
             ),
         )
 
-    def test_non_object_finding_is_rejected_before_any_report_write(self):
-        with self.assertRaisesRegex(TypeError, "must be an object"):
-            self.record_conformance(
-                self.sprint_id,
-                2,
-                body="Malformed findings",
-                findings=["not an object"],
-                final_report=FINAL_REPORT,
-                idempotency_key="malformed-findings",
-            )
-        self.assertEqual(
-            0,
-            self.con.execute(
-                "SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=? "
-                "AND report_kind='conformance'",
-                (self.sprint_id,),
-            ).fetchone()[0],
-        )
-
-    def test_wrong_role_and_cross_sprint_links_leave_no_report(self):
+    def test_wrong_role_leaves_no_report(self):
         self.add_participant(5, "reviewer")
         before = self.con.execute(
             "SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?",
@@ -1350,7 +1218,6 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 1,
                 body="Not a review",
-                findings=[],
                 final_report=FINAL_REPORT,
                 idempotency_key="wrong-role",
             )
@@ -1361,20 +1228,8 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.sprint_id,
                 5,
                 body="Competing Reviewer",
-                findings=[],
                 final_report=FINAL_REPORT,
                 idempotency_key="competing-reviewer",
-            )
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError, "not bound"
-        ):
-            self.record_conformance(
-                self.sprint_id,
-                2,
-                body="Bad link",
-                findings=[self.finding(spec_document_id=999)],
-                final_report=FINAL_REPORT,
-                idempotency_key="bad-link",
             )
         self.assertEqual(
             before,
@@ -1476,90 +1331,6 @@ class ConformanceFollowupTest(SprintCloseCase):
             ).fetchone()[0],
         )
 
-    def test_only_fnb_dispositions_followup_and_only_pending_is_unresolved(self):
-        self.con.execute(
-            "INSERT INTO shells "
-            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
-            "VALUES (5,'FnB','FNB','admin','prompt',1)"
-        )
-        self.con.commit()
-        receipt = self.record_conformance(
-            self.sprint_id,
-            2,
-            body="Two follow-ups",
-            findings=[
-                self.finding(title="Accepted"),
-                self.finding(title="Resolved"),
-            ],
-            final_report=FINAL_REPORT,
-            idempotency_key="disposition-pass",
-        )
-        with self.assertRaisesRegex(
-            sprint_domain.SprintAuthorityError, "only FnB"
-        ):
-            self.close.disposition_followup(
-                self.sprint_id,
-                receipt.followup_ids[0],
-                3,
-                disposition="accepted",
-            )
-        self.assertEqual(
-            "pending",
-            self.con.execute(
-                "SELECT disposition FROM sprint_followups WHERE followup_id=?",
-                (receipt.followup_ids[0],),
-            ).fetchone()[0],
-        )
-
-        self.assertTrue(
-            self.close.disposition_followup(
-                self.sprint_id,
-                receipt.followup_ids[0],
-                5,
-                disposition="accepted",
-            )
-        )
-        self.assertTrue(
-            self.close.disposition_followup(
-                self.sprint_id,
-                receipt.followup_ids[1],
-                5,
-                disposition="resolved",
-                resolution="Fixed by PR #900",
-            )
-        )
-        self.assertFalse(
-            self.close.disposition_followup(
-                self.sprint_id,
-                receipt.followup_ids[1],
-                5,
-                disposition="resolved",
-                resolution="Fixed by PR #900",
-            )
-        )
-        self.assertEqual(
-            [
-                ("accepted", None, None),
-                ("resolved", "Fixed by PR #900", 1),
-            ],
-            [
-                (
-                    row["disposition"],
-                    row["resolution"],
-                    int(row["resolved_at"] is not None) if row["resolved_at"] else None,
-                )
-                for row in self.con.execute(
-                    "SELECT disposition,resolution,resolved_at "
-                    "FROM sprint_followups WHERE source_report_id=? "
-                    "ORDER BY followup_id",
-                    (receipt.report_id,),
-                )
-            ],
-        )
-        packet = self.close.compile_evidence_packet(self.sprint_id, 3)
-        self.assertEqual(0, packet["unresolved_work"]["followups"]["total"])
-        self.assertEqual([], packet["unresolved_work"]["followups"]["items"])
-
 
 class EvidenceCompilerTest(SprintCloseCase):
     def setUp(self) -> None:
@@ -1623,7 +1394,6 @@ class EvidenceCompilerTest(SprintCloseCase):
             self.sprint_id,
             2,
             body="Integrated review",
-            findings=[self.finding(severity="Low")],
             final_report=FINAL_REPORT,
             idempotency_key="compiler-review",
         )
@@ -1681,12 +1451,8 @@ class EvidenceCompilerTest(SprintCloseCase):
             "Integrated review",
             packet["conformance"]["reports"]["items"][0]["body"],
         )
-        self.assertEqual(
-            "The delivered seam does not preserve the bound contract.",
-            packet["conformance"]["followups"]["items"][0]["body"],
-        )
-        followup = packet["unresolved_work"]["followups"]["items"][0]
-        self.assertEqual("Low", followup["severity"])
+        self.assertNotIn("followups", packet["conformance"])
+        self.assertNotIn("followups", packet["unresolved_work"])
         self.assertEqual(
             f"/_sc/sprint/{self.sprint_id}/timeline",
             packet["full_history_links"]["timeline"],

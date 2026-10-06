@@ -1001,8 +1001,6 @@ class SprintBoardApiCase(unittest.TestCase):
                 "conformance.recorded",
                 {
                     "report_id": 4,
-                    "followup_count": 2,
-                    "followup_ids": [11, 12],
                     "secret": "hidden",
                 },
             ),

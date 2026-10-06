@@ -107,7 +107,6 @@ SPRINT_INSTANCE_TABLES = [
     "pr_subscription_poll_failures",
     "sprint_judgments",
     "sprint_reports",
-    "sprint_followups",
     "sprint_events",
     "sprint_wake_recovery_messages",
 ]
