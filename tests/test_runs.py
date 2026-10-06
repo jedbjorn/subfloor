@@ -31,10 +31,11 @@ import job
 import run_wakes
 import runs
 import server
+import sprint_message_delivery as delivery
 import sprint_runtime
 import test_sprint_work_dispatch as sprint_fixture
 from conversation_launch import ConversationLaunchPreparer
-from sprint_message_delivery import SprintMessageStore
+from sprint_message_delivery import SprintMessageStore, SprintWakeDeliveryService
 from test_conversation_broker import ConversationBrokerCase, FakeAdapter
 from test_job import TOKEN, build_db
 
@@ -145,6 +146,75 @@ class RunLedgerTest(ApiFixture, unittest.TestCase):
         self.con.commit()
         self.store = runs.RunStore(self.con, self.root / "engine")
         self.start_api()
+
+    def _devkit(self, key, **data):
+        return self.store.register(
+            1,
+            {
+                "registration_key": key,
+                "kind": "devkit",
+                "argv": ["./sc", "test"],
+                "cwd": str(self.root),
+                "label": "devkit-test",
+                **data,
+            },
+        )
+
+    def _done(self, row):
+        return self.store.terminal(
+            row["run_id"],
+            1,
+            {"state": "done", "exit_code": 0, "finished_at": "2026-10-06T10:00:00Z"},
+        )
+
+    def test_parallel_devkit_outcomes_deliver_as_one_turn(self):
+        first, second = self._devkit("first"), self._devkit("second")
+        service = SprintWakeDeliveryService(self.con)
+        first = self._done(first)
+        self.assertIsNone(service.claim_next("worker"))
+        second = self._done(second)
+        self.assertEqual(first["wake_id"], second["wake_id"])
+        prompts = []
+        with mock.patch.object(service, "_resolve_conversation", return_value="chat"):
+            outcome = service.deliver_once(
+                "worker", lambda _c, prompt, key: prompts.append(prompt) or key
+            )
+        self.assertEqual(outcome.state, "delivered")
+        (prompt,) = prompts
+        for row in (first, second):
+            self.assertIn(f"wake_message #{row['message_id']} ", prompt)
+
+    def test_outcome_wake_waits_only_for_background_devkit_siblings(self):
+        self.register(registration_key="server")
+        self._devkit("foreground", foreground=True)
+        self._done(self._devkit("quick"))
+        self.assertIsNotNone(SprintWakeDeliveryService(self.con).claim_next("worker"))
+
+    def test_hung_sibling_releases_outcome_after_hold_window(self):
+        self._devkit("hung")
+        self._done(self._devkit("quick"))
+        now = datetime.now(timezone.utc)
+        held = SprintWakeDeliveryService(self.con, now=lambda: now)
+        self.assertIsNone(held.claim_next("worker"))
+        later = now + timedelta(seconds=delivery.RUN_BATCH_HOLD_SECONDS + 1)
+        released = SprintWakeDeliveryService(self.con, now=lambda: later)
+        self.assertIsNotNone(released.claim_next("worker"))
+
+    def test_non_run_message_releases_held_wake_as_its_own_turn(self):
+        self._devkit("slow")
+        row = self._done(self._devkit("quick"))
+        note = SprintMessageStore(self.con).send_to_shell(
+            1,
+            message_kind="notification",
+            body="PR checks passed",
+            idempotency_key="pr-green",
+            declared_type="re-enter",
+        )
+        self.assertEqual(row["wake_id"], note.wake_id)
+        lease = SprintWakeDeliveryService(self.con).claim_next("worker")
+        self.assertEqual(
+            lease.turn_message_ids, ((row["message_id"],), (note.message_id,))
+        )
 
     def test_legacy_ids_remain_unambiguous_without_retroactive_wakes(self):
         legacy = self.engine / "run" / "jobs" / "18"
@@ -798,9 +868,13 @@ class RunContinuationTest(ApiFixture, ConversationBrokerCase):
         finally:
             con.close()
 
-    def _busy_setup(self):
+    def _busy_setup(self, outcomes=1):
         self.add_conversation(state="idle")
-        row = self.terminal(self.register())
+        self.outcomes = [
+            self.terminal(self.register(registration_key=f"busy-{n}"))
+            for n in range(outcomes)
+        ]
+        row = self.outcomes[0]
         held = {"busy": True}
         native_preparer = ConversationLaunchPreparer(
             self.db_path,
@@ -861,6 +935,35 @@ class RunContinuationTest(ApiFixture, ConversationBrokerCase):
             "SELECT error_code FROM conversation_runs ORDER BY run_id"
         ).fetchall()
         self.assertEqual([r[0] for r in attempts], ["SHELL_BUSY", None])
+
+    def test_busy_retry_replays_a_batched_turn_once(self):
+        _row, held, adapter, broker, _runtime, con, _mid = self._busy_setup(
+            outcomes=2
+        )
+        now = datetime.now(timezone.utc)
+        run_wakes.reconcile(con, now=now)
+        held["busy"] = False
+        run_wakes.reconcile(con, now=now + timedelta(seconds=16))
+        (mid,) = {
+            r[0]
+            for r in con.execute(
+                "SELECT conversation_message_id FROM engine_wake_receipts"
+            )
+        }
+        broker.notify()
+        wait_for(lambda: self._message_state(mid) == "completed")
+        run_wakes.reconcile(con)
+        for row in self.outcomes:
+            self.assertEqual(
+                job.ledger_run(str(row["run_id"]))["wake_state"], "consumed"
+            )
+        self.assertEqual(adapter.started, 1)
+        self.assertEqual(
+            con.execute(
+                "SELECT count(*) FROM conversation_runs WHERE error_code IS NULL"
+            ).fetchone()[0],
+            1,
+        )
 
     def test_busy_retry_enqueue_outage_retains_retry_and_does_not_halt_pulse(self):
         row, held, _adapter, broker, runtime, con, _mid = self._busy_setup()
