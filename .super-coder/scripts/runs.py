@@ -129,14 +129,22 @@ class RunStore:
         return out
 
     def list(self, owner: int | None = None, *, kind: str | None = None,
-             state: str | None = None) -> list[dict]:
+             state: str | None = None, limit: int = 200) -> list[dict]:
         rows = self.con.execute(
             "SELECT run_id FROM runs WHERE (? IS NULL OR owner_shell_id=?) "
             "AND (? IS NULL OR kind=?) AND (? IS NULL OR state=?) "
-            "ORDER BY run_id DESC LIMIT 200",
-            (owner, owner, kind, kind, state, state),
+            "ORDER BY run_id DESC LIMIT ?",
+            (owner, owner, kind, kind, state, state, min(max(limit, 1), 200)),
         ).fetchall()
         return [self.get(row[0], owner) for row in rows]
+
+    def count(self, owner: int | None = None, *, kind: str | None = None,
+              state: str | None = None) -> int:
+        return self.con.execute(
+            "SELECT count(*) FROM runs WHERE (? IS NULL OR owner_shell_id=?) "
+            "AND (? IS NULL OR kind=?) AND (? IS NULL OR state=?)",
+            (owner, owner, kind, kind, state, state),
+        ).fetchone()[0]
 
     def register(self, owner: int, data: dict) -> dict:
         argv = data.get("argv")

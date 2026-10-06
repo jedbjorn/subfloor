@@ -400,6 +400,9 @@ const runAge = (value) => {
   const seconds = Math.max(0, Math.floor((Date.now() - stamp) / 1000));
   return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h`;
 };
+// GUI lists show the newest LIST_LIMIT rows; the API reports the full total.
+const LIST_LIMIT = 20;
+const countLabel = (shown, total) => (total > shown ? `${shown} of ${total}` : `${shown}`);
 function receiptRows(receipts) {
   return el("div", { className: "run-receipts" }, ...(receipts || []).map((receipt) => {
     const summary = receipt.summary;
@@ -504,10 +507,11 @@ async function renderRunsFleet(host, shells, badge) {
   const state = select("States", ["registered", "running", "done", "failed", "timeout", "killed", "lost"].map((s) => [s, s]));
   const paint = () => renderRunRows(list, runs.filter((r) => (!shell.value || String(r.owner_shell_id) === shell.value)
     && (!kind.value || r.kind === kind.value) && (!state.value || r.state === state.value)), shells, refresh);
+  const caption = el("p", { className: "muted" });
   let refreshEpoch = 0;
   const refresh = async () => {
     const epoch = ++refreshEpoch;
-    const query = new URLSearchParams();
+    const query = new URLSearchParams({ limit: LIST_LIMIT });
     if (shell.value) query.set("shell_id", shell.value);
     if (kind.value) query.set("kind", kind.value);
     if (state.value) query.set("state", state.value);
@@ -515,8 +519,9 @@ async function renderRunsFleet(host, shells, badge) {
       const result = await api(`/runs?${query}`);
       if (!host.isConnected || epoch !== refreshEpoch) return;
       runs = result.runs;
+      caption.textContent = `Newest ${countLabel(runs.length, result.total)} matching runs.`;
       // The tab always counts the fleet, even when its rows are filtered.
-      const count = shell.value ? await api("/runs") : result;
+      const count = shell.value ? await api("/runs?limit=1") : result;
       if (!host.isConnected || epoch !== refreshEpoch) return;
       badge.textContent = `Runs (${count.attention_count})`;
       paint();
@@ -525,7 +530,7 @@ async function renderRunsFleet(host, shells, badge) {
   const button = el("button", { className: "act", type: "button" }, "Refresh");
   button.onclick = refresh;
   filters.append(button);
-  host.append(el("h2", {}, "Runs"), el("p", { className: "muted" }, "Newest 200 matching runs."), filters, list);
+  host.append(el("h2", {}, "Runs"), caption, filters, list);
   await refresh();
 }
 async function renderConversionStatus(host) {
@@ -637,7 +642,7 @@ async function renderShells(root) {
     className: "shell-pane" + (shellTab === "assignments" ? " skill-assignments" : ""),
   });
   root.append(pane);
-  if (shellTab !== "runs") api("/runs").then(({ attention_count }) => {
+  if (shellTab !== "runs") api("/runs?limit=1").then(({ attention_count }) => {
     if (epoch === shellRenderEpoch) runsBadge.textContent = `Runs (${attention_count})`;
   }).catch(() => { runsBadge.title = "Run count unavailable"; });
   if (shellTab === "runs") renderRunsFleet(pane, shells, runsBadge);
@@ -6430,11 +6435,13 @@ async function renderInterface(root) {
 
   const prPanel = el("details", { className: "chat-pr-panel" });
   const prList = el("div", { className: "chat-pr-list" });
-  prPanel.append(el("summary", {}, "Pull requests"), prList);
+  const prSummary = el("summary", {}, "Pull requests");
+  prPanel.append(prSummary, prList);
   const refreshPRs = async () => {
     try {
-      const { prs } = await api(`/runs/prs?shell_id=${shell.shell_id}`);
+      const { prs, total } = await api(`/runs/prs?shell_id=${shell.shell_id}`);
       if (generation !== chatRenderGeneration) return;
+      prSummary.textContent = `Pull requests (${countLabel(prs.length, total)})`;
       prList.replaceChildren(...(prs || []).map((pr) => el("article", { className: "chat-pr-row" },
         el("a", { href: `https://github.com/${pr.repository}/pull/${pr.pr_number}`, target: "_blank", rel: "noopener" }, `${pr.repository}#${pr.pr_number}`),
         el("div", {}, `GitHub: ${pr.normalized_state || "unobserved"} · ${(pr.observed_head_sha || "unknown head").slice(0, 12)}`),
@@ -6456,9 +6463,9 @@ async function renderInterface(root) {
     if (runsRefreshInFlight) return;
     runsRefreshInFlight = true;
     try {
-      const { runs } = await api(`/runs?shell_id=${shell.shell_id}`);
+      const { runs, total } = await api(`/runs?shell_id=${shell.shell_id}&limit=${LIST_LIMIT}`);
       if (generation !== chatRenderGeneration) return;
-      runsSummary.textContent = `Runs (${runs.length})`;
+      runsSummary.textContent = `Runs (${countLabel(runs.length, total)})`;
       renderRunRows(runsList, runs, shells, async () => { await refreshRuns(); await refreshPRs(); });
       if (selectedConversation && (selectedConversation.state === "running" || selectedConversation.process?.alive)) {
         const snapshot = await api(`/runs/processes?conversation_id=${encodeURIComponent(selectedConversation.conversation_id)}`);

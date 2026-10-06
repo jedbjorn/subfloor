@@ -85,7 +85,7 @@ class AttachmentsTest(ApiFixture, unittest.TestCase):
         self.git('commit', '--allow-empty', '-qm', 'replacement')
         replacement = self.git('rev-parse', 'HEAD')
         self.observe(replacement)
-        projected = self.attachments.prs(1)[0]
+        projected = self.attachments.prs(1)['prs'][0]
         states = {r['run_id']: r['ancestry'] for r in projected['receipts']}
         self.assertEqual(states, {current: 'current', stale: 'stale'})
         self.assertEqual(projected['normalized_state'], 'green')
@@ -126,6 +126,32 @@ class AttachmentsTest(ApiFixture, unittest.TestCase):
         receipt = self.attachments.pr_receipts('fixture/project', 42, self.head)[0]
         self.assertTrue(receipt['evidence_pruned'])
         self.assertEqual(receipt['summary']['passed'], 3)
+
+    def test_pr_list_shows_open_first_and_caps_with_total(self):
+        self.observe(self.head)
+        for number in range(100, 100 + run_attachments.PR_LIMIT + 2):
+            sub = self.con.execute("INSERT INTO pr_subscriptions(owner_shell_id,repository,pr_number) VALUES(1,'fixture/project',?)",
+                                   (number,)).lastrowid
+            self.con.execute("INSERT INTO pr_subscription_transitions(subscription_id,normalized_state,transition_key) "
+                             "VALUES(?,'merged',?)", (sub, f'merged-{number}'))
+        self.con.commit()
+        listed = self.attachments.prs(1)
+        # The oldest PR is the only open one, so it leads despite 22 newer merged PRs.
+        self.assertEqual(listed['prs'][0]['pr_number'], 42)
+        self.assertEqual(len(listed['prs']), run_attachments.PR_LIMIT)
+        self.assertEqual(listed['total'], run_attachments.PR_LIMIT + 3)
+
+    def test_receipts_and_run_list_return_newest_within_limit(self):
+        rids = [self.receipt() for _ in range(run_attachments.RECEIPT_LIMIT + 2)]
+        for rid in rids[:-1]:
+            self.attachments.attach(rid, 1, {'pr': 42})
+        self.attachments.attach(rids[-1], 1, {'work_unit': self.unit})
+        receipts = self.attachments.pr_receipts('fixture/project', 42, self.head)
+        self.assertEqual([r['run_id'] for r in receipts], rids[::-1][:run_attachments.RECEIPT_LIMIT])
+        limited = job._api('GET', '/_sc/runs?limit=2')
+        self.assertEqual([r['run_id'] for r in limited['runs']], rids[::-1][:2])
+        self.assertEqual(limited['total'], len(rids))
+        self.assertEqual(len(job._api('GET', '/_sc/runs')['runs']), len(rids))
 
     def test_reseed_is_idempotent_and_preserves_shell_identity(self):
         migration = Path(__file__).resolve().parents[1] / '.super-coder/migrations/0279_run_receipt_attachments.sql'
