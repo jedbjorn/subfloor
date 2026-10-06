@@ -2367,7 +2367,8 @@ class SprintLiveProof(unittest.TestCase):
             document_id, packet["spec_revisions"]["bound"][0]["document_id"]
         )
         self.assertEqual([], packet["unresolved_work"]["work_units"]["items"])
-        self.assertEqual([], packet["unresolved_work"]["followups"]["items"])
+        self.assertNotIn("followups", packet["unresolved_work"])
+        self.assertNotIn("followups", packet["conformance"])
         return packet
 
     def test_serial_sprint_runs_correction_merge_dispatch_and_close(self) -> None:
