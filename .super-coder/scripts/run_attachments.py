@@ -12,6 +12,9 @@ import subprocess
 import db_driver
 from runs import TERMINAL, RunStore
 
+PR_LIMIT = 20
+RECEIPT_LIMIT = 5
+
 
 def ancestry(cwd: str, commit: str | None, head: str | None) -> str:
     if not isinstance(commit, str) or not isinstance(head, str):
@@ -103,8 +106,12 @@ class RunAttachments:
 
     def receipts(self, *, subscription: int | None = None, work_unit: int | None = None,
                  head: str | None = None) -> list[dict]:
-        rows = self.con.execute('SELECT run_id FROM runs WHERE attached_pr=? OR attached_work_unit=? ORDER BY run_id DESC',
-                                (subscription, work_unit)).fetchall()
+        return self._receipts('attached_pr=? OR attached_work_unit=?', (subscription, work_unit), head)
+
+    def _receipts(self, where: str, params: tuple, head: str | None) -> list[dict]:
+        # Newest RECEIPT_LIMIT only: each receipt costs a git ancestry probe.
+        rows = self.con.execute(f'SELECT run_id FROM runs WHERE {where} ORDER BY run_id DESC LIMIT ?',
+                                (*params, RECEIPT_LIMIT)).fetchall()
         result = []
         for item in rows:
             row = self.store.get(item[0])
@@ -121,16 +128,17 @@ class RunAttachments:
                               (repository, number)).fetchone()
         if not pr:
             return []
-        units = self.con.execute('SELECT link.work_unit_id FROM sprint_pr_work_units link JOIN pr_subscriptions p '
-                                 'ON p.sprint_registered_pr_id=link.registered_pr_id WHERE p.subscription_id=?', (pr[0],)).fetchall()
-        receipts = {r['run_id']: r for r in self.receipts(subscription=pr[0], head=head)}
-        for unit in units:
-            receipts.update((r['run_id'], r) for r in self.receipts(work_unit=unit[0], head=head))
-        return list(receipts.values())
+        return self._receipts('attached_pr=? OR attached_work_unit IN (SELECT link.work_unit_id FROM sprint_pr_work_units link '
+                              'JOIN pr_subscriptions p ON p.sprint_registered_pr_id=link.registered_pr_id '
+                              'WHERE p.subscription_id=?)', (pr[0], pr[0]), head)
 
-    def prs(self, owner: int) -> list[dict]:
+    def prs(self, owner: int) -> dict:
+        """Open PRs first, then newest; capped at PR_LIMIT with the owner's full total."""
         rows = self.con.execute('SELECT p.*,t.normalized_state,t.observed_head_sha,t.observed_at FROM pr_subscriptions p '
                                'LEFT JOIN pr_subscription_transitions t ON t.transition_id=(SELECT MAX(transition_id) '
                                'FROM pr_subscription_transitions WHERE subscription_id=p.subscription_id) '
-                               'WHERE p.owner_shell_id=? ORDER BY p.subscription_id DESC LIMIT 50', (owner,)).fetchall()
-        return [dict(r, receipts=self.pr_receipts(r['repository'], r['pr_number'], r['observed_head_sha'])) for r in rows]
+                               "WHERE p.owner_shell_id=? ORDER BY COALESCE(t.normalized_state IN ('merged','closed'),0), "
+                               'p.subscription_id DESC LIMIT ?', (owner, PR_LIMIT)).fetchall()
+        total = self.con.execute('SELECT count(*) FROM pr_subscriptions WHERE owner_shell_id=?', (owner,)).fetchone()[0]
+        return {'prs': [dict(r, receipts=self.pr_receipts(r['repository'], r['pr_number'], r['observed_head_sha']))
+                        for r in rows], 'total': total}
