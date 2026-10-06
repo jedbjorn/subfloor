@@ -36,6 +36,9 @@ SYSTEM_IDEMPOTENCY_KEY_PREFIX = "_sc:system:"
 # A wake of run outcomes waits for the receiver's other background dev-kit
 # runs so parallel gates wake once; a hung sibling releases it after this.
 RUN_BATCH_HOLD_SECONDS = 600
+# runs.RunStore.terminal keys each outcome run-<id>-terminal. Matching the key
+# keeps delivery free of the runs table on schemas that predate it.
+RUN_OUTCOME_KEY_GLOB = "run-[0-9]*-terminal"
 
 
 class ForceNewDeferred(RuntimeError):
@@ -1057,12 +1060,12 @@ class SprintWakeDeliveryService:
         Their outcomes coalesce into this pending wake and deliver as one turn.
         """
         held = self.con.execute(
-            "SELECT count(*) AS total,count(r.run_id) AS outcomes,"
+            "SELECT count(*) AS total,"
+            "sum(m.idempotency_key GLOB ?) AS outcomes,"
             "min(m.created_at) AS oldest FROM sprint_wake_messages wm "
             "JOIN wake_message m USING (message_id) "
-            "LEFT JOIN runs r ON r.message_id=m.message_id "
             "WHERE wm.wake_id=? AND m.delivered_at IS NULL",
-            (wake_id,),
+            (RUN_OUTCOME_KEY_GLOB, wake_id),
         ).fetchone()
         if not held["total"] or held["outcomes"] != held["total"]:
             return False
@@ -1181,15 +1184,14 @@ class SprintWakeDeliveryService:
                 "m.receiver_shell_id) "
                 "THEN 'new' ELSE m.declared_type END AS declared_type,"
                 "m.body,s.lifecycle,p.role,"
-                "EXISTS (SELECT 1 FROM runs r WHERE r.message_id=m.message_id) "
-                "AS run_outcome "
+                "m.idempotency_key GLOB ? AS run_outcome "
                 "FROM wake_message m LEFT JOIN sprints s "
                 "ON s.sprint_id=m.sprint_id LEFT JOIN sprint_participants p "
                 "ON p.sprint_id=m.sprint_id "
                 "AND p.participant_id=m.to_participant_id "
                 "WHERE m.receiver_shell_id=? AND m.delivered_at IS NULL "
                 "ORDER BY m.message_id",
-                (row["receiver_shell_id"],),
+                (RUN_OUTCOME_KEY_GLOB, row["receiver_shell_id"]),
             ).fetchall()
             if not messages:
                 raise SprintInvariantError("claimed wake has no undelivered messages")
