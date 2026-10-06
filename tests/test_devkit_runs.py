@@ -296,6 +296,8 @@ class PytestSummaryTest(unittest.TestCase):
                 if custom:
                     con.execute("UPDATE skills SET content='fork-owned custom body' WHERE name='dev_kit'")
                     con.commit()
-                con.executescript((ENGINE / 'migrations/0276_devkit_run_receipts.sql').read_text())
+                for migration in sorted((ENGINE / 'migrations').glob('*.sql')):
+                    if migration.name >= '0276':
+                        con.executescript(migration.read_text())
                 actual = con.execute("SELECT content FROM skills WHERE name='dev_kit'").fetchone()[0]
                 self.assertEqual(actual, 'fork-owned custom body' if custom else desired)

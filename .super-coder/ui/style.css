@@ -1761,3 +1761,9 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .shell-pane .run-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(220px, 1fr) auto; align-items: center; gap: 12px; }
 .shell-pane .conversion-status .run-row { display: block; }
 @media (max-width: 1000px) { .shell-pane .run-row { display: block; } }
+
+/* Receipt evidence stays beside, and distinct from, the observed GitHub check. */
+.run-receipts { display: grid; gap: .5rem; margin-top: .5rem; }
+.run-receipt { display: grid; gap: .2rem; font-size: .8rem; overflow-wrap: anywhere; }
+.chat-pr-panel { margin-top: .75rem; padding: .5rem; border-top: 1px solid var(--border); }
+.chat-pr-row { padding: .6rem 0; overflow-wrap: anywhere; }

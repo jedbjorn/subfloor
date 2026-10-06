@@ -400,6 +400,36 @@ const runAge = (value) => {
   const seconds = Math.max(0, Math.floor((Date.now() - stamp) / 1000));
   return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h`;
 };
+function receiptRows(receipts) {
+  return el("div", { className: "run-receipts" }, ...(receipts || []).map((receipt) => {
+    const summary = receipt.summary;
+    const log = el("a", { href: receipt.log_url, target: "_blank", rel: "noopener" }, receipt.evidence_pruned ? "Log pruned" : "Log");
+    log.onclick = (event) => event.stopPropagation();
+    return el("div", { className: "run-receipt", title: "Run evidence supplements GitHub checks; it does not satisfy the merge gate." },
+      el("span", {}, `Run #${receipt.run_id} · ${receipt.hook || receipt.kind} · ${(receipt.commit || "unknown commit").slice(0, 12)} · ${receipt.state} · exit ${receipt.exit_code ?? "unknown"}`),
+      el("span", {}, summary ? `${summary.passed} passed · ${summary.failed} failed · ${summary.errors} errors · ${summary.skipped} skipped` : "Test summary unavailable"),
+      el("span", { className: receipt.ancestry === "stale" ? "warning" : "muted" }, receipt.ancestry === "current" ? "Ancestor of PR head" : receipt.ancestry === "stale" ? "Stale: not an ancestor of PR head" : "PR ancestry unknown"), log);
+  }));
+}
+async function attachRun(run, refresh) {
+  try {
+    const { targets } = await api(`/runs/${run.run_id}/attachment-targets`);
+    if (!targets.length) return toast("No PRs or work units owned by this run's shell.");
+    const select = el("select", { ariaLabel: "Receipt target" }, ...targets.map((target, index) => el("option", { value: String(index) }, target.label)));
+    const attach = el("button", { className: "act primary", type: "button" }, "Attach");
+    const cancel = el("button", { className: "act", type: "button" }, "Cancel");
+    const close = openModal({ title: `Attach run #${run.run_id}`, bodyNode: select, footerEnd: el("div", {}, cancel, attach) });
+    cancel.onclick = close;
+    attach.onclick = async () => {
+      const target = targets[Number(select.value)];
+      attach.disabled = true;
+      try {
+        await api(`/runs/${run.run_id}/attach`, "POST", { [target.kind]: target.id, ...(target.repository ? { repository: target.repository } : {}) });
+        close(); await refresh(); toast("Run attached");
+      } catch (error) { toast(error.message); attach.disabled = false; }
+    };
+  } catch (error) { toast(error.message); }
+}
 function renderRunRows(host, runs, shells, refresh) {
   host.replaceChildren();
   if (!runs.length) { host.append(el("div", { className: "muted" }, "No runs.")); return; }
@@ -437,6 +467,11 @@ function renderRunRows(host, runs, shells, refresh) {
         finally { kill.disabled = false; }
       };
       actions.append(kill);
+    }
+    if (["done", "failed", "timeout", "killed", "lost"].includes(run.state)) {
+      const attach = el("button", { className: "act", type: "button" }, "Attach receipt");
+      attach.onclick = () => attachRun(run, refresh);
+      actions.append(attach);
     }
     row.append(actions);
     host.append(row);
@@ -6393,6 +6428,25 @@ async function renderInterface(root) {
     rail.append(shellRow);
   }
 
+  const prPanel = el("details", { className: "chat-pr-panel" });
+  const prList = el("div", { className: "chat-pr-list" });
+  prPanel.append(el("summary", {}, "Pull requests"), prList);
+  const refreshPRs = async () => {
+    try {
+      const { prs } = await api(`/runs/prs?shell_id=${shell.shell_id}`);
+      if (generation !== chatRenderGeneration) return;
+      prList.replaceChildren(...(prs || []).map((pr) => el("article", { className: "chat-pr-row" },
+        el("a", { href: `https://github.com/${pr.repository}/pull/${pr.pr_number}`, target: "_blank", rel: "noopener" }, `${pr.repository}#${pr.pr_number}`),
+        el("div", {}, `GitHub: ${pr.normalized_state || "unobserved"} · ${(pr.observed_head_sha || "unknown head").slice(0, 12)}`),
+        el("div", { className: "muted" }, `Observed: ${pr.observed_at || "not yet"}`), receiptRows(pr.receipts))));
+      if (!prs?.length) prList.append(el("div", { className: "muted" }, "No registered PRs."));
+    } catch (error) { if (generation === chatRenderGeneration) prList.replaceChildren(el("div", { className: "error" }, error.message)); }
+  };
+  const refreshPRButton = el("button", { className: "act", type: "button" }, "Refresh PRs");
+  refreshPRButton.onclick = refreshPRs;
+  prPanel.append(refreshPRButton);
+  rail.append(prPanel);
+  refreshPRs();
   const runsDrawer = el("details", { className: "runs-drawer" });
   const runsSummary = el("summary", {}, "Runs");
   const runsList = el("div", { className: "run-list" });
@@ -6405,7 +6459,7 @@ async function renderInterface(root) {
       const { runs } = await api(`/runs?shell_id=${shell.shell_id}`);
       if (generation !== chatRenderGeneration) return;
       runsSummary.textContent = `Runs (${runs.length})`;
-      renderRunRows(runsList, runs, shells, refreshRuns);
+      renderRunRows(runsList, runs, shells, async () => { await refreshRuns(); await refreshPRs(); });
       if (selectedConversation && (selectedConversation.state === "running" || selectedConversation.process?.alive)) {
         const snapshot = await api(`/runs/processes?conversation_id=${encodeURIComponent(selectedConversation.conversation_id)}`);
         if (generation === chatRenderGeneration) renderProcessTile(processTile, snapshot);
@@ -7529,9 +7583,9 @@ function openSprintUnitModal(unit, snapshot) {
 }
 
 function sprintWorkUnitCard(unit, snapshot) {
-  const card = el("button", {
+  const card = el("article", {
     className: `sprint-unit sprint-unit-${unit.disposition}`,
-    type: "button",
+    tabIndex: 0,
     title: `U${unit.work_unit_id} ${unit.title}`,
   });
   card.dataset.unitId = String(unit.work_unit_id);
@@ -7553,6 +7607,9 @@ function sprintWorkUnitCard(unit, snapshot) {
     el("div", { className: "sprint-unit-foot" },
       el("span", {}, unit.output_kind.replaceAll("_", " ")),
       el("span", {}, pr ? `PR #${pr.pr_number} · ${pr.normalized_state || "registered"}` : "No PR")));
+  const receipts = new Map((unit.receipts || []).map((r) => [r.run_id, r]));
+  for (const item of unit.pull_requests) for (const r of item.receipts || []) receipts.set(r.run_id, r);
+  card.append(receiptRows([...receipts.values()]));
   if (snapshot.sprint.lifecycle === "armed"
       && !["completed", "cancelled"].includes(unit.disposition)
       && health) {
@@ -7584,6 +7641,7 @@ function sprintWorkUnitCard(unit, snapshot) {
       `Runtime ${unit.delivery.runtime_state} — wake ${unit.delivery.wake_id} has `,
       `${unit.delivery.attempt_count} delivery attempts`));
   card.onclick = () => openSprintUnitModal(unit, snapshot);
+  card.onkeydown = (event) => { if (event.target === card && ["Enter", " "].includes(event.key)) { event.preventDefault(); openSprintUnitModal(unit, snapshot); } };
   return card;
 }
 

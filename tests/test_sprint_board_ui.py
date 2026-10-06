@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 INDEX = (ROOT / ".super-coder" / "ui" / "index.html").read_text()
 STYLE = (ROOT / ".super-coder" / "ui" / "style.css").read_text()
-SPRINT_BLOCK = APP[
+SPRINT_BLOCK = APP[APP.index("function receiptRows"):APP.index("async function attachRun")] + APP[
     APP.index("const SPRINTS_REFRESH_MS"):
     APP.index("// ── Tabs + boot")
 ]
@@ -352,7 +352,7 @@ function all(node, pred, out = []) {
   return out;
 }
 const columns = all(root, (node) => node.tagName === "section");
-const cards = all(root, (node) => node.tagName === "button" && node.dataset.unitId);
+const cards = all(root, (node) => node.dataset.unitId);
 console.log(JSON.stringify({
   headings: columns.map((column) => column.children[0].textContent),
   cards: cards.map((card) => card.textContent),

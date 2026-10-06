@@ -158,10 +158,12 @@ class ProbeTest(ApiFixture, unittest.TestCase):
 class ProbeGuidanceTest(unittest.TestCase):
     def test_reseed_is_idempotent_and_boot_teaches_cli_and_watcher_boundary(self):
         template = (ENGINE / 'templates/shells/dev.md').read_text()
-        guidance = template.split('## BOUNDED PROBES\n', 1)[1].split('## CODE CRAFT', 1)[0]
+        guidance = template.split('## BOUNDED PROBES\n', 1)[1].split('## ', 1)[0]
         block = '## BOUNDED PROBES\n' + guidance
-        old = 'Custom focus\n' + template.replace(block, '')
+        receipts = '## RUN RECEIPTS\n' + template.split('## RUN RECEIPTS\n', 1)[1].split('## ', 1)[0]
+        old = 'Custom focus\n' + template.replace(block, '').replace(receipts, '')
         migration = (ENGINE / 'migrations/0278_developer_bounded_probes.sql').read_text()
+        later = (ENGINE / 'migrations/0279_run_receipt_attachments.sql').read_text()
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / 'test.db'
             build_db(str(db))
@@ -171,6 +173,8 @@ class ProbeGuidanceTest(unittest.TestCase):
                 con.commit()
                 con.executescript(migration)
                 con.executescript(migration)
+                con.executescript(later)
+                con.executescript(later)
                 shell = con.execute('SELECT * FROM shells WHERE shell_id=1').fetchone()
                 self.assertEqual(shell['system_prompt'], 'Custom focus\n' + template)
                 user = con.execute('SELECT * FROM users WHERE user_id=1').fetchone()

@@ -76,6 +76,17 @@ a file appearing (`--until 'test -f build/ready'`), or a remote build finishing
 means the condition you need is met. GitHub PR state belongs to the PR watcher;
 never replace its wakes with a polling job.
 
+## RUN RECEIPTS
+
+Attach completed local evidence by run id with `sc job attach <id> --pr <number>`
+or `sc job attach <id> --work-unit <id>`. The run and target must share an owner;
+a PR must already be registered. Use `--repository owner/name` if its number is
+ambiguous. The Runs drawer and fleet offer the same attachment action.
+Receipts show beside the observed GitHub check in Chats and the Sprint board.
+A commit outside the PR head's ancestry is stale; unavailable ancestry stays
+unknown. Pruned logs retain their receipt. Receipts supplement CI evidence;
+only GitHub checks and the existing merge grant authorize a merge.
+
 ## CODE CRAFT
 
 How to write, not just what.

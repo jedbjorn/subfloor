@@ -174,7 +174,8 @@
     ".super-coder/scripts/runs.py",
     "tests/test_runs.py",
     ".super-coder/migrations/0275_runs_ledger.sql",
-    ".super-coder/migrations/0276_devkit_run_receipts.sql"
+    ".super-coder/migrations/0276_devkit_run_receipts.sql",
+    ".super-coder/migrations/0279_run_receipt_attachments.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
@@ -420,7 +421,10 @@
     ".super-coder/docs/sprint-pr-watcher.md",
     "docs/environment.md",
     ".super-coder/migrations/0278_developer_bounded_probes.sql",
-    "tests/test_job_probe.py"
+    "tests/test_job_probe.py",
+    ".super-coder/scripts/run_attachments.py",
+    "tests/test_run_attachments.py",
+    "tests/test_run_attachments_browser.py"
   ],
   "decision": 33,
   "generation_markers": {
