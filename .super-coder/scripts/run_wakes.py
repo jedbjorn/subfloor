@@ -153,23 +153,31 @@ def reconcile(con, *, now=None):
 
     # Enqueue can notify the broker; no external work inside a DB transaction.
     db_path = con.execute("PRAGMA database_list").fetchone()[2]
+    replayed = set()
     for row in retries:
+        # Batched run outcomes share one turn; replay it once for all of them.
+        if row["conversation_message_id"] in replayed:
+            continue
+        replayed.add(row["conversation_message_id"])
         try:
             _retry_receipt(con, db_path, row)
         except OSError as exc:
             # Retain the idempotent attempt after a temporary enqueue outage.
             with db_driver.write_transaction(con, "wake.receipt_retry"):
                 con.execute(
-                    "UPDATE engine_wake_receipts SET last_error=?,retry_at=? WHERE message_id=?",
+                    "UPDATE engine_wake_receipts SET last_error=?,retry_at=? "
+                    "WHERE conversation_message_id=?",
                     (
                         f"{type(exc).__name__}: retry enqueue unavailable",
                         _stamp(now + timedelta(seconds=BACKOFF[-1])),
-                        row["message_id"],
+                        row["conversation_message_id"],
                     ),
                 )
         except Exception as exc:  # noqa: BLE001 - one failed enqueue must not halt the pulse
             with db_driver.write_transaction(con, "wake.receipt_blocked"):
-                _block_receipt(con, row, _reconcile_error(exc), now)
+                for shared in retries:
+                    if shared["conversation_message_id"] == row["conversation_message_id"]:
+                        _block_receipt(con, shared, _reconcile_error(exc), now)
 
 
 def _reconcile_error(exc):
@@ -301,8 +309,8 @@ def _retry_receipt(con, db_path, row):
     with db_driver.write_transaction(con, "wake.busy_retry"):
         con.execute(
             "UPDATE engine_wake_receipts SET conversation_message_id=?,retry_at=NULL,last_error=NULL "
-            "WHERE message_id=?",
-            (int(native_ref.split(":")[1]), row["message_id"]),
+            "WHERE conversation_message_id=?",
+            (int(native_ref.split(":")[1]), row["conversation_message_id"]),
         )
 
 

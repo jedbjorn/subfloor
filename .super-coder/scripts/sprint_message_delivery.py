@@ -33,6 +33,9 @@ MESSAGE_INTENTS = frozenset(
 )
 REPLY_REQUIRED_INTENTS = frozenset({"question", "blocker", "decision"})
 SYSTEM_IDEMPOTENCY_KEY_PREFIX = "_sc:system:"
+# A wake of run outcomes waits for the receiver's other background dev-kit
+# runs so parallel gates wake once; a hung sibling releases it after this.
+RUN_BATCH_HOLD_SECONDS = 600
 
 
 class ForceNewDeferred(RuntimeError):
@@ -68,10 +71,12 @@ class WakeLease:
     receiver_shell_id: int
     message_ids: tuple[int, ...]
     declared_types: tuple[str, ...]
-    # One prompt per message, aligned with message_ids: each message is its
-    # own queued turn, so a procedure that ends its turn cannot strand a
-    # message that arrived in the same wake.
+    # One queued turn per message, so a procedure that ends its turn cannot
+    # strand a message that arrived in the same wake. Consecutive run
+    # outcomes are pure facts and share one turn; turn_message_ids aligns
+    # each prompt with the messages it carries.
     prompts: tuple[str, ...]
+    turn_message_ids: tuple[tuple[int, ...], ...]
     idempotency_key: str
     attempt_number: int
     claim_owner: str
@@ -1044,6 +1049,35 @@ class SprintWakeDeliveryService:
             is not None
         )
 
+    def _awaits_sibling_runs(
+        self, wake_id: int, receiver_shell_id: int, now_value: datetime
+    ) -> bool:
+        """Hold a run-outcome-only wake while sibling dev-kit runs are active.
+
+        Their outcomes coalesce into this pending wake and deliver as one turn.
+        """
+        held = self.con.execute(
+            "SELECT count(*) AS total,count(r.run_id) AS outcomes,"
+            "min(m.created_at) AS oldest FROM sprint_wake_messages wm "
+            "JOIN wake_message m USING (message_id) "
+            "LEFT JOIN runs r ON r.message_id=m.message_id "
+            "WHERE wm.wake_id=? AND m.delivered_at IS NULL",
+            (wake_id,),
+        ).fetchone()
+        if not held["total"] or held["outcomes"] != held["total"]:
+            return False
+        age = (now_value - _parse_stamp(str(held["oldest"]))).total_seconds()
+        if age >= RUN_BATCH_HOLD_SECONDS:
+            return False
+        return (
+            self.con.execute(
+                "SELECT 1 FROM runs WHERE owner_shell_id=? AND kind='devkit' "
+                "AND foreground=0 AND state IN ('registered','running') LIMIT 1",
+                (receiver_shell_id,),
+            ).fetchone()
+            is not None
+        )
+
     def claim_next(self, owner: str, *, lease_seconds: int = 60) -> WakeLease | None:
         owner = owner.strip()
         if not owner:
@@ -1081,6 +1115,10 @@ class SprintWakeDeliveryService:
             row = None
             for candidate in candidates:
                 receiver_shell_id = int(candidate["receiver_shell_id"])
+                if candidate["state"] == "pending" and self._awaits_sibling_runs(
+                    int(candidate["wake_id"]), receiver_shell_id, now_value
+                ):
+                    continue
                 if not self._receiver_has_force_new(receiver_shell_id):
                     row = candidate
                     break
@@ -1142,7 +1180,9 @@ class SprintWakeDeliveryService:
                 "AND coordinate_sprint.originating_planner_shell_id="
                 "m.receiver_shell_id) "
                 "THEN 'new' ELSE m.declared_type END AS declared_type,"
-                "m.body,s.lifecycle,p.role "
+                "m.body,s.lifecycle,p.role,"
+                "EXISTS (SELECT 1 FROM runs r WHERE r.message_id=m.message_id) "
+                "AS run_outcome "
                 "FROM wake_message m LEFT JOIN sprints s "
                 "ON s.sprint_id=m.sprint_id LEFT JOIN sprint_participants p "
                 "ON p.sprint_id=m.sprint_id "
@@ -1197,6 +1237,12 @@ class SprintWakeDeliveryService:
                 ),
             )
             message_ids = tuple(int(message["message_id"]) for message in messages)
+            turns: list[list[sqlite3.Row]] = []
+            for message in messages:
+                if turns and message["run_outcome"] and turns[-1][-1]["run_outcome"]:
+                    turns[-1].append(message)
+                else:
+                    turns.append([message])
             marks = ",".join("?" for _ in message_ids)
             self.con.execute(
                 "UPDATE sprint_wake_messages SET wake_id=? "
@@ -1222,8 +1268,12 @@ class SprintWakeDeliveryService:
                     str(message["declared_type"]) for message in messages
                 ),
                 prompts=tuple(
-                    self._delivery_prompt(route_sprint_id, route_role, [message])
-                    for message in messages
+                    self._delivery_prompt(route_sprint_id, route_role, turn)
+                    for turn in turns
+                ),
+                turn_message_ids=tuple(
+                    tuple(int(message["message_id"]) for message in turn)
+                    for turn in turns
                 ),
                 idempotency_key=str(row["idempotency_key"]),
                 attempt_number=int(row["attempt_count"]) + 1,
@@ -1409,18 +1459,19 @@ class SprintWakeDeliveryService:
             # health, which resolve the wake by that key and its run ref,
             # track the final queued turn.
             last = len(lease.prompts) - 1
-            for index, (message_id, prompt) in enumerate(
-                zip(lease.message_ids, lease.prompts, strict=True)
+            for index, (turn_ids, prompt) in enumerate(
+                zip(lease.turn_message_ids, lease.prompts, strict=True)
             ):
                 native_run_ref = deliver(
                     target_conversation_id,
                     prompt,
                     lease.idempotency_key
                     if index == last
-                    else f"{lease.idempotency_key}:message:{message_id}",
+                    else f"{lease.idempotency_key}:message:{turn_ids[0]}",
                 )
                 import run_wakes
-                run_wakes.record_enqueue(self.con, message_id, native_run_ref)
+                for message_id in turn_ids:
+                    run_wakes.record_enqueue(self.con, message_id, native_run_ref)
         except ForceNewDeferred:
             self._defer_force_new(lease)
             return DeliveryOutcome(
