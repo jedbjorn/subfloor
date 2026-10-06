@@ -421,7 +421,10 @@
     ".super-coder/docs/sprint-pr-watcher.md",
     "docs/environment.md",
     ".super-coder/migrations/0278_developer_bounded_probes.sql",
-    "tests/test_job_probe.py"
+    "tests/test_job_probe.py",
+    ".super-coder/scripts/run_attachments.py",
+    "tests/test_run_attachments.py",
+    "tests/test_run_attachments_browser.py"
   ],
   "decision": 33,
   "generation_markers": {

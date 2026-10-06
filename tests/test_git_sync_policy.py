@@ -17,6 +17,7 @@ LATER_RESEED = ENGINE / "migrations" / "0255_reseed_merge_gate_one_rule.sql"
 RECONCILIATION = ENGINE / "migrations" / "0257_guidance_reconciliation.sql"
 CLOSEOUT_SCOPE = ENGINE / "migrations" / "0260_reseed_sprint_closeout_scope.sql"
 DOCS_PASS = ENGINE / "migrations" / "0267_reseed_docs_pass_skills.sql"
+RUN_RECEIPTS = ENGINE / "migrations" / "0279_run_receipt_attachments.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import seed_skills  # noqa: E402
@@ -96,11 +97,21 @@ class GitSyncPolicyTest(unittest.TestCase):
             closeout = CLOSEOUT_SCOPE.read_text()
             con.executescript(closeout)
             con.executescript(closeout)
-            # 0267 re-owns it last, completing the gitignored-artifact list;
-            # compare after the whole chain has replayed.
+            # 0267 completes the gitignored-artifact list.
             docs_pass = DOCS_PASS.read_text()
             con.executescript(docs_pass)
             con.executescript(docs_pass)
+            # 0279 adds receipt guidance; replay its schema and guidance twice
+            # before comparing the current asset, preserving the local skill.
+            con.executescript(
+                "CREATE TABLE shells (shell_id INTEGER PRIMARY KEY, "
+                "flavor TEXT, system_prompt TEXT);"
+                "CREATE TABLE runs (run_id INTEGER PRIMARY KEY, "
+                "attached_pr INTEGER, attached_work_unit INTEGER);"
+            )
+            receipts = RUN_RECEIPTS.read_text()
+            con.executescript(receipts)
+            con.executescript(receipts)
 
             parsed = seed_skills.parse_skill(ASSET)
             actual = con.execute(
