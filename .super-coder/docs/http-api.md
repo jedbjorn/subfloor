@@ -142,7 +142,7 @@ Writes — all `POST`, all under `/_sc/sprint/`, body is JSON:
 `reroute-participant` · `dispatch` · `monitor` · `send` · `inbox-read` ·
 `inbox-decline` · `review-request` · `review-record` · `register-pr` ·
 `reconcile-pr` · `merge-authorize` · `pause` · `resume` · `complete` ·
-`abort` · `conformance` · `followup-disposition` · `cleanup-runs`
+`abort` · `conformance` · `cleanup-runs`
 
 Refusals are uniform across the family (`Handler._sprint_error`,
 `_sprint_board_mutation_error`): `403 forbidden` for a `SprintAuthorityError`,

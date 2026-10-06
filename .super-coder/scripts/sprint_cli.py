@@ -12,9 +12,6 @@ import mem
 import project_root
 
 PAYLOAD_FILE_HELP = "text file; hard maximum 8,000 characters"
-FINDINGS_FILE_HELP = (
-    "JSON array; each finding body has a hard maximum of 8,000 characters"
-)
 
 
 def _text(path: str, name: str) -> str:
@@ -464,30 +461,10 @@ def cmd_record_conformance(args: argparse.Namespace) -> int:
         {
             "sprint_id": args.sprint,
             "body": _text(args.body_file, "conformance body"),
-            "findings": _json_array(args.findings_file),
             "final_report": _text(args.final_report_file, "final report body"),
             "reason": args.reason,
             "terminal_outcome": args.outcome,
             "idempotency_key": args.key,
-        },
-        idempotent=True,
-    )
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return 0
-
-
-def cmd_disposition_followup(args: argparse.Namespace) -> int:
-    result = _post(
-        "/_sc/sprint/followup-disposition",
-        {
-            "sprint_id": args.sprint,
-            "followup_id": args.followup,
-            "disposition": args.disposition,
-            "resolution": (
-                _text(args.resolution_file, "resolution")
-                if args.resolution_file
-                else None
-            ),
         },
         idempotent=True,
     )
@@ -821,14 +798,11 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup.set_defaults(fn=cmd_cleanup)
 
     conformance = sub.add_parser(
-        "record-conformance", help="Reviewer records a report and follow-ups"
+        "record-conformance", help="Reviewer records conformance and completes the Sprint"
     )
     conformance.add_argument("--sprint", type=int, required=True)
     conformance.add_argument(
         "--body-file", required=True, help=PAYLOAD_FILE_HELP
-    )
-    conformance.add_argument(
-        "--findings-file", required=True, help=FINDINGS_FILE_HELP
     )
     conformance.add_argument(
         "--final-report-file", required=True, help=PAYLOAD_FILE_HELP
@@ -837,19 +811,6 @@ def build_parser() -> argparse.ArgumentParser:
     conformance.add_argument("--outcome", required=True)
     conformance.add_argument("--key", required=True, help="stable retry identity")
     conformance.set_defaults(fn=cmd_record_conformance)
-
-    followup = sub.add_parser(
-        "disposition-followup", help="FnB records a terminal follow-up disposition"
-    )
-    followup.add_argument("--sprint", type=int, required=True)
-    followup.add_argument("--followup", type=int, required=True)
-    followup.add_argument(
-        "--disposition",
-        choices=("accepted", "resolved", "dismissed"),
-        required=True,
-    )
-    followup.add_argument("--resolution-file", help=PAYLOAD_FILE_HELP)
-    followup.set_defaults(fn=cmd_disposition_followup)
 
     show = sub.add_parser(
         "show",

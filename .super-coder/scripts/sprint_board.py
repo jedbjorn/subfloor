@@ -221,9 +221,8 @@ _EVENT_FIELDS = {
         {"work_unit_id", "registered_pr_id", "pr_number", "head_sha"}
     ),
     "merge.grant_bypassed": frozenset({"work_unit_id", "before", "transition_key"}),
-    "conformance.recorded": frozenset({"report_id", "followup_count", "followup_ids"}),
+    "conformance.recorded": frozenset({"report_id"}),
     "final_report.recorded": frozenset({"report_id"}),
-    "followup.dispositioned": frozenset({"followup_id", "disposition", "resolution"}),
     "spec.body_edited": frozenset(
         {
             "document_id",

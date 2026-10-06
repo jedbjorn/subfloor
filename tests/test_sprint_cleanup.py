@@ -346,7 +346,6 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
         )
         kwargs = {
             "body": "Conformance passed.",
-            "findings": [],
             "final_report": "Final integrated evidence.",
             "reason": "Reviewer approved",
             "terminal_outcome": "accepted",
@@ -391,7 +390,6 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
                 self.sprint_id,
                 2,
                 body="Conformance must roll back.",
-                findings=[],
                 final_report="No orphan report.",
                 reason="Reviewer approved",
                 terminal_outcome="accepted",

@@ -26,6 +26,7 @@ MIGRATIONS = (
     ENGINE / "migrations" / "0260_reseed_sprint_closeout_scope.sql",
     ENGINE / "migrations" / "0261_dev_long_job_guidance.sql",
     ENGINE / "migrations" / "0262_reseed_sprint_resume_reentry.sql",
+    ENGINE / "migrations" / "0280_remove_sprint_followups.sql",
 )
 sys.path.insert(0, str(ENGINE / "scripts"))
 

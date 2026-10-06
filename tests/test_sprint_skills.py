@@ -39,6 +39,7 @@ RECONCILIATION = (
     ENGINE / "migrations" / "0258_reseed_non_sprint_green_wake.sql",
     ENGINE / "migrations" / "0260_reseed_sprint_closeout_scope.sql",
     ENGINE / "migrations" / "0262_reseed_sprint_resume_reentry.sql",
+    ENGINE / "migrations" / "0280_remove_sprint_followups.sql",
 )
 RETIRED = (
     "memory", "db_map", "bootstrap", "surface_catalogue", "messaging", "flags",
@@ -147,12 +148,11 @@ class SprintSkillTest(unittest.TestCase):
             "resolve-unit", "register-pr", "reconcile-pr", "pause", "resume",
             "complete", "abort", "request-review", "record-review",
             "authorize-merge", "dispatch", "monitor", "watcher-state",
-            "record-conformance", "disposition-followup", "compile-report",
+            "record-conformance", "compile-report",
             "cleanup-status", "cleanup", "show",
         }
         combined = "\n".join(skill_text(name) for name in SKILLS)
-        for command in expected - {"monitor", "spec-revision", "complete",
-                                   "disposition-followup"}:
+        for command in expected - {"monitor", "spec-revision", "complete"}:
             self.assertIn(f"sc sprint {command}", combined)
         for gone in ("sc sprint monitor", "record-qaqc"):
             self.assertNotIn(gone, combined)
@@ -207,9 +207,8 @@ class SprintSkillTest(unittest.TestCase):
             "complete-unit": ("--result-file",),
             "request-review": ("--readiness-file",),
             "record-review": ("--body-file",),
-            "record-conformance": ("--body-file", "--findings-file",
+            "record-conformance": ("--body-file",
                                    "--final-report-file"),
-            "disposition-followup": ("--resolution-file",),
             "complete": ("--report-file",),
         }.items():
             with self.subTest(command=command):

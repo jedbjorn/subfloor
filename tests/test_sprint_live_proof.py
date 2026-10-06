@@ -2341,8 +2341,6 @@ class SprintLiveProof(unittest.TestCase):
             str(sprint_id),
             "--body-file",
             self.write_input("Integrated live proof matches its bound contract."),
-            "--findings-file",
-            self.write_input("[]"),
             "--final-report-file",
             self.write_input(
                 "Reviewer final report: the live proof matches its bound contract."
@@ -2354,7 +2352,7 @@ class SprintLiveProof(unittest.TestCase):
             "--key",
             f"proof:{sprint_id}:conformance",
         )
-        self.assertEqual([], receipt["followup_ids"])
+        self.assertNotIn("followup_ids", receipt)
         self.assertTrue(receipt["completed"])
         packet = self.run_cli(
             3,
@@ -2369,7 +2367,8 @@ class SprintLiveProof(unittest.TestCase):
             document_id, packet["spec_revisions"]["bound"][0]["document_id"]
         )
         self.assertEqual([], packet["unresolved_work"]["work_units"]["items"])
-        self.assertEqual([], packet["unresolved_work"]["followups"]["items"])
+        self.assertNotIn("followups", packet["unresolved_work"])
+        self.assertNotIn("followups", packet["conformance"])
         return packet
 
     def test_serial_sprint_runs_correction_merge_dispatch_and_close(self) -> None:

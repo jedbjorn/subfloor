@@ -1,10 +1,9 @@
-"""Sprints v2 conformance follow-ups and bounded close evidence."""
+"""Sprints v2 conformance reports and bounded close evidence."""
 from __future__ import annotations
 
 import hashlib
 import json
 import sqlite3
-from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,7 +24,6 @@ MAX_SECTION_LIMIT = 200
 @dataclass(frozen=True)
 class ConformanceReceipt:
     report_id: int
-    followup_ids: tuple[int, ...]
     final_report_id: int
     planner_message_id: int
     planner_wake_id: int
@@ -67,7 +65,6 @@ class SprintCloseStore:
         reviewer_shell_id: int,
         *,
         body: str,
-        findings: Iterable[dict[str, Any]],
         final_report: str,
         reason: str,
         terminal_outcome: str,
@@ -83,7 +80,6 @@ class SprintCloseStore:
         idempotency_key = self._required(
             idempotency_key, "idempotency key", maximum=220
         )
-        normalized = tuple(self._normalize_finding(item) for item in findings)
         existing_before = self.con.execute(
             "SELECT 1 FROM sprint_reports WHERE sprint_id=? "
             "AND report_kind='conformance' AND idempotency_key=?",
@@ -105,9 +101,11 @@ class SprintCloseStore:
                 (sprint_id, idempotency_key),
             ).fetchone()
             if existing is not None:
-                report_id, followup_ids = self._replay_evidence(
-                    existing, body, normalized, idempotency_key
-                )
+                if existing["body"] != body:
+                    raise SprintInvariantError(
+                        "conformance idempotency key was reused with different input"
+                    )
+                report_id = int(existing["report_id"])
                 final_report_id = self._replay_final_report(
                     sprint_id,
                     reviewer_shell_id=reviewer_shell_id,
@@ -126,7 +124,6 @@ class SprintCloseStore:
                     reviewer_shell_id=reviewer_shell_id,
                     planner_shell_id=planner_shell_id,
                     report_id=report_id,
-                    followup_ids=followup_ids,
                     final_report_id=final_report_id,
                     reason=reason,
                     terminal_outcome=terminal_outcome,
@@ -135,7 +132,6 @@ class SprintCloseStore:
                 )
                 return ConformanceReceipt(
                     report_id,
-                    followup_ids,
                     final_report_id,
                     notification.message_id,
                     self._required_wake_id(notification.wake_id),
@@ -157,29 +153,6 @@ class SprintCloseStore:
                     (sprint_id, reviewer_shell_id, body, idempotency_key),
                 ).lastrowid
             )
-            followup_ids = []
-            for index, finding in enumerate(normalized, start=1):
-                self._validate_links(sprint_id, finding)
-                followup_ids.append(
-                    int(
-                        self.con.execute(
-                            "INSERT INTO sprint_followups "
-                            "(sprint_id,source_report_id,severity,title,body,"
-                            "spec_document_id,work_unit_id,idempotency_key) "
-                            "VALUES (?,?,?,?,?,?,?,?)",
-                            (
-                                sprint_id,
-                                report_id,
-                                finding["severity"],
-                                finding["title"],
-                                finding["body"],
-                                finding["spec_document_id"],
-                                finding["work_unit_id"],
-                                f"{idempotency_key}:finding:{index}",
-                            ),
-                        ).lastrowid
-                    )
-                )
             final_report_id = self._insert_final_report(
                 sprint_id,
                 reviewer_shell_id=reviewer_shell_id,
@@ -195,7 +168,6 @@ class SprintCloseStore:
                 reviewer_shell_id=reviewer_shell_id,
                 planner_shell_id=planner_shell_id,
                 report_id=report_id,
-                followup_ids=tuple(followup_ids),
                 final_report_id=final_report_id,
                 reason=reason,
                 terminal_outcome=terminal_outcome,
@@ -214,8 +186,6 @@ class SprintCloseStore:
                 {
                     "report_id": report_id,
                     "final_report_id": final_report_id,
-                    "followup_count": len(followup_ids),
-                    "followup_ids": followup_ids,
                     "planner_message_id": notification.message_id,
                     "planner_wake_id": planner_wake_id,
                 },
@@ -241,7 +211,6 @@ class SprintCloseStore:
             raise notification_error
         return ConformanceReceipt(
             report_id,
-            tuple(followup_ids),
             final_report_id,
             notification.message_id,
             planner_wake_id,
@@ -388,82 +357,6 @@ class SprintCloseStore:
         )
         return FinalReportReceipt(report_id, True)
 
-    def disposition_followup(
-        self,
-        sprint_id: int,
-        followup_id: int,
-        caller_shell_id: int,
-        *,
-        disposition: str,
-        resolution: str | None = None,
-    ) -> bool:
-        """Record the FnB's terminal disposition of one conformance follow-up."""
-        if disposition not in {"accepted", "resolved", "dismissed"}:
-            raise ValueError(
-                "follow-up disposition must be accepted, resolved, or dismissed"
-            )
-        normalized_resolution = (resolution or "").strip()
-        if disposition == "accepted" and normalized_resolution:
-            raise ValueError("accepted follow-ups do not take a resolution")
-        if disposition in {"resolved", "dismissed"} and not normalized_resolution:
-            raise ValueError(f"{disposition} follow-ups require a resolution")
-        if len(normalized_resolution) > 8000:
-            raise ValueError(
-                f"follow-up resolution is {len(normalized_resolution)} characters; "
-                "maximum is 8000"
-            )
-        with db_driver.write_transaction(self.con, "sprint.followup.disposition"):
-            caller = self.con.execute(
-                "SELECT flavor FROM shells WHERE shell_id=? "
-                "AND COALESCE(is_deleted,0)=0",
-                (caller_shell_id,),
-            ).fetchone()
-            if caller is None or caller["flavor"] != "admin":
-                raise SprintAuthorityError("only FnB may disposition Sprint follow-ups")
-            followup = self.con.execute(
-                "SELECT sprint_id,disposition,resolution FROM sprint_followups "
-                "WHERE sprint_id=? AND followup_id=?",
-                (sprint_id, followup_id),
-            ).fetchone()
-            if followup is None:
-                raise KeyError(
-                    f"unknown Sprint follow-up {followup_id} for Sprint {sprint_id}"
-                )
-            if followup["disposition"] != "pending":
-                existing_resolution = (followup["resolution"] or "").strip()
-                if (
-                    followup["disposition"] == disposition
-                    and existing_resolution == normalized_resolution
-                ):
-                    return False
-                raise SprintInvariantError(
-                    "Sprint follow-up already has a terminal disposition"
-                )
-            if disposition == "accepted":
-                self.con.execute(
-                    "UPDATE sprint_followups SET disposition='accepted' "
-                    "WHERE followup_id=?",
-                    (followup_id,),
-                )
-            else:
-                self.con.execute(
-                    "UPDATE sprint_followups SET disposition=?,resolution=?,"
-                    "resolved_at=datetime('now') WHERE followup_id=?",
-                    (disposition, normalized_resolution, followup_id),
-                )
-            self._event(
-                int(followup["sprint_id"]),
-                "followup.dispositioned",
-                caller_shell_id,
-                {
-                    "followup_id": followup_id,
-                    "disposition": disposition,
-                    "resolution": normalized_resolution or None,
-                },
-                actor_kind="fnb",
-            )
-        return True
-
     def compile_evidence_packet(
         self,
         sprint_id: int,
@@ -525,24 +418,11 @@ class SprintCloseStore:
             "AND disposition='pending' ORDER BY message_id",
             (sprint_id,),
         )
-        pending_followups = self._rows(
-            "SELECT followup_id,severity,title,spec_document_id,work_unit_id,"
-            "disposition,created_at FROM sprint_followups WHERE sprint_id=? "
-            "AND disposition='pending' ORDER BY followup_id",
-            (sprint_id,),
-        )
         conformance_reports = self._rows(
             "SELECT r.report_id,r.author_shell_id,s.shortname,r.body,r.created_at "
             "FROM sprint_reports r LEFT JOIN shells s "
             "ON s.shell_id=r.author_shell_id WHERE r.sprint_id=? "
             "AND r.report_kind='conformance' ORDER BY r.report_id",
-            (sprint_id,),
-        )
-        conformance_followups = self._rows(
-            "SELECT followup_id,source_report_id,severity,title,body,"
-            "spec_document_id,work_unit_id,disposition,resolution,created_at,"
-            "resolved_at FROM sprint_followups WHERE sprint_id=? "
-            "ORDER BY followup_id",
             (sprint_id,),
         )
         final_reports = self._rows(
@@ -595,7 +475,6 @@ class SprintCloseStore:
             },
             "conformance": {
                 "reports": self._bounded(conformance_reports, section_limit),
-                "followups": self._bounded(conformance_followups, section_limit),
                 "final_reports": self._bounded(final_reports, section_limit),
                 "missing_conformance": not conformance_reports,
                 "missing_final_report": not final_reports,
@@ -605,7 +484,6 @@ class SprintCloseStore:
                 "actionable_messages": self._bounded(
                     pending_messages, section_limit
                 ),
-                "followups": self._bounded(pending_followups, section_limit),
             },
             "full_history_links": self._history_links(sprint_id),
         }
@@ -875,7 +753,6 @@ class SprintCloseStore:
         reviewer_shell_id: int,
         planner_shell_id: int,
         report_id: int,
-        followup_ids: tuple[int, ...],
         final_report_id: int,
         reason: str,
         terminal_outcome: str,
@@ -884,11 +761,10 @@ class SprintCloseStore:
     ) -> Any:
         from sprint_message_delivery import SprintMessageStore
 
-        followups = ",".join(str(value) for value in followup_ids) or "none"
         rendered_body = (
             f"Sprint {sprint_id} completed by Reviewer conformance. "
             f"conformance_report_id={report_id}; final_report_id={final_report_id}; "
-            f"followup_ids={followups}; outcome={terminal_outcome}; "
+            f"outcome={terminal_outcome}; "
             f"closed_developer_chats={closed_developer_chats}. Planner and Reviewer "
             f"chats persist; the engine deletes shared/sprints/sprint-{sprint_id} "
             "and reports only if that fails.\n\n"
@@ -916,59 +792,6 @@ class SprintCloseStore:
         if row is None:
             raise KeyError(f"unknown Sprint: {sprint_id}")
         return str(row["lifecycle"])
-
-    def _validate_links(self, sprint_id: int, finding: dict[str, Any]) -> None:
-        document_id = finding["spec_document_id"]
-        if document_id is not None and self.con.execute(
-            "SELECT 1 FROM sprint_specs WHERE sprint_id=? AND document_id=?",
-            (sprint_id, document_id),
-        ).fetchone() is None:
-            raise SprintInvariantError(
-                f"spec document {document_id} is not bound to Sprint {sprint_id}"
-            )
-        work_unit_id = finding["work_unit_id"]
-        if work_unit_id is not None and self.con.execute(
-            "SELECT 1 FROM sprint_work_units WHERE sprint_id=? AND work_unit_id=?",
-            (sprint_id, work_unit_id),
-        ).fetchone() is None:
-            raise SprintInvariantError(
-                f"work unit {work_unit_id} does not belong to Sprint {sprint_id}"
-            )
-
-    def _replay_evidence(
-        self,
-        report: sqlite3.Row,
-        body: str,
-        findings: tuple[dict[str, Any], ...],
-        key: str,
-    ) -> tuple[int, tuple[int, ...]]:
-        if report["body"] != body:
-            raise SprintInvariantError(
-                "conformance idempotency key was reused with different input"
-            )
-        rows = self._rows(
-            "SELECT followup_id,severity,title,body,spec_document_id,work_unit_id "
-            "FROM sprint_followups WHERE source_report_id=? ORDER BY followup_id",
-            (report["report_id"],),
-        )
-        comparable = [
-            {
-                "severity": row["severity"],
-                "title": row["title"],
-                "body": row["body"],
-                "spec_document_id": row["spec_document_id"],
-                "work_unit_id": row["work_unit_id"],
-            }
-            for row in rows
-        ]
-        if comparable != list(findings):
-            raise SprintInvariantError(
-                f"conformance idempotency key {key!r} was reused with different findings"
-            )
-        return (
-            int(report["report_id"]),
-            tuple(int(row["followup_id"]) for row in rows),
-        )
 
     def _insert_final_report(
         self,
@@ -1058,53 +881,6 @@ class SprintCloseStore:
                 "conformance idempotency key was reused with different completion"
             )
         return closed_conversation_ids
-
-    @classmethod
-    def _normalize_finding(cls, finding: Any) -> dict[str, Any]:
-        if not isinstance(finding, dict):
-            raise TypeError("each conformance finding must be an object")
-        unknown = set(finding) - {
-            "severity",
-            "title",
-            "body",
-            "spec_document_id",
-            "work_unit_id",
-        }
-        if unknown:
-            raise ValueError(
-                "unknown conformance finding field(s): " + ", ".join(sorted(unknown))
-            )
-        return {
-            "severity": cls._required(
-                str(finding.get("severity") or ""), "finding severity", 32
-            ),
-            "title": cls._required(
-                str(finding.get("title") or ""), "finding title", 255
-            ),
-            "body": cls._required(
-                str(finding.get("body") or ""), "finding body", 8000
-            ),
-            "spec_document_id": cls._optional_int(
-                finding.get("spec_document_id"), "spec_document_id"
-            ),
-            "work_unit_id": cls._optional_int(
-                finding.get("work_unit_id"), "work_unit_id"
-            ),
-        }
-
-    @staticmethod
-    def _optional_int(value: Any, name: str) -> int | None:
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            raise TypeError(f"{name} must be a positive integer")
-        try:
-            result = int(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{name} must be a positive integer") from exc
-        if result <= 0:
-            raise ValueError(f"{name} must be a positive integer")
-        return result
 
     @staticmethod
     def _required(value: str, name: str, maximum: int = 8000) -> str:
