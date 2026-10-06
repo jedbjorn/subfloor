@@ -128,11 +128,13 @@ class RunStore:
                 out["delivery_error"] = wake["last_error"]
         return out
 
-    def list(self, owner: int | None = None) -> list[dict]:
+    def list(self, owner: int | None = None, *, kind: str | None = None,
+             state: str | None = None) -> list[dict]:
         rows = self.con.execute(
             "SELECT run_id FROM runs WHERE (? IS NULL OR owner_shell_id=?) "
+            "AND (? IS NULL OR kind=?) AND (? IS NULL OR state=?) "
             "ORDER BY run_id DESC LIMIT 200",
-            (owner, owner),
+            (owner, owner, kind, kind, state, state),
         ).fetchall()
         return [self.get(row[0], owner) for row in rows]
 

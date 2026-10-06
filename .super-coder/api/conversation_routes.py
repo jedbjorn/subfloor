@@ -2283,6 +2283,8 @@ def _transcript_activity_label(event_type: str, payload: dict) -> str:
         label = "Waiting for input"
     elif event_type == "run.interrupted":
         label = "Turn interrupted"
+    elif event_type == "run.process.ended":
+        label = payload.get("label", "Turn process ended")
     elif event_type == "run.unknown":
         label = "Turn outcome could not be proven"
     else:
@@ -2547,7 +2549,7 @@ def _transcript_projection(
             event_scope.append(
                 "(message_id IS NULL AND run_id IS NULL AND event_type IN "
                 "('permission.requested','input.requested','run.failed',"
-                "'run.interrupted','run.unknown'))"
+                "'run.interrupted','run.unknown','run.process.ended'))"
             )
         event_scope_sql = " OR ".join(event_scope) or "0"
         event_rows = con.execute(
@@ -2571,7 +2573,7 @@ def _transcript_projection(
             " ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
             ") AS segment_anchor_sequence "
             " FROM conversation_events "
-            " WHERE conversation_id=? AND sequence<=? AND ("
+            " WHERE conversation_id=? AND sequence<=? AND event_type!='run.process.snapshot' AND ("
             + event_scope_sql
             + ")"
             ") SELECT * FROM ranked "
@@ -2678,6 +2680,7 @@ def _transcript_projection(
             "run.failed",
             "run.interrupted",
             "run.unknown",
+            "run.process.ended",
         }
         for event in events:
             run_id = event["run_id"]

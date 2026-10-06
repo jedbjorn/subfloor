@@ -4386,9 +4386,22 @@ class Handler(BaseHTTPRequestHandler):
                     return
             store = RunStore(con, ENGINE)
             parts = path.strip('/').split('/')
+            if operator and not post and parts[2:] == ['processes']:
+                from run_processes import observe
+                query = parse_qs(urlparse(self.path).query)
+                conversation_id = query.get('conversation_id', [''])[0]
+                return self._send(200, observe(con, conversation_id))
             if len(parts) == 2:
                 if not post:
-                    return self._send(200, {'runs': store.list(sid)})
+                    query = parse_qs(urlparse(self.path).query)
+                    owner = int(query['shell_id'][0]) if operator and query.get('shell_id') else sid
+                    listed = store.list(owner, kind=query.get('kind', [None])[0],
+                                        state=query.get('state', [None])[0])
+                    attention = con.execute(
+                        "SELECT count(*) FROM runs WHERE (? IS NULL OR owner_shell_id=?) "
+                        "AND (state='running' OR wake_state='blocked')", (owner, owner),
+                    ).fetchone()[0]
+                    return self._send(200, {'runs': listed, 'attention_count': attention})
                 if operator:
                     raise PermissionError('registration requires shell authentication')
                 return self._send(201, store.register(sid, self._body()))

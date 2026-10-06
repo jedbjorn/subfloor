@@ -659,13 +659,17 @@ class SubprocessRunner:
         )
         if self.start_new_session:
             process.__dict__["_sc_conversation_process_group"] = process.pid
+            cleanup_done = threading.Event()
+            process.__dict__["_sc_conversation_cleanup_done"] = cleanup_done
 
             def reap_owned_group() -> None:
                 try:
                     process.wait()
+                    cleanup_owned_process(process, 1.0)
                 except (OSError, subprocess.SubprocessError):
                     return
-                cleanup_owned_process(process, 1.0)
+                finally:
+                    cleanup_done.set()
 
             threading.Thread(
                 target=reap_owned_group,

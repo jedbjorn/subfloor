@@ -1735,3 +1735,29 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   .scripts-layout { grid-template-columns: minmax(0, 1fr); }
   .services-panel { position: static; }
 }
+
+/* Runs share an operator fleet surface and a compact shell drawer. */
+.run-list { display: grid; gap: 10px; }
+.run-row { padding: 12px; border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
+.run-heading, .run-facts, .run-actions, .run-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.run-heading { justify-content: space-between; overflow-wrap: anywhere; }
+.run-facts { margin: 8px 0; font-size: 12px; color: var(--dim); }
+.run-state, .run-wake { padding: 2px 6px; border-radius: 4px; background: var(--panel); }
+.run-state-running { color: #5dacee; }
+.run-state-done, .run-wake-consumed { color: #63b58d; }
+.run-state-failed, .run-state-lost, .run-state-timeout, .run-wake-blocked { color: #e59a73; }
+.run-filters { margin-bottom: 16px; }
+.run-filters select { padding: 6px; background: var(--panel); color: inherit; border: 1px solid var(--line); border-radius: 4px; }
+.runs-drawer { margin-top: 12px; padding: 8px; border-top: 1px solid var(--line); }
+.runs-drawer summary { cursor: pointer; margin-bottom: 8px; }
+.runs-drawer .run-list { margin-top: 8px; }
+.runs-drawer .act { font-size: 11px; padding: 4px 6px; }
+.process-tile:not(:empty) { padding: 12px 8px; border-top: 1px solid var(--line); }
+.run-process { margin-top: 8px; font-size: 11px; }
+.run-process code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-log { white-space: pre-wrap; overflow-wrap: anywhere; }
+.conversion-status { margin-bottom: 16px; }
+.run-filters select { width: auto; flex: 1; min-width: 130px; }
+.shell-pane .run-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(220px, 1fr) auto; align-items: center; gap: 12px; }
+.shell-pane .conversion-status .run-row { display: block; }
+@media (max-width: 1000px) { .shell-pane .run-row { display: block; } }

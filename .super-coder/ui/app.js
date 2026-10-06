@@ -220,6 +220,7 @@ const SHELL_TAB_HASH = {
   skills: "shells-skills",
   assignments: "shells-skill-assignments",
   models: "shells-default-models",
+  runs: "shells-runs",
 };
 
 // Rough token estimator — BPE-ish, ~15% off for English; the tilde in the
@@ -392,6 +393,135 @@ function openNewShellModal(templates, root) {
   nm.focus();
 }
 
+// Runs use the same rows in the shell drawer and operator fleet view.
+const runAge = (value) => {
+  const stamp = Date.parse(String(value || "").replace(" ", "T") + (/Z$|[+-]\d\d:\d\d$/.test(value || "") ? "" : "Z"));
+  if (!Number.isFinite(stamp)) return "—";
+  const seconds = Math.max(0, Math.floor((Date.now() - stamp) / 1000));
+  return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h`;
+};
+function renderRunRows(host, runs, shells, refresh) {
+  host.replaceChildren();
+  if (!runs.length) { host.append(el("div", { className: "muted" }, "No runs.")); return; }
+  for (const run of runs) {
+    const owner = shells.find((s) => s.shell_id === run.owner_shell_id);
+    const row = el("article", { className: "run-row", ariaLabel: `Run ${run.run_id}` });
+    row.append(el("div", { className: "run-heading" },
+      el("strong", {}, `#${run.run_id} ${run.label}`),
+      el("span", { className: `run-state run-state-${run.state}` }, run.state)));
+    row.append(el("div", { className: "run-facts" },
+      `${owner?.shortname || run.owner_shell_id} · ${run.kind} · ${runAge(run.started_at || run.created_at)} · exit ${run.exit_code ?? "—"}`,
+      el("span", { className: `run-wake run-wake-${run.wake_state}`, title: run.delivery_error || run.last_error || "" }, `Wake: ${run.wake_state}`)));
+    const actions = el("div", { className: "run-actions" });
+    const tail = el("button", { className: "act", type: "button" }, "Tail");
+    tail.onclick = async () => {
+      try {
+        const evidence = await api(`/runs/${run.run_id}/tail`);
+        const close = el("button", { className: "act", type: "button" }, "Close");
+        const dismiss = openModal({ title: `Run #${run.run_id} · ${run.label}`,
+          bodyNode: el("pre", { className: "run-log" }, evidence.evidence_pruned ? "Evidence was pruned." : evidence.text || "No output yet."), footerEnd: close });
+        close.onclick = dismiss;
+      } catch (error) { toast(error.message); }
+    };
+    const copy = el("button", { className: "act", type: "button" }, "Copy status command");
+    copy.onclick = () => Promise.resolve().then(() => navigator.clipboard.writeText(`sc job status ${run.run_id}`))
+      .then(() => toast("copied"), () => toast("copy failed"));
+    actions.append(tail, copy);
+    if (["registered", "running"].includes(run.state)) {
+      const kill = el("button", { className: "act danger", type: "button" }, "Kill");
+      kill.onclick = async () => {
+        if (!confirm(`Kill run #${run.run_id} (${run.label})?`)) return;
+        kill.disabled = true;
+        try { await api(`/runs/${run.run_id}/kill`, "POST", {}); await refresh(); }
+        catch (error) { toast(error.message); }
+        finally { kill.disabled = false; }
+      };
+      actions.append(kill);
+    }
+    row.append(actions);
+    host.append(row);
+  }
+}
+function renderProcessTile(host, snapshot) {
+  host.replaceChildren();
+  if (!snapshot?.pid && !snapshot?.indeterminate) return;
+  host.append(el("strong", {}, "Turn processes"),
+    el("div", { className: "muted" }, `Observed ${runAge(snapshot.observed_at)} ago · ${snapshot.indeterminate || 0} indeterminate · ${snapshot.omitted || 0} omitted`));
+  for (const process of snapshot.processes || []) host.append(el("div", { className: "run-process", title: process.cmdline },
+    el("span", {}, `${process.pid} · ${process.comm} · ${Math.floor(process.age_s)}s`),
+    el("code", {}, process.cmdline)));
+  if (!snapshot.processes?.length) host.append(el("div", { className: "muted" }, "No live processes observed."));
+}
+async function renderRunsFleet(host, shells, badge) {
+  const filters = el("div", { className: "run-filters" });
+  const list = el("div", { className: "run-list" });
+  let runs = [];
+  const select = (label, options) => {
+    const node = el("select", { ariaLabel: label });
+    node.append(el("option", { value: "" }, `All ${label.toLowerCase()}`));
+    for (const [value, name] of options) node.append(el("option", { value }, name));
+    filters.append(node);
+    node.onchange = () => refresh();
+    return node;
+  };
+  const shell = select("Shells", shells.map((s) => [String(s.shell_id), s.shortname || s.display_name]));
+  const kind = select("Kinds", ["job", "devkit", "probe"].map((s) => [s, s]));
+  const state = select("States", ["registered", "running", "done", "failed", "timeout", "killed", "lost"].map((s) => [s, s]));
+  const paint = () => renderRunRows(list, runs.filter((r) => (!shell.value || String(r.owner_shell_id) === shell.value)
+    && (!kind.value || r.kind === kind.value) && (!state.value || r.state === state.value)), shells, refresh);
+  let refreshEpoch = 0;
+  const refresh = async () => {
+    const epoch = ++refreshEpoch;
+    const query = new URLSearchParams();
+    if (shell.value) query.set("shell_id", shell.value);
+    if (kind.value) query.set("kind", kind.value);
+    if (state.value) query.set("state", state.value);
+    try {
+      const result = await api(`/runs?${query}`);
+      if (!host.isConnected || epoch !== refreshEpoch) return;
+      runs = result.runs;
+      // The tab always counts the fleet, even when its rows are filtered.
+      const count = shell.value ? await api("/runs") : result;
+      if (!host.isConnected || epoch !== refreshEpoch) return;
+      badge.textContent = `Runs (${count.attention_count})`;
+      paint();
+    } catch (error) { list.replaceChildren(el("div", { className: "error" }, error.message)); }
+  };
+  const button = el("button", { className: "act", type: "button" }, "Refresh");
+  button.onclick = refresh;
+  filters.append(button);
+  host.append(el("h2", {}, "Runs"), el("p", { className: "muted" }, "Newest 200 matching runs."), filters, list);
+  await refresh();
+}
+async function renderConversionStatus(host) {
+  host.replaceChildren(el("div", { className: "muted" }, "Loading harness conversion status…"));
+  try {
+    const { harness_status: statuses = {} } = await api("/flavor-defaults");
+    if (!host.isConnected) return;
+    host.replaceChildren(el("h3", {}, "GUI background conversion"));
+    const explanations = { rewrite: "Background calls become durable jobs.", "deny-only": "Background calls are refused; use sc job.", disarmed: "Conversion is off; use sc job manually." };
+    for (const [harness, status] of Object.entries(statuses)) {
+      const evidence = status.conversion;
+      const row = el("div", { className: "run-row" }, el("strong", {}, harness));
+      if (!evidence) row.append(el("div", { className: "muted" }, "No conversion hook; use sc job for durable GUI work."));
+      else {
+        row.append(el("div", {}, `${evidence.version || "version unverified"} · ${evidence.tier}`),
+          el("div", {}, explanations[evidence.tier] || "Conversion status unavailable."),
+          el("div", { className: "muted" }, `Verified: ${evidence.verified_at || "never"}`));
+        if (evidence.error) row.append(el("div", { className: "error" }, evidence.error));
+        const verify = el("button", { className: "act", type: "button" }, "Re-verify");
+        verify.onclick = async () => {
+          verify.disabled = true; verify.textContent = "Verifying…";
+          try { await api(`/harnesses/${harness}/conversion/verify`, "POST", {}); await renderConversionStatus(host); }
+          catch (error) { toast(error.message); verify.disabled = false; verify.textContent = "Re-verify"; }
+        };
+        row.append(verify);
+      }
+      host.append(row);
+    }
+  } catch (error) { host.replaceChildren(el("div", { className: "error" }, error.message)); }
+}
+
 async function renderShells(root) {
   const epoch = ++shellRenderEpoch;
   const { shells } = await api("/shells");
@@ -449,7 +579,7 @@ async function renderShells(root) {
   sub.append(delBtn);
   // Default Models is fork-global config — the shell-scoped header (picker,
   // role/mandate, ＋New shell) is greyed out and inert there, not load-bearing.
-  if (shellTab === "assignments" || shellTab === "models")
+  if (shellTab === "assignments" || shellTab === "models" || shellTab === "runs")
     sub.classList.add("subbar-inert");
   root.append(sub);
 
@@ -457,10 +587,12 @@ async function renderShells(root) {
   // Default Models are fork-global views nested here to keep shell setup in
   // one place. Hash navigation gives every section a reload-safe URL.
   const tabs = el("div", { className: "vtabs" });
+  let runsBadge;
   for (const [key, label] of [["harness", "Harness"], ["skills", "Skills"],
                               ["assignments", "Skill Assignments"],
-                              ["models", "Default Models"]]) {
+                              ["models", "Default Models"], ["runs", "Runs"]]) {
     const b = el("button", { className: shellTab === key ? "active-tab" : "", type: "button", textContent: label });
+    if (key === "runs") runsBadge = b;
     b.onclick = () => { location.hash = SHELL_TAB_HASH[key]; };
     tabs.append(b);
   }
@@ -470,7 +602,11 @@ async function renderShells(root) {
     className: "shell-pane" + (shellTab === "assignments" ? " skill-assignments" : ""),
   });
   root.append(pane);
-  if (shellTab === "harness") renderHarness(pane, s);
+  if (shellTab !== "runs") api("/runs").then(({ attention_count }) => {
+    if (epoch === shellRenderEpoch) runsBadge.textContent = `Runs (${attention_count})`;
+  }).catch(() => { runsBadge.title = "Run count unavailable"; });
+  if (shellTab === "runs") renderRunsFleet(pane, shells, runsBadge);
+  else if (shellTab === "harness") renderHarness(pane, s);
   else if (shellTab === "models") renderDefaultModels(pane, s);
   else if (shellTab === "assignments") renderSkillAssignments(pane);
   else renderSkillViewer(pane, s);
@@ -1013,6 +1149,9 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
 // then the law-curated identity (read-only by design, Laws 2–4 / 7), then the
 // record. Char/token readout spans everything below it.
 function renderHarness(root, s) {
+  const conversion = el("section", { className: "conversion-status vpanel" });
+  root.append(conversion);
+  renderConversionStatus(conversion);
   const groups = [{ title: "Operational", items: [
     { label: "CURRENT STATE", text: s.current_state || "", editable: true },
     ...(s.system_prompt ? [{ label: "SYSTEM PROMPT", text: s.system_prompt }] : []),
@@ -3982,7 +4121,7 @@ function chatOpenStream(
     "assistant.delta", "tool.started", "tool.completed", "permission.requested",
     "input.requested", "usage", "run.completed", "run.resumed", "run.failed",
     "run.interrupt.requested", "run.interrupted", "run.unknown",
-    "run.deferred", "run.reaped",
+    "run.deferred", "run.reaped", "run.process.snapshot", "run.process.ended",
   ];
   for (const type of types) {
     source.addEventListener(type, (raw) => {
@@ -5893,6 +6032,7 @@ async function chatRenderOpen(
   paint();
   const activityLabel = (event) => {
     const payload = event.payload || {};
+    if (event.event_type === "run.process.ended") return payload.label || "Turn process ended";
     if (event.event_type === "permission.requested")
       return "Waiting for permission";
     if (event.event_type === "input.requested") return "Waiting for input";
@@ -6015,6 +6155,7 @@ async function chatRenderOpen(
       "run.failed",
       "run.interrupted",
       "run.unknown",
+      "run.process.ended",
     ].includes(type)) {
       const itemId = `event:${sequence}`;
       transcriptState.items.set(itemId, {
@@ -6251,6 +6392,36 @@ async function renderInterface(root) {
     shellRow.append(status);
     rail.append(shellRow);
   }
+
+  const runsDrawer = el("details", { className: "runs-drawer" });
+  const runsSummary = el("summary", {}, "Runs");
+  const runsList = el("div", { className: "run-list" });
+  const processTile = el("section", { className: "process-tile" });
+  let runsRefreshInFlight = false;
+  const refreshRuns = async () => {
+    if (runsRefreshInFlight) return;
+    runsRefreshInFlight = true;
+    try {
+      const { runs } = await api(`/runs?shell_id=${shell.shell_id}`);
+      if (generation !== chatRenderGeneration) return;
+      runsSummary.textContent = `Runs (${runs.length})`;
+      renderRunRows(runsList, runs, shells, refreshRuns);
+      if (selectedConversation && (selectedConversation.state === "running" || selectedConversation.process?.alive)) {
+        const snapshot = await api(`/runs/processes?conversation_id=${encodeURIComponent(selectedConversation.conversation_id)}`);
+        if (generation === chatRenderGeneration) renderProcessTile(processTile, snapshot);
+      } else processTile.replaceChildren();
+    } catch (error) {
+      if (generation === chatRenderGeneration) {
+        runsList.replaceChildren(el("div", { className: "error" }, error.message));
+        processTile.replaceChildren(el("div", { className: "muted" }, "Process observation unavailable."));
+      }
+    } finally { runsRefreshInFlight = false; }
+  };
+  const refreshRunsButton = el("button", { className: "act", type: "button" }, "Refresh");
+  refreshRunsButton.onclick = refreshRuns;
+  runsDrawer.append(runsSummary, refreshRunsButton, runsList);
+  rail.append(runsDrawer, processTile);
+  refreshRuns();
 
   const paintShellIndicators = (nextShells) => {
     for (const next of nextShells) {
@@ -6582,6 +6753,7 @@ async function renderInterface(root) {
       for (const [shellId, button] of shellItems)
         chatPaintShellState(button, nextOpenByShell.get(shellId));
       paintShellIndicators(nextShells);
+      await refreshRuns();
     } catch { /* The next poll retries without disrupting the open chat. */ }
     finally { historyPollInFlight = false; }
   };
