@@ -449,6 +449,12 @@ CAPTURE_MIME_TYPES = {
     "png": "image/png",
     "ppm": "image/x-portable-pixmap",
 }
+# The hypervisor picks the screenshot encoding, not the file name: recent QEMU
+# writes PNG where older builds wrote PPM (#1747). Name the bytes by content.
+CAPTURE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpeg"),
+)
 
 DOMAIN_STATES = {
     "blocked": "blocked",
@@ -1544,7 +1550,10 @@ def do_capture(command: str | None = None) -> dict:
         data = shot.read_bytes()
         result["screenshot_b64"] = base64.b64encode(data).decode()
         result["screenshot_bytes"] = len(data)
-        result["screenshot_format"] = "ppm"
+        result["screenshot_format"] = next(
+            (fmt for magic, fmt in CAPTURE_MAGIC if data.startswith(magic)),
+            "ppm",
+        )
         try:
             shot.unlink()
         except OSError:

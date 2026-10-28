@@ -246,6 +246,21 @@ class VerbDispatchTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertIn("screenshot_b64", r)
         self.assertEqual(r["screenshot_bytes"], len(b"P6 fake ppm bytes"))
+        self.assertEqual(r["screenshot_format"], "ppm")
+
+    def test_capture_names_png_bytes_png_whatever_the_temp_name(self):
+        # #1747: recent QEMU answers `virsh screenshot` with PNG even into a
+        # *.ppm path; the reported format must follow the bytes.
+        png = b"\x89PNG\r\n\x1a\n fake png bytes"
+        def fake_run(argv, timeout=30):
+            Path(argv[-1]).write_bytes(png)
+            return True, "Screenshot saved to x.ppm, with type of image/png"
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run", side_effect=fake_run):
+            r = vm.do_capture()
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["screenshot_format"], "png")
+        self.assertEqual(r["screenshot_bytes"], len(png))
 
 
 class McpTunnelTests(unittest.TestCase):
