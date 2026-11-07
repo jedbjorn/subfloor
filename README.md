@@ -134,6 +134,15 @@ for setup, boundaries, and the separate operator-run real-extension acceptance.
 The guide is themed Markdown: read it on GitHub or
 [open its tabbed presentation](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/docs/README.md).
 
+## Reusable skills
+
+[Create a presentation](skills/create-presentation/SKILL.md) is a portable,
+style-neutral skill for offline HTML decks, animated SVGs, authentic demo
+footage, presenter notes, and short video exports. Copy the complete
+`skills/create-presentation/` folder, including its references, into your
+harness's supported skill directory. This package is not yet installed or
+granted automatically by Subfloor.
+
 ## License
 
 [MIT](LICENSE) © 2026 jedbjorn.
