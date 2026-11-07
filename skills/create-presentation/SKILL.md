@@ -9,7 +9,7 @@ Build a presentation that works for its audience, speaking context, and delivery
 
 ## Establish the brief
 
-Use supplied source material and existing assets first. Resolve the audience, desired decision or action, presentation length, delivery environment, and required outputs from context. Ask only about consequential gaps. A live talk, a self-guided deck, and a narrated recording need different amounts of on-screen explanation and different timing.
+Use supplied source material and existing assets first. Ideally a .md file is supplied outlining the slides and with some user ideas on flow and topic. If no file is provided, suggest one be started, if user prefers, offer to work on it in line in chat. Resolve the audience, desired decision or action, presentation length, delivery environment, and required outputs from context. Ask only about consequential gaps. A live talk, a self-guided deck, and a narrated recording need different amounts of on-screen explanation and different timing.
 
 Separate verified product behavior, conceptual illustrations, and future plans. Write useful, readable copy around the evidence. Keep speaker elaboration in notes; do not turn slides into transcripts. Remove captions or duplicated copy where the request and layout justify it, without treating all captions as clutter. Preserve labels, explanations, credits, and accessibility text that serve a purpose.
 
