@@ -13,6 +13,7 @@
     "git",
     "sprint_protocol",
     "sprint_prep",
-    "sprint_pln"
+    "sprint_pln",
+    "cli_orchestration"
   ]
 }
