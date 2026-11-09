@@ -24,6 +24,7 @@ RATIFIED_OPT_INS = {
         "snapshot",
     },
     "planner": {
+        "cli_orchestration",
         "dev_kit",
         "flag_sweep",
         "fork_skill_design",
