@@ -2986,11 +2986,54 @@ def _link_check(check: str, config: dict) -> dict | None:
     return response if isinstance(response.get("ok"), bool) else None
 
 
+POWERED_OFF_NEXT = (
+    "./sc vm start, then re-run ./sc vm init - or pass --no-verify to link "
+    "the guest while it is off"
+)
+
+
+def _link_power_state(config: dict) -> str | None:
+    """The domain's power state, or None when it cannot be read.
+
+    `./sc vm bake` leaves a seat powered off, so a re-link of a healthy seat
+    meets a guest that cannot answer SSH. That is a different fact from a
+    wrong host, user or key and must not be reported as one.
+    """
+    if os.environ.get("SC_SANDBOX"):
+        try:
+            response = broker_call(
+                "GET", "/status", None, timeout=DEFAULT_CLIENT_TIMEOUT
+            )
+        except (BrokerConnectionError, BrokerTimeoutError, BrokerResponseError):
+            return None
+        state = response.get("domain_state")
+        return state if isinstance(state, str) else None
+    ok, state = _domain_state(config)
+    return state if ok else None
+
+
 def verify_link(config: dict) -> dict:
-    """Run every setup check against `config`; pass/fail and a next step each."""
+    """Run every setup check against `config`; pass/fail and a next step each.
+
+    A powered-off guest is reported as that (`powered_off` on the ssh and
+    toolchain entries, `guest_powered_off` on the report): the checks that
+    need a running guest are not run, rather than run and blamed on the link.
+    """
     checks: list[dict] = []
     ssh_ok = True
+    powered_off = False
     for check in CHECKS:
+        if check == "ssh" and checks and checks[0]["ok"]:
+            powered_off = _link_power_state(config) == "powered_off"
+        if check in ("ssh", "toolchain") and powered_off:
+            checks.append({
+                "check": check, "ok": False, "skipped": True,
+                "powered_off": True,
+                "output": "not run: the guest is powered off, so this was "
+                          "not tested (the link itself may be fine)",
+                "next": POWERED_OFF_NEXT if check == "ssh" else None,
+            })
+            continue
         if check == "toolchain" and not ssh_ok:
             checks.append({
                 "check": check, "ok": False, "skipped": True,
@@ -3015,7 +3058,11 @@ def verify_link(config: dict) -> dict:
         if check == "ssh":
             ssh_ok = entry["ok"]
         checks.append(entry)
-    return {"passed": all(item["ok"] for item in checks), "checks": checks}
+    return {
+        "passed": all(item["ok"] for item in checks),
+        "checks": checks,
+        "guest_powered_off": powered_off,
+    }
 
 
 def link_lines(checks: list, broker: dict | None) -> list[str]:
@@ -3059,6 +3106,18 @@ def verify_init(config: dict) -> dict:
             "init", {"vm": config, "broker": broker, "verify": verify}
         )
     failed = [item["check"] for item in verify["checks"] if not item["ok"]]
+    if all(item["ok"] or item.get("powered_off") for item in verify["checks"]):
+        # Not a wrong link: everything that can be tested with the guest off
+        # passed. Still non-zero, because SSH was not proven.
+        return operation_error(
+            "init", "init_guest_powered_off",
+            "the vm block IS saved and the checks that do not need a running "
+            "guest passed, but the guest is powered off, so SSH was not "
+            "tested. This is not a wrong link. Run ./sc vm start and re-run "
+            "./sc vm init, or pass --no-verify to link it while it is off.",
+            {"saved": True, "guest_powered_off": True,
+             "checks": verify["checks"], "broker": broker},
+        )
     return operation_error(
         "init", "init_verify_failed",
         "the vm block IS saved, but the link did not verify ("
@@ -3073,7 +3132,7 @@ def _human_result(value: dict) -> str:
         error = value["error"]
         head = f"✗ {value['operation']} [{error['code']}]: {error['message']}"
         details = error.get("details") or {}
-        if error["code"] == "init_verify_failed":
+        if error["code"] in ("init_verify_failed", "init_guest_powered_off"):
             return "\n".join(
                 [head, *link_lines(details.get("checks"), details.get("broker"))]
             )

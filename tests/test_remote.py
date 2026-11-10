@@ -23,6 +23,13 @@ import remote
 import vm
 import vm_broker
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import seat_seam_guard  # noqa: E402
+
+# Every test in this module: no real ssh/scp/virsh/tailscale/dispatcher child
+# process and no call on a real broker socket. See tests/seat_seam_guard.py.
+seat_seam_guard.install(globals())
+
 
 class RemoteVerbTests(unittest.TestCase):
     def setUp(self):

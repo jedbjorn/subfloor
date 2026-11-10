@@ -16,6 +16,13 @@ sys.path.insert(0, str(ENGINE / "api"))
 import vm
 import vm_broker
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import seat_seam_guard  # noqa: E402
+
+# Every test in this module: no real ssh/scp/virsh/tailscale/dispatcher child
+# process and no call on a real broker socket. See tests/seat_seam_guard.py.
+seat_seam_guard.install(globals())
+
 SAVED = {
     "domain": "win-test",
     "ssh_host": "127.0.0.1",
@@ -1025,6 +1032,10 @@ class LinkTruthTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         vm.os.environ.pop("SC_SANDBOX", None)
+        self.power = mock.patch.object(
+            vm, "_domain_state", return_value=(True, "running"))
+        self.domain_state = self.power.start()
+        self.addCleanup(self.power.stop)
 
     @staticmethod
     def _checks(failing=()):
@@ -1123,6 +1134,56 @@ class LinkTruthTests(unittest.TestCase):
         # The toolchain check needs ssh, so it is skipped rather than re-failed.
         self.assertIn("- toolchain", text)
 
+    def test_a_powered_off_guest_is_not_reported_as_a_wrong_link(self):
+        # `./sc vm bake` leaves the seat off; re-linking it must say so
+        # instead of blaming host, user or key.
+        self.domain_state.return_value = (True, "powered_off")
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             self._checks() as validate:
+            code, text = self._init("--json")
+        value = json.loads(text)
+        self.assertEqual(code, 1)  # SSH was not proven, so still non-zero
+        self.assertEqual(value["error"]["code"], "init_guest_powered_off")
+        self.assertIn("powered off", value["error"]["message"])
+        self.assertIn("not a wrong link", value["error"]["message"])
+        self.assertIn("--no-verify", value["error"]["message"])
+        self.assertIn("./sc vm start", value["error"]["message"])
+        self.assertTrue(value["error"]["details"]["guest_powered_off"])
+        # Only the checks that work with the guest off were run.
+        self.assertEqual(
+            [call.args[0] for call in validate.call_args_list],
+            ["domain", "snapshot"],
+        )
+        by_name = {c["check"]: c for c in value["error"]["details"]["checks"]}
+        self.assertTrue(by_name["domain"]["ok"])
+        self.assertTrue(by_name["snapshot"]["ok"])
+        self.assertTrue(by_name["ssh"]["powered_off"])
+        self.assertIn("--no-verify", by_name["ssh"]["next"])
+
+    def test_a_powered_off_guest_with_a_wrong_snapshot_is_still_a_wrong_link(self):
+        self.domain_state.return_value = (True, "powered_off")
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             self._checks(failing=("snapshot",)):
+            code, text = self._init()
+        self.assertEqual(code, 1)
+        self.assertIn("init_verify_failed", text)
+        self.assertIn("✗ snapshot", text)
+        self.assertIn("guest is powered off", text)
+
+    def test_a_running_guest_that_refuses_ssh_is_a_wrong_link(self):
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             self._checks(failing=("ssh",)):
+            code, text = self._init("--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            json.loads(text)["error"]["code"], "init_verify_failed")
+
+    def test_power_state_is_not_probed_for_a_domain_libvirt_does_not_know(self):
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             self._checks(failing=("domain",)):
+            self._init("--json")
+        self.domain_state.assert_not_called()
+
     def test_init_starts_a_down_broker_the_way_adopt_does(self):
         started = []
 
@@ -1172,13 +1233,15 @@ class LinkTruthTests(unittest.TestCase):
 
         def broker(method, path, body=None, timeout=130):
             seen.append(path)
-            return {"ok": True, "output": "fine"}
+            return {"ok": True, "output": "fine", "domain_state": "running"}
 
         with mock.patch.object(vm, "broker_call", side_effect=broker), \
              mock.patch.object(vm, "validate") as direct:
             code, _ = self._init("--json")
         self.assertEqual(code, 0)
         direct.assert_not_called()
+        self.domain_state.assert_not_called()  # the broker is asked instead
+        self.assertIn("/status", seen)
         for check in vm.CHECKS:
             self.assertIn(f"/validate/{check}", seen)
 
@@ -1194,6 +1257,43 @@ class LinkTruthTests(unittest.TestCase):
         self.assertEqual(value["error"]["code"], "init_verify_failed")
         self.assertTrue(
             all(c["skipped"] for c in value["error"]["details"]["checks"]))
+
+
+class SeamGuardTests(unittest.TestCase):
+    """The module-level guard itself: an unmocked seam fails loudly."""
+
+    def tearDown(self):
+        # These tests trip the guard on purpose; do not fail the module.
+        seat_seam_guard._violations.clear()
+
+    def test_an_unmocked_virsh_or_ssh_never_starts(self):
+        for argv in (["virsh", "dominfo", "x"], ["ssh", "h", "true"],
+                     ["/usr/bin/tailscale", "status"],
+                     ["sh", "/x/.super-coder/scripts/dispatch.sh", "vm-broker-up"]):
+            with self.subTest(argv=argv), self.assertRaises(AssertionError):
+                vm.subprocess.run(argv, capture_output=True)
+
+    def test_engine_seams_are_covered_without_a_per_test_patch(self):
+        with self.assertRaises(AssertionError):
+            vm._run(["virsh", "list"])
+        with self.assertRaises(AssertionError):
+            vm._domain_state({"domain": "x"})
+        with self.assertRaises(AssertionError):
+            vm._dispatch_broker_up()
+        with self.assertRaises(AssertionError):
+            vm.broker_call("GET", "/health", None, timeout=1)
+
+    def test_other_child_processes_still_run(self):
+        done = vm.subprocess.run(
+            [sys.executable, "-c", "print('ok')"], capture_output=True, text=True)
+        self.assertEqual(done.stdout.strip(), "ok")
+
+    def test_a_swallowed_violation_still_fails_the_module(self):
+        try:
+            vm.subprocess.run(["virsh", "list"])
+        except AssertionError:
+            pass  # what a broad `except` at an engine boundary would do
+        self.assertTrue(seat_seam_guard._violations)
 
 
 class LifecycleClientTests(unittest.TestCase):
