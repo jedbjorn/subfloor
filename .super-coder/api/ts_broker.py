@@ -14,8 +14,9 @@ Routes (all JSON `{ok, ...}`):
 
     GET  /health               liveness
     GET  /ts                   read the saved ts block
-    PUT  /ts        {ts}        write the ts block; a failed save answers
-                               {ok: false, error: ts_write_failed, message}
+    PUT  /ts        {ts}        write the ts block; host and user names are
+                               validated ({error: ts_block_invalid}) and a
+                               failed save answers {error: ts_write_failed}
     GET  /status               `tailscale status --json` -> self + peers summary
     POST /exec      {host,command,timeout?}  tailscale ssh -> {ok, exit, stdout, stderr}
                     readonly_hosts are limited to ts.READONLY_COMMANDS and
@@ -100,6 +101,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"ok": False, "error": "ts must be an object"})
             try:
                 saved = ts.write(block)
+            except ts.BlockInvalid as e:  # a bad name is refused, not saved
+                return self._send(400, {
+                    "ok": False, "error": "ts_block_invalid",
+                    "message": f"the ts block was not saved: {e}",
+                })
             except Exception as e:  # the save failed: say so, keep serving
                 return self._send(500, {
                     "ok": False, "error": "ts_write_failed",

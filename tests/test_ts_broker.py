@@ -31,6 +31,13 @@ sys.path.insert(0, str(ENGINE / "api"))
 import ts  # noqa: E402
 import ts_broker  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import seat_seam_guard  # noqa: E402
+
+# Every test in this module: no real ssh/scp/virsh/tailscale/dispatcher child
+# process and no call on a real broker socket. See tests/seat_seam_guard.py.
+seat_seam_guard.install(globals())
+
 SAVED = {
     "ssh_user": "tester",
     "allowed_hosts": ["build-box", "deploy-target"],
@@ -514,19 +521,27 @@ class ClientTests(unittest.TestCase):
         self.assertNotIn("ssh_users", block)  # pruned with its host
         self.assertEqual(result["hosts"]["removed"], ["old"])
 
-    def test_naming_a_readonly_host_as_allowed_never_loosens_it(self):
-        current = {"ssh_user": "jed", "allowed_hosts": [], "readonly_hosts": ["blade"]}
-        with mock.patch.object(ts, "read", return_value=current), \
-             mock.patch.object(ts, "write") as write, \
-             mock.patch.object(ts, "broker_call", return_value={"ok": True}):
-            code, result = self._run(
-                ["init", "--allowed-host", "blade", "--no-verify"])
-        block = write.call_args[0][0]
-        self.assertEqual(code, 0)
-        self.assertIn("blade", block["readonly_hosts"])
-        self.assertIn("stays read-only", result["hosts"]["notes"][0])
-        with mock.patch.object(ts, "read", return_value=block):
-            self.assertIsNotNone(ts.do_exec("blade", "rm -rf /x").get("error"))
+    def test_init_refuses_to_name_a_readonly_host_as_allowed(self):
+        current = {"ssh_user": "jed", "allowed_hosts": ["seat"],
+                   "readonly_hosts": ["prod"]}
+        for argv in (
+            ["init", "--allowed-host", "root@prod"],
+            ["init", "--allowed-host", "prod", "--replace-hosts"],
+            ["init", "--allowed-host", "new", "--allowed-host", "root@prod",
+             "--ssh-user", "other", "--no-verify"],
+            ["add-host", "root@prod"],
+        ):
+            with self.subTest(argv=argv), \
+                 mock.patch.object(ts, "read", return_value=current), \
+                 mock.patch.object(ts, "write") as write:
+                code, result = self._run(argv)
+                self.assertEqual(code, 1)
+                self.assertEqual(result["error"], "host_is_readonly")
+                self.assertEqual(result["host"], "prod")
+                self.assertIn("nothing was saved", result["message"])
+                # A refused change changes NOTHING: no list, no per-host
+                # user, no ssh_user, no other host named beside it.
+                write.assert_not_called()
 
     def test_naming_an_allowed_host_readonly_tightens_it(self):
         current = {"ssh_user": "jed", "allowed_hosts": ["dev", "blade"]}
@@ -660,16 +675,36 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(by_name["peer"]["skipped"])
         self.assertTrue(by_name["ssh"]["skipped"])
 
-    def test_a_block_with_no_hosts_verifies_the_node_and_says_exec_is_refused(self):
+    def test_init_naming_no_host_checks_the_broker_only_and_says_so(self):
+        # `ts init --ssh-user X` used to probe every declared host, machines
+        # in real use included, 20s each; one sleeping host failed it.
+        current = {"ssh_user": "old", "allowed_hosts": ["seat"],
+                   "readonly_hosts": ["prod", "asleep"]}
         calls, passing = self._passing()
-        with mock.patch.object(ts, "read", return_value=None), \
+        with mock.patch.object(ts, "read", return_value=current), \
              mock.patch.object(ts, "write"), \
-             mock.patch.object(ts, "broker_call", return_value={"ok": True}), \
+             mock.patch.object(ts, "broker_call", return_value={"ok": True}) as broker, \
              passing:
             code, result = self._run(["init", "--ssh-user", "ops"])
         self.assertEqual(code, 0)
-        self.assertEqual([c for c, _ in calls], ["daemon", "auth"])
+        self.assertEqual(calls, [])  # nothing on the tailnet was probed
+        broker.assert_called_once_with("GET", "/health", timeout=5)
+        self.assertTrue(result["broker"]["ready"])
+        self.assertEqual(result["verify"]["checks"], [])
+        self.assertIn("only the broker was checked", result["verify"]["note"])
         self.assertIn("add-host", result["verify"]["note"])
+
+    def test_init_verifies_only_the_hosts_it_names(self):
+        current = {"ssh_user": "ops", "allowed_hosts": ["seat"],
+                   "readonly_hosts": ["prod"]}
+        calls, passing = self._passing()
+        with mock.patch.object(ts, "read", return_value=current), \
+             mock.patch.object(ts, "write"), \
+             mock.patch.object(ts, "broker_call", return_value={"ok": True}), \
+             passing:
+            code, _ = self._run(["init", "--allowed-host", "seat2"])
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [(check, ["seat2"]) for check in ts.CHECKS])
 
     def test_when_the_broker_cannot_be_started_the_exact_command_is_given(self):
         _, passing = self._passing()
@@ -713,6 +748,281 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(result["error"], "ts_write_failed")
         self.assertNotIn("ts", result)
+
+
+class _StatefulClient(unittest.TestCase):
+    """Runs client verbs against an in-memory block through the REAL
+    `ts.write` (so its validation and tier normalization are exercised); only
+    the instance-file write underneath is replaced."""
+
+    def setUp(self):
+        self.block: dict | None = None
+
+        def update(values, remove=()):
+            if "ts" in values:
+                self.block = json.loads(json.dumps(values["ts"]))
+            if "ts" in remove:
+                self.block = None
+
+        for target, name, kwargs in (
+            (ts, "read", {"side_effect": lambda: (
+                json.loads(json.dumps(self.block)) if self.block else None)}),
+            (ts.ports, "update", {"side_effect": update}),
+            (ts, "broker_call", {"return_value": {"ok": True}}),
+            (ts, "validate", {"side_effect": lambda check, cfg, hosts=None: {
+                "ok": True, "output": "fine", "check": check}}),
+        ):
+            patcher = mock.patch.object(target, name, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(ts.os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        ts.os.environ.pop("SC_SANDBOX", None)
+
+    def run_client(self, *argv):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = ts.client_main(list(argv))
+        return code, json.loads(output.getvalue())
+
+    def assert_tiers_disjoint(self, context=""):
+        block = self.block or {}
+        both = set(block.get("allowed_hosts") or []) & set(
+            block.get("readonly_hosts") or [])
+        self.assertEqual(both, set(), f"host in both tiers after {context}: {block}")
+
+
+class TierInvariantTests(_StatefulClient):
+    """A read-only host never reaches the exec tier, and no host is ever
+    saved in both tiers, across any sequence of commands."""
+
+    def test_the_reviewed_two_step_sequence_cannot_loosen_a_readonly_host(self):
+        self.block = {"ssh_user": "ops", "allowed_hosts": ["seat"],
+                      "readonly_hosts": ["prod"], "tailscale_bin": "tailscale"}
+        before = json.loads(json.dumps(self.block))
+
+        code, result = self.run_client("init", "--allowed-host", "root@prod")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["error"], "host_is_readonly")
+        self.assertEqual(self.block, before)  # incl. no ssh_users[prod]=root
+
+        code, result = self.run_client(
+            "init", "--replace-hosts", "--readonly-host", "other")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.block["allowed_hosts"], ["seat"])
+        self.assertEqual(self.block["readonly_hosts"], ["other"])
+        self.assertEqual(result["hosts"]["removed"], ["prod"])
+        self.assertNotIn("ssh_users", self.block)
+        # prod is no longer declared at all, so exec is refused outright.
+        with mock.patch("subprocess.run") as run:
+            refused = ts.do_exec("prod", "rm -rf /srv")
+        self.assertFalse(refused["ok"])
+        run.assert_not_called()
+
+    def test_a_saved_block_with_a_host_in_both_tiers_is_read_as_readonly(self):
+        # What the pre-fix code could write (or a hand edit). Replacing the
+        # read-only list must DROP the host, not leave it allowed.
+        self.block = {"ssh_user": "ops", "allowed_hosts": ["seat", "prod"],
+                      "readonly_hosts": ["prod"], "ssh_users": {"prod": "root"}}
+        code, result = self.run_client(
+            "init", "--replace-hosts", "--readonly-host", "other", "--no-verify")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.block["allowed_hosts"], ["seat"])
+        self.assertEqual(self.block["readonly_hosts"], ["other"])
+        self.assertEqual(result["hosts"]["removed"], ["prod"])
+        self.assertNotIn("ssh_users", self.block)
+
+    def test_any_write_of_a_both_tier_block_saves_it_readonly_only(self):
+        for argv in (
+            ("init", "--ssh-user", "x", "--no-verify"),
+            ("add-host", "new", "--no-verify"),
+            ("remove-host", "seat"),
+        ):
+            with self.subTest(argv=argv):
+                self.block = {"ssh_user": "ops", "allowed_hosts": ["seat", "prod"],
+                              "readonly_hosts": ["prod"]}
+                code, _ = self.run_client(*argv)
+                self.assertEqual(code, 0)
+                self.assert_tiers_disjoint(str(argv))
+                self.assertIn("prod", self.block["readonly_hosts"])
+
+    def test_no_sequence_of_commands_leaves_a_host_in_both_tiers(self):
+        steps = (
+            ("init", "--ssh-user", "ops", "--allowed-host", "a",
+             "--readonly-host", "p"),
+            ("init", "--allowed-host", "p"),                    # refused
+            ("add-host", "p"),                                  # refused
+            ("add-host", "u@b"),
+            ("init", "--readonly-host", "a"),                   # tightens a
+            ("init", "--allowed-host", "a"),                    # refused
+            ("init", "--allowed-host", "c", "--readonly-host", "c"),
+            ("add-host", "b", "--readonly"),                    # tightens b
+            ("init", "--replace-hosts", "--allowed-host", "d",
+             "--readonly-host", "d"),
+            ("init", "--replace-hosts", "--allowed-host", "p"),  # refused or new
+            ("init", "--replace-hosts", "--readonly-host", "q"),
+            ("remove-host", "q"),
+            ("add-host", "q"),               # two deliberate commands: allowed
+            ("init", "--replace-hosts", "--allowed-host", "e",
+             "--readonly-host", "q"),
+            ("remove-host", "nope"),                            # refused
+        )
+        readonly_ever = set()
+        for step in steps:
+            before = json.loads(json.dumps(self.block)) if self.block else None
+            was_readonly = set((before or {}).get("readonly_hosts") or [])
+            code, result = self.run_client(*step, *(
+                ["--no-verify"] if step[0] != "remove-host" else []))
+            self.assert_tiers_disjoint(str(step))
+            if code != 0:
+                self.assertEqual(self.block, before, f"refused {step} wrote")
+            # A host that was read-only before this command is never allowed
+            # after it: loosening takes remove-host, then a second command.
+            self.assertEqual(
+                was_readonly & set((self.block or {}).get("allowed_hosts") or []),
+                set(), f"{step} loosened a read-only host")
+            readonly_ever |= was_readonly
+        self.assertTrue(readonly_ever)
+
+    def test_put_ts_cannot_save_a_host_in_both_tiers(self):
+        saved = ts.write({"ssh_user": "ops", "allowed_hosts": ["seat", "prod"],
+                          "readonly_hosts": ["prod"]})
+        self.assertEqual(saved["allowed_hosts"], ["seat"])
+        self.assert_tiers_disjoint("write")
+
+
+class NameValidationTests(_StatefulClient):
+    """Host and user names become one `tailscale ssh` argv element; nothing
+    option-shaped may be saved or run."""
+
+    BAD_ARGUMENTS = (
+        "-oProxyCommand=x@h",   # user would be `-oProxyCommand=x`
+        "-h",
+        "u@-oFoo",
+        "--help",
+        "u@",
+        "@h",
+        "u@h h",
+        "a b",
+        "h;id",
+        "u$(id)@h",
+        "h/../x",
+        "",
+    )
+
+    def test_parse_host_rejects_option_shaped_and_unsafe_names(self):
+        for value in self.BAD_ARGUMENTS:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ts._parse_host(value)
+
+    def test_parse_host_accepts_real_tailnet_names(self):
+        for value, expected in (
+            ("build-box", ("build-box", "")),
+            ("jedi@mac-test", ("mac-test", "jedi")),
+            ("box.tail0.ts.net", ("box.tail0.ts.net", "")),
+            ("svc_user@100.64.0.2", ("100.64.0.2", "svc_user")),
+            ("first.last@h1", ("h1", "first.last")),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(ts._parse_host(value), expected)
+
+    def test_the_client_refuses_bad_names_before_any_write(self):
+        self.block = dict(SAVED)
+        before = dict(SAVED)
+        for argv in (
+            ["init", "--allowed-host=-oProxyCommand=x@h"],
+            ["init", "--readonly-host=u@-oFoo"],
+            ["init", "--ssh-user=-oProxyCommand=x"],
+            ["init", "--allowed-host", "ok-host", "--readonly-host=-h"],
+            ["add-host", "u@-oFoo"],
+        ):
+            with self.subTest(argv=argv):
+                code, result = self.run_client(*argv)
+                self.assertEqual(code, 1)
+                self.assertEqual(result["error"], "host_invalid")
+                self.assertEqual(self.block, before)
+
+    def test_write_refuses_a_block_with_a_bad_name_wherever_it_comes_from(self):
+        for block in (
+            {"allowed_hosts": ["-h"]},
+            {"readonly_hosts": ["ok", "u@-oFoo"]},
+            {"allowed_hosts": ["h"], "ssh_user": "-oProxyCommand=x"},
+            {"allowed_hosts": ["h"], "ssh_users": {"h": "-oProxyCommand=x"}},
+            {"allowed_hosts": ["h"], "ssh_users": {"-h": "u"}},
+            {"allowed_hosts": ["h"], "ssh_users": ["h"]},
+            {"allowed_hosts": "h"},
+        ):
+            with self.subTest(block=block):
+                self.block = None
+                with self.assertRaises(ts.BlockInvalid):
+                    ts.write(block)
+                self.assertIsNone(self.block)
+
+    def test_exec_never_builds_an_option_shaped_target_from_a_hand_edit(self):
+        # instance.json can be edited by hand, bypassing every write check.
+        self.block = {"allowed_hosts": ["h"], "ssh_users": {"h": "-oProxyCommand=x"}}
+        with mock.patch("subprocess.run") as run:
+            result = ts.do_exec("h", "uptime")
+        self.assertFalse(result["ok"])
+        self.assertIn("not a valid name", result["stderr"])
+        run.assert_not_called()
+        self.block = {"allowed_hosts": ["-oFoo"]}
+        with mock.patch("subprocess.run") as run:
+            self.assertFalse(ts.do_exec("-oFoo", "uptime")["ok"])
+        run.assert_not_called()
+
+    def test_a_hand_edited_bad_entry_can_still_be_removed(self):
+        self.block = {"ssh_user": "ops", "allowed_hosts": ["good", "-bad"]}
+        code, _ = self.run_client("add-host", "new", "--no-verify")
+        self.assertEqual(code, 1)  # the block is refused as a whole, loudly
+        code, _ = self.run_client("remove-host", "--", "-bad")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.block["allowed_hosts"], ["good"])
+
+
+class PutValidationTests(unittest.TestCase):
+    """`PUT /ts` accepted any ssh_users map unvalidated."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.sock = Path(self._dir.name) / "ts.sock"
+        patcher = mock.patch.object(ts, "SOCKET", self.sock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.updates = []
+        patcher = mock.patch.object(
+            ts.ports, "update",
+            side_effect=lambda values, remove=(): self.updates.append(values))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.srv = ts_broker.UnixHTTPServer(str(self.sock), ts_broker.Handler)
+        thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(self.srv.server_close)
+        self.addCleanup(self.srv.shutdown)
+
+    def test_put_refuses_option_shaped_names_and_saves_nothing(self):
+        for block in (
+            {"allowed_hosts": ["h"], "ssh_users": {"h": "-oProxyCommand=x"}},
+            {"allowed_hosts": ["-oFoo"]},
+            {"readonly_hosts": ["h"], "ssh_user": "-l"},
+        ):
+            with self.subTest(block=block):
+                reply = ts.broker_call("PUT", "/ts", {"ts": block})
+                self.assertFalse(reply["ok"])
+                self.assertEqual(reply["error"], "ts_block_invalid")
+                self.assertIn("not saved", reply["message"])
+        self.assertEqual(self.updates, [])
+        self.assertTrue(ts.broker_call("GET", "/health")["ok"])
+
+    def test_put_saves_a_valid_block_with_per_host_users(self):
+        block = {"ssh_user": "ops", "allowed_hosts": ["seat"],
+                 "readonly_hosts": ["prod"], "ssh_users": {"seat": "jedi"}}
+        reply = ts.broker_call("PUT", "/ts", {"ts": block})
+        self.assertTrue(reply["ok"])
+        self.assertEqual(self.updates, [{"ts": block}])
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -98,10 +99,70 @@ def read() -> dict | None:
     return ports.resolve(persist=False).get("ts")
 
 
+# Host and user names end up as ONE argv element of `tailscale ssh`
+# (`user@host`). A name that starts with a dash would be read as an option
+# there, so both are held to a conservative shape wherever a block is written:
+# a tailnet machine name, MagicDNS name or IPv4 address for the host, a plain
+# account name for the user. Neither may start with `-`.
+HOST_NAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9._-]{0,251}[A-Za-z0-9])?\Z")
+USER_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}\Z")
+
+
+class BlockInvalid(ValueError):
+    """The ts block carries a host or user name that must not be saved."""
+
+
+def valid_host(value: object) -> bool:
+    return isinstance(value, str) and bool(HOST_NAME.fullmatch(value))
+
+
+def valid_user(value: object) -> bool:
+    return isinstance(value, str) and bool(USER_NAME.fullmatch(value))
+
+
+def block_error(block: dict) -> str | None:
+    """Why `block` must not be saved, or None. Applied to EVERY write - the
+    client verbs and a block arriving through `PUT /ts` alike."""
+    for key in ("allowed_hosts", "readonly_hosts"):
+        hosts = block.get(key)
+        if hosts is None:
+            continue
+        if not isinstance(hosts, list):
+            return f"{key} must be a list of host names"
+        for host in hosts:
+            if not valid_host(host):
+                return f"{key} entry is not a valid host name: {host!r}"
+    user = block.get("ssh_user")
+    if user not in (None, "") and not valid_user(user):
+        return f"ssh_user is not a valid user name: {user!r}"
+    users = block.get("ssh_users")
+    if users is not None:
+        if not isinstance(users, dict):
+            return "ssh_users must be an object of host: user"
+        for host, name in users.items():
+            if not valid_host(host):
+                return f"ssh_users key is not a valid host name: {host!r}"
+            if not valid_user(name):
+                return f"ssh_users[{host!r}] is not a valid user name: {name!r}"
+    return None
+
+
 def write(ts: dict | None) -> dict | None:
     """Persist (or clear) the ts block, preserving every other config key
-    (ports, and the `vm` block written by vm.py — both coexist)."""
+    (ports, and the `vm` block written by vm.py — both coexist).
+
+    Two things hold for every block that is saved, whoever sends it: its
+    names pass `block_error` (BlockInvalid otherwise, nothing written), and no
+    host sits in both tiers - a host in `readonly_hosts` is dropped from
+    `allowed_hosts`, which is what exec already treated it as.
+    """
     if ts:
+        if problem := block_error(ts):
+            raise BlockInvalid(problem)
+        readonly = ts.get("readonly_hosts") or []
+        if readonly and any(h in readonly for h in ts.get("allowed_hosts") or []):
+            ts = {**ts, "allowed_hosts": [
+                h for h in ts["allowed_hosts"] if h not in readonly]}
         ports.update({"ts": ts})
     else:
         ports.update({}, remove=("ts",))
@@ -367,6 +428,13 @@ def do_exec(host: str, command: str, timeout: int = 120) -> dict:
         return {"ok": False, "exit": -1, "stdout": "", "stderr": "exec: empty command"}
     if denied := _denied(cfg, host):
         return {"ok": False, "exit": -1, "stdout": "", "stderr": denied}
+    # A hand-edited block is not validated on the way in; never build an argv
+    # element that could be read as an option.
+    user = _user_for(cfg, host)
+    if not valid_host(host) or (user and not valid_user(user)):
+        return {"ok": False, "exit": -1, "stdout": "",
+                "stderr": f"exec: the saved host or user name for '{host}' is "
+                          "not a valid name; fix the ts block"}
     if host in (cfg.get("readonly_hosts") or []) and (
         token := readonly_refusal(command)
     ):
@@ -538,16 +606,28 @@ def _link_check(check: str, cfg: dict, hosts: list[str]) -> dict | None:
     return response if isinstance(response.get("ok"), bool) else None
 
 
-def verify_link(cfg: dict, hosts: list[str] | None = None) -> dict:
-    """Run the setup checks in order against `cfg`: pass/fail and a next step
-    each. `hosts` narrows peer and ssh to the hosts a command just declared.
-    A check is skipped once one it depends on has failed, so one cause is
-    reported once."""
-    scope = _scope(cfg, hosts)
-    names = CHECKS if scope else ("daemon", "auth")
+def verify_link(cfg: dict, hosts: list[str]) -> dict:
+    """Test the hosts a command just NAMED: daemon, auth, then peer and ssh
+    for those hosts only. A check is skipped once one it depends on has
+    failed, so one cause is reported once.
+
+    With no host named nothing on the tailnet is probed - the caller has
+    already checked the broker, and that is all this reports. A command that
+    only changes `ssh_user` must not fail because some other declared machine
+    is asleep, and must not open a session to every machine in real use.
+    """
+    scope = _scope(cfg, hosts) if hosts else []
+    if not scope:
+        return {
+            "passed": True, "checks": [], "hosts": [],
+            "note": ("no host was named, so only the broker was checked and "
+                     "no tailnet host was probed; ./sc ts add-host <host> "
+                     "tests one host (it is safe to repeat for a host "
+                     "already declared)"),
+        }
     checks: list[dict] = []
     blocked = False
-    for check in names:
+    for check in CHECKS:
         if blocked:
             checks.append({"check": check, "ok": False, "skipped": True,
                            "output": "not run: an earlier check failed",
@@ -565,21 +645,28 @@ def verify_link(cfg: dict, hosts: list[str] | None = None) -> dict:
                      "next": None if ok else LINK_NEXT[check]}
         blocked = not entry["ok"]
         checks.append(entry)
-    report = {"passed": all(item["ok"] for item in checks), "checks": checks,
-              "hosts": scope}
-    if not scope:
-        report["note"] = ("no hosts are declared, so exec is refused for every "
-                          "host until ./sc ts add-host <host>")
-    return report
+    return {"passed": all(item["ok"] for item in checks), "checks": checks,
+            "hosts": scope}
+
+
+class TierRefused(ValueError):
+    """A command named a read-only host as allowed. Nothing may be written."""
+
+    def __init__(self, host: str) -> None:
+        super().__init__(f"'{host}' is declared read-only")
+        self.host = host
 
 
 def _parse_host(value: str) -> tuple[str, str]:
     """`host` or `user@host` -> (host, user). The user is that host's own
-    remote user; without one the block's `ssh_user` applies."""
-    text = str(value).strip()
-    user, _, host = text.rpartition("@")
-    if not host or any(character.isspace() for character in text):
+    remote user; without one the block's `ssh_user` applies. Both are held to
+    HOST_NAME / USER_NAME, so neither can begin with a dash."""
+    text = str(value)
+    user, separator, host = text.rpartition("@")
+    if not valid_host(host):
         raise ValueError(f"not a host name: {value!r}")
+    if separator and not valid_user(user):
+        raise ValueError(f"not a user name: {value!r}")
     return host, user
 
 
@@ -587,39 +674,44 @@ def _merge_hosts(current: dict, allowed: list[str] | None,
                  readonly: list[str] | None, replace: bool) -> tuple[dict, dict]:
     """Fold named hosts into the saved lists. Returns (fields, changes).
 
-    Additive by default: a host already declared is never dropped by naming
-    another one. `replace` restores the old wholesale behaviour for each list
-    that was named. Tiers only ever tighten here: a host named read-only
-    leaves `allowed_hosts`, while a read-only host named as allowed STAYS
-    read-only (the read-only tier wins) and is reported, so a real machine is
-    never loosened as a side effect.
+    Every argument is parsed and every refusal raised BEFORE anything is
+    built, so a refused command changes nothing - not a list, not a host's
+    user.
+
+    - Additive by default: a host already declared is never dropped by naming
+      another one. `replace` restores the wholesale behaviour for each list
+      that was named.
+    - A host that is read-only in the SAVED block can never be named as
+      allowed: TierRefused, whatever else the command says. Loosening a host
+      is `remove-host` followed by `add-host`, two deliberate commands.
+    - Naming an allowed host read-only moves it (tightening is always fine).
+    - The result never holds a host in both tiers. A saved block that does
+      (hand-edited; exec already treated it as read-only) is read as
+      read-only first, so replacing `readonly_hosts` drops such a host rather
+      than leaving it behind in `allowed_hosts`.
     """
-    before_allowed = list(current.get("allowed_hosts") or [])
+    named_allowed = [_parse_host(value) for value in allowed or []]
+    named_readonly = [_parse_host(value) for value in readonly or []]
     before_readonly = list(current.get("readonly_hosts") or [])
-    users = dict(current.get("ssh_users") or {}) if isinstance(
-        current.get("ssh_users"), dict) else {}
+    before_allowed = [host for host in current.get("allowed_hosts") or []
+                      if host not in before_readonly]
+    readonly_names = {host for host, _ in named_readonly}
+    for host, _ in named_allowed:
+        if host in before_readonly and host not in readonly_names:
+            raise TierRefused(host)
+
+    saved_users = current.get("ssh_users")
+    users = dict(saved_users) if isinstance(saved_users, dict) else {}
     new_allowed = [] if replace and allowed is not None else list(before_allowed)
     new_readonly = [] if replace and readonly is not None else list(before_readonly)
-    notes: list[str] = []
-    named: list[str] = []
-    for values, target in ((allowed, new_allowed), (readonly, new_readonly)):
-        for value in values or []:
-            host, user = _parse_host(value)
-            named.append(host)
+    for pairs, target in ((named_allowed, new_allowed),
+                          (named_readonly, new_readonly)):
+        for host, user in pairs:
             if user:
                 users[host] = user
             if host not in target:
                 target.append(host)
-    named_readonly = {_parse_host(value)[0] for value in readonly or []}
-    for host in list(new_allowed):
-        if host not in new_readonly:
-            continue
-        if host in named_readonly:
-            new_allowed.remove(host)
-        elif host in named:
-            notes.append(
-                f"'{host}' is in readonly_hosts and stays read-only; "
-                f"./sc ts remove-host {host} first to change its tier")
+    new_allowed = [host for host in new_allowed if host not in new_readonly]
     declared = set(new_allowed) | set(new_readonly)
     users = {host: user for host, user in users.items() if host in declared}
     before = list(dict.fromkeys([*before_allowed, *before_readonly]))
@@ -628,10 +720,9 @@ def _merge_hosts(current: dict, allowed: list[str] | None,
         "added": [host for host in after if host not in before],
         "kept": [host for host in after if host in before],
         "removed": [host for host in before if host not in after],
-        "named": list(dict.fromkeys(named)),
+        "named": list(dict.fromkeys(
+            host for host, _ in [*named_allowed, *named_readonly])),
     }
-    if notes:
-        changes["notes"] = notes
     return ({"allowed_hosts": new_allowed, "readonly_hosts": new_readonly,
              "ssh_users": users}, changes)
 
@@ -657,7 +748,12 @@ def _save_and_report(operation: str, block: dict, changes: dict,
     link. The block is durable before the checks run, so a failed check says
     it IS saved rather than discarding it."""
     try:
-        write(block)
+        saved = write(block)
+        if isinstance(saved, dict):  # write() may have normalized the tiers
+            block = saved
+    except BlockInvalid as exc:
+        return {"ok": False, "error": "ts_block_invalid", "operation": operation,
+                "message": f"nothing was saved: {exc}"}
     except Exception as exc:  # a failed save must never look like a save
         return {"ok": False, "error": "ts_write_failed", "operation": operation,
                 "message": (f"the ts block could not be saved "
@@ -668,7 +764,7 @@ def _save_and_report(operation: str, block: dict, changes: dict,
     if not verify:
         return {**result, "verified": False, "broker": _broker_health()}
     broker = ensure_broker()
-    report = verify_link(block, changes.get("named") or None)
+    report = verify_link(block, changes.get("named") or [])
     result.update({"verified": report["passed"], "broker": broker,
                    "verify": report})
     if not report["passed"]:
@@ -736,6 +832,8 @@ def client_main(argv: list[str]) -> int:
         current = read() or {}
     try:
         if args.operation == "init":
+            if args.ssh_user not in (None, "") and not valid_user(args.ssh_user):
+                raise ValueError(f"not a user name: {args.ssh_user!r}")
             fields, changes = _merge_hosts(
                 current, args.allowed_hosts, args.readonly_hosts, args.replace_hosts
             )
@@ -744,25 +842,19 @@ def client_main(argv: list[str]) -> int:
                 changes, not args.no_verify,
             )
         elif args.operation == "add-host":
-            host, _ = _parse_host(args.host)
-            if not args.readonly and host in (current.get("readonly_hosts") or []):
-                result = {
-                    "ok": False, "error": "host_is_readonly", "operation": "add-host",
-                    "message": (f"'{host}' is declared read-only; ./sc ts "
-                                f"remove-host {host} first to change its tier"),
-                }
-            else:
-                fields, changes = _merge_hosts(
-                    current,
-                    None if args.readonly else [args.host],
-                    [args.host] if args.readonly else None,
-                    False,
-                )
-                result = _save_and_report(
-                    "add-host", _block(current, fields), changes, not args.no_verify
-                )
+            fields, changes = _merge_hosts(
+                current,
+                None if args.readonly else [args.host],
+                [args.host] if args.readonly else None,
+                False,
+            )
+            result = _save_and_report(
+                "add-host", _block(current, fields), changes, not args.no_verify
+            )
         elif args.operation == "remove-host":
-            host, _ = _parse_host(args.host)
+            # Not parsed: any declared entry can be removed, including a
+            # hand-edited one that would not pass validation today.
+            host = args.host
             if host not in _declared_hosts(current):
                 result = {
                     "ok": False, "error": "host_not_declared",
@@ -772,11 +864,13 @@ def client_main(argv: list[str]) -> int:
                 }
             else:
                 users = current.get("ssh_users")
+                kept_readonly = [
+                    h for h in current.get("readonly_hosts") or [] if h != host]
                 fields = {
                     "allowed_hosts": [
-                        h for h in current.get("allowed_hosts") or [] if h != host],
-                    "readonly_hosts": [
-                        h for h in current.get("readonly_hosts") or [] if h != host],
+                        h for h in current.get("allowed_hosts") or []
+                        if h != host and h not in kept_readonly],
+                    "readonly_hosts": kept_readonly,
                     "ssh_users": {
                         h: u for h, u in (users if isinstance(users, dict) else {}).items()
                         if h != host},
@@ -800,9 +894,18 @@ def client_main(argv: list[str]) -> int:
                     )
             except ConnectionError as exc:
                 result = _client_error(args.operation, str(exc))
+    except TierRefused as exc:
+        result = {
+            "ok": False, "error": "host_is_readonly", "operation": args.operation,
+            "host": exc.host,
+            "message": (f"nothing was saved: '{exc.host}' is declared read-only "
+                        f"and stays read-only; ./sc ts remove-host {exc.host} "
+                        "first to change its tier"),
+        }
     except ValueError as exc:
         result = {"ok": False, "error": "host_invalid",
-                  "operation": args.operation, "message": str(exc)}
+                  "operation": args.operation,
+                  "message": f"nothing was saved: {exc}"}
     print(json.dumps(result, separators=(",", ":")))
     return 0 if result.get("ok") else 1
 
