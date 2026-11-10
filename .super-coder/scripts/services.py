@@ -50,11 +50,14 @@ SERVICES: dict[str, dict] = {
         "unit": "sc-ts-broker-{repo}.service",
         "onboarding": (
             "No tailnet is linked to this fork. On the host: 1. `tailscale up` "
-            "and confirm `tailscale status` shows your node. 2. Add a `ts` block "
-            "to .super-coder/instance.json naming the hosts shells may reach, "
-            "e.g. {\"allowed_hosts\": [\"build-box\"], \"ssh_user\": \"deploy\"} "
-            "(PUT /api/ts writes it; POST /api/ts/validate/{daemon|auth|peer|ssh} "
-            "tests it). 3. Switch the broker on here. "
+            "and confirm `tailscale status` shows your node. 2. Declare the "
+            "hosts shells may reach: `./sc ts init --ssh-user deploy "
+            "--allowed-host build-box` for a disposable test seat, "
+            "`--readonly-host <host>` for a machine in real use (diagnostic "
+            "commands only). It saves the `ts` block, starts the broker and "
+            "tests the link, printing pass/fail per check; `./sc ts add-host "
+            "<host>` adds one more later without dropping the rest. "
+            "3. The broker switch here then shows it running. "
             "See .super-coder/docs/tailscale-broker.md."),
     },
     "vm": {
