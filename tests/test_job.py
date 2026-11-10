@@ -151,6 +151,33 @@ class SupervisorTest(unittest.TestCase):
         self.assertIn("sc job status", body)
 
 
+class HelpTest(unittest.TestCase):
+    """`sc job --help` charts what the verb really does — and only that."""
+
+    def test_help_documents_probes_and_attach_and_hides_the_supervisor(self):
+        parser = job.build_parser()
+        rendered = parser.format_help()
+        for needle in ("attach", "--until", "--every", "--pr", "--work-unit"):
+            self.assertIn(needle, rendered)
+        self.assertNotIn("_supervise", rendered)
+        self.assertNotIn("SUPPRESS", rendered)
+        self.assertNotIn("_supervise", parser.format_usage())
+        self.assertNotIn("_supervise", job.PUBLIC_VERBS)
+
+    def test_the_hidden_supervisor_entry_still_parses(self):
+        args = job.build_parser().parse_args(["_supervise", "/tmp/jobdir"])
+        self.assertIs(args.fn, job.cmd_supervise)
+        self.assertEqual(args.jobdir, "/tmp/jobdir")
+
+    def test_every_public_verb_is_a_real_subcommand(self):
+        parser = job.build_parser()
+        choices = next(
+            action for action in parser._actions
+            if isinstance(action, job.argparse._SubParsersAction)
+        ).choices
+        self.assertEqual(set(job.PUBLIC_VERBS) | {"_supervise"}, set(choices))
+
+
 class StateTest(unittest.TestCase):
     def test_lost_when_supervisor_dead_and_unfinished(self):
         meta = {"supervisor_pid": 2**22 + 1234567, "job_id": "1"}  # not a real pid

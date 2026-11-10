@@ -665,14 +665,36 @@ def cmd_attach(args) -> int:
 
 # ── arg parsing ───────────────────────────────────────────────────────────────
 
+PUBLIC_VERBS = ("start", "list", "status", "tail", "wait", "kill", "attach")
+
+HELP_EPILOG = """\
+forms:
+  sc job start [--label L] [--timeout S] -- <command and args>
+      run one command detached; its completion wakes you
+  sc job start [--label L] [--timeout S] --until "<probe command>" [--every S]
+      repeat a quoted /bin/sh probe until it exits 0, then wake you; --every
+      is the delay between attempts (default 30, minimum 5) and needs --until;
+      probes time out after 3600s unless --timeout says otherwise
+  sc job attach <id> (--pr N [--repository owner/name] | --work-unit N)
+      link a finished run to a PR or a Sprint work unit as supporting evidence
+  sc job list [--all] · status <id> · tail <id> [-n N] · wait <id> [--for S] · kill <id>
+
+Service teardown/reboot may interrupt computation; recovery records lost when
+no exit evidence survives. Interrupted runs are never automatically restarted.
+TUI wakes wait out the CLI lock. Legacy job status/logs remain readable.
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sc job",
         description="Registered jobs survive harness exit and durably wake their owner.",
-        epilog="Service teardown/reboot may interrupt computation; recovery records lost "
-               "when no exit evidence survives. Interrupted runs are never automatically restarted. "
-               "TUI wakes wait out the CLI lock. Legacy job status/logs remain readable.")
-    sub = p.add_subparsers(dest="cmd_name", required=True)
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=HELP_EPILOG)
+    # The metavar is the PUBLIC verb list: `_supervise` is the detached
+    # supervisor's own re-entry point, dispatchable but never an operator verb.
+    sub = p.add_subparsers(dest="cmd_name", required=True,
+                           metavar="{" + ",".join(PUBLIC_VERBS) + "}")
 
     sp = sub.add_parser("start", help="register and detach; completion durably wakes the owner")
     sp.add_argument("--label", help="display label (never used in a filesystem path)")
@@ -718,7 +740,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--repository", help="owner/name when a PR number is ambiguous")
     sp.set_defaults(fn=cmd_attach)
 
-    sp = sub.add_parser("_supervise", help=argparse.SUPPRESS)
+    # No help= at all: argparse lists a subcommand only when it has one, and
+    # help=SUPPRESS printed a literal "==SUPPRESS==" row instead of hiding it.
+    sp = sub.add_parser("_supervise")
     sp.add_argument("jobdir")
     sp.set_defaults(fn=cmd_supervise)
     return p
