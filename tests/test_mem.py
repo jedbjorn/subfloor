@@ -1048,11 +1048,10 @@ class ApiMemTest(unittest.TestCase):
                 body = (ENGINE / "templates" / "shells" / f"{flavor}.md").read_text()
                 self.assertIn(f"`{skill}`", body)
                 detail = ENGINE / "assets" / "skills" / skill / "SKILL.md"
-                if detail.exists():
-                    self.assertIn(
-                        "sc mem doc move <document_id> --feature <target>",
-                        detail.read_text(),
-                    )
+                self.assertIn(
+                    "sc mem doc move <document_id> --feature <target>",
+                    detail.read_text(),
+                )
         planner = (ENGINE / "templates" / "shells" / "planner.md").read_text()
         self.assertIn("## REVISE, FREEZE, DOCUMENT", planner)
         self.assertIn("sc mem doc move", (ENGINE / "scripts" / "mem.py").read_text())
@@ -1934,10 +1933,9 @@ class ApiMemTest(unittest.TestCase):
         self.assertIn("Retiring a document is metadata about it", revise)
         self.assertIn("`spec_authoring`", revise)
         detail = ENGINE / "assets" / "skills" / "spec_authoring" / "SKILL.md"
-        if detail.exists():
-            self.assertIn(
-                "sc mem doc retire <id> [--superseded-by <id>]", detail.read_text()
-            )
+        self.assertIn(
+            "sc mem doc retire <id> [--superseded-by <id>]", detail.read_text()
+        )
         self.assertIn("sc mem doc retire", mem.__doc__)
 
 

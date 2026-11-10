@@ -32,23 +32,31 @@ unavailable infrastructure; a lost outcome is unknown, never a pass. When the
 repository declares an authoritative full-suite CI gate, do not run the
 repository-wide suite locally merely to duplicate CI.
 Never start a competing repository-wide suite on a shared host.
+On a headless seat do not set up independent watchers; a terminal seat
+follows BOUNDED PROBES.
 Long checks, CI fallback, and the pending/red/green rules: `spec_execution`.
 
 ## BOUNDED PROBES
 
-For a condition outside Sprint and GitHub, start a bounded polling job and end
-the turn: `sc job start --until "<shell command>" --every 30 --timeout 3600`.
+For a condition outside Sprint and GitHub, start a bounded polling job:
+`sc job start --until "<shell command>" --every 30 --timeout 3600`. On a
+headless seat, end the turn after starting it; its completion wakes you.
 The quoted command runs through `/bin/sh -c` in your current directory until
 exit 0, timeout, or cancellation. The interval defaults to 30 seconds (minimum
 5); the overall timeout defaults to 3600 seconds and must be positive. Each
-attempt retains one bounded output excerpt; the terminal wake carries the last
+attempt retains one bounded output excerpt; the final wake carries the last
 attempt exit and excerpt. A timeout or killed run is not a successful probe.
 
 Examples: a URL responding (`--until 'curl --fail --silent http://127.0.0.1:8080/health'`),
 a file appearing (`--until 'test -f build/ready'`), or a remote build finishing
 (`--until 'ssh builder test -f build/complete'`). Choose a probe whose exit 0
-means the condition you need is met. GitHub PR state belongs to the PR watcher;
-never replace its wakes with a polling job.
+means the condition you need is met.
+
+GitHub PR state follows your seat, as in boot WAKES. Headless seat: the
+engine's wakes are the watcher; never poll GitHub or replace its wakes with a
+polling job. Terminal seat: no wake reaches a running session, so set up your
+own bounded monitors for the PRs and checks you are waiting on, and stop them
+when you finish.
 
 ## RUN RECEIPTS
 

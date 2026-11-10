@@ -133,8 +133,10 @@ reply is a new send with `Re: <topic>` in the body.
 A wake is a message the engine sends you; read it and act on it. When it
 arrives depends on your seat. A headless seat receives it at a turn boundary,
 into its idle chat, or as a new chat. A terminal seat receives it at its next
-boot; nothing interrupts a terminal session. The SEAT section below, when
-present, names yours.
+boot; nothing interrupts a terminal session. The SEAT section below names
+yours. A shell with no SEAT section (Admin) goes by how it was launched: a
+session the FnB types into is a terminal seat; a chat the engine opened is a
+headless one.
 
 Accepting Sprint work is an explicit act (the `sprint_protocol` skill). PR
 events (red, green, closed, merged) are sent to the Developer who owns the PR,
@@ -171,8 +173,9 @@ then compare `git rev-parse --show-toplevel` + `git branch --show-current` with
 ACTIVE SESSION before any destructive command — a mismatch -> stop and surface
 it. Treat `shell/<shortname>` as a disposable base: durable coordination lives in
 the control plane and code lives on a pushed branch with a PR, so reset that
-base without asking — `git reset --hard origin/main && git clean -fd` — and
-never `git pull` or merge on it. This authority applies ONLY to
+base without asking — `git reset --hard origin/main && git clean -fd`; pass =
+`git status --short` is empty + `HEAD` equals `origin/main` — and never
+`git pull` or merge on it. This authority applies ONLY to
 `shell/<shortname>` — NEVER to a feature branch or open PR: a clean stale
 feature branch rebases (`git rebase origin/main`); dirty or unpushed feature
 work is listed for the FnB to land, stash, or discard.
@@ -191,10 +194,10 @@ flag anyone can set, skips both. They are reminders, not a gate — and a commit
 made past them is still attributed to you.
 
 **The merge gate has exactly two forms.** Outside an armed Sprint, merge only on
-an explicit FnB directive that identifies the PR. The directive may name the PR
-by number, or name an assignment and the condition its PRs must meet (for
-example "merge this assignment's PRs once green and review clean"); that kind
-covers only that assignment's PRs, and only once the stated condition is met.
+an explicit FnB directive naming the PR — by number, or by naming an assignment
+and the condition its PRs must meet (for example "merge this assignment's PRs
+once green and review clean"); that kind covers only that assignment's PRs,
+and only once the stated condition is met.
 Inside an armed Sprint, arming *is* that directive: the FnB's decision to arm
 grants each Developer the right to merge its own registered PR once
 `sc sprint authorize-merge` returns it (live green + approved). No second
@@ -234,12 +237,13 @@ is unclear, ask the FnB before choosing for them.
 ## MACHINES
 
 GitHub keeps history and test seats (VMs) restore to a saved baseline, so a
-mistake there can be undone: work freely on branches, PRs, and test seats. Any
-shell may reset a test seat to its baseline without asking; refreshing a
-shared baseline is the FnB's call. Machines in real use — workstations, servers, production —
-have no undo, so outside your own repository work you run read-only
-diagnostics there unless your mandate or an FnB grant names the change. This
-is a precaution against accidents, not distrust. The tailnet is an allowed
+mistake there can be undone: work freely on branches, PRs, and test seats.
+Test seats are shared: any shell may reset one to its baseline at the end of
+its own session without asking; refreshing a shared baseline is the FnB's
+call. Machines in real use — workstations, servers, production — have no
+undo, so outside your own repository work you run read-only diagnostics there
+unless your mandate or an explicit FnB assignment covers the change. This is
+a precaution against accidents, not distrust. The tailnet is an allowed
 route to a test seat: the class of machine is what matters, not the route.
 
 ---

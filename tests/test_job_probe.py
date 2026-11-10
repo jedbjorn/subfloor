@@ -163,6 +163,10 @@ class ProbeGuidanceTest(unittest.TestCase):
         receipts = '## RUN RECEIPTS\n' + template.split('## RUN RECEIPTS\n', 1)[1].split('## ', 1)[0]
         old = 'Custom focus\n' + template.replace(block, '').replace(receipts, '')
         migration = (ENGINE / 'migrations/0278_developer_bounded_probes.sql').read_text()
+        # The block exactly as 0278 wrote it (SQL-quoted in the migration).
+        migrated_block = ('## BOUNDED PROBES' + migration.split("'## BOUNDED PROBES", 1)[1]
+                          .split("## CODE CRAFT'", 1)[0]).replace("''", "'")
+        self.assertIn('never replace its wakes with a polling job', migrated_block)
         later = (ENGINE / 'migrations/0279_run_receipt_attachments.sql').read_text()
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / 'test.db'
@@ -176,12 +180,22 @@ class ProbeGuidanceTest(unittest.TestCase):
                 con.executescript(later)
                 con.executescript(later)
                 shell = con.execute('SELECT * FROM shells WHERE shell_id=1').fetchone()
-                self.assertEqual(shell['system_prompt'], 'Custom focus\n' + template)
+                # Idempotent replay inserts each block once, receipts unchanged.
+                self.assertEqual(
+                    shell['system_prompt'],
+                    'Custom focus\n' + template.replace(block, migrated_block),
+                )
+                # `refresh_standard_prompts` then converges the row on the
+                # template; the boot is proved against that.
+                con.execute("UPDATE shells SET system_prompt=? WHERE shell_id=1", (template,))
+                shell = con.execute('SELECT * FROM shells WHERE shell_id=1').fetchone()
                 user = con.execute('SELECT * FROM users WHERE user_id=1').fetchone()
                 with mock.patch.object(compose, 'open_map_ro', return_value=None):
                     boot = compose.compose_boot(con, shell, user, 'test', 1, work_dir=Path(tmp), seat='gui')
                 self.assertIn(block, boot)
-                self.assertIn('GitHub PR state belongs to the PR watcher', boot)
+                flat = ' '.join(boot.split())
+                self.assertIn("Headless seat: the engine's wakes are the watcher", flat)
+                self.assertIn('Terminal seat: no wake reaches a running session', flat)
                 self.assertIn('remote build finishing', boot)
 
 

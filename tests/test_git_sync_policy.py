@@ -38,6 +38,9 @@ class GitSyncPolicyTest(unittest.TestCase):
         # still stops the shell before any destructive command.
         self.assertIn("a mismatch -> stop and surface it", body)
         self.assertIn("never `git pull` or merge on it", body)
+        self.assertIn(
+            "pass = `git status --short` is empty + `HEAD` equals `origin/main`", body
+        )
         self.assertIn("dirty or unpushed feature work is listed for the FnB", body)
 
     def test_boot_makes_the_base_reset_executable_and_bounded(self):

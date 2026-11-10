@@ -58,22 +58,39 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
         self.assertIn(SHARED_HOST_BOUNDARY, focus)
         posture = focus.split(POLICY_HEADING, 1)[1].split("## ", 1)[0]
         self.assertIn("`spec_execution`", posture)
+        # Seat-conditional, matching boot WAKES: the headless seat never sets
+        # up its own watchers; the terminal seat follows BOUNDED PROBES.
+        self.assertIn(
+            "On a headless seat do not set up independent watchers; "
+            "a terminal seat follows BOUNDED PROBES.",
+            posture,
+        )
+        probes = focus.split("## BOUNDED PROBES", 1)[1].split("## ", 1)[0]
+        self.assertIn(
+            "Headless seat: the engine's wakes are the watcher; never poll "
+            "GitHub or replace its wakes with a polling job.",
+            probes,
+        )
+        self.assertIn(
+            "Terminal seat: no wake reaches a running session, so set up your "
+            "own bounded monitors",
+            probes,
+        )
 
         skill = ASSETS / "spec_execution" / "SKILL.md"
-        if skill.exists():
-            detail = " ".join(skill.read_text().split())
-            self.assertIn("Complete the implementation before using CI fallback", detail)
-            self.assertIn(
-                "Required checks pending -> wait; red -> diagnose, fix, and push; "
-                "green -> review readiness",
-                detail,
-            )
-            self.assertIn("no trustworthy seat remains", detail)
-            self.assertIn(
-                "browser-capability skip is informational and non-failing", detail
-            )
-            self.assertIn(LONG_JOB_BOUNDARY, detail)
-            self.assertIn("A lost outcome is unknown, never a pass.", detail)
+        detail = " ".join(skill.read_text().split())
+        self.assertIn("Complete the implementation before using CI fallback", detail)
+        self.assertIn(
+            "Required checks pending -> wait; red -> diagnose, fix, and push; "
+            "green -> review readiness",
+            detail,
+        )
+        self.assertIn("no trustworthy seat remains", detail)
+        self.assertIn(
+            "browser-capability skip is informational and non-failing", detail
+        )
+        self.assertIn(LONG_JOB_BOUNDARY, detail)
+        self.assertIn("A lost outcome is unknown, never a pass.", detail)
 
     def test_role_guidance_keeps_ci_fallback_and_authority_boundaries(self):
         bodies = {

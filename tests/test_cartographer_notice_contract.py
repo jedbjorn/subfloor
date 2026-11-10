@@ -14,6 +14,8 @@ import compose  # noqa: E402
 import map_notices  # noqa: E402
 
 
+SKILL_SUMMARY_FLOOR = 40
+
 VALID = (
     "shape: API routes landed — paths: app/api/; ref: feature #8 / PR #123\n"
     "flags: 41=SC-041, 52=MAP-052\n"
@@ -68,6 +70,32 @@ class InstructionContractTest(unittest.TestCase):
             self.assertIn(text, self.skill)
         self.assertIn("Open any blocking map-quality flag first", compose.MAP_DISCREPANCY_BLOCK)
         self.assertIn("flags: <numeric_id>=<SC-name>", compose.MAP_DISCREPANCY_BLOCK)
+        self.assertIn("retain its numeric ID + display name", compose.MAP_DISCREPANCY_BLOCK)
+        self.assertIn(
+            "Pass = the Cartographer's scoped map checks pass + every named flag "
+            "is resolved + the notice is read",
+            compose.MAP_DISCREPANCY_BLOCK,
+        )
+
+    def test_boot_skill_listing_keeps_a_usable_summary_for_every_shipped_skill(self):
+        # Some harnesses get no native skill listing, so the boot line is the
+        # only trigger: it keeps the whole first sentence, never a fragment.
+        import seed_skills
+
+        self.assertEqual(
+            compose._skill_summary("Admin work — run when X happens. More detail."),
+            "Admin work — run when X happens",
+        )
+        roots = (ENGINE / "assets" / "skills", ENGINE / "assets" / "seed" / "skills")
+        paths = sorted(p for r in roots if r.exists() for p in r.glob("*/SKILL.md"))
+        self.assertTrue(paths)
+        for path in paths:
+            with self.subTest(skill=path.parent.name):
+                summary = compose._skill_summary(
+                    seed_skills.parse_skill(path)["description"]
+                )
+                self.assertGreaterEqual(len(summary), SKILL_SUMMARY_FLOOR, summary)
+                self.assertLessEqual(len(summary), compose.SKILL_SUMMARY_CHARS + 1)
 
     def test_cartographer_closes_exact_rows_before_marking_read(self):
         get_position = self.skill.index("sc mem get flags <numeric_id>")

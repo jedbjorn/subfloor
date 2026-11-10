@@ -28,7 +28,8 @@ import run_seat
 # `{{map_discrepancy}}` slot in boot.md; stripped clean for the cartographer.
 MAP_DISCREPANCY_BLOCK = (
     "**If the map is wrong, report it — you don't map.** Open any blocking "
-    "map-quality flag first, tell the FnB to boot the Cartographer, and send "
+    "map-quality flag first and retain its numeric ID + display name, tell "
+    "the FnB to boot the Cartographer, and send "
     "`cartographer` one notice in exactly this shape "
     "(`sc mem message send cartographer \"…\"`):\n\n"
     "```text\n"
@@ -36,7 +37,8 @@ MAP_DISCREPANCY_BLOCK = (
     "flags: <numeric_id>=<SC-name>[, <numeric_id>=<SC-name>] | none\n"
     "curate; verify and close each flag; mark this notice read last.\n"
     "```\n\n"
-    "Keep working from what the map does show."
+    "Pass = the Cartographer's scoped map checks pass + every named flag is "
+    "resolved + the notice is read. Keep working from what the map does show."
 )
 # PROJECT vs ENGINE renders by repo position (`{{project_vs_engine}}` slot).
 # A fork consumes the engine as a gitignored dependency; the SOURCE repo
@@ -477,17 +479,13 @@ def render_skills(con, shell_id: int) -> str:
     return "\n".join(lines)
 
 
-SKILL_SUMMARY_CHARS = 140
+SKILL_SUMMARY_CHARS = 200
 
 
 def _skill_summary(description: "str | None") -> str:
     """First sentence of a skill description, capped for the boot listing."""
     line = (description or "").strip().splitlines()[0] if (description or "").strip() else ""
-    for stop in (". ", " — "):
-        head, found, _ = line.partition(stop)
-        if found:
-            line = head
-    line = line.rstrip(".")
+    line = line.partition(". ")[0].rstrip(".")
     if len(line) > SKILL_SUMMARY_CHARS:
         line = line[:SKILL_SUMMARY_CHARS].rsplit(" ", 1)[0] + "…"
     return line

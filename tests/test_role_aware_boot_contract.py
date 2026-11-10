@@ -285,12 +285,11 @@ class StandardPromptRefreshTest(unittest.TestCase):
         self.assertIn("label inference as proof", flat)
         self.assertIn("`spec_authoring`", body)
         skill = ENGINE / "assets" / "skills" / "spec_authoring" / "SKILL.md"
-        if skill.exists():
-            detail = skill.read_text()
-            self.assertIn("surface and discuss with the FnB", detail)
-            self.assertIn("`drive_browser`", detail)
-            self.assertIn("`remote_seats`", detail)
-            self.assertIn("Dev or an alpha production", detail)
+        detail = skill.read_text()
+        self.assertIn("surface and discuss with the FnB", detail)
+        self.assertIn("`drive_browser`", detail)
+        self.assertIn("`remote_seats`", detail)
+        self.assertIn("Dev or an alpha production", detail)
 
     def test_role_triggers_name_their_skill_under_every_moved_heading(self):
         planner = shell_factory.load_procedure("planner")
