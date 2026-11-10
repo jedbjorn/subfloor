@@ -1902,13 +1902,15 @@ case "$cmd" in
     # status, and an HTTP error is nonzero too — `curl -s` alone exits 0 on a
     # 500, so a caller gating on `sc health` read a failing server as healthy.
     health_url="http://127.0.0.1:$(port)/api/health"
+    # curl appends the status code as a last line; tail/sed split it off.
+    # This file runs under /bin/sh — no bash-only $'\n' expansion here.
     health_out="$(curl -s -w '\n%{http_code}' "$health_url")" || {
       health_rc=$?
       echo "sc health: no answer from $health_url (curl exit $health_rc)" >&2
       exit "$health_rc"
     }
-    health_code="${health_out##*$'\n'}"
-    printf '%s\n' "${health_out%$'\n'*}"
+    health_code="$(printf '%s\n' "$health_out" | tail -n 1)"
+    printf '%s\n' "$health_out" | sed '$d'
     case "$health_code" in
       2??) ;;
       *) echo "sc health: $health_url answered HTTP $health_code" >&2; exit 1 ;;
