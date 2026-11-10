@@ -22,6 +22,16 @@ import seed_skills
 SPEC_SKILLS = {"spec_authoring": "planner", "spec_execution": "dev"}
 
 
+def summary(description: str) -> str:
+    """The boot listing's cut of a description (compose._skill_summary)."""
+    line = description.strip().splitlines()[0]
+    for stop in (". ", " — "):
+        head, found, _ = line.partition(stop)
+        if found:
+            line = head
+    return line.rstrip(".")
+
+
 def flat(name: str) -> str:
     return " ".join((ASSETS / name / "SKILL.md").read_text().split())
 
@@ -55,8 +65,7 @@ class SpecSkillTest(unittest.TestCase):
                 self.assertEqual(granted, {flavor})
                 pack = json.loads((PACKS / f"{flavor}.json").read_text())
                 self.assertIn(name, pack["skills"])
-                # A trigger description says when to load, first.
-                self.assertTrue(parsed["description"].startswith("Load before"))
+                self.assertIn("load before", summary(parsed["description"]))
 
     def test_reseed_replays_idempotently(self):
         con = sqlite3.connect(":memory:")
@@ -135,10 +144,18 @@ class SpecSkillTest(unittest.TestCase):
             "Never freeze or author the shipped doc yourself",
             "## TESTING POSTURE",
             "every available smallest affected test target",
-            "Use `sc job start --label gate -- <command and args>`",
-            "end the turn and continue on the owner wake",
+            # Commands are carried from the Developer template exactly.
+            "Use `./sc job start --label gate -- <command and args>` for checks "
+            "that may outlive the current tool call or session.",
+            "`./sc job status <id>` and `./sc job tail <id>`",
             "A lost outcome is unknown, never a pass.",
-            "Do not set up independent watchers.",
+            # The watcher rule follows the seat, as boot WAKES states it.
+            "On a headless seat the engine's wakes are the watcher",
+            "end the turn and continue on the owner wake",
+            "do not set up independent watchers",
+            "On a terminal seat no wake reaches a running session, so set up "
+            "your own bounded monitors for the PRs, checks, and jobs you are "
+            "waiting on",
             "Complete the implementation before using CI fallback",
             "pending -> wait; red -> diagnose, fix, and push; green -> review readiness",
             "incomplete code is a failure",
@@ -156,11 +173,24 @@ class SingleHomeTest(unittest.TestCase):
         dev_kit = " ".join(
             (ENGINE / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md")
             .read_text().split())
-        for body in (flat("git"), dev_kit):
-            self.assertIn("sc job attach <id> --pr <number>|--work-unit <id>", body)
-            self.assertIn("never authorizes a merge", body)
-            self.assertNotIn("must share an owner", body)
-            self.assertNotIn("Pruned logs retain their receipt", body)
+        # `git` reaches every pack that can attach or read a receipt, so it
+        # carries the full rules; the Planner-only dev_kit starter points at it.
+        git = flat("git")
+        for rule in (
+            "## RUN RECEIPTS",
+            "sc job attach <id> --pr <number>",
+            "The run and target must share an owner",
+            "a PR must already be registered",
+            "A commit outside the PR head's ancestry is stale",
+            "Pruned logs retain their receipt",
+            "only GitHub checks and the existing merge grant authorize a merge",
+        ):
+            self.assertIn(rule, git)
+        self.assertIn("sc job attach <id> --pr <number>|--work-unit <id>", dev_kit)
+        self.assertIn("the RUN RECEIPTS section of the `git` skill", dev_kit)
+        self.assertIn("never authorizes a merge", dev_kit)
+        self.assertNotIn("Developer boot", dev_kit)
+        self.assertNotIn("must share an owner", dev_kit)
 
     def test_fork_worded_skills_carry_a_source_repo_branch(self):
         for name in ("git_cleanup", "self_update", "harness_readiness",
@@ -173,22 +203,41 @@ class SingleHomeTest(unittest.TestCase):
 
     def test_cli_orchestration_merge_is_the_first_gate_form(self):
         body = flat("cli_orchestration")
-        self.assertIn("an explicit FnB directive naming the PR", body)
+        self.assertIn("merge only on an explicit FnB directive that identifies the PR", body)
+        self.assertIn(
+            "that kind covers only that assignment's PRs, and only once the "
+            "stated condition is met", body)
+        self.assertNotIn("directive naming the PR", body)
         self.assertIn("not a standing grant or a third form", body)
         self.assertIn("report the PR as ready and wait", body)
         self.assertIn("## Monitors", body)
         self.assertIn("On the terminal seat, set up your own monitors", body)
 
-    def test_trigger_descriptions_say_when(self):
+    def test_first_sentence_of_each_description_says_what_and_when(self):
+        """The boot listing shows only the first sentence, cut at the first
+        ". " or " — " and capped at 140 characters, so that sentence must
+        carry the purpose and the trigger on its own."""
         specs = {
             name: seed_skills.parse_skill(ASSETS / name / "SKILL.md")["description"]
-            for name in ("git", "snapshot")
+            for name in (
+                "cli_orchestration", "curate", "git", "git_cleanup",
+                "issue_reporting", "remote_seats", "self_update", "snapshot",
+                "spec_authoring", "spec_execution", "sprint_protocol",
+                "sprint_rev", "tailscale_diagnostics",
+            )
         }
         specs["dev_kit"] = seed_skills.parse_skill(
             seed_skills.DEV_KIT_STARTER)["description"]
-        self.assertTrue(specs["snapshot"].startswith("Admin work"))
-        self.assertTrue(specs["git"].startswith("Load when"))
-        self.assertTrue(specs["dev_kit"].startswith("Load before"))
+        for name, description in specs.items():
+            with self.subTest(name=name):
+                first = summary(description)
+                self.assertEqual(first, description.split(". ", 1)[0].rstrip("."))
+                self.assertNotIn(" — ", first)
+                self.assertLessEqual(len(first), 140)
+                self.assertRegex(
+                    first, r"\b(load|run it|use) (before|when|on|it|after)\b|the moment")
+        self.assertTrue(summary(specs["snapshot"]).startswith("Admin work that"))
+        self.assertTrue(summary(specs["git_cleanup"]).startswith("Admin-only cleanup"))
 
 
 if __name__ == "__main__":

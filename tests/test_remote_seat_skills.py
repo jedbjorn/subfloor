@@ -123,7 +123,7 @@ class SkillAssetTests(unittest.TestCase):
             "./sc vm adopt", "bake", "./sc vm pull", "--running",
             "snapshot_live_unsupported", "remote_path_not_allowed",
             "adopt_sandboxed", "any `adopt_*`",
-            "decision #372", "decision #101",
+            "decision #434", "decision #101",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, body)
@@ -146,6 +146,23 @@ class SkillAssetTests(unittest.TestCase):
         windows = _flat(specs["windows_testing"]["content"])
         self.assertIn("decision #434", windows)
         self.assertIn("without asking", windows)
+        # Decision #434 supersedes #372 and adds the refresh proposal.
+        for name in ("remote_seats", "windows_testing"):
+            body = _flat(specs[name]["content"])
+            with self.subTest(skill=name, rule="refresh proposal"):
+                self.assertNotIn("#372", body)
+                self.assertIn("reinstalling the same dependencies", body)
+                self.assertIn("instead of absorbing the cost", body)
+        # One wording for the read-only exception, wherever it appears.
+        exception = "unless your mandate or an explicit FnB assignment covers the change"
+        self.assertEqual(_flat(specs["remote_seats"]["content"]).count(exception), 1)
+        tailnet = _flat(specs["tailscale_diagnostics"]["content"])
+        self.assertIn(exception, tailnet)
+        self.assertIn(
+            "only when your mandate or an explicit FnB assignment covers the change",
+            tailnet,
+        )
+        self.assertNotIn("changes nothing", tailnet)
         self.assertIn(
             "Read-only applies to machines in real use",
             _flat(specs["tailscale_diagnostics"]["content"]),
@@ -160,7 +177,7 @@ class SkillAssetTests(unittest.TestCase):
         for phrase in (
             "./sc vm adopt", "bootstrap.ps1", ".subfloor/winbox.json",
             "winget_manifest", "mcp_port", "C:\\SubfloorTest",
-            "## Authority", "decision #372", "decision #353",
+            "## Authority", "decision #434", "decision #353",
             "windows-mcp-server",
             "windows-mcp install --transport streamable-http",
             "./sc vm bake", "--command-file",
@@ -279,7 +296,22 @@ class ErrorVocabularyTests(unittest.TestCase):
         errors = skill[skill.index("## Structured errors"):]
         named = set(re.findall(r"`([a-z<>]+(?:_[a-z<>]+)+)`", errors))
         self.assertGreaterEqual(len(named), 10)
-        for code in sorted(named):
+        # Argument errors are the shell's to correct; host configuration is
+        # reported.
+        flat_errors = _flat(errors)
+        self.assertLess(
+            flat_errors.index("Argument errors are yours to correct"),
+            flat_errors.index("Host-configuration errors are reported"),
+        )
+        for code in ("pull_source_invalid", "remote_name_invalid",
+                     "snapshot_name_invalid"):
+            self.assertLess(
+                flat_errors.index(f"`{code}`"),
+                flat_errors.index("Host-configuration errors are reported"),
+            )
+        # `vm_not_linked` reaches the runbook with the seat-fix change that
+        # adds the code; until then the skill is allowed to name it first.
+        for code in sorted(named - {"vm_not_linked"}):
             with self.subTest(skill_code=code):
                 self.assertIn(f"`{code}`", doc, "skill names a code the runbook lacks")
 

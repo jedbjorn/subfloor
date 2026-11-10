@@ -11,7 +11,7 @@ BEGIN;
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'spec_authoring',
-  'Load before you create a roadmap feature, write or revise a spec, set or check acceptance criteria, bring a spec into a Sprint, move or freeze a spec, or write a shipped feature''s doc. Holds the feature/spec/doc model, posture-then-challenge, the acceptance feasibility walk, the spec contract, and the revise/freeze/document commands. Planner.',
+  'Planner spec procedures; load before you create a feature, write or revise a spec, set acceptance criteria, or freeze and document one. Holds the feature/spec/doc model, posture-then-challenge, the acceptance feasibility walk (also for a spec entering a Sprint), the spec contract, and the revise, move, freeze, document, and retire commands.',
   'workflow',
   NULL,
   0,
@@ -171,7 +171,7 @@ ON CONFLICT(name) DO UPDATE SET
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'spec_execution',
-  'Load before you build against a feature spec, task, or work unit, and before you choose which tests prove a change. Holds spec selection, the pre-plan analysis, the task ledger, one-task-at-a-time execution, verification, the ship and docs handoff, and the testing posture (smallest affected gate, long-running checks, CI fallback, when the full suite runs). Developer.',
+  'Developer spec loop and testing posture; load before you build against a spec or work unit, or pick the tests that prove a change. Holds spec selection, the pre-plan analysis, the task ledger, one-task-at-a-time execution, verification, the ship and docs handoff, and the testing posture (smallest affected gate, long-running checks by seat, CI fallback, when the full suite runs).',
   'workflow',
   NULL,
   0,
@@ -235,11 +235,15 @@ below applies to every change.
 
 - **What to run.** Run every available smallest affected test target that
   proves the changed behavior and realistic failure paths.
-- **Long checks.** Use `sc job start --label gate -- <command and args>` for
-  checks that may outlive the current tool call or session. After confirmed
-  registration/start, end the turn and continue on the owner wake; inspect
-  `sc job status <id>` and `sc job tail <id>`. A lost outcome is unknown,
-  never a pass. Do not set up independent watchers.
+- **Long checks.** Start any check that may outlive the current tool call or
+  session as a registered job, then follow your seat''s rule (boot WAKES):
+<!-- sc-root-only: commands carried verbatim from the Developer template; bare `sc` works the same from a worktree -->
+  Use `./sc job start --label gate -- <command and args>` for checks that may outlive the current tool call or session. Inspect a run with `./sc job status <id>` and `./sc job tail <id>`.
+  On a headless seat the engine''s wakes are the watcher: after confirmed
+  registration/start, end the turn and continue on the owner wake, and do not
+  set up independent watchers or poll. On a terminal seat no wake reaches a
+  running session, so set up your own bounded monitors for the PRs, checks,
+  and jobs you are waiting on. A lost outcome is unknown, never a pass.
 - **CI fallback.** Complete the implementation before using CI fallback. If a
   focused local gate cannot execute because the selected interpreter, runner,
   or declared dependency is unavailable, record the exact evidence, run the
@@ -267,7 +271,7 @@ ON CONFLICT(name) DO UPDATE SET
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'cli_orchestration',
-  'Planner-run delivery from a terminal seat — the FnB names the work, you stay the oversight layer, and native or cross-harness CLI agents verify the spec, build, review, deploy to Dev, and verify. Covers the kickoff contract, agent launch per harness (Claude, Codex, Kimi), terminal-seat PR/CI monitors, the FnB''s merge and deploy directives, acceptance review, and cleanup.',
+  'Planner-run delivery from a terminal seat; load when the FnB assigns work in this chat for you to orchestrate with CLI agents. You stay the oversight layer while native or cross-harness agents verify the spec, build, review, deploy to Dev, and verify. Covers the kickoff contract, agent launch per harness (Claude, Codex, Kimi), terminal-seat PR/CI monitors, the FnB''s merge and deploy directives, acceptance review, and cleanup.',
   'workflow',
   NULL,
   0,
@@ -311,13 +315,15 @@ Tell the FnB that this work needs a terminal session and stop.
    batch:
    - Spec freshness. The spec may name sites that have moved on main. Offer
      a spec-verification agent before dev starts.
-   - Merge authority. Your boot''s merge gate has two forms and this loop
-     runs outside an armed Sprint, so only the first applies: an explicit FnB
-     directive naming the PR. Ask for it here: which of this assignment''s PRs
-     you may merge, and on what condition, for example "green and review
-     clean". The FnB''s answer is that directive for those PRs. It is not a
-     standing grant or a third form: no answer, a PR outside the assignment,
-     or an unmet condition -> report the PR as ready and wait.
+   - Merge authority. This loop runs outside an armed Sprint, so your boot''s
+     merge gate applies in its first form: merge only on an explicit FnB
+     directive that identifies the PR. The directive may name the PR by
+     number, or name an assignment and the condition its PRs must meet (for
+     example "merge this assignment''s PRs once green and review clean"); that
+     kind covers only that assignment''s PRs, and only once the stated
+     condition is met. Ask for that directive here. It is not a standing
+     grant or a third form: no answer, a PR outside the assignment, or an
+     unmet condition -> report the PR as ready and wait.
    - Deploy authority. Ask for the target (Dev only, unless the FnB says
      otherwise), when to deploy, and whether a final deploy at the end
      replaces the intermediate ones.
@@ -470,7 +476,7 @@ ON CONFLICT(name) DO UPDATE SET
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'curate',
-  'The periodic L&S sweep. Run when the STATUS L&S line says "curation due" — resolve contradictions, merge entries stating one rule, recommend recurring processes upstream, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.',
+  'The periodic L&S sweep; run it when the STATUS L&S line says "curation due". Resolve contradictions, merge entries stating one rule, recommend recurring processes upstream, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.',
   'substrate',
   NULL,
   1,
@@ -713,7 +719,7 @@ ON CONFLICT(name) DO UPDATE SET
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'git',
-  'Load when a Git step goes beyond the every-session rules in your boot — a push or gh call fails on auth, the FnB hands you a stack to merge, a PR just merged and your tree needs cleanup, you are unsure whether a file may be committed (engine, renders, generated config), or you need to know which repo and worktree you are in. Sync, branch, PR, merge gate, and finish stay in boot.',
+  'Git event procedures beyond the boot rules; load on a GitHub auth failure, a stack merge, after-merge cleanup, or doubt about what to commit. Also holds the run-receipt rules and which repo and worktree you are in. Sync, branch, PR, merge gate, and finish stay in boot.',
   'substrate',
   NULL,
   0,
@@ -772,12 +778,16 @@ Only after the PR is merged:
 
 NEVER delete a branch carrying unmerged, un-PR''d work — no PR = lost work.
 
-## Run receipts
+## RUN RECEIPTS
 
-Attach a finished local run to its PR or work unit with
-`sc job attach <id> --pr <number>|--work-unit <id>` (`sc job attach --help`).
-The rules live in the Developer boot''s RUN RECEIPTS section; a receipt
-supplements CI and never authorizes a merge.
+Attach completed local evidence by run id with `sc job attach <id> --pr <number>`
+or `sc job attach <id> --work-unit <id>`. The run and target must share an owner;
+a PR must already be registered. Use `--repository owner/name` if its number is
+ambiguous. The Runs drawer and fleet offer the same attachment action.
+Receipts show beside the observed GitHub check in Chats and the Sprint board.
+A commit outside the PR head''s ancestry is stale; unavailable ancestry stays
+unknown. Pruned logs retain their receipt. Receipts supplement CI evidence;
+only GitHub checks and the existing merge grant authorize a merge.
 
 ## Never commit the engine or derived files
 
@@ -803,7 +813,7 @@ ON CONFLICT(name) DO UPDATE SET
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'git_cleanup',
-  'Admin-only — triage and clean the repo''s git state across main + every worktree. The acting sibling of git_hygiene.py''s read pass: delete what''s provably merged, preserve (never discard) outstanding work, sync to remote. Use when the FnB asks to tidy/clean git, prune branches, or reconcile worktrees.',
+  'Admin-only cleanup of git state across main and every worktree; load when the FnB asks to tidy git, prune branches, or reconcile worktrees. The acting sibling of git_hygiene.py''s read pass: delete what''s provably merged, preserve (never discard) outstanding work, sync to remote.',
   'substrate',
   NULL,
   0,
@@ -972,7 +982,7 @@ ON CONFLICT(name) DO UPDATE SET
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'issue_reporting',
-  'Report engine defects — the moment a sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. From a fork, file a GitHub issue on Subfloor (app bugs stay in the fork); in the Subfloor source repo, flag it and fix it here.',
+  'Report an engine defect the moment a sc command fails or lies, a skill contradicts reality, or you work around the engine. Also when the API blocks a documented workflow. From a fork, file a GitHub issue on Subfloor (app bugs stay in the fork); in the Subfloor source repo, flag it and fix it here.',
   'substrate',
   NULL,
   1,
@@ -1110,7 +1120,7 @@ ON CONFLICT(name) DO UPDATE SET
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'remote_seats',
-  'Drive another machine through the host vm-broker — posture 1 owns a test VM''s lifecycle with sc vm (start, exec, push/pull, snapshot, reset); posture 2 runs exec, push, and pull against named remotes with sc remote. Load before touching a test seat or named remote. Opt-in; Linux targets need nothing more, Windows adds windows_testing.',
+  'Drive a test VM or named remote through the host vm-broker with sc vm and sc remote; load before touching a test seat or named remote. Posture 1 owns a test VM''s lifecycle (start, exec, push/pull, snapshot, reset); posture 2 runs exec, push, and pull against named remotes. Opt-in; Linux targets need nothing more, Windows adds windows_testing.',
   'substrate',
   'sc remote',
   0,
@@ -1120,14 +1130,16 @@ VALUES (
 
 GitHub has history and a test VM has snapshots, so a mistake there is
 recoverable. A machine in real use — a workstation, a server, production — has
-no undo, so there you run read-only diagnostics unless the FnB assigned the
-change. That is a precaution against accidents, not distrust. The class of
+no undo, so there you run read-only diagnostics unless your mandate or an
+explicit FnB assignment covers the change. That is a precaution against accidents, not distrust. The class of
 machine decides, not the route: a test seat reached over the tailnet is still
 a test seat.
 
 A test seat is disposable and shared. Any shell may reset one to its snapshot
 at the end of its own session without asking, on every OS. Refreshing the
-shared snapshot itself is the owner''s call (decision #434).
+shared snapshot itself is the owner''s call: a shell that keeps reinstalling
+the same dependencies proposes a snapshot refresh to the FnB instead of
+absorbing the cost (decision #434).
 
 ## Access model
 
@@ -1206,9 +1218,9 @@ host-key pin live there); a pull destination inside `.super-coder/` or `.git/`
 is refused too. Add `--json` to any verb for one result object.
 
 The VM is a disposable test box, so install, reconfigure, snapshot, and reset
-are yours (decision #372). `bake` replaces the baseline every later session
-resets to: that is the snapshot refresh decision #434 leaves to the owner, so
-bake when the FnB asked for it or agreed.
+are yours (decision #434). `bake` replaces the baseline every later session
+resets to: that is the snapshot refresh the same decision leaves to the owner,
+so propose it and bake when the FnB asked for it or agreed.
 
 Sharing rule: the broker''s mutation lock is the only concurrency control, so
 read `status` first, do not start, reset, or snapshot a VM another shell is
@@ -1237,7 +1249,9 @@ The ones you act on:
 
 | Code | Do |
 |---|---|
-| `broker_unreachable` | report the printed start command to the FnB |
+| `vm_not_linked` | no `vm` block exists; starting the broker fixes nothing. Ask the FnB to link a VM with `./sc vm adopt` or `./sc vm init` |
+| `remote_not_found` | the name is undeclared (also the answer when the broker is down and the remote was never added); check `./sc remote list`, then ask the FnB to add it |
+| `broker_unreachable` | a seat is linked but the broker is down; report the printed start command (`./sc vm-broker-up`) to the FnB |
 | `vm_busy` | another call holds the mutation lock and nothing was attempted; wait, then retry |
 | `remote_path_not_allowed` | move the file inside the repo or `.sc-state/local/` |
 | `remote_unreachable`, `remote_exec_failed`, `exec_failed`, `push_failed`, `pull_failed` | read `stderr` or the message; report, do not retry blindly |
@@ -1246,8 +1260,13 @@ The ones you act on:
 | `stop_timeout`, `reset_result_unknown`, `<operation>_timeout` | the final state is unconfirmed and the work may still be running; read `status`, report it, do not retry blindly |
 | any `adopt_*` | adoption is the FnB''s host-only command (`adopt_sandboxed` says so from a sandbox); report the code and message verbatim. `adopt_host_key_changed` names a pin file and the `rm` that clears it — leave that removal to the FnB. After `adopt_broker_failed` the `vm` block IS written: the resume is `./sc vm-broker-up`, then adopt again |
 
-Any other code names host configuration (keys, the saved block, the host''s
-OpenSSH): report it. Do not hand-install keys, aliases, or known-hosts entries,
+Other codes fall into two groups. Argument errors are yours to correct:
+`remote_name_invalid`, `snapshot_name_invalid`, `pull_source_invalid`,
+`pull_destination_invalid`, `push_source_invalid`, and an empty command''s
+`exec_validation_failed`. Host-configuration errors are reported: keys
+(`remote_key_invalid`), the saved block (`remote_config_invalid`,
+`bake_config_write_failed`), the host''s OpenSSH (`scp_unsupported`,
+`exec_unavailable`). Do not hand-install keys, aliases, or known-hosts entries,
 and do not open a raw `ssh` to a target the broker serves. If a target needs
 something the broker does not give you, stop and report it.',
   0
@@ -1260,7 +1279,7 @@ ON CONFLICT(name) DO UPDATE SET
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'self_update',
-  'Update the Subfloor engine in place — in a fork, fetch + materialize new code + migrations; in the source repo, reconcile the tracked engine after a merge. All memory intact; sound rollback. The shell hands off to its own next boot. Use when a Subfloor update is available or an engine change just merged.',
+  'Update the Subfloor engine in place with sc update; use when an update is available or an engine change just merged in the source repo. In a fork it fetches + materializes new code + migrations; in the source repo it reconciles the tracked engine. All memory intact; sound rollback. The shell hands off to its own next boot.',
   'substrate',
   'sc update',
   0,
@@ -1370,7 +1389,7 @@ ON CONFLICT(name) DO UPDATE SET
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'snapshot',
-  'Admin work — serialize the live DB to the gitignored local snapshot and refresh the flat renders with sc snapshot, sc render flat, and sc render-check. Load before a rebuild, after authoring skills or documents that must survive one, or when render-check is red. A working shell never runs it; generated instance state never enters Git.',
+  'Admin work that serializes the live DB to the local snapshot and refreshes flat renders; load before a rebuild or when render-check is red. Runs sc snapshot, sc render flat, and sc render-check, also after authoring skills or documents that must survive a rebuild. A working shell never runs it; generated instance state never enters Git.',
   'substrate',
   'sc snapshot',
   0,
@@ -1914,7 +1933,7 @@ ON CONFLICT(name) DO UPDATE SET
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'sprint_protocol',
-  'The shared Sprints v2 protocol every participant follows — lifecycle, wake types, inbox/accept/decline, the typed relay with stable keys, the one handoff order and body limit, artifact paths, receipt recovery, and the authority boundary. Load first in every Sprint turn, then your role skill.',
+  'The shared Sprints v2 protocol for every participant; load it first in every Sprint turn, then your role skill. Covers lifecycle, wake types, inbox/accept/decline, the typed relay with stable keys, the one handoff order and body limit, artifact paths, receipt recovery, and the authority boundary.',
   'workflow',
   NULL,
   0,
@@ -2072,7 +2091,7 @@ ON CONFLICT(name) DO UPDATE SET
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'sprint_rev',
-  'Review Sprints v2 work and whole-Sprint conformance — own review, re-enter, abort, and conclude judgments, author the conformance and Sprint reports, and direct safety actions through durable messages. Inside an armed Sprint the recorded verdict replaces the Reviewer boot''s FnB-gated handoff.',
+  'Review Sprints v2 work units and whole-Sprint conformance as Reviewer; load after sprint_protocol in every Sprint review turn. Own review, re-enter, abort, and conclude judgments, author the conformance and Sprint reports, and direct safety actions through durable messages. Inside an armed Sprint the recorded verdict replaces the Reviewer boot''s FnB-gated handoff.',
   'workflow',
   NULL,
   0,
@@ -2282,7 +2301,7 @@ ON CONFLICT(name) DO UPDATE SET
 INSERT INTO skills (name, description, category, command, common, content, is_deleted)
 VALUES (
   'tailscale_diagnostics',
-  'Observe declared tailnet hosts through the host ts-broker with sc ts — tailnet status and a fixed read-only diagnostic verb table on readonly_hosts. Load before running anything on a tailnet host. Read-only applies to machines in real use; a test seat reached over the tailnet is still a test seat. Opt-in; a readonly_refused answer is a stop, never something to work around.',
+  'Observe declared tailnet hosts through the host ts-broker with sc ts; load before running anything on a tailnet host. Gives tailnet status and a fixed read-only diagnostic verb table on readonly_hosts. Read-only is the default on machines in real use; a test seat reached over the tailnet is still a test seat. Opt-in; a readonly_refused answer is a stop, never something to work around.',
   'substrate',
   'sc ts',
   0,
@@ -2291,13 +2310,15 @@ VALUES (
 ## Posture
 
 Read-only applies to machines in real use: workstations, servers, production.
-They have no undo, so a shell observes there and changes nothing. That is a
-precaution against accidents, not distrust. GitHub has history and test VMs
+They have no undo, so the default there is to observe, and you change one
+only when your mandate or an explicit FnB assignment covers the change. That
+is a precaution against accidents, not distrust. GitHub has history and test VMs
 have snapshots, so mistakes there are recoverable; a test seat reached over
 the tailnet is still a test seat. The class of machine decides, not the route:
 on a test seat you work freely and may reset it to its snapshot at the end of
 your own session without asking, while refreshing a shared snapshot stays the
 owner''s call (decision #434; `remote_seats` holds the seat rules).
+`readonly_hosts` is the tier with no exception: nothing on it is changed.
 
 ## The broker
 
@@ -2359,11 +2380,14 @@ slip past the table, split it into permitted pieces that add up to a change,
 run it from another host, or open your own session to the target. The broker
 does not restrict a host that is only in `allowed_hosts`, so the class of
 machine still decides there: a test seat is yours to change, and a machine in
-real use is changed only when the FnB assigned that change.
+real use stays read-only unless your mandate or an explicit FnB assignment
+covers the change.
 
 Other refusals: `not in allowed_hosts or readonly_hosts` means the fork has
-not declared the host — ask the FnB; `broker_unreachable` means the ts-broker
-is down — report the printed start command.',
+not declared the host — ask the FnB; `ts_not_linked` means no `ts` block
+exists, so `./sc ts-broker-up` starts nothing — ask the FnB to run
+`./sc ts init`; `broker_unreachable` means a tailnet is linked but the
+ts-broker is down — report the printed start command.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -2386,7 +2410,9 @@ never need it.
 
 The Windows guest is a test seat: mistakes there are recoverable from its
 snapshot, so work freely and reset it at the end of your own session without
-asking. Refreshing the shared baseline is the owner''s call (decision #434).
+asking. Refreshing the shared baseline is the owner''s call: if you keep
+reinstalling the same dependencies, propose a refresh to the FnB instead of
+absorbing the cost (decision #434).
 
 ## Preparing a Windows guest
 
@@ -2443,7 +2469,7 @@ running `./sc vm adopt` again, or doing it by hand over `./sc vm exec` and then
 The guest is a disposable test box: it holds no real data and no real accounts,
 snapshots are free, and the FnB owns the physical host. So install software,
 change settings, schedule tasks, snapshot and reset are all yours
-(decision #372). Snapshot before a risky change and reset to it when the change
+(decision #434). Snapshot before a risky change and reset to it when the change
 goes wrong. `./sc vm snapshot create <name>` is allowed while the domain is
 running, but many hosts cannot checkpoint a live guest (a host-passthrough CPU
 with non-migratable flags, UEFI pflash) and answer `snapshot_live_unsupported`.
@@ -2542,7 +2568,7 @@ INSERT OR IGNORE INTO flavor_skills (flavor, skill_id)
 SELECT 'dev', skill_id FROM skills
 WHERE name='spec_execution' AND is_deleted=0;
 
-UPDATE skills SET description='Load before you run or diagnose sc deps, sc test, sc lint, or sc typecheck, when a hook reports any state but ready, or when you plan what this fork''s seats can prove. Holds the fork''s declared development hooks, execution seat, readiness states, evidence locations, and supported recovery surfaces. Planner-only on demand; Developer and Reviewer receive the same inventory in boot.',
+UPDATE skills SET description='The fork''s dev hooks and seats; load before you run or diagnose sc deps, sc test, sc lint, or sc typecheck, or plan what a seat can prove. Holds the fork''s declared development hooks, execution seat, readiness states, evidence locations, and supported recovery surfaces. Planner-only on demand; Developer and Reviewer receive the same inventory in boot.',
   content='# dev_kit — read the fork development contract
 
 The fork owns `.subfloor/dev-kit.json`. Subfloor validates the declaration,
@@ -2622,9 +2648,9 @@ deployment ritual, database technique, or VM lifecycle.
 ## Run receipts
 
 Attach a finished local run to its PR or work unit with
-`sc job attach <id> --pr <number>|--work-unit <id>` (`sc job attach --help`).
-The rules live in the Developer boot''s RUN RECEIPTS section; a receipt
-supplements CI and never authorizes a merge.'
+`sc job attach <id> --pr <number>|--work-unit <id>`. The ownership,
+registration, and stale-ancestry rules are the RUN RECEIPTS section of the
+`git` skill; a receipt supplements CI and never authorizes a merge.'
 WHERE name='dev_kit' AND content='# dev_kit — read the fork development contract
 
 The fork owns `.subfloor/dev-kit.json`. Subfloor validates the declaration,
