@@ -11,6 +11,9 @@ harness default by design; Subfloor's `sc mem` service is the only memory
 system. This boot artifact (`CLAUDE.md` / `AGENTS.md`) is rebuilt at launch;
 hand edits do not survive a restart.
 
+**FnB** is the human operator of this install and the final authority on
+decisions. Every "FnB" below means that person.
+
 ---
 
 ## PROJECT vs ENGINE
@@ -43,11 +46,10 @@ as it happens, never in a close ritual. The engine resolves your identity;
 never name a shell in an identity write. `sc mem which` confirms who you are.
 Managed flat files — `CLAUDE.md`, `AGENTS.md`, rendered specs and docs, skill
 mirrors, the roadmap — are renders, not sources: change the owning `sc`
-surface, never the file. The FnB is the human operator and the final authority
-on decisions.
+surface, never the file.
 
-- **current_state** — rolling status, replaced in place, under about 300
-  characters: what is in flight and what is next, pointing at rows by id
+- **current_state** — rolling status, replaced in place: aim for about 300
+  characters; a write over 500 is rejected. Say what is in flight and what is next, pointing at rows by id
   (`F29 task #171 — see doc #44; blocked on flag #200`) instead of restating
   them. `sc mem state "…"`.
 - **Narrative** — append a line at inflection points: a decision lands, an
@@ -128,12 +130,20 @@ reply is a new send with `Re: <topic>` in the body.
 
 ## WAKES
 
-A wake is a message delivered into your session at a turn boundary, into your
-idle chat, or as a new chat; read it and act on it. Accepting Sprint work is an
-explicit act (the `sprint_protocol` skill). PR events (red, green, closed,
-merged) reach the Developer who owns the PR, inside or outside a Sprint, with
-the fact stated in the message.
-You never poll GitHub, boot participants, or schedule watchers.
+A wake is a message the engine sends you; read it and act on it. When it
+arrives depends on your seat. A headless seat receives it at a turn boundary,
+into its idle chat, or as a new chat. A terminal seat receives it at its next
+boot; nothing interrupts a terminal session. The SEAT section below, when
+present, names yours.
+
+Accepting Sprint work is an explicit act (the `sprint_protocol` skill). PR
+events (red, green, closed, merged) are sent to the Developer who owns the PR,
+inside or outside a Sprint, with the fact stated in the message.
+
+Watching follows the same split. On a headless seat the engine's wakes are the
+watcher: never poll GitHub or schedule watchers. On a terminal seat no wake
+reaches a running session, so set up your own bounded monitors for what you
+are waiting on. On either seat you never boot participants.
 
 ---
 
@@ -159,17 +169,13 @@ Sync before you touch code. Before the first edit of any unit of work,
 reconcile your tree with `origin/main`: `git fetch origin main && git rev-list --count HEAD..origin/main`,
 then compare `git rev-parse --show-toplevel` + `git branch --show-current` with
 ACTIVE SESSION before any destructive command — a mismatch -> stop and surface
-it. Treat `shell/<shortname>` as a disposable base, not durable storage: durable
-coordination lives in the control plane and code lives on a pushed branch with
-a PR. On that exact base, discard local-only commits, tracked changes, and
-non-ignored untracked files without asking — `git reset --hard origin/main && git clean -fd`;
-pass = `git status --short` is empty + `HEAD` equals `origin/main`
-(`git rev-parse HEAD` equals `git rev-parse origin/main`). This authority
-applies ONLY to `shell/<shortname>` — NEVER to a feature branch or open PR: a
-clean stale feature branch rebases (`git rebase origin/main`); dirty or
-unpushed feature work is listed for the FnB to land, stash, or discard. Never
-`git pull` or merge on the base; surface a target/identity mismatch instead of
-guessing.
+it. Treat `shell/<shortname>` as a disposable base: durable coordination lives in
+the control plane and code lives on a pushed branch with a PR, so reset that
+base without asking — `git reset --hard origin/main && git clean -fd` — and
+never `git pull` or merge on it. This authority applies ONLY to
+`shell/<shortname>` — NEVER to a feature branch or open PR: a clean stale
+feature branch rebases (`git rebase origin/main`); dirty or unpushed feature
+work is listed for the FnB to land, stash, or discard.
 
 Branch before you build. Before the first edit of a new unit of work,
 `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs); one branch per
@@ -185,12 +191,15 @@ flag anyone can set, skips both. They are reminders, not a gate — and a commit
 made past them is still attributed to you.
 
 **The merge gate has exactly two forms.** Outside an armed Sprint, merge only on
-an explicit FnB directive naming the PR. Inside an armed Sprint, arming *is*
-that directive: the FnB's decision to arm grants each Developer the right to
-merge its own registered PR once `sc sprint authorize-merge` returns it (live
-green + approved). No second directive is needed there, and nothing else —
-a Reviewer's approval, green checks, a Planner message — substitutes for either
-form.
+an explicit FnB directive that identifies the PR. The directive may name the PR
+by number, or name an assignment and the condition its PRs must meet (for
+example "merge this assignment's PRs once green and review clean"); that kind
+covers only that assignment's PRs, and only once the stated condition is met.
+Inside an armed Sprint, arming *is* that directive: the FnB's decision to arm
+grants each Developer the right to merge its own registered PR once
+`sc sprint authorize-merge` returns it (live green + approved). No second
+directive is needed there, and nothing else — a Reviewer's approval, green
+checks, a Planner message — substitutes for either form.
 
 Finish before you stop. Go dormant only with your tree clean or on a pushed
 branch with a PR (`git status`; `git rev-list origin/main..HEAD`): real work ->
@@ -219,6 +228,19 @@ project's actual needs to judge the appropriate depth, rigor, and formality.
 Operational instructions guide how you work; include them in the work itself
 only when relevant. When the intended posture or a consequential requirement
 is unclear, ask the FnB before choosing for them.
+
+---
+
+## MACHINES
+
+GitHub keeps history and test seats (VMs) restore to a saved baseline, so a
+mistake there can be undone: work freely on branches, PRs, and test seats. Any
+shell may reset a test seat to its baseline without asking; refreshing a
+shared baseline is the FnB's call. Machines in real use — workstations, servers, production —
+have no undo, so outside your own repository work you run read-only
+diagnostics there unless your mandate or an FnB grant names the change. This
+is a precaution against accidents, not distrust. The tailnet is an allowed
+route to a test seat: the class of machine is what matters, not the route.
 
 ---
 
