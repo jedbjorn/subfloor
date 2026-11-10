@@ -902,7 +902,7 @@
         "merge authority. Start with one manual handoff; use [Sprints](#sprints) when",
         "| Planner | Scope, specifications, fork-local skills, Sprint preparation and shipped documentation |",
         "| Reviewer | Independent review and Sprint conformance judgments |",
-        "6. Outside an armed Sprint, give an explicit directive **naming the PR** before",
+        "6. Outside an armed Sprint, give an explicit directive **that identifies the PR**",
         "Inside an armed Sprint, your arming decision is the recorded grant; the",
         "`sc sprint authorize-merge` approval.",
         "## Sprints",
