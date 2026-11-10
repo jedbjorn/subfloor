@@ -205,15 +205,27 @@ order, and report each:
 |---|---|
 | `./sc vm init` | `domain` (libvirt knows it) · `ssh` (the guest answers with the key) · `snapshot` (the kept snapshot exists) · `toolchain` (the fork's declared `checks`; skipped when `ssh` failed) |
 | `./sc remote add` | `ssh` (key path and mode, then one `echo ok` — this is also what pins the host key on first contact) |
-| `./sc ts init`, `./sc ts add-host` | `daemon` · `auth` · `peer` · `ssh` — see the [tailnet broker](tailscale-broker.md) |
+| `./sc ts init`, `./sc ts add-host` | `daemon` · `auth` · `peer` · `ssh`, for the hosts the command names only; none named means the broker alone is checked — see the [tailnet broker](tailscale-broker.md) |
 
 A failed check exits non-zero with `init_verify_failed` /
 `remote_verify_failed` / `ts_verify_failed`, and the message says the block
-**is saved**: fix the cause and re-run the same command. `--no-verify` on any
-of them saves without testing or starting anything, for setting a seat up
-while it is offline; the result then says `not verified`. A sandboxed caller
+**is saved**: fix the cause and re-run the same command. A sandboxed caller
 runs the checks through the broker, and reports them skipped — never passed —
 when the broker is not reachable.
+
+**A powered-off guest is not a wrong link.** `./sc vm bake` leaves a seat
+powered off, so re-linking a healthy seat meets a guest that cannot answer
+SSH. `./sc vm init` reads the domain's power state first: when it is off, the
+`domain` and `snapshot` checks still run, `ssh` and `toolchain` are reported
+`not run: the guest is powered off`, and the result is
+`init_guest_powered_off` rather than `init_verify_failed`. It still exits
+non-zero, because SSH was not proven; the message names both ways forward —
+`./sc vm start` then re-run, or `--no-verify` to link it while it is off.
+
+`--no-verify` on any link command saves without testing the link or starting
+the broker, for setting a seat up while it is offline; the result then says
+`not verified`. It still reports whether the broker is already answering (one
+read of the local socket) — no guest, remote or tailnet host is contacted.
 
 `./sc remote list`, `./sc remote remove <name>`, and the GUI `PUT /vm` wizard
 manage the blocks afterwards. `remotes` has no GUI surface yet.
@@ -283,6 +295,7 @@ Act on the code.
 |---|---|
 | `vm_not_linked` | no `vm` block exists, so a `./sc vm` verb has nothing to act on. `./sc vm-broker-up` starts nothing in this state (or is serving only `remotes`); the fix is to link a VM with `./sc vm adopt` or `./sc vm init`, not to start the broker |
 | `broker_unreachable` | a seat **is** linked but the vm-broker is not answering; `./sc vm-broker-up` on the host is the fix |
+| `init_guest_powered_off` | the block **is saved** and every check that works with the guest off passed, but the guest is powered off, so SSH was not tested — not a wrong link. `./sc vm start` and re-run `./sc vm init`, or pass `--no-verify` |
 | `init_verify_failed`, `remote_verify_failed` | the block **is saved** but a link check failed; `error.details.checks[]` carries `check`, `ok`, `skipped`, `output` and `next` (the command to run), and `details.broker` the broker state. Re-run the link command once fixed, or pass `--no-verify` to save without testing |
 | `init_write_failed`, `remote_write_failed` | the block could not be saved; nothing changed |
 | `remote_not_found`, `remote_name_invalid` | the named remote is undeclared or malformed. `./sc remote` answers `remote_not_found`, not `broker_unreachable`, when the broker is down **and** the remote was never added |

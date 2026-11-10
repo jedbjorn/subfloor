@@ -123,20 +123,39 @@ Write it with the client, not by hand:
   else.
 - **`[USER@]HOST`** on `--allowed-host`, `--readonly-host` and `add-host`
   records that host's own user in `ssh_users`.
+- **Names are validated wherever a block is written** — these verbs and
+  `PUT /ts` alike. A host is a tailnet machine name, MagicDNS name or IPv4
+  address (`[A-Za-z0-9._-]`, starting and ending alphanumeric); a user is a
+  plain account name (`[A-Za-z0-9_.-]`, not starting with `.` or `-`).
+  Neither may begin with a dash: both become one argument of `tailscale ssh`,
+  where a leading dash would be read as an option. A bad name is refused with
+  `host_invalid` (client) or `ts_block_invalid` (any write) and nothing is
+  saved; `exec` also refuses a bad name that reached the file by hand edit.
 - **Tiers only tighten.** Naming an allowed host read-only moves it to
-  `readonly_hosts`. Naming a read-only host as allowed leaves it read-only and
-  says so; `add-host` refuses with `host_is_readonly`. Loosening a host is two
-  deliberate commands: `remove-host`, then `add-host`.
+  `readonly_hosts`. Naming a host that is read-only in the saved block as
+  allowed is **refused** — by `init` and `add-host` alike, with
+  `host_is_readonly` — and a refused command changes nothing: no list, no
+  per-host user, nothing else it named. Loosening a host is two deliberate
+  commands: `remove-host`, then `add-host`.
+- **No host is ever saved in both tiers.** Every write drops a read-only host
+  from `allowed_hosts`. A block that already lists one in both (a hand edit)
+  is read as read-only, so replacing `readonly_hosts` removes that host
+  instead of leaving it behind as allowed.
 - **The link is tested when it is declared.** `init` and `add-host` save the
   block, start the broker if it is not answering (on the host; from a sandbox
-  they print the exact command instead), then run the setup checks and print
-  pass/fail per check with the next command for each failure: `daemon`, `auth`,
-  then `peer` and `ssh` for the hosts the command named (every declared host
-  when it named none). A check that depends on a failed one is reported
-  skipped, not failed again. A failed check exits non-zero with
-  `ts_verify_failed` and `saved: true` — the block **is** saved, so fix the
-  cause and re-run. `--no-verify` saves without testing or starting anything,
-  for offline setup.
+  they print the exact command instead), then test **only the hosts the
+  command named**: `daemon`, `auth`, then `peer` and `ssh` for those hosts,
+  with pass/fail per check and the next command for each failure. A check
+  that depends on a failed one is reported skipped, not failed again. A
+  command that names no host (`./sc ts init --ssh-user X`) probes nothing on
+  the tailnet — it checks the broker only and says so — so it never opens a
+  session to every machine in real use and never fails because one of them is
+  asleep. To test a host that is already declared, repeat `add-host` for it.
+  A failed check exits non-zero with `ts_verify_failed` and `saved: true` —
+  the block **is** saved, so fix the cause and re-run.
+- **`--no-verify`** saves without testing the link or starting the broker,
+  for offline setup. It still reports whether the broker is already answering
+  (one read of the local socket); nothing is sent to any tailnet host.
 - Every command writes only the `ts` block and keeps values it was not given.
 
 ## Read-only tier
@@ -173,7 +192,7 @@ host; `/validate` tests a **candidate** block passed in the body (before save).
 |---|---|---|
 | `GET` | `/health` | liveness |
 | `GET` | `/ts` | read the saved `ts` block |
-| `PUT` | `/ts` `{ts}` | write the `ts` block; a failed save answers `{ok: false, error: ts_write_failed, message}` instead of closing the connection |
+| `PUT` | `/ts` `{ts}` | write the `ts` block. Host and user names are validated (`ts_block_invalid`, nothing saved) and a read-only host is dropped from `allowed_hosts`; a failed save answers `{ok: false, error: ts_write_failed, message}` instead of closing the connection |
 | `GET` | `/status` | `tailscale status --json` → self + peers summary |
 | `POST` | `/exec` `{host, command, timeout?}` | `tailscale ssh` → `{ok, exit, stdout, stderr}`; on a `readonly_hosts` entry, off-table input → `{error: readonly_refused, token}` |
 | `POST` | `/validate/{check}` `{ts, hosts?}` | one live setup check: `daemon` · `auth` · `peer` · `ssh`; `hosts` narrows `peer`/`ssh` to the named declared hosts (without it `ssh` probes the first declared host) |
@@ -225,8 +244,9 @@ The `error` field of a failed result. Act on the code.
 | `ts_verify_failed` | the block is saved (`saved: true`) but a setup check failed; `verify.checks[]` carries `check`, `ok`, `skipped`, `output` and `next` | the `next` of each failed check |
 | `ts_write_failed` | the block could **not** be saved; the previous block is still in effect. From `PUT /ts` this means the broker process could not write the instance file | run `./sc ts init` / `./sc ts add-host` in the operator's own terminal, which writes the file directly |
 | `host_not_declared` | `remove-host` named a host in neither list; nothing changed | `./sc ts init` output or `GET /ts` lists the declared hosts |
-| `host_is_readonly` | `add-host` named a read-only host without `--readonly`; nothing changed | `./sc ts remove-host <host>`, then `add-host` |
-| `host_invalid` | a `[USER@]HOST` argument has no host or contains whitespace | fix the argument |
+| `host_is_readonly` | `init --allowed-host` or `add-host` named a host that is read-only in the saved block; nothing changed (`host` names it) | `./sc ts remove-host <host>`, then `add-host` |
+| `host_invalid` | a `[USER@]HOST` argument or `--ssh-user` is not a valid name (see the rules above); nothing changed | fix the argument |
+| `ts_block_invalid` | a block being written carries an invalid host or user name, from a client verb or `PUT /ts`; nothing was saved. Also how a client verb reports an invalid entry already in the file | fix the name; a bad saved entry is dropped with `./sc ts remove-host -- <entry>` |
 | `readonly_refused` | `exec` on a `readonly_hosts` entry used input outside the diagnostic table; `token` names what was refused | a refusal is a stop, not something to rephrase around |
 
 A refused `exec` for an undeclared host answers `{ok: false, exit: -1,
