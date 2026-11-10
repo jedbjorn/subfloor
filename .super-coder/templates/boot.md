@@ -194,10 +194,10 @@ flag anyone can set, skips both. They are reminders, not a gate — and a commit
 made past them is still attributed to you.
 
 **The merge gate has exactly two forms.** Outside an armed Sprint, merge only on
-an explicit FnB directive naming the PR — by number, or by naming an assignment
-and the condition its PRs must meet (for example "merge this assignment's PRs
-once green and review clean"); that kind covers only that assignment's PRs,
-and only once the stated condition is met.
+an explicit FnB directive that identifies the PR. The directive may name the PR
+by number, or name an assignment and the condition its PRs must meet (for
+example "merge this assignment's PRs once green and review clean"); that kind
+covers only that assignment's PRs, and only once the stated condition is met.
 Inside an armed Sprint, arming *is* that directive: the FnB's decision to arm
 grants each Developer the right to merge its own registered PR once
 `sc sprint authorize-merge` returns it (live green + approved). No second

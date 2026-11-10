@@ -316,8 +316,8 @@ Map :::class2 -> Spec :::class1 -> Build :::class1 -> Review :::class2 -> Author
    `.sc-worktrees/dev1`; each Developer has a separate editing lane.
 5. The Reviewer checks the diff against the spec and reports findings. The
    Developer fixes issues and repeats affected checks until review and CI pass.
-6. Outside an armed Sprint, give an explicit directive **naming the PR** before
-   a shell merges: by number, or by naming an assignment and the condition its
+6. Outside an armed Sprint, give an explicit directive **that identifies the PR**
+   before a shell merges: by number, or by naming an assignment and the condition its
    PRs must meet. Review approval and green checks alone are insufficient.
    Inside an armed Sprint, your arming decision is the recorded grant; the
    owning Developer merges its registered PR only after live
@@ -806,7 +806,8 @@ wake.
 The instruction depends on the Sprint lifecycle. Inside an armed or paused
 Sprint it points at the Sprint's own gate; outside one, a green wake says
 plainly that green is not authorization — merge only under an explicit FnB
-directive naming the PR, by number or by assignment and stated condition —
+directive that identifies the PR, by number or by assignment and stated
+condition —
 and a merged wake sends the Developer to the `git`
 skill's after-merge cleanup. Watcher internals, health and recovery:
 [`.super-coder/docs/sprint-pr-watcher.md`](../.super-coder/docs/sprint-pr-watcher.md).
