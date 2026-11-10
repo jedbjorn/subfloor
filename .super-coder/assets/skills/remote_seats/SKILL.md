@@ -1,6 +1,6 @@
 ---
 name: remote_seats
-description: Drive a machine through the host brokers — posture 1 owns a VM's lifecycle with sc vm; posture 2 runs broker-served SSH exec, push, and pull against named remotes with sc remote. Keys never enter the shell. Opt-in; Linux targets need nothing more, Windows adds windows_testing.
+description: Drive another machine through the host vm-broker — posture 1 owns a test VM's lifecycle with sc vm (start, exec, push/pull, snapshot, reset); posture 2 runs exec, push, and pull against named remotes with sc remote. Load before touching a test seat or named remote. Opt-in; Linux targets need nothing more, Windows adds windows_testing.
 category: substrate
 command: sc remote
 common: false
@@ -8,20 +8,38 @@ common: false
 
 # remote_seats — two postures, one broker
 
-A shell drives another machine only through the host-side vm-broker. It holds
-the libvirt connection, every SSH key, and the known-hosts files; the shell
-calls `./sc vm` and `./sc remote`, which speak to the broker's unix socket, and
-never runs `ssh`, `scp`, or `virsh` itself — on bare metal or in a sandbox.
-That is the whole access model (decision #353). Two postures share it
-(decision #355):
+## Posture
+
+GitHub has history and a test VM has snapshots, so a mistake there is
+recoverable. A machine in real use — a workstation, a server, production — has
+no undo, so there you run read-only diagnostics unless the FnB assigned the
+change. That is a precaution against accidents, not distrust. The class of
+machine decides, not the route: a test seat reached over the tailnet is still
+a test seat.
+
+A test seat is disposable and shared. Any shell may reset one to its snapshot
+at the end of its own session without asking, on every OS. Refreshing the
+shared snapshot itself is the owner's call (decision #434).
+
+## Access model
+
+Reach a target through the host-side vm-broker: `./sc vm` and `./sc remote`
+speak to its unix socket, on bare metal or in a sandbox. The broker holds the
+libvirt connection, the SSH keys, and the known-hosts files, so key material
+has one host-side home and never lands in a worktree, a log, or a sandbox
+(decision #353). This is key hygiene, not a mechanism that confines you: use
+the broker instead of raw `ssh`, `scp`, or `virsh` because it pins host keys,
+serializes sessions behind one lock, and returns structured results. Two
+postures share it (decision #355):
 
 | Posture | Who owns lifecycle | Shell verbs |
 |---|---|---|
 | 1 · host to VM | this engine, through `./sc vm` | adopt, status, start, stop, restart, snapshot, bake, reset (`--running` or `--off`), push, pull, exec, capture |
 | 2 · VM to VM | the FnB or the upstream instance | `./sc remote` status, exec, push, pull |
 
-Under posture 2 lifecycle and snapshots are someone else's job: never ask for
-a start, reset, or snapshot on a named remote; report the need instead.
+`./sc remote` has no lifecycle verbs. When a named remote is a test seat, its
+fork skill names the reset procedure; otherwise report the need for a start,
+reset, or snapshot instead of improvising one.
 
 ## Set up once per fork
 
@@ -41,15 +59,13 @@ command that starts it (`./sc vm-broker-up`).
 line in the guest console, then `adopt` installs a host-held key, provisions the
 guest, writes the block and takes the baseline snapshot. It is host-only and
 idempotent. `init` is the hand-link path for a guest already prepared by other
-means. Either way the key is generated and kept on the host and never enters a
-shell (decision #353); `windows_testing` carries the Windows detail.
+means. `windows_testing` carries the Windows detail.
 
 Remote names match `[a-z0-9][a-z0-9-]{0,31}`. `key_path` is an absolute,
 host-owned, mode-0600 file; the broker refuses anything else. Without
 `known_hosts_path` the broker pins the host key on first contact into its own
 file under `.sc-state/local/remotes/`. `./sc remote list` and
-`./sc remote remove <name>` manage the block; no output ever includes key
-material.
+`./sc remote remove <name>` manage the block; no output includes key material.
 
 ## Posture 1 session
 
@@ -63,24 +79,28 @@ material.
 ./sc vm reset --off                  # back to the configured baseline, powered off
 ```
 
-Lifecycle verbs beside those: `stop` (graceful; `--force` is the only route to
-`virsh destroy`), `restart`, `snapshot list`, `snapshot create <name>` (allowed
-in any state — a running domain gets a live snapshot, and a hypervisor that
-refuses one answers `snapshot_live_unsupported`), `snapshot delete <name>` (the
-configured baseline is refused; redefine it with `bake` instead), `bake [<name>]`
-(graceful shutdown, then a replace-not-stack offline snapshot that becomes the
-baseline; `./sc vm-bake` is the host-direct escape hatch that runs the same
-operation against libvirt in-process with no broker in the path — host-only,
-never in the sandbox, and only when the broker is down; `vm bake` is the
-normal route), and `reset [<name>] --off|--running` for a named snapshot.
-Exactly one of `--off` and `--running` is required on every reset.
+Lifecycle verbs beside those:
+
+- `stop` is graceful; `--force` is the only route to `virsh destroy`. `restart`.
+- `snapshot list`, `snapshot create <name>` (any state; a running domain gets a
+  live snapshot, and a hypervisor that refuses one answers
+  `snapshot_live_unsupported`), `snapshot delete <name>` (the configured
+  baseline is refused).
+- `reset [<name>] --off|--running`; exactly one of the two flags is required.
+- `bake [<name>]`: graceful shutdown, then a replace-not-stack offline snapshot
+  that becomes the baseline. `./sc vm-bake` runs the same operation against
+  libvirt in-process with no broker — host-only, never in the sandbox, and only
+  when the broker is down.
+
 `push` sources and `pull` destinations must sit inside the repo or
 `.sc-state/local/`, and never inside `.sc-state/local/vm/` (the host's key and
 host-key pin live there); a pull destination inside `.super-coder/` or `.git/`
 is refused too. Add `--json` to any verb for one result object.
 
-Posture 1's VM is a disposable test box, so the lifecycle verbs above are
-genuinely yours to use — snapshot, bake and reset included (decision #372).
+The VM is a disposable test box, so install, reconfigure, snapshot, and reset
+are yours (decision #372). `bake` replaces the baseline every later session
+resets to: that is the snapshot refresh decision #434 leaves to the owner, so
+bake when the FnB asked for it or agreed.
 
 Sharing rule: the broker's mutation lock is the only concurrency control, so
 read `status` first, do not start, reset, or snapshot a VM another shell is
@@ -102,36 +122,23 @@ it and say what you changed.
 
 ## Structured errors
 
-Every verb returns `{ok, operation, error: {code, message}}` on failure. Act on
-the code; never repair the transport yourself.
+Every verb returns `{ok, operation, error: {code, message}}` on failure. The
+full vocabulary is the Structured errors table in
+`.super-coder/docs/remote-seats.md`; read the row for a code not listed here.
+The ones you act on:
 
-| Code | Meaning | Do |
-|---|---|---|
-| `broker_unreachable` | vm-broker is not serving | report the printed start command to the FnB |
-| `remote_not_found`, `remote_name_invalid` | name undeclared or malformed | check `./sc remote list`; ask the FnB to add it |
-| `remote_key_invalid`, `remote_config_invalid` | key path, mode, or fields wrong on the host | report; the FnB owns keys |
-| `remote_path_not_allowed` | push source or pull destination outside the allowed roots | move the file inside the repo or `.sc-state/local/` |
-| `remote_unreachable`, `remote_exec_failed` | SSH failed or the command exited non-zero | read `stderr`; report, do not retry blindly |
-| `snapshot_protected`, `snapshot_name_invalid` | a lifecycle guard tripped | the baseline is redefined with `bake`, never deleted |
-| `snapshot_live_unsupported` | libvirt refused a live internal snapshot | `./sc vm stop`, snapshot, then start again |
-| `stop_timeout`, `reset_result_unknown` | the final state was not confirmed | run `status`, report it, do not retry blindly |
-| `adopt_sandboxed` | `adopt` is host-only; it needs `virsh`, `ssh-keygen`, `scp` and a TTY | ask the FnB to run it on the host |
-| `adopt_guest_not_found` | no address resolved from DHCP, ARP or `--ssh-host` | report; the FnB passes `--ssh-host` |
-| `adopt_ssh_timeout` | the guest never answered on TCP 22 in the wait window | the bootstrap line has not run in the guest yet |
-| `adopt_key_install_failed` | the password-authenticated key install did not take | report; key material is the FnB's |
-| `adopt_harden_failed` | `PasswordAuthentication no` did not take, or sshd did not come back | report; the FnB owns the guest's sshd |
-| `adopt_host_key_changed` | the guest's host key differs from the pinned one | report the message verbatim: it names the pin file and the `rm` that clears it. Never delete it yourself |
-| `adopt_provision_failed`, `adopt_verify_failed` | a provisioning step or a declared check failed | read the named step; fix `.subfloor/winbox.json` or the guest, re-run adopt |
-| `adopt_config_invalid` | a flag or the saved block is unusable, or there is no TTY for the password prompt | report; adopt is the FnB's command |
-| `adopt_block_write_failed`, `adopt_baseline_failed` | the block did not save, or the baseline snapshot was not taken | report |
-| `adopt_broker_failed` | adopt could not bring the broker up. The `vm` block IS written | the resume is `./sc vm-broker-up` then adopt again; ask the FnB |
-| `push_failed`, `pull_failed` | `scp` itself failed | read the output; report, do not retry blindly |
-| `pull_source_invalid`, `pull_destination_invalid`, `push_source_invalid` | a transfer path was empty | pass both paths |
-| `scp_unsupported` | the host's `scp` predates OpenSSH 8.7 and rejects `-s` | report; the FnB upgrades the host's OpenSSH client |
-| `bake_config_write_failed` | the snapshot was baked, the block was not updated to name it | report; the snapshot exists, the baseline pointer does not |
-| `<operation>_timeout` | the broker call exceeded that verb's budget (`exec_timeout`, `push_timeout`, `bake_timeout`, …) | the work may still be running — read `status` before retrying |
+| Code | Do |
+|---|---|
+| `broker_unreachable` | report the printed start command to the FnB |
+| `vm_busy` | another call holds the mutation lock and nothing was attempted; wait, then retry |
+| `remote_path_not_allowed` | move the file inside the repo or `.sc-state/local/` |
+| `remote_unreachable`, `remote_exec_failed`, `exec_failed`, `push_failed`, `pull_failed` | read `stderr` or the message; report, do not retry blindly |
+| `snapshot_live_unsupported` | normal on many hosts: `./sc vm stop`, snapshot, then start again |
+| `snapshot_protected` | the baseline is redefined with `bake`, never deleted |
+| `stop_timeout`, `reset_result_unknown`, `<operation>_timeout` | the final state is unconfirmed and the work may still be running; read `status`, report it, do not retry blindly |
+| any `adopt_*` | adoption is the FnB's host-only command (`adopt_sandboxed` says so from a sandbox); report the code and message verbatim. `adopt_host_key_changed` names a pin file and the `rm` that clears it — leave that removal to the FnB. After `adopt_broker_failed` the `vm` block IS written: the resume is `./sc vm-broker-up`, then adopt again |
 
-Never hand-install keys, aliases, or known-hosts entries anywhere, and never
-open a raw `ssh` to a target the broker serves — key material stays host-side
-(decision #353). If a target needs something the brokers do not give you, stop
-and report it.
+Any other code names host configuration (keys, the saved block, the host's
+OpenSSH): report it. Do not hand-install keys, aliases, or known-hosts entries,
+and do not open a raw `ssh` to a target the broker serves. If a target needs
+something the broker does not give you, stop and report it.

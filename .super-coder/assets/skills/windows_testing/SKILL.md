@@ -8,8 +8,13 @@ common: false
 
 # windows_testing — the Windows add-on
 
-`remote_seats` owns setup, the session shape, sharing, snapshots, and errors.
-This skill adds only what a Windows guest changes. Linux guests never need it.
+`remote_seats` owns the posture, setup, the session shape, sharing, snapshots,
+and errors. This skill adds only what a Windows guest changes. Linux guests
+never need it.
+
+The Windows guest is a test seat: mistakes there are recoverable from its
+snapshot, so work freely and reset it at the end of your own session without
+asking. Refreshing the shared baseline is the owner's call (decision #434).
 
 ## Preparing a Windows guest
 
@@ -31,8 +36,9 @@ exists, else `main`; `./sc vm adopt` prints the exact line. Then, on the host:
 Adopt locates the guest, installs a host-held key behind one password prompt,
 turns password auth off, pins the host key, provisions, verifies, writes the
 `vm` block, brings the broker up and takes the baseline snapshot. The key is
-generated on the host and never handed to a shell (decision #353); the password
-is read from the operator's TTY, never on argv, never persisted. Every phase is
+generated on the host and never handed to a shell (decision #353) — key
+hygiene, not a control on you; the password is read from the operator's TTY,
+never on argv, never persisted. Every phase is
 idempotent, so re-running adopt after a toolchain change skips what is already
 satisfied. `./sc vm init` still hand-links a guest prepared by other means.
 
@@ -58,13 +64,13 @@ must not contain a double quote: cmd re-parses the line and the quotes arrive as
 literal characters. Anything needing quotes goes in a `.cmd` file you push and
 name instead. Changing the fork's toolchain means editing `winbox.json` and
 running `./sc vm adopt` again, or doing it by hand over `./sc vm exec` and then
-`./sc vm bake`.
+`./sc vm bake` — both redefine the baseline, so both wait for the FnB's word.
 
 ## Authority
 
 The guest is a disposable test box: it holds no real data and no real accounts,
 snapshots are free, and the FnB owns the physical host. So install software,
-change settings, schedule tasks, snapshot, bake and reset are all yours
+change settings, schedule tasks, snapshot and reset are all yours
 (decision #372). Snapshot before a risky change and reset to it when the change
 goes wrong. `./sc vm snapshot create <name>` is allowed while the domain is
 running, but many hosts cannot checkpoint a live guest (a host-passthrough CPU
@@ -77,13 +83,12 @@ That is the normal case, not a fault; take the snapshot offline instead:
 4. Later, `./sc vm reset <name> --running` returns to that state booted, or
    `--off` leaves it powered down.
 
-Redefine the baseline with `./sc vm bake [<name>]` rather than trying to
-delete it; the baseline is the one snapshot `reset` depends on and delete still
-refuses it. Leave the box in a state the next shell can either use or reset:
-finish with `./sc vm reset --off`, or say plainly what you changed and which
-snapshot returns the box to the state you found it in. The sharing rule in
-`remote_seats` still governs: read `status` first and do not reset or snapshot a
-VM another shell is visibly using.
+The baseline is the one snapshot `reset` depends on, and delete refuses it. It
+is redefined only with `./sc vm bake [<name>]`, when the FnB asked for a new
+baseline or agreed to one. Leave the box in a state the next shell can either
+use or reset: finish with `./sc vm reset --off`, or say plainly what you
+changed and which snapshot returns the box to the state you found it in. The
+sharing rule in `remote_seats` still governs.
 
 ## PowerShell exec conventions
 
@@ -102,8 +107,8 @@ on the guest side and `--json` when you need `exit_code`, `stdout`, and `stderr`
 separately. A guest path for `push` and `pull` may be written with either
 separator — `C:\SubfloorTest\out.bin` or `C:/SubfloorTest/out.bin` — because
 the engine normalises it for scp's SFTP mode; `exec` command text is yours and
-is passed through untouched. `push` and `pull` will not read from or write into
-`.sc-state/local/vm/`, and will not write into `.super-coder/` or `.git/`. Guest console output is decoded lossily; base64-encode guest-side
+is passed through untouched. The transfer path limits are in `remote_seats`.
+Guest console output is decoded lossily; base64-encode guest-side
 (`[Convert]::ToBase64String(...)`) when a result must be byte-exact, and write
 large results to a file and `./sc vm pull` it rather than through stdout.
 

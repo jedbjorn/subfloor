@@ -1,6 +1,6 @@
 ---
 name: tailscale_diagnostics
-description: Observe declared tailnet hosts through the host ts-broker with sc ts — tailnet status and a fixed read-only diagnostic verb table on readonly_hosts. Opt-in; a readonly_refused answer is a stop, never something to work around.
+description: Observe declared tailnet hosts through the host ts-broker with sc ts — tailnet status and a fixed read-only diagnostic verb table on readonly_hosts. Load before running anything on a tailnet host. Read-only applies to machines in real use; a test seat reached over the tailnet is still a test seat. Opt-in; a readonly_refused answer is a stop, never something to work around.
 category: substrate
 command: sc ts
 common: false
@@ -8,11 +8,26 @@ common: false
 
 # tailscale_diagnostics — look, do not touch
 
-The host's Tailscale identity stays on the host. The ts-broker runs there and
-serves two verbs over a unix socket; `./sc ts` is the client. The fork's `ts`
-block names `allowed_hosts` (unrestricted exec as the configured `ssh_user`)
-and `readonly_hosts` (diagnostic verbs only). A host in `readonly_hosts` is
-implicitly allowed; a host in neither list is refused.
+## Posture
+
+Read-only applies to machines in real use: workstations, servers, production.
+They have no undo, so a shell observes there and changes nothing. That is a
+precaution against accidents, not distrust. GitHub has history and test VMs
+have snapshots, so mistakes there are recoverable; a test seat reached over
+the tailnet is still a test seat. The class of machine decides, not the route:
+on a test seat you work freely and may reset it to its snapshot at the end of
+your own session without asking, while refreshing a shared snapshot stays the
+owner's call (decision #434; `remote_seats` holds the seat rules).
+
+## The broker
+
+The ts-broker runs on the host with the host's Tailscale identity and serves
+two verbs over a unix socket; `./sc ts` is the client. Keeping that identity
+host-side is hygiene, not a mechanism that confines you. The fork's `ts` block
+names `readonly_hosts` (machines in real use: diagnostic verbs only) and
+`allowed_hosts` (unrestricted exec as the configured `ssh_user`; a test seat
+belongs here). A host in `readonly_hosts` is implicitly allowed; a host in
+neither list is refused.
 
 ```bash
 ./sc ts status                        # tailnet backend, self, peers
@@ -31,8 +46,9 @@ bare metal or otherwise, even when the operator's own tailnet identity or a
 login would let it; the only path to a `readonly_hosts` entry is
 `./sc ts exec`, and observation means observation — read state and logs,
 report what you saw, and change nothing on that host by any route. The broker
-allowlist plus this paragraph is the accepted boundary (decision #354);
-device-side enforcement is deferred, not a gap you are free to use.
+enforces the verb table only on its own path; nothing on the device enforces
+it, so this paragraph is the rest of the boundary (decision #354), kept by you
+because that machine has no undo.
 
 ## What a read-only host accepts
 
@@ -60,10 +76,10 @@ The broker answers `{ok: false, error: "readonly_refused", token: "<what>"}`
 and names the offending token. Stop. Report the host, the exact command, and
 the token to the FnB or the assigning shell. Do not rephrase the command to
 slip past the table, split it into permitted pieces that add up to a change,
-run it from another host, or open your own session to the target. A host that
-is only in `allowed_hosts` is unrestricted by the broker, which is why the
-fork declares which hosts are which; do not treat that as permission to
-mutate production.
+run it from another host, or open your own session to the target. The broker
+does not restrict a host that is only in `allowed_hosts`, so the class of
+machine still decides there: a test seat is yours to change, and a machine in
+real use is changed only when the FnB assigned that change.
 
 Other refusals: `not in allowed_hosts or readonly_hosts` means the fork has
 not declared the host — ask the FnB; `broker_unreachable` means the ts-broker
