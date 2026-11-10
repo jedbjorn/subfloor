@@ -43,25 +43,37 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
     def test_fresh_developer_template_carries_the_complete_boundary(self):
         # F72: the posture lives in the dev flavor's procedure body, rendered
         # into the system prompt after the JSON focus.
-        focus = (ENGINE / "templates" / "shells" / "dev.md").read_text()
+        # The boot keeps the boundary every Developer turn needs and names
+        # `spec_execution`; the long-job, CI-fallback and check-state rules
+        # live in that skill.
+        focus = " ".join(
+            (ENGINE / "templates" / "shells" / "dev.md").read_text().split()
+        )
 
         self.assertEqual(focus.count(POLICY_HEADING), 1)
         self.assertIn("every available smallest affected test target", focus)
-        self.assertIn("Complete the implementation before using CI fallback", focus)
-        self.assertIn(
-            "Required checks pending -> wait; red -> diagnose, fix, and push; "
-            "green -> review readiness",
-            focus,
-        )
         self.assertIn("incomplete code is a failure", focus)
-        self.assertIn("no trustworthy seat remains", focus)
-        self.assertIn("browser-capability skip is informational and non-failing", focus)
-        self.assertIn(LONG_JOB_BOUNDARY, focus)
-        self.assertIn("end the turn and continue on the owner wake", focus)
-        self.assertIn("A lost outcome is unknown, never a pass.", focus)
-        self.assertIn("Do not set up independent watchers.", focus)
+        self.assertIn("a lost outcome is unknown, never a pass", focus)
         self.assertIn(FULL_SUITE_BOUNDARY, focus)
         self.assertIn(SHARED_HOST_BOUNDARY, focus)
+        posture = focus.split(POLICY_HEADING, 1)[1].split("## ", 1)[0]
+        self.assertIn("`spec_execution`", posture)
+
+        skill = ASSETS / "spec_execution" / "SKILL.md"
+        if skill.exists():
+            detail = " ".join(skill.read_text().split())
+            self.assertIn("Complete the implementation before using CI fallback", detail)
+            self.assertIn(
+                "Required checks pending -> wait; red -> diagnose, fix, and push; "
+                "green -> review readiness",
+                detail,
+            )
+            self.assertIn("no trustworthy seat remains", detail)
+            self.assertIn(
+                "browser-capability skip is informational and non-failing", detail
+            )
+            self.assertIn(LONG_JOB_BOUNDARY, detail)
+            self.assertIn("A lost outcome is unknown, never a pass.", detail)
 
     def test_role_guidance_keeps_ci_fallback_and_authority_boundaries(self):
         bodies = {
@@ -76,7 +88,7 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
 
         normalized = {name: " ".join(body.split()) for name, body in bodies.items()}
         self.assertIn("TESTING POSTURE", normalized["sprint_dev"])
-        self.assertIn("follows TESTING POSTURE", normalized["dev"])
+        self.assertIn("Verification follows TESTING POSTURE", normalized["dev"])
         self.assertIn("Verification", normalized["dev"])
 
         self.assertIn(
@@ -192,10 +204,16 @@ class FocusedDeveloperVerificationMigrationTest(unittest.TestCase):
         )
         self.assertEqual(first_prompts[2].count(POLICY_HEADING), 1)
         self.assertEqual(first_prompts[3], original_planner)
+        # These migrations wrote the full posture into every Developer prompt.
+        # The template has since shortened it to a trigger for `spec_execution`
+        # and `refresh_standard_prompts` converges live rows on the template,
+        # so prove here that both migrated rows agree and carry the boundary.
+        migrated_policy = self._testing_posture(first_prompts[1])
+        self.assertEqual(self._testing_posture(first_prompts[2]), migrated_policy)
+        for boundary in (FULL_SUITE_BOUNDARY, SHARED_HOST_BOUNDARY, LONG_JOB_BOUNDARY):
+            self.assertIn(boundary, migrated_policy)
         source_focus = (ENGINE / "templates" / "shells" / "dev.md").read_text()
-        source_policy = self._testing_posture(source_focus)
-        self.assertEqual(self._testing_posture(first_prompts[1]), source_policy)
-        self.assertEqual(self._testing_posture(first_prompts[2]), source_policy)
+        self.assertEqual(source_focus.count(POLICY_HEADING), 1)
 
         paths = {
             name: ASSETS / name / "SKILL.md"

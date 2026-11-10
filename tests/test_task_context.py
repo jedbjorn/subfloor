@@ -938,9 +938,15 @@ class GuidanceTest(unittest.TestCase):
         self.assertNotIn("don't grep blind", dev["focus"])
         body = (ENGINE / "templates" / "shells" / "dev.md").read_text()
         self.assertIn("sc context --task <id>", body)
-        self.assertLess(body.index("sc context --task <id>"),
-                        body.index("sc mem get documents --doc <doc_id>"))
-        self.assertIn("only for an unresolved need", body)
+        self.assertIn("Never auto-pick the latest document", " ".join(body.split()))
+        self.assertIn("`spec_execution`", body)
+        # The full selection order lives in the `spec_execution` skill.
+        detail_path = ENGINE / "assets" / "skills" / "spec_execution" / "SKILL.md"
+        if detail_path.exists():
+            detail = detail_path.read_text()
+            self.assertLess(detail.index("sc context --task <id>"),
+                            detail.index("sc mem get documents --doc <doc_id>"))
+            self.assertIn("only for an unresolved need", detail)
         dev_skill = self.skill("sprint_dev")
         self.assertIn("sc context --work-unit <id>", dev_skill)
         self.assertIn("default planning context", dev_skill)

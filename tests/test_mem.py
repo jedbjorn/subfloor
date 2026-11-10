@@ -1041,11 +1041,18 @@ class ApiMemTest(unittest.TestCase):
             self.write("DROP TRIGGER fail_atomic_spec_move")
 
     def test_feature_move_guidance_is_rendered_for_shells(self):
-        # F72: the move verb lives in the planner and dev flavor bodies.
-        for flavor in ("planner", "dev"):
+        # The move verb lives in the `spec_authoring` (Planner) and
+        # `spec_execution` (Developer) skills; each flavor body names its skill.
+        for flavor, skill in (("planner", "spec_authoring"), ("dev", "spec_execution")):
             with self.subTest(flavor=flavor):
                 body = (ENGINE / "templates" / "shells" / f"{flavor}.md").read_text()
-                self.assertIn("sc mem doc move <document_id> --feature <target>", body)
+                self.assertIn(f"`{skill}`", body)
+                detail = ENGINE / "assets" / "skills" / skill / "SKILL.md"
+                if detail.exists():
+                    self.assertIn(
+                        "sc mem doc move <document_id> --feature <target>",
+                        detail.read_text(),
+                    )
         planner = (ENGINE / "templates" / "shells" / "planner.md").read_text()
         self.assertIn("## REVISE, FREEZE, DOCUMENT", planner)
         self.assertIn("sc mem doc move", (ENGINE / "scripts" / "mem.py").read_text())
@@ -1923,7 +1930,14 @@ class ApiMemTest(unittest.TestCase):
     def test_retirement_guidance_is_rendered_for_the_planner(self):
         planner = (ENGINE / "templates" / "shells" / "planner.md").read_text()
         self.assertIn("## REVISE, FREEZE, DOCUMENT", planner)
-        self.assertIn("sc mem doc retire <id> [--superseded-by <id>]", planner)
+        revise = planner.split("## REVISE, FREEZE, DOCUMENT", 1)[1]
+        self.assertIn("Retiring a document is metadata about it", revise)
+        self.assertIn("`spec_authoring`", revise)
+        detail = ENGINE / "assets" / "skills" / "spec_authoring" / "SKILL.md"
+        if detail.exists():
+            self.assertIn(
+                "sc mem doc retire <id> [--superseded-by <id>]", detail.read_text()
+            )
         self.assertIn("sc mem doc retire", mem.__doc__)
 
 
