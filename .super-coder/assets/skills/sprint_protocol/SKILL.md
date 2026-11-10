@@ -1,6 +1,6 @@
 ---
 name: sprint_protocol
-description: The shared Sprints v2 protocol every participant follows — lifecycle, wake types, inbox/accept/decline, the typed relay with stable keys, body limits, artifact paths, receipt recovery, and the authority boundary. Load first in every Sprint turn, then your role skill.
+description: The shared Sprints v2 protocol every participant follows — lifecycle, wake types, inbox/accept/decline, the typed relay with stable keys, the one handoff order and body limit, artifact paths, receipt recovery, and the authority boundary. Load first in every Sprint turn, then your role skill.
 category: workflow
 common: false
 ---
@@ -65,9 +65,7 @@ sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 
 Inspect the inbox once per trigger. Accepting an assignment starts ownership;
 decline only with a concrete reason. After an informational message, `accept`
-marks it read and changes no Sprint or work-unit state. Re-run the inbox once
-immediately before each typed handoff and act on new items; after the handoff
-confirms its durable write, stop without another pass.
+marks it read and changes no Sprint or work-unit state.
 
 ## Relay
 
@@ -101,12 +99,27 @@ recipient, so send no duplicate reminder.
 
 **Stable key** = recipient + exact body + intent + reply target + scope. Reuse
 it only to retry the same failed or ambiguous write; when any field changes,
-use a new key. **Body size**: near 6,000 characters and below 8,000 — run
-`wc -m < <path>` before sending. A handoff is complete only when the command
-exits successfully and confirms the durable write and wake. Rejected or
-transport-failed -> correct and retry. Relay itself unavailable -> give the FnB
-the attempted command, evidence, impact, and recommendation; invent no
-alternate protocol.
+use a new key. Rejected or transport-failed -> correct and retry. Relay itself
+unavailable -> give the FnB the attempted command, evidence, impact, and
+recommendation; invent no alternate protocol.
+
+## Typed handoffs
+
+A typed handoff is a command that passes work to another seat: a relay `send`,
+`complete-unit`, `register-pr`, `request-review`, `record-review`,
+`record-conformance`. Every one follows this order; role skills name their
+handoffs and add only what differs.
+
+1. Finish the work, the bookkeeping, and every body file first.
+2. Re-run `sc sprint inbox --sprint <id>` once; handle and `accept` new items.
+3. Keep each body, result, verdict, and report file near 6,000 characters. The
+   engine refuses anything over 8,000 and writes nothing, so check with
+   `wc -m < <path>`.
+4. Run the command. It is complete only when it exits successfully and
+   confirms the durable write and the wake.
+5. Do not run the inbox again. A handoff a role skill marks **final** ends the
+   turn: it is the literal last action, with no trailing Git, Sprint, inbox,
+   cleanup, or status command after it. Stop and wait for the next wake.
 
 ## Receipt recovery
 
