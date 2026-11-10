@@ -149,10 +149,12 @@ class SprintSkillTest(unittest.TestCase):
             "complete", "abort", "request-review", "record-review",
             "authorize-merge", "dispatch", "monitor", "watcher-state",
             "record-conformance", "compile-report",
-            "cleanup-status", "cleanup", "show",
+            "cleanup-status", "cleanup", "show", "timeline",
         }
         combined = "\n".join(skill_text(name) for name in SKILLS)
-        for command in expected - {"monitor", "spec-revision", "complete"}:
+        # `timeline` is a CLI-only read; the skills do not teach it yet.
+        for command in expected - {"monitor", "spec-revision", "complete",
+                                   "timeline"}:
             self.assertIn(f"sc sprint {command}", combined)
         for gone in ("sc sprint monitor", "record-qaqc"):
             self.assertNotIn(gone, combined)
