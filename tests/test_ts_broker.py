@@ -1025,5 +1025,89 @@ class PutValidationTests(unittest.TestCase):
         self.assertEqual(self.updates, [{"ts": block}])
 
 
+class ApiRouteTests(unittest.TestCase):
+    """`PUT /api/ts` (the GUI's seat form) answers like the broker's PUT /ts.
+
+    Before, a refused name or a failed save fell through to the server's
+    generic handler: 500 `{"error": "<exception text>"}`.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import server  # heavy import; only this class needs it
+        from http.server import ThreadingHTTPServer
+
+        cls.server = server
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls._saved_db = server.DB_PATH
+        server.DB_PATH = Path(cls.tmp.name) / "shell_db.db"
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server.DB_PATH = cls._saved_db
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.updates = []
+        patcher = mock.patch.object(
+            ts.ports, "update",
+            side_effect=lambda values, remove=(): self.updates.append(values))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def put(self, block):
+        import urllib.error
+        import urllib.request
+
+        request = urllib.request.Request(
+            self.base + "/api/ts", method="PUT",
+            data=json.dumps({"ts": block}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as reply:
+                return reply.status, json.loads(reply.read())
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, json.loads(exc.read())
+
+    def test_a_bad_name_is_a_400_with_the_broker_shape_and_nothing_saved(self):
+        for block in (
+            {"allowed_hosts": ["h"], "ssh_users": {"h": "-oProxyCommand=x"}},
+            {"allowed_hosts": ["-oFoo"]},
+        ):
+            with self.subTest(block=block):
+                status, reply = self.put(block)
+                self.assertEqual(status, 400)
+                self.assertFalse(reply["ok"])
+                self.assertEqual(reply["error"], "ts_block_invalid")
+                self.assertIn("not saved", reply["message"])
+        self.assertEqual(self.updates, [])
+
+    def test_a_failed_save_is_named_as_one(self):
+        with mock.patch.object(
+            ts.ports, "update", side_effect=PermissionError(13, "Permission denied")
+        ), mock.patch.object(self.server.traceback, "print_exc"):
+            status, reply = self.put(dict(SAVED))
+        self.assertEqual(status, 500)
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"], "ts_write_failed")
+        self.assertIn("previous block is still in effect", reply["message"])
+
+    def test_a_valid_block_is_saved_with_its_tiers_disjoint(self):
+        block = {"ssh_user": "ops", "allowed_hosts": ["seat", "prod"],
+                 "readonly_hosts": ["prod"], "ssh_users": {"seat": "jedi"}}
+        status, reply = self.put(block)
+        self.assertEqual(status, 200)
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["ts"]["allowed_hosts"], ["seat"])
+        self.assertEqual(self.updates, [{"ts": reply["ts"]}])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
