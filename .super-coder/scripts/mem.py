@@ -49,8 +49,11 @@ Run from the repo root, like every engine command:
     ./sc mem get tasks (<id> | --doc ID | --feature ID)
     ./sc mem get qaqc (<spec_document_id> | --doc ID)
 
-  Writes — every write verb takes `--json` (one JSON object on stdout, ids
-  included, no prose). Wherever a body is text, `--body-file PATH|-` reads it
+  Writes — every write verb takes `--json`: exactly one JSON object on stdout
+  on every path, no prose — `{"ok": true, <ids>, "message"}` on success,
+  `{"ok": false, "error": {code, message, http_status}}` on failure (same
+  nonzero status, same prose on stderr; several-id verbs add
+  applied_ids/not_applied_ids). Wherever a body is text, `--body-file PATH|-` reads it
   from a file or stdin instead of the argument:
     ./sc mem state "<text>"          [--body-file PATH|-]
     ./sc mem seed  "<body>"          [--date YYYY-MM-DD] [--tag cc] [--body-file PATH|-]
@@ -86,7 +89,7 @@ Run from the repo root, like every engine command:
     ./sc mem doc qaqc <spec_document_id> --verdict pass|fail [--findings-doc ID]   # Reviewer signs the spec's current body
     ./sc mem narrative "<line>"      [--body-file PATH|-]
     ./sc mem delivery-audit          [--json]      # Planner-only bounded delivery reconciliation
-    ./sc mem message check [N]                         # your unread inbox, newest N (read-only); sender shown by shortname
+    ./sc mem message check [N]                         # your unread inbox, newest N (read-only; N ≥ 1); sender shown by shortname
     ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result] [--body-file PATH|-]
     ./sc mem message sent                              # outbound view — verify delivery
     ./sc mem message mark-read <message_id> [<message_id> …]
@@ -98,9 +101,9 @@ Exit status (the same table `sc mem --help` prints):
     1  refused or failed — the API answered an error, is unreachable or
        unwired, or the client refused the arguments; the write did not land
        unless the message says it MAY have (a lost receipt). A several-id
-       call that stops part-way has applied the ids before the one it names
-    2  usage error (unknown verb/flag, missing argument), or a runtime
-       credential outside the trust boundary
+       call that stops part-way names the ids it applied and those it did not
+    2  usage error (unknown verb/flag, missing or conflicting argument), or
+       a runtime credential outside the trust boundary
 
 Writes retry on engine-DB contention (#331): the server answers 503 when the
 shared DB is busy (nothing committed) and every method retries it; ambiguous
@@ -147,9 +150,50 @@ _PROG = "mem"
 # outside the trust boundary" without parsing stderr.
 EXIT_UNAVAILABLE = 1   # service down / artifact missing, unreadable, malformed, ambiguous
 EXIT_UNSAFE = 2        # artifact present but not an owner-only regular file
+EXIT_USAGE = 2         # the command line itself is wrong (argparse's status)
+
+# `--json`: stdout carries exactly one JSON object on EVERY path — success or
+# failure. main() sets it from argv before parsing so a usage error is covered.
+_JSON = False
+# A several-id verb records its progress here so a failure part-way reports
+# which ids were applied and which were not: {"applied_ids", "not_applied_ids"}.
+_BATCH: "dict | None" = None
 
 
-def die(msg: str, code: int = EXIT_UNAVAILABLE) -> "NoReturn":  # noqa: F821
+def _batch_begin(ids: list) -> None:
+    global _BATCH
+    _BATCH = {"applied_ids": [], "not_applied_ids": list(ids)}
+
+
+def _batch_applied(item_id: int) -> None:
+    _BATCH["applied_ids"].append(item_id)
+    _BATCH["not_applied_ids"].remove(item_id)
+
+
+def _failure_json(code: str, message: str, status: "int | None" = None) -> None:
+    out: dict = {"ok": False,
+                 "error": {"code": code, "message": message, "http_status": status}}
+    if _BATCH is not None:
+        out.update(_BATCH)
+    print(json.dumps(out, default=str))
+    sys.stdout.flush()
+
+
+def die(msg: str, code: int = EXIT_UNAVAILABLE, *, error: str = "refused",
+        status: "int | None" = None) -> "NoReturn":  # noqa: F821
+    """Refuse loudly: prose on stderr, a nonzero status — and under --json one
+    `{"ok": false, "error": {code, message, http_status}}` object on stdout.
+
+    `error` is the stable machine code: usage · refused (the client declined
+    the arguments) · api_error (the API answered `http_status`) · unreachable ·
+    no_receipt (the write MAY have landed) · unwired · credential."""
+    if _BATCH is not None:
+        def ids(key: str) -> str:
+            return ", ".join(f"#{i}" for i in _BATCH[key]) or "none"
+        msg += (f" (applied: {ids('applied_ids')}; "
+                f"not applied: {ids('not_applied_ids')})")
+    if _JSON:
+        _failure_json(error, msg, status)
     if code == EXIT_UNAVAILABLE:
         sys.exit(f"{_PROG}: {msg}")   # sys.exit(str) := stderr + status 1
     print(f"{_PROG}: {msg}", file=sys.stderr)
@@ -184,7 +228,7 @@ def _refuse_unsafe(path: Path, reason: str) -> "NoReturn":  # noqa: F821
     die(f"runtime credential {path} is {reason} — the trust boundary covers "
         "only an owner-only regular file; remove what is there and let the "
         "supervised service re-provision it with mode 0600 at boot "
-        "(`subfloor restart`).", EXIT_UNSAFE)
+        "(`subfloor restart`).", EXIT_UNSAFE, error="credential")
 
 
 def _load_runtime_credential(path: Path) -> None:
@@ -278,7 +322,8 @@ def _require_api() -> None:
         f"Boot via `./sc enter` (run.py injects them) with the server up (`./sc launch`). "
         f"On a host Admin seat, the supervised service provisions a runtime "
         f"credential at {_CRED_DIR}/<shortname>.json that `sc mem` discovers "
-        f"automatically. `./sc mem` does not fall back to direct DB.")
+        f"automatically. `./sc mem` does not fall back to direct DB.",
+        error="unwired")
 
 
 _RETRIES = 3          # extra attempts beyond the first
@@ -300,7 +345,8 @@ _SKILL_WRITE_TIMEOUT = _DOC_WRITE_TIMEOUT
 def _api(method: str, path: str, payload: "dict | None" = None,
          idempotent: "bool | None" = None,
          timeout: "float | None" = None,
-         idem_key: "str | None" = None) -> dict:
+         idem_key: "str | None" = None,
+         allow_404: bool = False) -> "dict | None":
     """POST/PATCH/GET to the engine API; die loud on any error.
 
     Retries (#331 — multi-shell write contention on the engine DB):
@@ -342,12 +388,16 @@ def _api(method: str, path: str, payload: "dict | None" = None,
                 die(f"the runtime credential {_DISCOVERED_FROM} is stale — the API "
                     "refused it (the key was rotated after the artifact was written). "
                     "The supervised service refreshes the artifact at boot: "
-                    "`subfloor restart`, then retry.")
+                    "`subfloor restart`, then retry.",
+                    error="api_error", status=401)
+            if e.code == 404 and allow_404:
+                return None       # the caller asked to see absence, not die on it
             try:
                 msg = json.loads(e.read()).get("error", e.reason)
             except Exception:
                 msg = e.reason
-            die(f"API {method} {path} → HTTP {e.code}: {msg}")
+            die(f"API {method} {path} → HTTP {e.code}: {msg}",
+                error="api_error", status=e.code)
         except Exception as exc:
             timed_out = isinstance(exc, TimeoutError) or "timed out" in str(exc)
             if timed_out and idempotent and not last:
@@ -358,14 +408,14 @@ def _api(method: str, path: str, payload: "dict | None" = None,
                 # is a lost receipt, never an unreachable API (#1507, #1379).
                 die(f"API {method} {path} gave no receipt within {timeout:g}s — "
                     "the write MAY have landed server-side; verify with a read "
-                    "before resending")
-            die(f"API unreachable ({SC_API_BASE}): {exc}")
+                    "before resending", error="no_receipt")
+            die(f"API unreachable ({SC_API_BASE}): {exc}", error="unreachable")
 
 
-# `--json` on a write verb: stdout carries exactly one JSON object — the ids
-# the write created or touched, plus the prose summary as `message` — and no
-# prose. Set once per invocation in main(); reads keep their own --json.
-_JSON = False
+# `--json` on a write verb (see _JSON above): on success the one object holds
+# the ids the write created or touched plus the prose summary as `message`.
+# Known keys are always present — `null` when a value does not apply — and a
+# several-id verb always reports the plural list. Reads keep their own --json.
 _STDIN_TAKEN = False   # stdin feeds at most one `-` argument per invocation
 
 EXIT_CODES = """\
@@ -376,13 +426,15 @@ exit status:
   1  refused or failed — the API answered an error, is unreachable or
      unwired, or the client refused the arguments; the write did not land
      unless the message says it MAY have (a lost receipt). A several-id
-     call that stops part-way has applied the ids before the one it names
-  2  usage error (unknown verb/flag, missing argument), or a runtime
-     credential outside the trust boundary
+     call that stops part-way names the ids it applied and those it did not
+  2  usage error (unknown verb/flag, missing or conflicting argument), or a
+     runtime credential outside the trust boundary
 
-every write verb takes --json: one JSON object on stdout (ids included), no
-prose; errors stay on stderr with the status above. Text bodies also read
-from a file or stdin: --body-file PATH|- .
+every verb takes --json: exactly one JSON object on stdout on every path, no
+prose. Success: {"ok": true, <ids>, "message"}. Failure: {"ok": false,
+"error": {"code", "message", "http_status"}} with the same nonzero status and
+the same prose on stderr; a several-id verb adds applied_ids/not_applied_ids.
+Text bodies also read from a file or stdin: --body-file PATH|- .
 """
 
 _SERIALIZE_WARNING = ("post-write snapshot/render failed — the DB row is live "
@@ -407,7 +459,7 @@ def _finish_api(summary: str, *, receipt: "dict | None" = None, **fields) -> int
     failed = bool(ser) and not ser.get("ok")
     if _JSON:
         out: dict = {"ok": True}
-        out.update({k: v for k, v in fields.items() if v is not None})
+        out.update(fields)        # known keys stay, null when not applicable
         out["message"] = summary
         if failed:
             out["warning"] = _SERIALIZE_WARNING
@@ -438,6 +490,30 @@ def _read_text_arg(raw: str, what: str) -> str:
         die(f"cannot read {what} from {raw}: {exc}")
 
 
+def _usage(msg: str) -> "NoReturn":  # noqa: F821
+    """A wrong command line found after parsing: argparse's status (2)."""
+    die(msg, EXIT_USAGE, error="usage")
+
+
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{raw}' is not a whole number")
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be a positive count")
+    return value
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse, with the --json failure contract on usage errors too."""
+
+    def error(self, message: str) -> "NoReturn":  # noqa: F821
+        if _JSON:
+            _failure_json("usage", message)
+        super().error(message)
+
+
 def _text_arg(inline: "str | None", file_arg: "str | None", what: str,
               flag: str = "--body-file", required: bool = True) -> "str | None":
     """One text value from its inline argument OR its file/stdin flag.
@@ -446,10 +522,12 @@ def _text_arg(inline: "str | None", file_arg: "str | None", what: str,
     form is the same value without the quoting. A file's trailing newlines are
     not part of the body."""
     if inline is not None and file_arg is not None:
-        die(f"pass the {what} inline or with {flag}, not both")
+        _usage(f"pass the {what} inline or with {flag}, not both")
     if file_arg is None:
         if inline is None and required:
-            die(f"the {what} is required — pass it inline or with {flag} PATH|-")
+            # The positional used to be required by argparse (status 2); it is
+            # optional only so the file form can replace it.
+            _usage(f"the {what} is required — pass it inline or with {flag} PATH|-")
         return inline
     text = _read_text_arg(file_arg, what).rstrip("\r\n")
     if not text.strip():
@@ -969,6 +1047,11 @@ def cmd_flag(args) -> int:
         # (#316) — the API always supported the PATCH; this exposes it.
         append = _text_arg(args.append, args.append_file, "appended text",
                            flag="--append-file", required=False)
+        if args.append_file is not None and not append.startswith("\n"):
+            # A file's trailing newline is dropped and the server concatenates
+            # raw, so successive file appends glued onto one line. Each one
+            # starts on its own line; inline --append stays byte-exact.
+            append = "\n" + append
         if args.description is not None and append is not None:
             die("--description replaces the body and --append adds to it — pick one")
         payload: dict = {}
@@ -997,42 +1080,65 @@ def cmd_flag(args) -> int:
     # holds the wrong record while the record still exists.
     #
     # Several ids close in one call with the same notes. EVERY row is read and
-    # checked before the first write, so a wrong or already-closed id refuses
-    # the whole call instead of leaving it half-applied.
+    # checked before anything is printed or written, so a wrong or
+    # already-closed id refuses the whole call instead of leaving it
+    # half-applied behind a "closing …" line.
     notes = _text_arg(args.notes, args.notes_file, "closure notes",
                       flag="--notes-file", required=False)
     flag_ids = list(dict.fromkeys(args.flag_id))
-    closing = []
+    _batch_begin(flag_ids)
+    found = {}
     for flag_id in flag_ids:
-        row = _api("GET", f"/_sc/mem/flags/{flag_id}").get("flag") or {}
+        got = _api("GET", f"/_sc/mem/flags/{flag_id}", allow_404=True)
+        found[flag_id] = (got or {}).get("flag")
+    missing = [i for i in flag_ids if not found[i]]
+    if missing:
+        die("no such flag " + ", ".join(f"#{i}" for i in missing)
+            + " — nothing was closed", error="api_error", status=404)
+
+    def label(row: dict) -> str:
         name = row.get("display_name") or ""
-        label = f" ({name})" if name else " (unnamed)"
-        _say(f"mem: closing flag #{flag_id}{label} "
+        return f" ({name})" if name else " (unnamed)"
+
+    for flag_id in flag_ids:
+        row = found[flag_id]
+        _say(f"mem: closing flag #{flag_id}{label(row)} "
              f"[{row.get('priority') or '?'}, opened {row.get('created_date') or '?'}"
              f" by {row.get('owner') or '?'}]")
         _say(f"    {_one_line(row.get('description'))}")
+    for flag_id in flag_ids:
+        row = found[flag_id]
         if row.get("resolved"):
             # Closing an already-closed flag is not a no-op: it OVERWRITES the
             # resolution notes of whoever verified it with the closer's. Refuse,
             # and print what that write would have destroyed.
             others = (" — none of the flags named in this call were closed"
                       if len(flag_ids) > 1 else "")
-            die(f"flag #{flag_id}{label} is already closed "
+            die(f"flag #{flag_id}{label(row)} is already closed "
                 f"({row.get('resolved_date') or 'no date'}) — closing it again would "
                 f"overwrite its resolution notes: "
                 f"{_one_line(row.get('resolution_notes')) or '(none recorded)'}{others}")
-        closing.append((flag_id, name, label))
-    for flag_id, _name, _label in closing:
+    for flag_id in flag_ids:
         _api("PATCH", f"/_sc/mem/flags/{flag_id}",
              {"resolved": True, "resolution_notes": notes})
-    rows_out = [{"flag_id": i, "display_name": n or None} for i, n, _ in closing]
-    if len(closing) == 1:
-        flag_id, _name, label = closing[0]
-        return _finish_api(f"mem: flag #{flag_id}{label} closed",
-                           flag_id=flag_id, flag_ids=[flag_id], flags=rows_out)
-    listed = ", ".join(f"#{i}{label}" for i, _n, label in closing)
-    return _finish_api(f"mem: {len(closing)} flags closed: {listed}",
-                       flag_ids=[i for i, _n, _l in closing], flags=rows_out)
+        _batch_applied(flag_id)
+    # The row each id resolved to rides in the JSON: it is the same target
+    # confirmation the prose prints before the write (#149).
+    rows_out = [{"flag_id": i,
+                 "display_name": found[i].get("display_name"),
+                 "priority": found[i].get("priority"),
+                 "owner": found[i].get("owner"),
+                 "created_date": found[i].get("created_date"),
+                 "feature_id": found[i].get("feature_id"),
+                 "feature_title": found[i].get("feature_title"),
+                 "description": found[i].get("description")} for i in flag_ids]
+    if len(flag_ids) == 1:
+        summary = f"mem: flag #{flag_ids[0]}{label(found[flag_ids[0]])} closed"
+    else:
+        summary = (f"mem: {len(flag_ids)} flags closed: "
+                   + ", ".join(f"#{i}{label(found[i])}" for i in flag_ids))
+    return _finish_api(summary, flag_ids=flag_ids, flags=rows_out,
+                       resolution_notes=notes)
 
 
 def cmd_roadmap(args) -> int:
@@ -1263,8 +1369,6 @@ def cmd_message(args) -> int:
         msgs = r.get("messages", [])
         unread = [m for m in msgs if not m.get("read_at")]
         # N bounds what is SHOWN (newest first); the count stays the truth.
-        if args.limit is not None and args.limit < 1:
-            die("message check [N] takes a positive count")
         shown = unread if args.limit is None else unread[:args.limit]
         if _JSON:
             print(json.dumps({"ok": True, "unread": len(unread),
@@ -1316,8 +1420,10 @@ def cmd_message(args) -> int:
     # mark-read — one or several ids. Stamping is idempotent, so a call that
     # stops on a bad id is safe to repeat once the id is corrected.
     message_ids = list(dict.fromkeys(args.message_id))
+    _batch_begin(message_ids)     # a failure names what was and was not stamped
     for message_id in message_ids:
         _api("PATCH", f"/_sc/mem/messages/{message_id}/read")
+        _batch_applied(message_id)
     if len(message_ids) == 1:
         summary = f"mem: message #{message_ids[0]} marked read"
     else:
@@ -1329,7 +1435,7 @@ def cmd_message(args) -> int:
 # ── arg parsing ───────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _Parser(
         prog="sc mem", description="engine memory surface (over the API)",
         epilog=EXIT_CODES, formatter_class=argparse.RawDescriptionHelpFormatter)
     body_file_help = "read the text from a file, or `-` for stdin, instead of the argument"
@@ -1559,7 +1665,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("message", help="shell-to-shell inbox: check / send / sent / mark-read")
     msub = sp.add_subparsers(dest="message_cmd", required=True)
     mc = msub.add_parser("check", help="read-only surface of your unread inbox")
-    mc.add_argument("limit", type=int, nargs="?", default=None, metavar="N",
+    mc.add_argument("limit", type=_positive_int, nargs="?", default=None, metavar="N",
                     help="show only the newest N unread (default: all of your "
                          "latest 50); the unread count is always the full count")
     msub.add_parser("sent", help="your outbound view — verify delivery after a send timeout")
@@ -1591,7 +1697,8 @@ def _add_json_flag(parser: argparse.ArgumentParser) -> None:
         return
     if "--json" not in parser._option_string_actions:
         parser.add_argument("--json", action="store_true",
-                            help="one JSON object on stdout (ids included), no prose")
+                            help="exactly one JSON object on stdout, success or "
+                                 "failure (ids included), no prose")
 
 
 def main(argv: list[str]) -> int:
@@ -1599,10 +1706,14 @@ def main(argv: list[str]) -> int:
     # cli_entry.run_cli — one mechanism for every sc script (#384). This used to
     # restore SIG_DFL here (#299), which killed the process with signal 13
     # mid-write and cost the command its own exit status.
-    global _JSON, _STDIN_TAKEN
+    global _JSON, _STDIN_TAKEN, _BATCH
+    _STDIN_TAKEN = False
+    _BATCH = None
+    # From argv BEFORE parsing, so a usage error honours the contract too; a
+    # literal "--json" can never be a positional, argparse reads it as the flag.
+    _JSON = "--json" in argv
     args = build_parser().parse_args(argv)
     _JSON = bool(getattr(args, "json", False))
-    _STDIN_TAKEN = False
     _require_api()  # every command goes through the API — fail loud if unwired
     return args.fn(args)
 

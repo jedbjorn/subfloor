@@ -691,10 +691,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Registered jobs survive harness exit and durably wake their owner.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=HELP_EPILOG)
-    # The metavar is the PUBLIC verb list: `_supervise` is the detached
-    # supervisor's own re-entry point, dispatchable but never an operator verb.
-    sub = p.add_subparsers(dest="cmd_name", required=True,
-                           metavar="{" + ",".join(PUBLIC_VERBS) + "}")
+    sub = p.add_subparsers(dest="cmd_name", required=True)
 
     sp = sub.add_parser("start", help="register and detach; completion durably wakes the owner")
     sp.add_argument("--label", help="display label (never used in a filesystem path)")
@@ -740,17 +737,25 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--repository", help="owner/name when a PR number is ambiguous")
     sp.set_defaults(fn=cmd_attach)
 
-    # No help= at all: argparse lists a subcommand only when it has one, and
-    # help=SUPPRESS printed a literal "==SUPPRESS==" row instead of hiding it.
-    sp = sub.add_parser("_supervise")
-    sp.add_argument("jobdir")
-    sp.set_defaults(fn=cmd_supervise)
+    return p
+
+
+def supervisor_parser() -> argparse.ArgumentParser:
+    """The detached supervisor's own re-entry point (`job.py _supervise
+    <jobdir>`). Not a subcommand of the public parser: registered there it
+    surfaced in --help and in every invalid-choice message."""
+    p = argparse.ArgumentParser(prog="sc job _supervise")
+    p.add_argument("jobdir")
+    p.set_defaults(fn=cmd_supervise)
     return p
 
 
 def main(argv: list[str]) -> int:
     # Early-closed stdout is handled at the entrypoint (cli_entry.run_cli, #384).
-    args = build_parser().parse_args(argv)
+    if argv[:1] == ["_supervise"]:
+        args = supervisor_parser().parse_args(argv[1:])
+    else:
+        args = build_parser().parse_args(argv)
     return args.fn(args)
 
 

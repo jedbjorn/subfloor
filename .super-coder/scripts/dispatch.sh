@@ -1998,8 +1998,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              text bodies take --body-file PATH|- ; `./sc mem --help` carries the exit-status table
   ./sc pr subscribe --repository <owner/name> --pr <number>
                            subscribe the authenticated Developer shell to engine-wide PR event wakes
-  ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list);
-                             `sprint timeline --sprint <id>` reads the event log — the authoritative lifecycle read
+  ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)
                              caller identity is resolved by the engine; report and review bodies use files, and mutating retries carry stable keys where required
   ./sc browser <verb>      setup/status/open/up/down/doctor/arm/disarm — opt-in Chromium profile driving
   ./sc token               print the browser sign-in operator token — an Admin/operator recovery capability;
@@ -2013,7 +2012,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                            repeat a quoted /bin/sh probe until it exits 0, then wake you (--every: delay
                              between attempts, default 30, minimum 5; probes time out after 3600s by default)
   ./sc job attach <id> (--pr <n> [--repository <owner/name>] | --work-unit <n>)
-                           link a finished run to a PR or Sprint work unit as supporting evidence
+                           link a finished run to a PR or work unit as supporting evidence
   ./sc job wait <id>       bounded foreground wait — exit 0 done · 2 still running; --for <s> sets the
                              slice (default 300, cap 550) and you drain your inbox between slices;
                              list/status/tail/kill complete the set

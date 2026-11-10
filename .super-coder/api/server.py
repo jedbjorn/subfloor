@@ -4676,7 +4676,8 @@ class Handler(BaseHTTPRequestHandler):
                         "JOIN shells s ON s.shell_id = m.to_shell_id "
                         "WHERE m.from_shell_id=? "
                         "AND m.kind IN ('shell','task','result') "
-                        "ORDER BY m.created_at DESC LIMIT 50", (sid,)))
+                        "ORDER BY m.created_at DESC, m.message_id DESC "
+                        "LIMIT 50", (sid,)))
                     return self._send(200, {"messages": msgs, "direction": "sent"})
                 msgs = rows(con.execute(
                     "SELECT m.message_id, m.from_shell_id, "
@@ -4685,7 +4686,8 @@ class Handler(BaseHTTPRequestHandler):
                     "LEFT JOIN shells s ON s.shell_id = m.from_shell_id "
                     "WHERE m.to_shell_id=? "
                     "AND m.kind IN ('shell','task','result') "
-                    "ORDER BY m.read_at IS NOT NULL, m.created_at DESC LIMIT 50",
+                    "ORDER BY m.read_at IS NOT NULL, m.created_at DESC, "
+                    "m.message_id DESC LIMIT 50",
                     (sid,)))
                 return self._send(200, {"messages": msgs})
 
@@ -5050,26 +5052,42 @@ class Handler(BaseHTTPRequestHandler):
                         "document_id and title required (feature_id and seq "
                         "are inferred from the document when omitted)")})
                 did = int(did)
+                # The spec already names its feature: omitted, it is read off
+                # the document; given, it must agree. A frozen spec is not
+                # special here — its plan is still worked after it ships.
+                d = con.execute(
+                    "SELECT feature_id FROM documents WHERE document_id=?",
+                    (did,)).fetchone()
                 if fid is None:
-                    # The spec already names its feature — asking the caller
-                    # to repeat it cost a read and invited a mismatch.
-                    d = con.execute(
-                        "SELECT feature_id FROM documents WHERE document_id=?",
-                        (did,)).fetchone()
                     if d is None:
                         return self._send(404, {"error": "no such document"})
                     if d[0] is None:
                         return self._send(400, {"error": (
                             f"document #{did} has no feature — pass feature_id")})
                     fid = d[0]
+                elif d is not None and d[0] is not None and int(fid) != d[0]:
+                    return self._send(409, {"error": (
+                        f"document #{did} belongs to feature #{d[0]}, not "
+                        f"#{int(fid)} — pass --feature {d[0]} or omit it")})
                 # One statement reads the next free slot and writes it, so two
                 # concurrent adds cannot be handed the same number.
-                cur = con.execute(
-                    "INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id) "
-                    "VALUES (?, ?, COALESCE(?, (SELECT COALESCE(MAX(seq), 0) + 1 "
-                    "FROM spec_tasks WHERE document_id=?)), ?, ?, ?)",
-                    (int(fid), did, int(seq) if seq is not None else None, did,
-                     title, body.get("description") or None, sid))
+                try:
+                    cur = con.execute(
+                        "INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id) "
+                        "VALUES (?, ?, COALESCE(?, (SELECT COALESCE(MAX(seq), 0) + 1 "
+                        "FROM spec_tasks WHERE document_id=?)), ?, ?, ?)",
+                        (int(fid), did, int(seq) if seq is not None else None, did,
+                         title, body.get("description") or None, sid))
+                except sqlite3.IntegrityError as exc:
+                    con.rollback()
+                    if "UNIQUE" not in str(exc) or seq is None:
+                        raise
+                    free = con.execute(
+                        "SELECT COALESCE(MAX(seq), 0) + 1 FROM spec_tasks "
+                        "WHERE document_id=?", (did,)).fetchone()[0]
+                    return self._send(409, {"error": (
+                        f"seq {int(seq)} is already taken in document #{did}'s "
+                        f"plan — omit --seq for the next free slot ({free})")})
                 seq = con.execute(
                     "SELECT seq FROM spec_tasks WHERE task_id=?",
                     (cur.lastrowid,)).fetchone()[0]

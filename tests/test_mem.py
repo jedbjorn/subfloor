@@ -205,6 +205,39 @@ class ApiMemTest(unittest.TestCase):
         self.assertIsInstance(caught.exception.code, str)
         return caught.exception.code
 
+    def server_today(self) -> str:
+        """The date the SERVER stamps (SQLite `date('now')`, UTC). The local
+        `date.today()` differs from it for every hour the two calendars
+        disagree, so a stamped date is compared with this one."""
+        return self.q("SELECT date('now')")[0]
+
+    def fails(self, *argv, stdin: "str | None" = None):
+        """(exit status, stdout, stderr prose) of a call that must refuse."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            if stdin is not None:
+                stack.enter_context(mock.patch("sys.stdin", io.StringIO(stdin)))
+            with self.assertRaises(SystemExit) as caught:
+                self.run_mem(*argv)
+        code = caught.exception.code
+        if isinstance(code, str):      # sys.exit(str): stderr text + status 1
+            return 1, out.getvalue(), code
+        return code, out.getvalue(), err.getvalue()
+
+    def fails_json(self, *argv, stdin: "str | None" = None):
+        """A refusal under --json: nonzero status, prose on stderr, and
+        exactly one `{"ok": false, "error": …}` object on stdout."""
+        rc, out, err = self.fails(*argv, "--json", stdin=stdin)
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(err.strip(), "the stderr prose must survive --json")
+        self.assertEqual(len(out.strip().splitlines()), 1, out)
+        payload = json.loads(out)
+        self.assertIs(payload["ok"], False)
+        self.assertEqual(set(payload["error"]), {"code", "message", "http_status"})
+        return rc, payload
+
     def write(self, sql, *params):
         con = sqlite3.connect(self.db)
         try:
@@ -1588,8 +1621,15 @@ class ApiMemTest(unittest.TestCase):
         # close prints the row before it writes — under --json that prose is
         # gone and the row identity rides in the object instead
         rc, out = self.run_json("flag", "close", str(flag_id), "--notes", "done")
+        # … uniformly the plural list, with the full identifying row
         self.assertEqual(out["flag_ids"], [flag_id])
-        self.assertEqual(out["flags"], [{"flag_id": flag_id, "display_name": "SC-JSON"}])
+        self.assertNotIn("flag_id", out)
+        self.assertEqual(out["resolution_notes"], "done")
+        self.assertEqual(out["flags"], [{
+            "flag_id": flag_id, "display_name": "SC-JSON", "priority": "Medium",
+            "owner": "tc", "created_date": self.server_today(),
+            "feature_id": None, "feature_title": None,
+            "description": "[x] json flag | Blocker for: y"}])
 
         rc, out = self.run_json("message", "send", "peer", "json hello")
         self.assertEqual(
@@ -1621,6 +1661,51 @@ class ApiMemTest(unittest.TestCase):
         for status in ("  0  success", "  1  refused or failed", "  2  usage error"):
             self.assertIn(status, rendered)
         self.assertIn("Exit status", mem.__doc__)
+
+    def test_json_failure_is_one_object_on_stdout_with_the_same_status(self):
+        # the API answered an error
+        rc, payload = self.fails_json("retire", "999999")
+        self.assertEqual(rc, 1)
+        self.assertEqual((payload["error"]["code"], payload["error"]["http_status"]),
+                         ("api_error", 404))
+        # the client refused the arguments
+        rc, payload = self.fails_json("lns", "a rule with no triage")
+        self.assertEqual((rc, payload["error"]["code"]), (1, "refused"))
+        self.assertIn("--supersedes", payload["error"]["message"])
+        # argparse itself refused the command line
+        rc, payload = self.fails_json("flag", "edit", "not-a-number")
+        self.assertEqual((rc, payload["error"]["code"], payload["error"]["http_status"]),
+                         (2, "usage", None))
+        # a read under --json follows the same contract
+        rc, payload = self.fails_json("get", "flags", "999999")
+        self.assertEqual((rc, payload["error"]["http_status"]), (1, 404))
+        # without --json a failure prints nothing on stdout
+        rc, out, err = self.fails("retire", "999999")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("HTTP 404", err)
+
+    def test_json_keys_are_stable_null_not_omitted(self):
+        rc, out = self.run_json("flag", "open", "[x] unnamed json | Blocker for: y")
+        self.assertIn("display_name", out)
+        self.assertIsNone(out["display_name"])
+        rc, out = self.run_json("decision", "json decision without a feature")
+        self.assertIn("feature_id", out)
+        self.assertIsNone(out["feature_id"])
+        rc, out = self.run_json("flag", "close", str(
+            self.q("SELECT flag_id FROM flags WHERE description="
+                   "'[x] unnamed json | Blocker for: y'")[0]))
+        self.assertIsNone(out["resolution_notes"])
+        self.assertIsNone(out["flags"][0]["display_name"])
+
+    def test_missing_body_is_a_usage_error_like_argparse(self):
+        for argv in (("state",), ("narrative",), ("seed",), ("lns", "--new"),
+                     ("decision",), ("flag", "open"), ("message", "send", "peer")):
+            rc, out, err = self.fails(*argv)
+            self.assertEqual((rc, out), (2, ""), argv)
+            self.assertIn("is required", err, argv)
+            self.assertIn("--body-file PATH|-", err, argv)
+        rc, payload = self.fails_json("state")
+        self.assertEqual((rc, payload["error"]["code"]), (2, "usage"))
 
     # ── agent ergonomics: one read grammar ────────────────────────────────────
     def test_get_documents_positional_id_equals_doc_flag(self):
@@ -1804,10 +1889,10 @@ class ApiMemTest(unittest.TestCase):
     def test_body_file_refusals_name_the_fix_and_write_nothing(self):
         note = self.tmp / "both.txt"
         note.write_text("from file\n")
-        self.assertIn("not both", self.refusal(
-            "message", "send", "peer", "inline", "--body-file", str(note)))
-        self.assertIn("--body-file PATH|-",
-                      self.refusal("message", "send", "peer"))
+        rc, _, err = self.fails(
+            "message", "send", "peer", "inline", "--body-file", str(note))
+        self.assertEqual(rc, 2)
+        self.assertIn("not both", err)
         self.assertIn("cannot read", self.refusal(
             "narrative", "--body-file", str(self.tmp / "absent.txt")))
         self.assertIn("is empty", self.refusal(
@@ -1834,8 +1919,8 @@ class ApiMemTest(unittest.TestCase):
 
     def test_message_check_limit_bounds_the_listing_not_the_count(self):
         with mock.patch.object(mem, "SC_API_TOKEN", REVIEW_TOKEN):
-            before = len(mem._api("GET", "/_sc/mem/messages")["messages"])
-        self.assertEqual(before, 0)
+            for m in mem._api("GET", "/_sc/mem/messages")["messages"]:
+                mem._api("PATCH", f"/_sc/mem/messages/{m['message_id']}/read")
         for n in range(3):
             self.run_mem("message", "send", "rev1", f"limit probe {n}")
         with mock.patch.object(mem, "SC_API_TOKEN", REVIEW_TOKEN):
@@ -1847,7 +1932,15 @@ class ApiMemTest(unittest.TestCase):
             self.assertEqual(out.count("limit probe"), 3)
             rc, out = self.run_json("message", "check", "1")
             self.assertEqual((out["unread"], len(out["messages"])), (3, 1))
-            self.assertIn("positive count", self.refusal("message", "check", "0"))
+            # 0 / negative N is a usage error (status 2), not a silent
+            # "everything" and not a status-1 refusal
+            for bad in ("0", "-3"):
+                rc, out, err = self.fails("message", "check", bad)
+                self.assertEqual((rc, out), (2, ""), bad)
+                self.assertIn("usage:", err)
+            rc, payload = self.fails_json("message", "check", "0")
+            self.assertEqual((rc, payload["error"]["code"]), (2, "usage"))
+            self.assertIn("positive count", payload["error"]["message"])
             # several ids in one call
             ids = [m["message_id"] for m in
                    mem._api("GET", "/_sc/mem/messages")["messages"]]
@@ -1856,6 +1949,114 @@ class ApiMemTest(unittest.TestCase):
                           + " marked read", out)
             rc, out = self.run_out("message", "check")
             self.assertEqual(out, "mem: inbox empty\n")
+
+    def test_mark_read_batch_failure_reports_applied_and_not_applied(self):
+        ids = []
+        for n in range(2):
+            with mock.patch.object(mem, "SC_API_TOKEN", PEER_TOKEN):
+                self.run_mem("message", "send", "tc", f"batch probe {n}")
+            ids.append(self.q("SELECT message_id FROM shell_messages "
+                              "WHERE body=?", f"batch probe {n}")[0])
+        first, second = ids
+        rc, payload = self.fails_json(
+            "message", "mark-read", str(first), "999999", str(second))
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["error"]["http_status"], 404)
+        self.assertEqual(payload["applied_ids"], [first])
+        self.assertEqual(payload["not_applied_ids"], [999999, second])
+        self.assertIn(f"applied: #{first}; not applied: #999999, #{second}",
+                      payload["error"]["message"])
+        self.assertIsNotNone(self.q(
+            "SELECT read_at FROM shell_messages WHERE message_id=?", first)[0])
+        self.assertIsNone(self.q(
+            "SELECT read_at FROM shell_messages WHERE message_id=?", second)[0])
+        # the prose form names the same split on stderr
+        rc, out, err = self.fails("message", "mark-read", "999999", str(second))
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn(f"applied: none; not applied: #999999, #{second}", err)
+        # success: always the plural list, never a lone message_id
+        rc, out = self.run_json("message", "mark-read", str(second))
+        self.assertEqual(out["message_ids"], [second])
+        self.assertNotIn("message_id", out)
+
+    def test_inbox_newest_first_is_stable_within_one_second(self):
+        with mock.patch.object(mem, "SC_API_TOKEN", REVIEW_TOKEN):
+            for m in mem._api("GET", "/_sc/mem/messages")["messages"]:
+                mem._api("PATCH", f"/_sc/mem/messages/{m['message_id']}/read")
+        stamp = "2031-01-01 00:00:00"      # three rows inside one second
+        ids = [self.write(
+            "INSERT INTO shell_messages (from_shell_id, to_shell_id, kind, body, "
+            "created_at) VALUES (1, 3, 'shell', ?, ?)", f"tie {n}", stamp)
+            for n in range(3)]
+        with mock.patch.object(mem, "SC_API_TOKEN", REVIEW_TOKEN):
+            rc, out = self.run_json("message", "check", "1")
+            self.assertEqual([m["message_id"] for m in out["messages"]], [ids[-1]])
+            rc, out = self.run_json("message", "check")
+            self.assertEqual([m["message_id"] for m in out["messages"]], ids[::-1])
+            self.run_mem("message", "mark-read", *map(str, ids))
+
+    def test_flag_append_file_starts_on_a_new_line(self):
+        self.run_mem("flag", "open", "a\nb", "--name", "SC-APPEND-NL")
+        flag_id = self.q(
+            "SELECT flag_id FROM flags WHERE display_name='SC-APPEND-NL'")[0]
+        note = self.tmp / "append.txt"
+        note.write_text("appended\n")
+        self.run_mem("flag", "edit", str(flag_id), "--append-file", str(note))
+        self.run_out("flag", "edit", str(flag_id), "--body-file", "-",
+                     stdin="again\n")
+        self.assertEqual(
+            self.q("SELECT description FROM flags WHERE flag_id=?", flag_id)[0],
+            "a\nb\nappended\nagain")
+        # inline --append stays byte-exact, as on main
+        self.run_mem("flag", "edit", str(flag_id), "--append", " glued")
+        self.assertTrue(self.q(
+            "SELECT description FROM flags WHERE flag_id=?", flag_id)[0]
+            .endswith("again glued"))
+
+    def test_flag_close_missing_id_prints_no_closing_line_and_closes_nothing(self):
+        self.run_mem("flag", "open", "[x] precheck | Blocker for: z",
+                     "--name", "SC-PRECHECK")
+        flag_id = self.q(
+            "SELECT flag_id FROM flags WHERE display_name='SC-PRECHECK'")[0]
+        rc, out, err = self.fails("flag", "close", str(flag_id), "999999")
+        self.assertEqual((rc, out), (1, ""))      # no "closing flag …" line
+        self.assertIn("no such flag #999999 — nothing was closed", err)
+        self.assertEqual(
+            self.q("SELECT resolved FROM flags WHERE flag_id=?", flag_id)[0], 0)
+        rc, payload = self.fails_json("flag", "close", str(flag_id), "999999")
+        self.assertEqual(payload["error"]["http_status"], 404)
+        self.assertEqual(payload["applied_ids"], [])
+        self.assertEqual(payload["not_applied_ids"], [flag_id, 999999])
+        self.run_mem("flag", "close", str(flag_id))
+
+    def test_task_add_refuses_feature_mismatch_and_duplicate_seq_cleanly(self):
+        self.run_mem("roadmap", "add", "feat own")
+        self.run_mem("roadmap", "add", "feat other")
+        own = self.q("SELECT feature_id FROM roadmap WHERE title='feat own'")[0]
+        other = self.q("SELECT feature_id FROM roadmap WHERE title='feat other'")[0]
+        body = self.tmp / "own.md"
+        body.write_text("# own\nbody\n")
+        self.run_mem("doc", "add", "spec own", "--body-file", str(body),
+                     "--feature", str(own))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec own'")[0]
+        rc, payload = self.fails_json("task", "add", "wrong feature", "--doc",
+                                      str(did), "--feature", str(other))
+        self.assertEqual(payload["error"]["http_status"], 409)
+        self.assertIn(f"belongs to feature #{own}, not #{other}",
+                      payload["error"]["message"])
+        self.run_mem("task", "add", "seq one", "--doc", str(did), "--seq", "1")
+        rc, payload = self.fails_json("task", "add", "seq clash", "--doc",
+                                      str(did), "--seq", "1")
+        self.assertEqual(payload["error"]["http_status"], 409)
+        self.assertIn("seq 1 is already taken", payload["error"]["message"])
+        self.assertIn("next free slot (2)", payload["error"]["message"])
+        self.assertNotIn("UNIQUE", payload["error"]["message"])
+        self.assertIsNone(self.q("SELECT 1 FROM spec_tasks WHERE title IN "
+                                 "('wrong feature', 'seq clash')"))
+        # a frozen spec's plan is still worked: inference is unchanged by freeze
+        self.run_mem("doc", "freeze", str(did))
+        rc, out = self.run_json("task", "add", "after freeze", "--doc", str(did))
+        self.assertEqual((out["feature_id"], out["seq"]), (own, 2))
 
     def test_flag_close_several_ids_checks_all_before_closing_any(self):
         ids = []
@@ -2026,7 +2227,7 @@ class ApiMemTest(unittest.TestCase):
         row = self._row(target)
         self.assertEqual(row["retired"], 1)
         self.assertEqual(row["superseded_by"], successor)
-        self.assertEqual(row["retired_date"], str(date.today()))
+        self.assertEqual(row["retired_date"], self.server_today())
 
     def test_bare_retire_is_legal_and_leaves_no_successor(self):
         target = self._doc("retire bare B")
@@ -2267,7 +2468,7 @@ class ApiMemTest(unittest.TestCase):
         for payload in (listed, one):
             self.assertEqual(payload["frozen_date"], "2026-03-04")
             self.assertEqual(payload["retired"], 1)
-            self.assertEqual(payload["retired_date"], str(date.today()))
+            self.assertEqual(payload["retired_date"], self.server_today())
             self.assertEqual(payload["superseded_by"], successor)
             self.assertEqual(payload["superseded_by_title"],
                              "retire read successor K")
@@ -2307,7 +2508,7 @@ class ApiMemTest(unittest.TestCase):
                                           str(target)), 0)
         text = out.getvalue()
         self.assertIn(f"[retired → #{successor}]", text)
-        self.assertIn(f"retired {date.today()} — superseded by "
+        self.assertIn(f"retired {self.server_today()} — superseded by "
                       f"#{successor} retire single successor M", text)
         self.assertIn("# target M", text)   # the body still reads
 
