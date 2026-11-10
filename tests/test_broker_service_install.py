@@ -38,6 +38,28 @@ class BrokerServiceInstallContractTest(unittest.TestCase):
                     f'systemctl --user enable --now "${variable}"', body
                 )
 
+    def test_an_unlinked_broker_up_says_it_did_not_start_and_what_links_a_seat(
+        self,
+    ) -> None:
+        # `vm status` used to answer "broker unreachable" and point here, and
+        # this then printed "nothing to serve" and exited 0: a no-op hint.
+        for kind, commands in (
+            ("vm", ("./sc vm adopt", "./sc vm init", "./sc remote add")),
+            ("ts", ("./sc ts init",)),
+        ):
+            with self.subTest(kind=kind):
+                match = re.search(
+                    rf"sc_{kind}_broker_up\(\) \{{(?P<body>.*?)\n\}}", SC, re.DOTALL
+                )
+                self.assertIsNotNone(match)
+                unlinked = match.group("body").split("\n  fi\n", 1)[0]
+                self.assertIn("configured; then", unlinked)
+                self.assertIn("NOT started", unlinked)
+                for command in commands:
+                    self.assertIn(command, unlinked)
+                # Still not a failure: `launch` calls this on every fork.
+                self.assertIn("return 0", unlinked)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
