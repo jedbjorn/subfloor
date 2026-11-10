@@ -12,16 +12,19 @@ no schema migration — the tailnet is a host resource, not shell state). It hol
 NO secret material: the host node's identity is the credential, and it stays on
 the host. The block only configures *use*:
 
-    ssh_user       remote user for `tailscale ssh` (user@host)
+    ssh_user       default remote user for `tailscale ssh` (user@host)
+    ssh_users      optional {host: user} overrides of ssh_user, per host
     allowed_hosts  the tailnet hosts this fork may exec against (scoping policy)
     readonly_hosts implicitly allowed hosts restricted to diagnostic commands
     tailscale_bin  path/name of the tailscale CLI (default "tailscale")
 
 Unlike the VM seat (one fixed libvirt domain), a tailnet has N hosts — so the
 loop verbs are parameterized by `{host, command}`, not a single saved target, and
-`allowed_hosts` fail-closes exec to a declared set so a compromised sandbox can't
-reach arbitrary nodes. tailscaled + the tailnet identity stay on the HOST; the
-sandbox names verbs over the broker's unix socket and holds nothing. The broker
+exec is refused for any host the block does not declare. That is a rail against
+reaching the wrong machine by accident, not containment: what a tailnet node may
+actually do to another is decided by the tailnet policy, not by this file.
+tailscaled + the tailnet identity stay on the HOST; a sandboxed shell names
+verbs over the broker's unix socket. The broker
 (api/ts_broker.py) is the sibling of the VM and remotes broker
 (api/vm_broker.py); see .super-coder/docs/tailscale-broker.md.
 """
@@ -29,10 +32,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import socket
 import subprocess
 import sys
+import time
 
 import ports
 
@@ -128,9 +133,23 @@ def _ssh_argv(cfg: dict, host: str, remote: str) -> list[str]:
     """A `tailscale ssh [user@]host <command>` invocation. Auth is the host
     node's tailnet identity governed by the tailnet's SSH ACLs — no key, no
     password prompt, so it stays non-interactive without BatchMode."""
-    user = str(cfg.get("ssh_user", "")).strip()
+    user = _user_for(cfg, host)
     target = f"{user}@{host}" if user else host
     return [_bin(cfg), "ssh", target, remote]
+
+
+def _user_for(cfg: dict, host: str) -> str:
+    """The remote user for one host: its `ssh_users` entry, else `ssh_user`.
+
+    `ssh_users` is optional and additive, so a block written before it existed
+    behaves exactly as it did (one user for every host).
+    """
+    overrides = cfg.get("ssh_users")
+    if isinstance(overrides, dict):
+        override = str(overrides.get(host) or "").strip()
+        if override:
+            return override
+    return str(cfg.get("ssh_user") or "").strip()
 
 
 def _declared_hosts(cfg: dict) -> list[str]:
@@ -235,8 +254,16 @@ def _check_auth(cfg: dict) -> tuple[bool, str]:
                    "`tailscale up` on the host once.")
 
 
-def _check_peer(cfg: dict) -> tuple[bool, str]:
+def _scope(cfg: dict, hosts: list[str] | None) -> list[str]:
+    """The declared hosts a check covers: all of them, or the named subset."""
     declared = _declared_hosts(cfg)
+    if not hosts:
+        return declared
+    return [host for host in declared if host in hosts]
+
+
+def _check_peer(cfg: dict, hosts: list[str] | None = None) -> tuple[bool, str]:
+    declared = _scope(cfg, hosts)
     if not declared:
         return False, "no allowed_hosts or readonly_hosts configured — nothing to resolve."
     ok, data = _status_json(cfg)
@@ -250,16 +277,31 @@ def _check_peer(cfg: dict) -> tuple[bool, str]:
     return True, f"all declared hosts resolve as tailnet peers: {declared}"
 
 
-def _check_ssh(cfg: dict) -> tuple[bool, str]:
-    declared = _declared_hosts(cfg)
+def _check_ssh(cfg: dict, hosts: list[str] | None = None) -> tuple[bool, str]:
+    """Probe `tailscale ssh` as each host's own user.
+
+    With no `hosts` the first declared host is probed (the wizard's quick
+    check); a link command names the hosts it just declared and every one of
+    them is probed, since each may carry its own user.
+    """
+    declared = _scope(cfg, hosts)
     if not declared:
         return False, "no allowed_hosts or readonly_hosts configured — nothing to probe."
-    host = declared[0]
-    ok, out = _run(_ssh_argv(cfg, host, "echo ok"), timeout=20)
-    if ok:
-        return True, f"tailscale ssh to '{host}' works: {out or 'ok'}"
-    return False, (f"tailscale ssh to '{host}' failed — check the tailnet SSH "
-                   f"ACLs, the ssh_user, and that Tailscale SSH is enabled.\n{out}")
+    targets = declared if hosts else declared[:1]
+    passed, failed = [], []
+    for host in targets:
+        ok, out = _run(_ssh_argv(cfg, host, "echo ok"), timeout=20)
+        if ok:
+            passed.append(f"tailscale ssh to '{host}' works: {out or 'ok'}")
+        else:
+            user = _user_for(cfg, host) or "(default user)"
+            failed.append(
+                f"tailscale ssh to '{host}' as {user} failed — check the "
+                "tailnet SSH ACLs, the ssh_user, and that Tailscale SSH is "
+                f"enabled.\n{out}")
+    if failed:
+        return False, "\n".join(failed)
+    return True, "\n".join(passed)
 
 
 _CHECKS = {
@@ -270,14 +312,18 @@ _CHECKS = {
 }
 
 
-def validate(check: str, cfg: dict) -> dict | None:
+def validate(check: str, cfg: dict, hosts: list[str] | None = None) -> dict | None:
     """Run one live check against the CANDIDATE config in `cfg` (the in-progress
     form, not necessarily what is saved). Returns {ok, output, check} or None for
-    an unknown check name (→ 404 at the API layer)."""
+    an unknown check name (→ 404 at the API layer). `hosts` narrows the
+    per-host checks (peer, ssh) to the named declared hosts."""
     fn = _CHECKS.get(check)
     if fn is None:
         return None
-    ok, out = fn(cfg or {})
+    if check in ("peer", "ssh") and hosts:
+        ok, out = fn(cfg or {}, [str(host) for host in hosts])
+    else:
+        ok, out = fn(cfg or {})
     return {"ok": ok, "output": out or "(no output)", "check": check}
 
 
@@ -375,18 +421,266 @@ def broker_call(method: str, path: str, body: dict | None = None,
 
 # -- socket-backed public client ---------------------------------------------
 
+NOT_LINKED_MESSAGE = (
+    "no tailnet is linked on this install, so there is nothing for the broker "
+    "to serve - link one with ./sc ts init --ssh-user <user> --allowed-host "
+    "<host> (or --readonly-host <host>)"
+)
+BROKER_START_WAIT = 20
+BROKER_START_INTERVAL = 1
+BROKER_START_TIMEOUT = 120
+LINK_CHECK_TIMEOUT = 150
+LINK_NEXT = {
+    "daemon": (
+        "start tailscaled on the host (`sudo systemctl enable --now "
+        "tailscaled`), or name the CLI with ./sc ts init --tailscale-bin <path>"
+    ),
+    "auth": "run `tailscale up` on the host once, then re-run this command",
+    "peer": (
+        "compare the name with `tailscale status`; drop a wrong one with "
+        "./sc ts remove-host <host> and declare the right one with "
+        "./sc ts add-host <host>"
+    ),
+    "ssh": (
+        "allow this node to SSH as that user in the tailnet policy, or set "
+        "the host's own user with ./sc ts add-host <user>@<host>"
+    ),
+}
+
+
 def _client_error(operation: str, message: str) -> dict:
-    return {"ok": False, "error": "broker_unreachable",
-            "operation": operation, "message": message}
+    """A dead socket is one of two cases; say which.
+
+    `./sc ts-broker-up` deliberately starts nothing while no `ts` block
+    exists, so "start the broker" is the wrong fix for an unlinked install.
+    """
+    try:
+        linked = bool(read())
+    except Exception:  # an unreadable instance file is not "unlinked"
+        linked = True
+    if not linked:
+        return {"ok": False, "error": "ts_not_linked", "operation": operation,
+                "message": NOT_LINKED_MESSAGE}
+    return {"ok": False, "error": "broker_unreachable", "operation": operation,
+            "message": ("a tailnet is linked but the ts-broker is not running "
+                        f"- start it on the host with ./sc ts-broker-up ({message})"),
+            "start_command": "./sc ts-broker-up"}
+
+
+def _broker_ready() -> bool:
+    try:
+        return broker_call("GET", "/health", timeout=5).get("ok") is True
+    except ConnectionError:
+        return False
 
 
 def _broker_health() -> dict:
+    return {"ready": _broker_ready(), "start_command": "./sc ts-broker-up"}
+
+
+def _dispatch_broker_up() -> tuple[bool, str]:
+    """Run `./sc ts-broker-up` as one fixed dispatcher verb.
+
+    Kept as its own seam so tests replace it - it starts a real host process.
+    """
+    dispatch = ports.ENGINE / "scripts" / "dispatch.sh"
+    root = ports.ENGINE.parent.resolve()
     try:
-        response = broker_call("GET", "/health")
+        process = subprocess.run(
+            ["sh", str(dispatch), "ts-broker-up"], capture_output=True,
+            text=True, cwd=str(root), timeout=BROKER_START_TIMEOUT, check=False,
+            env={**os.environ, "SC_CALLER_ROOT": str(root)},
+            encoding="utf-8", errors="replace",
+        )
+    except FileNotFoundError as exc:
+        return False, f"command not found: {exc.filename}"
+    except subprocess.TimeoutExpired:
+        return False, f"ts-broker-up: timed out (>{BROKER_START_TIMEOUT}s)"
+    return process.returncode == 0, (process.stdout + process.stderr).strip()
+
+
+def ensure_broker() -> dict:
+    """Make sure the broker serves the block that was just saved: already
+    answering -> nothing to do; on the host -> start it and wait for the
+    socket; in a sandbox -> return the exact host command instead."""
+    state = {"ready": False, "started": False, "start_command": "./sc ts-broker-up"}
+    if _broker_ready():
+        return {**state, "ready": True}
+    if os.environ.get("SC_SANDBOX"):
+        return {**state,
+                "detail": "the broker runs on the host; run ./sc ts-broker-up there"}
+    ok, output = _dispatch_broker_up()
+    if not ok:
+        return {**state, "detail": output[:300] or "./sc ts-broker-up failed"}
+    deadline = time.monotonic() + BROKER_START_WAIT
+    while True:
+        if _broker_ready():
+            return {**state, "ready": True, "started": True}
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(BROKER_START_INTERVAL)
+    return {**state,
+            "detail": (f"the broker did not answer within {BROKER_START_WAIT}s "
+                       "of ./sc ts-broker-up - read .super-coder/run/ts-broker.log")}
+
+
+def _link_check(check: str, cfg: dict, hosts: list[str]) -> dict | None:
+    """One validator result, or None when it could not be run at all. The
+    tailscale CLI lives on the host; a sandboxed caller asks the broker."""
+    if not os.environ.get("SC_SANDBOX"):
+        return validate(check, cfg, hosts)
+    try:
+        response = broker_call("POST", f"/validate/{check}",
+                               {"ts": cfg, "hosts": hosts},
+                               timeout=LINK_CHECK_TIMEOUT)
     except ConnectionError:
-        return {"ready": False, "start_command": "./sc ts-broker-up"}
-    return {"ready": response.get("ok") is True,
-            "start_command": "./sc ts-broker-up"}
+        return None
+    return response if isinstance(response.get("ok"), bool) else None
+
+
+def verify_link(cfg: dict, hosts: list[str] | None = None) -> dict:
+    """Run the setup checks in order against `cfg`: pass/fail and a next step
+    each. `hosts` narrows peer and ssh to the hosts a command just declared.
+    A check is skipped once one it depends on has failed, so one cause is
+    reported once."""
+    scope = _scope(cfg, hosts)
+    names = CHECKS if scope else ("daemon", "auth")
+    checks: list[dict] = []
+    blocked = False
+    for check in names:
+        if blocked:
+            checks.append({"check": check, "ok": False, "skipped": True,
+                           "output": "not run: an earlier check failed",
+                           "next": None})
+            continue
+        result = _link_check(check, cfg, scope)
+        if result is None:
+            entry = {"check": check, "ok": False, "skipped": True,
+                     "output": "not run: the ts-broker is not reachable from here",
+                     "next": "./sc ts-broker-up on the host, then re-run this command"}
+        else:
+            ok = bool(result["ok"])
+            entry = {"check": check, "ok": ok, "skipped": False,
+                     "output": str(result.get("output") or "")[:400],
+                     "next": None if ok else LINK_NEXT[check]}
+        blocked = not entry["ok"]
+        checks.append(entry)
+    report = {"passed": all(item["ok"] for item in checks), "checks": checks,
+              "hosts": scope}
+    if not scope:
+        report["note"] = ("no hosts are declared, so exec is refused for every "
+                          "host until ./sc ts add-host <host>")
+    return report
+
+
+def _parse_host(value: str) -> tuple[str, str]:
+    """`host` or `user@host` -> (host, user). The user is that host's own
+    remote user; without one the block's `ssh_user` applies."""
+    text = str(value).strip()
+    user, _, host = text.rpartition("@")
+    if not host or any(character.isspace() for character in text):
+        raise ValueError(f"not a host name: {value!r}")
+    return host, user
+
+
+def _merge_hosts(current: dict, allowed: list[str] | None,
+                 readonly: list[str] | None, replace: bool) -> tuple[dict, dict]:
+    """Fold named hosts into the saved lists. Returns (fields, changes).
+
+    Additive by default: a host already declared is never dropped by naming
+    another one. `replace` restores the old wholesale behaviour for each list
+    that was named. Tiers only ever tighten here: a host named read-only
+    leaves `allowed_hosts`, while a read-only host named as allowed STAYS
+    read-only (the read-only tier wins) and is reported, so a real machine is
+    never loosened as a side effect.
+    """
+    before_allowed = list(current.get("allowed_hosts") or [])
+    before_readonly = list(current.get("readonly_hosts") or [])
+    users = dict(current.get("ssh_users") or {}) if isinstance(
+        current.get("ssh_users"), dict) else {}
+    new_allowed = [] if replace and allowed is not None else list(before_allowed)
+    new_readonly = [] if replace and readonly is not None else list(before_readonly)
+    notes: list[str] = []
+    named: list[str] = []
+    for values, target in ((allowed, new_allowed), (readonly, new_readonly)):
+        for value in values or []:
+            host, user = _parse_host(value)
+            named.append(host)
+            if user:
+                users[host] = user
+            if host not in target:
+                target.append(host)
+    named_readonly = {_parse_host(value)[0] for value in readonly or []}
+    for host in list(new_allowed):
+        if host not in new_readonly:
+            continue
+        if host in named_readonly:
+            new_allowed.remove(host)
+        elif host in named:
+            notes.append(
+                f"'{host}' is in readonly_hosts and stays read-only; "
+                f"./sc ts remove-host {host} first to change its tier")
+    declared = set(new_allowed) | set(new_readonly)
+    users = {host: user for host, user in users.items() if host in declared}
+    before = list(dict.fromkeys([*before_allowed, *before_readonly]))
+    after = list(dict.fromkeys([*new_allowed, *new_readonly]))
+    changes = {
+        "added": [host for host in after if host not in before],
+        "kept": [host for host in after if host in before],
+        "removed": [host for host in before if host not in after],
+        "named": list(dict.fromkeys(named)),
+    }
+    if notes:
+        changes["notes"] = notes
+    return ({"allowed_hosts": new_allowed, "readonly_hosts": new_readonly,
+             "ssh_users": users}, changes)
+
+
+def _block(current: dict, fields: dict, ssh_user: str | None = None,
+           tailscale_bin: str | None = None) -> dict:
+    block = {
+        "ssh_user": ssh_user if ssh_user is not None
+        else current.get("ssh_user", ""),
+        "allowed_hosts": fields["allowed_hosts"],
+        "readonly_hosts": fields["readonly_hosts"],
+        "tailscale_bin": tailscale_bin if tailscale_bin is not None
+        else current.get("tailscale_bin", "tailscale"),
+    }
+    if fields["ssh_users"]:  # written only when used, so old blocks round-trip
+        block["ssh_users"] = fields["ssh_users"]
+    return block
+
+
+def _save_and_report(operation: str, block: dict, changes: dict,
+                     verify: bool) -> dict:
+    """Save the block, then (unless told not to) start the broker and test the
+    link. The block is durable before the checks run, so a failed check says
+    it IS saved rather than discarding it."""
+    try:
+        write(block)
+    except Exception as exc:  # a failed save must never look like a save
+        return {"ok": False, "error": "ts_write_failed", "operation": operation,
+                "message": (f"the ts block could not be saved "
+                            f"({type(exc).__name__}: {exc}) - check that "
+                            f"{ports.CONFIG} and its directory are writable "
+                            "by this user")}
+    result = {"ok": True, "operation": operation, "ts": block, "hosts": changes}
+    if not verify:
+        return {**result, "verified": False, "broker": _broker_health()}
+    broker = ensure_broker()
+    report = verify_link(block, changes.get("named") or None)
+    result.update({"verified": report["passed"], "broker": broker,
+                   "verify": report})
+    if not report["passed"]:
+        failed = [item["check"] for item in report["checks"] if not item["ok"]]
+        result.update({
+            "ok": False, "error": "ts_verify_failed", "saved": True,
+            "message": ("the ts block IS saved, but the link did not verify ("
+                        + ", ".join(failed) + "). Fix what the checks name "
+                        "and re-run, or pass --no-verify to save without "
+                        "testing."),
+        })
+    return result
 
 
 def client_main(argv: list[str]) -> int:
@@ -401,38 +695,114 @@ def client_main(argv: list[str]) -> int:
     )
     execute.add_argument("host")
     execute.add_argument("command", nargs=argparse.REMAINDER, metavar="COMMAND")
-    init = commands.add_parser("init", help="write the ts block and show broker health")
-    init.add_argument("--ssh-user")
-    init.add_argument("--allowed-host", action="append", dest="allowed_hosts")
-    init.add_argument("--readonly-host", action="append", dest="readonly_hosts")
+    init = commands.add_parser(
+        "init",
+        help="write the ts block (hosts are ADDED to the saved lists), start "
+             "the broker and test the link",
+    )
+    init.add_argument("--ssh-user", help="default remote user for every host")
+    init.add_argument("--allowed-host", action="append", dest="allowed_hosts",
+                      metavar="[USER@]HOST",
+                      help="a disposable test seat: unrestricted exec (repeatable)")
+    init.add_argument("--readonly-host", action="append", dest="readonly_hosts",
+                      metavar="[USER@]HOST",
+                      help="a machine in real use: diagnostic commands only "
+                           "(repeatable)")
     init.add_argument("--tailscale-bin")
+    init.add_argument(
+        "--replace-hosts", action="store_true",
+        help="replace each host list that is named instead of adding to it",
+    )
+    add = commands.add_parser(
+        "add-host", help="declare one more tailnet host without touching the rest"
+    )
+    add.add_argument("host", metavar="[USER@]HOST")
+    add.add_argument(
+        "--readonly", action="store_true",
+        help="declare it in readonly_hosts (diagnostic commands only)",
+    )
+    remove = commands.add_parser("remove-host", help="stop declaring one tailnet host")
+    remove.add_argument("host")
+    for command in (init, add):
+        command.add_argument(
+            "--no-verify", action="store_true",
+            help="save without testing the link or starting the broker "
+                 "(offline setup)",
+        )
     args = parser.parse_args(argv)
 
-    if args.operation == "init":
+    current: dict = {}
+    if args.operation in ("init", "add-host", "remove-host"):
         current = read() or {}
-        block = {
-            "ssh_user": args.ssh_user if args.ssh_user is not None
-            else current.get("ssh_user", ""),
-            "allowed_hosts": args.allowed_hosts if args.allowed_hosts is not None
-            else current.get("allowed_hosts", []),
-            "readonly_hosts": args.readonly_hosts if args.readonly_hosts is not None
-            else current.get("readonly_hosts", []),
-            "tailscale_bin": args.tailscale_bin if args.tailscale_bin is not None
-            else current.get("tailscale_bin", "tailscale"),
-        }
-        write(block)
-        result = {"ok": True, "ts": block, "broker": _broker_health()}
-    else:
-        try:
-            if args.operation == "status":
-                result = broker_call("GET", "/status")
+    try:
+        if args.operation == "init":
+            fields, changes = _merge_hosts(
+                current, args.allowed_hosts, args.readonly_hosts, args.replace_hosts
+            )
+            result = _save_and_report(
+                "init", _block(current, fields, args.ssh_user, args.tailscale_bin),
+                changes, not args.no_verify,
+            )
+        elif args.operation == "add-host":
+            host, _ = _parse_host(args.host)
+            if not args.readonly and host in (current.get("readonly_hosts") or []):
+                result = {
+                    "ok": False, "error": "host_is_readonly", "operation": "add-host",
+                    "message": (f"'{host}' is declared read-only; ./sc ts "
+                                f"remove-host {host} first to change its tier"),
+                }
             else:
-                command = args.command[1:] if args.command[:1] == ["--"] else args.command
-                result = broker_call(
-                    "POST", "/exec", {"host": args.host, "command": " ".join(command)}
+                fields, changes = _merge_hosts(
+                    current,
+                    None if args.readonly else [args.host],
+                    [args.host] if args.readonly else None,
+                    False,
                 )
-        except ConnectionError as exc:
-            result = _client_error(args.operation, str(exc))
+                result = _save_and_report(
+                    "add-host", _block(current, fields), changes, not args.no_verify
+                )
+        elif args.operation == "remove-host":
+            host, _ = _parse_host(args.host)
+            if host not in _declared_hosts(current):
+                result = {
+                    "ok": False, "error": "host_not_declared",
+                    "operation": "remove-host",
+                    "message": f"'{host}' is not in allowed_hosts or readonly_hosts",
+                    "declared": _declared_hosts(current),
+                }
+            else:
+                users = current.get("ssh_users")
+                fields = {
+                    "allowed_hosts": [
+                        h for h in current.get("allowed_hosts") or [] if h != host],
+                    "readonly_hosts": [
+                        h for h in current.get("readonly_hosts") or [] if h != host],
+                    "ssh_users": {
+                        h: u for h, u in (users if isinstance(users, dict) else {}).items()
+                        if h != host},
+                }
+                changes = {"added": [], "removed": [host], "named": [],
+                           "kept": list(dict.fromkeys(
+                               [*fields["allowed_hosts"], *fields["readonly_hosts"]]))}
+                result = _save_and_report(
+                    "remove-host", _block(current, fields), changes, False
+                )
+        else:
+            try:
+                if args.operation == "status":
+                    result = broker_call("GET", "/status")
+                else:
+                    command = (args.command[1:] if args.command[:1] == ["--"]
+                               else args.command)
+                    result = broker_call(
+                        "POST", "/exec",
+                        {"host": args.host, "command": " ".join(command)},
+                    )
+            except ConnectionError as exc:
+                result = _client_error(args.operation, str(exc))
+    except ValueError as exc:
+        result = {"ok": False, "error": "host_invalid",
+                  "operation": args.operation, "message": str(exc)}
     print(json.dumps(result, separators=(",", ":")))
     return 0 if result.get("ok") else 1
 
@@ -457,7 +827,8 @@ def main(argv: list[str]) -> int:
     elif mode == "validate":
         print(json.dumps(validate(argv[1] if len(argv) > 1 else "", read() or {})))
     else:
-        sys.exit("usage: ts.py [client <status|exec|init>|sock|status|exec <host> <cmd>|validate <check>]")
+        sys.exit("usage: ts.py [client <status|exec|init|add-host|remove-host>"
+                 "|sock|status|exec <host> <cmd>|validate <check>]")
     return 0
 
 

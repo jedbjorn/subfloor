@@ -14,12 +14,14 @@ Routes (all JSON `{ok, ...}`):
 
     GET  /health               liveness
     GET  /ts                   read the saved ts block
-    PUT  /ts        {ts}        write the ts block
+    PUT  /ts        {ts}        write the ts block; a failed save answers
+                               {ok: false, error: ts_write_failed, message}
     GET  /status               `tailscale status --json` -> self + peers summary
     POST /exec      {host,command,timeout?}  tailscale ssh -> {ok, exit, stdout, stderr}
                     readonly_hosts are limited to ts.READONLY_COMMANDS and
                     refuse unsafe input as {error: readonly_refused, token}
     POST /validate/{check}     one live setup check against the body's candidate cfg
+                               ({ts, hosts?}: hosts narrows peer/ssh)
 
 Verbs act on the SAVED `ts` block + a caller-named host; `/validate` tests the
 CANDIDATE block in the body (the form, before save). The socket is fs-perm gated
@@ -67,7 +69,19 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
 
+    def _guard(self, action) -> None:
+        """Every route answers JSON. An exception that escapes a handler
+        closes the connection with no reply (`Empty reply from server`), which
+        reads as a dead broker instead of the failure it is."""
+        try:
+            action()
+        except Exception as e:  # never let one bad call kill a worker thread
+            self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+
     def do_GET(self) -> None:
+        self._guard(self._do_get)
+
+    def _do_get(self) -> None:
         if self.path == "/health":
             return self._send(200, {"ok": True, "service": "ts-broker"})
         if self.path == "/ts":
@@ -77,11 +91,27 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"ok": False, "error": "no such route"})
 
     def do_PUT(self) -> None:
+        self._guard(self._do_put)
+
+    def _do_put(self) -> None:
         if self.path == "/ts":
             block = self._body().get("ts")
             if block is not None and not isinstance(block, dict):
                 return self._send(400, {"ok": False, "error": "ts must be an object"})
-            return self._send(200, {"ok": True, "ts": ts.write(block)})
+            try:
+                saved = ts.write(block)
+            except Exception as e:  # the save failed: say so, keep serving
+                return self._send(500, {
+                    "ok": False, "error": "ts_write_failed",
+                    "message": (
+                        f"the ts block was not saved ({type(e).__name__}: {e}); "
+                        "the previous block is still in effect. The broker "
+                        "process could not write the instance file - run "
+                        "`./sc ts init` or `./sc ts add-host` in the host "
+                        "operator's own terminal, which writes it directly."
+                    ),
+                })
+            return self._send(200, {"ok": True, "ts": saved})
         return self._send(404, {"ok": False, "error": "no such route"})
 
     def do_POST(self) -> None:
@@ -92,7 +122,12 @@ class Handler(BaseHTTPRequestHandler):
                                                   b.get("command", ""),
                                                   int(b.get("timeout", 120))))
             if self.path.startswith("/validate/"):
-                r = ts.validate(self.path.rsplit("/", 1)[1], self._body().get("ts") or {})
+                body = self._body()
+                hosts = body.get("hosts")
+                r = ts.validate(
+                    self.path.rsplit("/", 1)[1], body.get("ts") or {},
+                    hosts if isinstance(hosts, list) else None,
+                )
                 if r is None:
                     return self._send(404, {"ok": False, "error": "no such check"})
                 return self._send(200, r)
