@@ -858,6 +858,8 @@ def _wait_for_ssh(cfg: dict, wait: int = START_READINESS_TIMEOUT,
 def do_status() -> dict:
     """Observe broker-owned VM state without starting, restarting, or resetting."""
     cfg = read() or {}
+    if not cfg:
+        return {"ok": False, "error": "vm_not_linked", "output": NOT_LINKED_MESSAGE}
     if m := _missing(cfg, "domain", "ssh_host", "ssh_user", "ssh_key_path"):
         return {"ok": False, "output": m}
     state_ok, state = _domain_state(cfg)
@@ -1329,9 +1331,17 @@ def _transfer_roots() -> tuple[Path, Path]:
 # (decision #353). The engine directory and the repository's own object store
 # are pull-side exclusions that matter as much: a pull destination in either
 # rewrites the running engine, or the repository itself, from guest bytes.
+# `.sc-state/local/remotes/` holds the known-hosts files the broker pins for
+# named remotes; a pull must not overwrite a pin with bytes from a remote.
+#
+# `./sc vm` and `./sc remote` share these through `transfer_path` so the two
+# transfer paths cannot drift apart. This is key hygiene - a key is never
+# copied to a guest or overwritten from one - not a boundary that confines
+# the caller.
 _PUSH_EXCLUDED = ((".sc-state", "local", "vm"),)
 _PULL_EXCLUDED = (
     (".sc-state", "local", "vm"),
+    (".sc-state", "local", "remotes"),
     (".super-coder",),
     (".git",),
 )
@@ -1398,6 +1408,17 @@ def _local_path(
     return path, None
 
 
+def transfer_path(value: str, direction: str) -> tuple[Path | None, dict | None]:
+    """Resolve one local push source or pull destination for ANY seat.
+
+    The single place the transfer roots and their carved-out sub-trees are
+    applied, used by `./sc vm` and `./sc remote` alike. `direction` is "push"
+    (a local source) or "pull" (a local destination).
+    """
+    excluded = _PUSH_EXCLUDED if direction == "push" else _PULL_EXCLUDED
+    return _local_path(str(value), _transfer_roots(), excluded)
+
+
 def _guest_path(path: str) -> str:
     """A guest path in the only separator scp's SFTP mode reads correctly.
 
@@ -1438,8 +1459,7 @@ def do_push(src: str, dest: str | None = None) -> dict:
         return {"ok": False, "output": m}
     if not str(src or "").strip():
         return {"ok": False, "output": "push: source is empty"}
-    roots = _transfer_roots()
-    source, error = _local_path(str(src), roots, _PUSH_EXCLUDED)
+    source, error = transfer_path(str(src), "push")
     if error:
         return error
     assert source is not None
@@ -1485,8 +1505,7 @@ def do_pull(src: str, dest: str) -> dict:
         return {"ok": False, "output": "pull: guest source is empty"}
     if not str(dest or "").strip():
         return {"ok": False, "output": "pull: destination is empty"}
-    roots = _transfer_roots()
-    destination, error = _local_path(str(dest), roots, _PULL_EXCLUDED)
+    destination, error = transfer_path(str(dest), "pull")
     if error:
         return error
     assert destination is not None
@@ -1892,6 +1911,34 @@ def broker_call(method: str, path: str, body: dict | None = None,
     if not isinstance(decoded, dict):
         raise BrokerResponseError("broker response JSON was not an object")
     return decoded
+
+
+NOT_LINKED_MESSAGE = (
+    "no VM is linked on this install, so there is nothing for the broker to "
+    "serve - link one with ./sc vm adopt --domain <domain> --ssh-user <user> "
+    "(Windows guest) or ./sc vm init --domain ... (a guest you prepared)"
+)
+BROKER_DOWN_MESSAGE = (
+    "a VM is linked but the VM broker is not running - start it on the host "
+    "with ./sc vm-broker-up"
+)
+
+
+def broker_unreachable_error(operation: str) -> dict:
+    """Name WHICH of the two cases a dead socket is.
+
+    `./sc vm-broker-up` deliberately starts nothing when no `vm` or `remotes`
+    block exists, so "start the broker" is the wrong fix for an unlinked
+    install. The client reads the same instance.json the broker would, so it
+    can tell the cases apart without the broker.
+    """
+    try:
+        linked = bool(read())
+    except Exception:  # an unreadable instance file is not "unlinked"
+        linked = True
+    if not linked:
+        return operation_error(operation, "vm_not_linked", NOT_LINKED_MESSAGE, {})
+    return operation_error(operation, "broker_unreachable", BROKER_DOWN_MESSAGE, {})
 
 
 def _bounded(value: object) -> object:
@@ -2345,9 +2392,7 @@ def _mcp_broker_call(method: str, path: str) -> tuple[dict | None, dict | None]:
             "mcp", "mcp_timeout", "the MCP broker operation timed out"
         )
     except BrokerConnectionError:
-        return None, operation_error(
-            "mcp", "broker_unreachable", "the VM broker is not reachable"
-        )
+        return None, broker_unreachable_error("mcp")
     except BrokerResponseError:
         return None, operation_error(
             "mcp", "broker_response_invalid",
@@ -2620,12 +2665,7 @@ def run_operation(operation: str, *, command: str | None = None,
                 {"domain_state": "unknown"},
             )
         if operation == "reset":
-            return operation_error(
-                operation,
-                "broker_unreachable",
-                "the VM broker is not reachable",
-                {},
-            )
+            return broker_unreachable_error(operation)
         return operation_error(
             operation,
             f"{operation}_timeout",
@@ -2640,12 +2680,7 @@ def run_operation(operation: str, *, command: str | None = None,
                 "the broker connection closed before reset could be confirmed",
                 {"domain_state": "unknown"},
             )
-        return operation_error(
-            operation,
-            "broker_unreachable",
-            "the VM broker is not reachable",
-            {},
-        )
+        return broker_unreachable_error(operation)
     except BrokerResponseError:
         if operation == "reset":
             return operation_error(
@@ -2838,10 +2873,211 @@ def run_init(config: dict) -> dict:
     })
 
 
+# -- link-time verification (shared by `vm init` and `remote add`) -----------
+#
+# A link command that only writes a block reports "saved" for a domain that
+# does not exist or a key the guest refuses. These run the same validators the
+# GUI wizard uses, at link time, and say what to run next for each failure.
+
+BROKER_START_WAIT = 20
+BROKER_START_INTERVAL = 1
+BROKER_START_TIMEOUT = 120
+LINK_CHECK_TIMEOUT = 150
+LINK_NEXT = {
+    "domain": (
+        "list the host's domains with `virsh list --all` (pass --libvirt-uri "
+        "when it is not the default connection), then re-run ./sc vm init "
+        "--domain <name>"
+    ),
+    "ssh": (
+        "make sure the guest is running and that --ssh-host, --ssh-user and "
+        "--ssh-key-path are right, then re-run ./sc vm init; a Windows guest "
+        "is prepared end to end by ./sc vm adopt"
+    ),
+    "snapshot": (
+        "name a snapshot that exists (./sc vm snapshot list) with ./sc vm "
+        "init --snapshot <name>, or take it with ./sc vm bake <name>"
+    ),
+    "toolchain": (
+        "provision the guest (./sc vm adopt, or install over ./sc vm exec), "
+        "then keep it with ./sc vm bake"
+    ),
+}
+
+
+def _broker_ready() -> bool:
+    try:
+        return broker_call("GET", "/health", None, timeout=5).get("ok") is True
+    except (BrokerConnectionError, BrokerTimeoutError, BrokerResponseError):
+        return False
+
+
+def _dispatch_broker_up() -> tuple[bool, str]:
+    """Run `./sc vm-broker-up` the way adoption does: one fixed dispatcher verb.
+
+    Kept as its own seam so tests replace it - it starts a real host process.
+    """
+    dispatch = ports.ENGINE / "scripts" / "dispatch.sh"
+    root = repo_root()
+    try:
+        process = subprocess.run(
+            ["sh", str(dispatch), "vm-broker-up"], capture_output=True,
+            text=True, cwd=str(root), timeout=BROKER_START_TIMEOUT, check=False,
+            env={**os.environ, "SC_CALLER_ROOT": str(root)},
+            encoding="utf-8", errors="replace",
+        )
+    except FileNotFoundError as exc:
+        return False, f"command not found: {exc.filename}"
+    except subprocess.TimeoutExpired:
+        return False, f"vm-broker-up: timed out (>{BROKER_START_TIMEOUT}s)"
+    return process.returncode == 0, (process.stdout + process.stderr).strip()
+
+
+def ensure_broker() -> dict:
+    """Make sure the broker serves the block that was just saved.
+
+    Already answering -> nothing to do. On the host -> start it exactly as
+    `./sc vm adopt` does and wait for the socket. In a sandbox the broker
+    cannot be started from here, so the exact host command is returned
+    instead of a guess.
+    """
+    state = {"ready": False, "started": False, "start_command": "./sc vm-broker-up"}
+    if _broker_ready():
+        return {**state, "ready": True}
+    if os.environ.get("SC_SANDBOX"):
+        return {
+            **state,
+            "detail": "the broker runs on the host; run ./sc vm-broker-up there",
+        }
+    ok, output = _dispatch_broker_up()
+    if not ok:
+        return {**state, "detail": output[:300] or "./sc vm-broker-up failed"}
+    deadline = time.monotonic() + BROKER_START_WAIT
+    while True:
+        if _broker_ready():
+            return {**state, "ready": True, "started": True}
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(BROKER_START_INTERVAL)
+    return {
+        **state,
+        "detail": (
+            f"the broker did not answer within {BROKER_START_WAIT}s of "
+            "./sc vm-broker-up - read .super-coder/run/vm-broker.log"
+        ),
+    }
+
+
+def _link_check(check: str, config: dict) -> dict | None:
+    """One validator result, or None when it could not be run at all.
+
+    The validators need `virsh` and the key, which only the host has; a
+    sandboxed caller asks the broker to run them against the candidate block.
+    """
+    if not os.environ.get("SC_SANDBOX"):
+        return validate(check, config)
+    try:
+        response = broker_call(
+            "POST", f"/validate/{check}", {"vm": config},
+            timeout=LINK_CHECK_TIMEOUT,
+        )
+    except (BrokerConnectionError, BrokerTimeoutError, BrokerResponseError):
+        return None
+    return response if isinstance(response.get("ok"), bool) else None
+
+
+def verify_link(config: dict) -> dict:
+    """Run every setup check against `config`; pass/fail and a next step each."""
+    checks: list[dict] = []
+    ssh_ok = True
+    for check in CHECKS:
+        if check == "toolchain" and not ssh_ok:
+            checks.append({
+                "check": check, "ok": False, "skipped": True,
+                "output": "not run: it needs the ssh check to pass first",
+                "next": None,
+            })
+            continue
+        result = _link_check(check, config)
+        if result is None:
+            entry = {
+                "check": check, "ok": False, "skipped": True,
+                "output": "not run: the VM broker is not reachable from here",
+                "next": "./sc vm-broker-up on the host, then re-run ./sc vm init",
+            }
+        else:
+            ok = bool(result["ok"])
+            entry = {
+                "check": check, "ok": ok, "skipped": False,
+                "output": str(result.get("output") or "")[:300],
+                "next": None if ok else LINK_NEXT[check],
+            }
+        if check == "ssh":
+            ssh_ok = entry["ok"]
+        checks.append(entry)
+    return {"passed": all(item["ok"] for item in checks), "checks": checks}
+
+
+def link_lines(checks: list, broker: dict | None) -> list[str]:
+    """Human lines for a link report: one per check, then the broker state."""
+    lines = []
+    for item in checks or []:
+        if not isinstance(item, dict):
+            continue
+        mark = "✓" if item.get("ok") else ("-" if item.get("skipped") else "✗")
+        detail = str(item.get("output") or "").strip().splitlines()
+        lines.append(
+            f"  {mark} {item.get('check')}"
+            + (f": {detail[0][:160]}" if detail and not item.get("ok") else "")
+        )
+        if item.get("next"):
+            lines.append(f"      next: {item['next']}")
+    if isinstance(broker, dict):
+        if broker.get("ready"):
+            lines.append(
+                "  broker started" if broker.get("started") else "  broker ready"
+            )
+        else:
+            lines.append(
+                f"  broker not running; start: {broker.get('start_command')}"
+                + (f" ({broker['detail']})" if broker.get("detail") else "")
+            )
+    return lines
+
+
+def verify_init(config: dict) -> dict:
+    """The verifying half of `./sc vm init`, run after the block is saved.
+
+    The block is ALREADY durable when this runs: a failed check reports
+    `init_verify_failed` and says so, rather than discarding a block the
+    operator may be fixing one field at a time. `--no-verify` skips this.
+    """
+    broker = ensure_broker()
+    verify = verify_link(config)
+    if verify["passed"]:
+        return operation_success(
+            "init", {"vm": config, "broker": broker, "verify": verify}
+        )
+    failed = [item["check"] for item in verify["checks"] if not item["ok"]]
+    return operation_error(
+        "init", "init_verify_failed",
+        "the vm block IS saved, but the link did not verify ("
+        + ", ".join(failed) + "). Fix what the checks name and re-run "
+        "./sc vm init, or pass --no-verify to save without testing.",
+        {"saved": True, "checks": verify["checks"], "broker": broker},
+    )
+
+
 def _human_result(value: dict) -> str:
     if not value["ok"]:
         error = value["error"]
-        return f"✗ {value['operation']} [{error['code']}]: {error['message']}"
+        head = f"✗ {value['operation']} [{error['code']}]: {error['message']}"
+        details = error.get("details") or {}
+        if error["code"] == "init_verify_failed":
+            return "\n".join(
+                [head, *link_lines(details.get("checks"), details.get("broker"))]
+            )
+        return head
     operation = value["operation"]
     result = value["result"]
     if operation == "status":
@@ -2893,9 +3129,17 @@ def _human_result(value: dict) -> str:
         action = "started" if result["started"] else "already running"
         return f"VM {action} · SSH ready after {result['ssh']['attempts']} attempt(s)"
     if operation == "init":
+        if "verify" in result:
+            return "\n".join([
+                "VM configuration saved · link verified",
+                *link_lines(result["verify"]["checks"], result["broker"]),
+            ])
         if result["broker"]["ready"]:
-            return "VM configuration saved · broker ready"
-        return "VM configuration saved · broker not running; start: ./sc vm-broker-up"
+            return "VM configuration saved (not verified) · broker ready"
+        return (
+            "VM configuration saved (not verified) · broker not running; "
+            "start: ./sc vm-broker-up"
+        )
     if operation == "stop":
         action = "force-stopped" if result["forced"] else (
             "stopped" if result["stopped"] else "already powered off"
@@ -2998,7 +3242,9 @@ def client_main(argv: list[str]) -> int:
     )
     adopt.add_argument("--json", action="store_true", help="print one JSON result object")
     init = commands.add_parser(
-        "init", help="write the vm block from explicit flags and report broker health"
+        "init",
+        help="write the vm block from explicit flags, start the broker and "
+             "test the link (domain, ssh, snapshot, declared checks)"
     )
     init.add_argument("--domain")
     init.add_argument("--snapshot")
@@ -3019,6 +3265,11 @@ def client_main(argv: list[str]) -> int:
     init.add_argument(
         "--known-hosts-path",
         help="host-side known_hosts file pinning the guest host key",
+    )
+    init.add_argument(
+        "--no-verify", action="store_true",
+        help="save the block without testing the link or starting the broker "
+             "(offline setup)",
     )
     init.add_argument("--json", action="store_true", help="print one JSON result object")
     status = commands.add_parser(
@@ -3312,6 +3563,8 @@ def client_main(argv: list[str]) -> int:
             )
         else:
             value = run_init(config)
+            if value["ok"] and not args.no_verify:
+                value = verify_init(config)
             if args.transfer_dir is not None and not args.json:  # retired-compat (spec #232)
                 print(
                     "note: --transfer-dir is retired and was ignored — the "  # retired-compat (spec #232)
