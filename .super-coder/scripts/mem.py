@@ -96,8 +96,9 @@ Exit status (the same table `sc mem --help` prints):
        render failed: that is a warning (a `warning` field under --json), so a
        retry never duplicates the row
     1  refused or failed — the API answered an error, is unreachable or
-       unwired, or the client refused the arguments; nothing was written
-       unless the message says the write MAY have landed (a lost receipt)
+       unwired, or the client refused the arguments; the write did not land
+       unless the message says it MAY have (a lost receipt). A several-id
+       call that stops part-way has applied the ids before the one it names
     2  usage error (unknown verb/flag, missing argument), or a runtime
        credential outside the trust boundary
 
@@ -373,8 +374,9 @@ exit status:
      render failed (a warning; `warning` field under --json), so a retry
      never duplicates the row
   1  refused or failed — the API answered an error, is unreachable or
-     unwired, or the client refused the arguments; nothing was written
-     unless the message says the write MAY have landed
+     unwired, or the client refused the arguments; the write did not land
+     unless the message says it MAY have (a lost receipt). A several-id
+     call that stops part-way has applied the ids before the one it names
   2  usage error (unknown verb/flag, missing argument), or a runtime
      credential outside the trust boundary
 
