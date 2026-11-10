@@ -95,7 +95,7 @@ Any other shell's worktree: `is_main: false` + `dirty > 0`.
 - NEVER act on a worktree whose shell may be live — surface instead.
 - NEVER merge a PR — opening is the default; merging is the FnB's gate.
 - NEVER delete a branch carrying unmerged, un-PR'd work — no PR = lost work.
-- NEVER touch the engine — `.super-coder/` is a gitignored materialized dependency, not your code.
+- In a tracking fork, NEVER touch the engine — there `.super-coder/` is a gitignored materialized dependency, not your code. In the Subfloor source repo it is tracked project source: treat a branch or dirty file under it as work like any other (Tier B/C), and land engine changes by branch and PR, never as a cleanup edit.
 
 ## Step 3 — Report
 

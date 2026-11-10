@@ -64,7 +64,9 @@ candidate reusable process. Follow the recommendation route in
 `skills: recommend <topic>` issue or open one. Curation never creates or
 promotes a skill. Keep one compressed L&S entry carrying the knowledge until a
 reviewed upstream skill ships **and is granted**; filing is not grounds to
-retire it. If issue search or creation is unavailable, surface the failure to
+retire it. In the Subfloor source repo "upstream" is this repo: the same
+search-then-file route applies, and an accepted skill is authored here by
+branch and PR. If issue search or creation is unavailable, surface the failure to
 the FnB, keep the L&S, and create no local skill or asset.
 
 ## Pass 4 — Category
