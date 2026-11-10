@@ -1,6 +1,6 @@
 ---
 name: self_update
-description: Update the Subfloor engine in place — in a fork, fetch + materialize new code + migrations; in the source repo, reconcile the tracked engine after a merge. All memory intact; sound rollback. The shell hands off to its own next boot. Use when a Subfloor update is available or an engine change just merged.
+description: Update the Subfloor engine in place with sc update; use when an update is available or an engine change just merged in the source repo. In a fork it fetches + materializes new code + migrations; in the source repo it reconciles the tracked engine. All memory intact; sound rollback. The shell hands off to its own next boot.
 category: substrate
 command: sc update
 common: false

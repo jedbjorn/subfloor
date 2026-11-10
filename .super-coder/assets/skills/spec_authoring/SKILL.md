@@ -1,6 +1,6 @@
 ---
 name: spec_authoring
-description: Load before you create a roadmap feature, write or revise a spec, set or check acceptance criteria, bring a spec into a Sprint, move or freeze a spec, or write a shipped feature's doc. Holds the feature/spec/doc model, posture-then-challenge, the acceptance feasibility walk, the spec contract, and the revise/freeze/document commands. Planner.
+description: Planner spec procedures; load before you create a feature, write or revise a spec, set acceptance criteria, or freeze and document one. Holds the feature/spec/doc model, posture-then-challenge, the acceptance feasibility walk (also for a spec entering a Sprint), the spec contract, and the revise, move, freeze, document, and retire commands.
 category: workflow
 common: false
 ---

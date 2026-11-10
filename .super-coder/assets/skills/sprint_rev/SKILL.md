@@ -1,6 +1,6 @@
 ---
 name: sprint_rev
-description: Review Sprints v2 work and whole-Sprint conformance — own review, re-enter, abort, and conclude judgments, author the conformance and Sprint reports, and direct safety actions through durable messages. Inside an armed Sprint the recorded verdict replaces the Reviewer boot's FnB-gated handoff.
+description: Review Sprints v2 work units and whole-Sprint conformance as Reviewer; load after sprint_protocol in every Sprint review turn. Own review, re-enter, abort, and conclude judgments, author the conformance and Sprint reports, and direct safety actions through durable messages. Inside an armed Sprint the recorded verdict replaces the Reviewer boot's FnB-gated handoff.
 category: workflow
 common: false
 ---

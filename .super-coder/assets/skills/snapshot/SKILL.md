@@ -1,6 +1,6 @@
 ---
 name: snapshot
-description: Admin work — serialize the live DB to the gitignored local snapshot and refresh the flat renders with sc snapshot, sc render flat, and sc render-check. Load before a rebuild, after authoring skills or documents that must survive one, or when render-check is red. A working shell never runs it; generated instance state never enters Git.
+description: Admin work that serializes the live DB to the local snapshot and refreshes flat renders; load before a rebuild or when render-check is red. Runs sc snapshot, sc render flat, and sc render-check, also after authoring skills or documents that must survive a rebuild. A working shell never runs it; generated instance state never enters Git.
 category: substrate
 command: sc snapshot
 common: false

@@ -1,6 +1,6 @@
 ---
 name: curate
-description: The periodic L&S sweep. Run when the STATUS L&S line says "curation due" — resolve contradictions, merge entries stating one rule, recommend recurring processes upstream, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.
+description: The periodic L&S sweep; run it when the STATUS L&S line says "curation due". Resolve contradictions, merge entries stating one rule, recommend recurring processes upstream, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.
 category: substrate
 common: true
 ---

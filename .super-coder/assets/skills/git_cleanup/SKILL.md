@@ -1,6 +1,6 @@
 ---
 name: git_cleanup
-description: Admin-only — triage and clean the repo's git state across main + every worktree. The acting sibling of git_hygiene.py's read pass: delete what's provably merged, preserve (never discard) outstanding work, sync to remote. Use when the FnB asks to tidy/clean git, prune branches, or reconcile worktrees.
+description: Admin-only cleanup of git state across main and every worktree; load when the FnB asks to tidy git, prune branches, or reconcile worktrees. The acting sibling of git_hygiene.py's read pass: delete what's provably merged, preserve (never discard) outstanding work, sync to remote.
 category: substrate
 common: false
 ---

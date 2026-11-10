@@ -1,6 +1,6 @@
 ---
 name: git
-description: Load when a Git step goes beyond the every-session rules in your boot — a push or gh call fails on auth, the FnB hands you a stack to merge, a PR just merged and your tree needs cleanup, you are unsure whether a file may be committed (engine, renders, generated config), or you need to know which repo and worktree you are in. Sync, branch, PR, merge gate, and finish stay in boot.
+description: Git event procedures beyond the boot rules; load on a GitHub auth failure, a stack merge, after-merge cleanup, or doubt about what to commit. Also holds the run-receipt rules and which repo and worktree you are in. Sync, branch, PR, merge gate, and finish stay in boot.
 category: substrate
 common: false
 ---
@@ -60,12 +60,16 @@ Only after the PR is merged:
 
 NEVER delete a branch carrying unmerged, un-PR'd work — no PR = lost work.
 
-## Run receipts
+## RUN RECEIPTS
 
-Attach a finished local run to its PR or work unit with
-`sc job attach <id> --pr <number>|--work-unit <id>` (`sc job attach --help`).
-The rules live in the Developer boot's RUN RECEIPTS section; a receipt
-supplements CI and never authorizes a merge.
+Attach completed local evidence by run id with `sc job attach <id> --pr <number>`
+or `sc job attach <id> --work-unit <id>`. The run and target must share an owner;
+a PR must already be registered. Use `--repository owner/name` if its number is
+ambiguous. The Runs drawer and fleet offer the same attachment action.
+Receipts show beside the observed GitHub check in Chats and the Sprint board.
+A commit outside the PR head's ancestry is stale; unavailable ancestry stays
+unknown. Pruned logs retain their receipt. Receipts supplement CI evidence;
+only GitHub checks and the existing merge grant authorize a merge.
 
 ## Never commit the engine or derived files
 

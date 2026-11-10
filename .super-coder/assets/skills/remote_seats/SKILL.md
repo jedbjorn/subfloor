@@ -1,6 +1,6 @@
 ---
 name: remote_seats
-description: Drive another machine through the host vm-broker — posture 1 owns a test VM's lifecycle with sc vm (start, exec, push/pull, snapshot, reset); posture 2 runs exec, push, and pull against named remotes with sc remote. Load before touching a test seat or named remote. Opt-in; Linux targets need nothing more, Windows adds windows_testing.
+description: Drive a test VM or named remote through the host vm-broker with sc vm and sc remote; load before touching a test seat or named remote. Posture 1 owns a test VM's lifecycle (start, exec, push/pull, snapshot, reset); posture 2 runs exec, push, and pull against named remotes. Opt-in; Linux targets need nothing more, Windows adds windows_testing.
 category: substrate
 command: sc remote
 common: false
@@ -12,14 +12,16 @@ common: false
 
 GitHub has history and a test VM has snapshots, so a mistake there is
 recoverable. A machine in real use — a workstation, a server, production — has
-no undo, so there you run read-only diagnostics unless the FnB assigned the
-change. That is a precaution against accidents, not distrust. The class of
+no undo, so there you run read-only diagnostics unless your mandate or an
+explicit FnB assignment covers the change. That is a precaution against accidents, not distrust. The class of
 machine decides, not the route: a test seat reached over the tailnet is still
 a test seat.
 
 A test seat is disposable and shared. Any shell may reset one to its snapshot
 at the end of its own session without asking, on every OS. Refreshing the
-shared snapshot itself is the owner's call (decision #434).
+shared snapshot itself is the owner's call: a shell that keeps reinstalling
+the same dependencies proposes a snapshot refresh to the FnB instead of
+absorbing the cost (decision #434).
 
 ## Access model
 
@@ -98,9 +100,9 @@ host-key pin live there); a pull destination inside `.super-coder/` or `.git/`
 is refused too. Add `--json` to any verb for one result object.
 
 The VM is a disposable test box, so install, reconfigure, snapshot, and reset
-are yours (decision #372). `bake` replaces the baseline every later session
-resets to: that is the snapshot refresh decision #434 leaves to the owner, so
-bake when the FnB asked for it or agreed.
+are yours (decision #434). `bake` replaces the baseline every later session
+resets to: that is the snapshot refresh the same decision leaves to the owner,
+so propose it and bake when the FnB asked for it or agreed.
 
 Sharing rule: the broker's mutation lock is the only concurrency control, so
 read `status` first, do not start, reset, or snapshot a VM another shell is
@@ -129,7 +131,9 @@ The ones you act on:
 
 | Code | Do |
 |---|---|
-| `broker_unreachable` | report the printed start command to the FnB |
+| `vm_not_linked` | no `vm` block exists; starting the broker fixes nothing. Ask the FnB to link a VM with `./sc vm adopt` or `./sc vm init` |
+| `remote_not_found` | the name is undeclared (also the answer when the broker is down and the remote was never added); check `./sc remote list`, then ask the FnB to add it |
+| `broker_unreachable` | a seat is linked but the broker is down; report the printed start command (`./sc vm-broker-up`) to the FnB |
 | `vm_busy` | another call holds the mutation lock and nothing was attempted; wait, then retry |
 | `remote_path_not_allowed` | move the file inside the repo or `.sc-state/local/` |
 | `remote_unreachable`, `remote_exec_failed`, `exec_failed`, `push_failed`, `pull_failed` | read `stderr` or the message; report, do not retry blindly |
@@ -138,7 +142,12 @@ The ones you act on:
 | `stop_timeout`, `reset_result_unknown`, `<operation>_timeout` | the final state is unconfirmed and the work may still be running; read `status`, report it, do not retry blindly |
 | any `adopt_*` | adoption is the FnB's host-only command (`adopt_sandboxed` says so from a sandbox); report the code and message verbatim. `adopt_host_key_changed` names a pin file and the `rm` that clears it — leave that removal to the FnB. After `adopt_broker_failed` the `vm` block IS written: the resume is `./sc vm-broker-up`, then adopt again |
 
-Any other code names host configuration (keys, the saved block, the host's
-OpenSSH): report it. Do not hand-install keys, aliases, or known-hosts entries,
+Other codes fall into two groups. Argument errors are yours to correct:
+`remote_name_invalid`, `snapshot_name_invalid`, `pull_source_invalid`,
+`pull_destination_invalid`, `push_source_invalid`, and an empty command's
+`exec_validation_failed`. Host-configuration errors are reported: keys
+(`remote_key_invalid`), the saved block (`remote_config_invalid`,
+`bake_config_write_failed`), the host's OpenSSH (`scp_unsupported`,
+`exec_unavailable`). Do not hand-install keys, aliases, or known-hosts entries,
 and do not open a raw `ssh` to a target the broker serves. If a target needs
 something the broker does not give you, stop and report it.

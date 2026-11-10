@@ -1,6 +1,6 @@
 ---
 name: spec_execution
-description: Load before you build against a feature spec, task, or work unit, and before you choose which tests prove a change. Holds spec selection, the pre-plan analysis, the task ledger, one-task-at-a-time execution, verification, the ship and docs handoff, and the testing posture (smallest affected gate, long-running checks, CI fallback, when the full suite runs). Developer.
+description: Developer spec loop and testing posture; load before you build against a spec or work unit, or pick the tests that prove a change. Holds spec selection, the pre-plan analysis, the task ledger, one-task-at-a-time execution, verification, the ship and docs handoff, and the testing posture (smallest affected gate, long-running checks by seat, CI fallback, when the full suite runs).
 category: workflow
 common: false
 ---
@@ -65,11 +65,15 @@ below applies to every change.
 
 - **What to run.** Run every available smallest affected test target that
   proves the changed behavior and realistic failure paths.
-- **Long checks.** Use `sc job start --label gate -- <command and args>` for
-  checks that may outlive the current tool call or session. After confirmed
-  registration/start, end the turn and continue on the owner wake; inspect
-  `sc job status <id>` and `sc job tail <id>`. A lost outcome is unknown,
-  never a pass. Do not set up independent watchers.
+- **Long checks.** Start any check that may outlive the current tool call or
+  session as a registered job, then follow your seat's rule (boot WAKES):
+<!-- sc-root-only: commands carried verbatim from the Developer template; bare `sc` works the same from a worktree -->
+  Use `./sc job start --label gate -- <command and args>` for checks that may outlive the current tool call or session. Inspect a run with `./sc job status <id>` and `./sc job tail <id>`.
+  On a headless seat the engine's wakes are the watcher: after confirmed
+  registration/start, end the turn and continue on the owner wake, and do not
+  set up independent watchers or poll. On a terminal seat no wake reaches a
+  running session, so set up your own bounded monitors for the PRs, checks,
+  and jobs you are waiting on. A lost outcome is unknown, never a pass.
 - **CI fallback.** Complete the implementation before using CI fallback. If a
   focused local gate cannot execute because the selected interpreter, runner,
   or declared dependency is unavailable, record the exact evidence, run the

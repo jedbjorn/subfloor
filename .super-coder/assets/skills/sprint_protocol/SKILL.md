@@ -1,6 +1,6 @@
 ---
 name: sprint_protocol
-description: The shared Sprints v2 protocol every participant follows — lifecycle, wake types, inbox/accept/decline, the typed relay with stable keys, the one handoff order and body limit, artifact paths, receipt recovery, and the authority boundary. Load first in every Sprint turn, then your role skill.
+description: The shared Sprints v2 protocol for every participant; load it first in every Sprint turn, then your role skill. Covers lifecycle, wake types, inbox/accept/decline, the typed relay with stable keys, the one handoff order and body limit, artifact paths, receipt recovery, and the authority boundary.
 category: workflow
 common: false
 ---

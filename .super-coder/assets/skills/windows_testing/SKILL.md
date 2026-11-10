@@ -14,7 +14,9 @@ never need it.
 
 The Windows guest is a test seat: mistakes there are recoverable from its
 snapshot, so work freely and reset it at the end of your own session without
-asking. Refreshing the shared baseline is the owner's call (decision #434).
+asking. Refreshing the shared baseline is the owner's call: if you keep
+reinstalling the same dependencies, propose a refresh to the FnB instead of
+absorbing the cost (decision #434).
 
 ## Preparing a Windows guest
 
@@ -71,7 +73,7 @@ running `./sc vm adopt` again, or doing it by hand over `./sc vm exec` and then
 The guest is a disposable test box: it holds no real data and no real accounts,
 snapshots are free, and the FnB owns the physical host. So install software,
 change settings, schedule tasks, snapshot and reset are all yours
-(decision #372). Snapshot before a risky change and reset to it when the change
+(decision #434). Snapshot before a risky change and reset to it when the change
 goes wrong. `./sc vm snapshot create <name>` is allowed while the domain is
 running, but many hosts cannot checkpoint a live guest (a host-passthrough CPU
 with non-migratable flags, UEFI pflash) and answer `snapshot_live_unsupported`.

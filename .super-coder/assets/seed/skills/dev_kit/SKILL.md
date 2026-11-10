@@ -1,6 +1,6 @@
 ---
 name: dev_kit
-description: Load before you run or diagnose sc deps, sc test, sc lint, or sc typecheck, when a hook reports any state but ready, or when you plan what this fork's seats can prove. Holds the fork's declared development hooks, execution seat, readiness states, evidence locations, and supported recovery surfaces. Planner-only on demand; Developer and Reviewer receive the same inventory in boot.
+description: The fork's dev hooks and seats; load before you run or diagnose sc deps, sc test, sc lint, or sc typecheck, or plan what a seat can prove. Holds the fork's declared development hooks, execution seat, readiness states, evidence locations, and supported recovery surfaces. Planner-only on demand; Developer and Reviewer receive the same inventory in boot.
 category: substrate
 common: false
 ---
@@ -84,6 +84,6 @@ deployment ritual, database technique, or VM lifecycle.
 ## Run receipts
 
 Attach a finished local run to its PR or work unit with
-`sc job attach <id> --pr <number>|--work-unit <id>` (`sc job attach --help`).
-The rules live in the Developer boot's RUN RECEIPTS section; a receipt
-supplements CI and never authorizes a merge.
+`sc job attach <id> --pr <number>|--work-unit <id>`. The ownership,
+registration, and stale-ancestry rules are the RUN RECEIPTS section of the
+`git` skill; a receipt supplements CI and never authorizes a merge.

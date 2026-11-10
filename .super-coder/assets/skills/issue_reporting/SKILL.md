@@ -1,6 +1,6 @@
 ---
 name: issue_reporting
-description: Report engine defects — the moment a sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. From a fork, file a GitHub issue on Subfloor (app bugs stay in the fork); in the Subfloor source repo, flag it and fix it here.
+description: Report an engine defect the moment a sc command fails or lies, a skill contradicts reality, or you work around the engine. Also when the API blocks a documented workflow. From a fork, file a GitHub issue on Subfloor (app bugs stay in the fork); in the Subfloor source repo, flag it and fix it here.
 category: substrate
 common: true
 ---

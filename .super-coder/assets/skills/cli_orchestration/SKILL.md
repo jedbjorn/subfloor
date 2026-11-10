@@ -1,6 +1,6 @@
 ---
 name: cli_orchestration
-description: Planner-run delivery from a terminal seat — the FnB names the work, you stay the oversight layer, and native or cross-harness CLI agents verify the spec, build, review, deploy to Dev, and verify. Covers the kickoff contract, agent launch per harness (Claude, Codex, Kimi), terminal-seat PR/CI monitors, the FnB's merge and deploy directives, acceptance review, and cleanup.
+description: Planner-run delivery from a terminal seat; load when the FnB assigns work in this chat for you to orchestrate with CLI agents. You stay the oversight layer while native or cross-harness agents verify the spec, build, review, deploy to Dev, and verify. Covers the kickoff contract, agent launch per harness (Claude, Codex, Kimi), terminal-seat PR/CI monitors, the FnB's merge and deploy directives, acceptance review, and cleanup.
 category: workflow
 common: false
 ---
@@ -45,13 +45,15 @@ Tell the FnB that this work needs a terminal session and stop.
    batch:
    - Spec freshness. The spec may name sites that have moved on main. Offer
      a spec-verification agent before dev starts.
-   - Merge authority. Your boot's merge gate has two forms and this loop
-     runs outside an armed Sprint, so only the first applies: an explicit FnB
-     directive naming the PR. Ask for it here: which of this assignment's PRs
-     you may merge, and on what condition, for example "green and review
-     clean". The FnB's answer is that directive for those PRs. It is not a
-     standing grant or a third form: no answer, a PR outside the assignment,
-     or an unmet condition -> report the PR as ready and wait.
+   - Merge authority. This loop runs outside an armed Sprint, so your boot's
+     merge gate applies in its first form: merge only on an explicit FnB
+     directive that identifies the PR. The directive may name the PR by
+     number, or name an assignment and the condition its PRs must meet (for
+     example "merge this assignment's PRs once green and review clean"); that
+     kind covers only that assignment's PRs, and only once the stated
+     condition is met. Ask for that directive here. It is not a standing
+     grant or a third form: no answer, a PR outside the assignment, or an
+     unmet condition -> report the PR as ready and wait.
    - Deploy authority. Ask for the target (Dev only, unless the FnB says
      otherwise), when to deploy, and whether a final deploy at the end
      replaces the intermediate ones.

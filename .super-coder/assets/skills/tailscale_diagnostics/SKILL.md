@@ -1,6 +1,6 @@
 ---
 name: tailscale_diagnostics
-description: Observe declared tailnet hosts through the host ts-broker with sc ts — tailnet status and a fixed read-only diagnostic verb table on readonly_hosts. Load before running anything on a tailnet host. Read-only applies to machines in real use; a test seat reached over the tailnet is still a test seat. Opt-in; a readonly_refused answer is a stop, never something to work around.
+description: Observe declared tailnet hosts through the host ts-broker with sc ts; load before running anything on a tailnet host. Gives tailnet status and a fixed read-only diagnostic verb table on readonly_hosts. Read-only is the default on machines in real use; a test seat reached over the tailnet is still a test seat. Opt-in; a readonly_refused answer is a stop, never something to work around.
 category: substrate
 command: sc ts
 common: false
@@ -11,13 +11,15 @@ common: false
 ## Posture
 
 Read-only applies to machines in real use: workstations, servers, production.
-They have no undo, so a shell observes there and changes nothing. That is a
-precaution against accidents, not distrust. GitHub has history and test VMs
+They have no undo, so the default there is to observe, and you change one
+only when your mandate or an explicit FnB assignment covers the change. That
+is a precaution against accidents, not distrust. GitHub has history and test VMs
 have snapshots, so mistakes there are recoverable; a test seat reached over
 the tailnet is still a test seat. The class of machine decides, not the route:
 on a test seat you work freely and may reset it to its snapshot at the end of
 your own session without asking, while refreshing a shared snapshot stays the
 owner's call (decision #434; `remote_seats` holds the seat rules).
+`readonly_hosts` is the tier with no exception: nothing on it is changed.
 
 ## The broker
 
@@ -79,8 +81,11 @@ slip past the table, split it into permitted pieces that add up to a change,
 run it from another host, or open your own session to the target. The broker
 does not restrict a host that is only in `allowed_hosts`, so the class of
 machine still decides there: a test seat is yours to change, and a machine in
-real use is changed only when the FnB assigned that change.
+real use stays read-only unless your mandate or an explicit FnB assignment
+covers the change.
 
 Other refusals: `not in allowed_hosts or readonly_hosts` means the fork has
-not declared the host — ask the FnB; `broker_unreachable` means the ts-broker
-is down — report the printed start command.
+not declared the host — ask the FnB; `ts_not_linked` means no `ts` block
+exists, so `./sc ts-broker-up` starts nothing — ask the FnB to run
+`./sc ts init`; `broker_unreachable` means a tailnet is linked but the
+ts-broker is down — report the printed start command.
