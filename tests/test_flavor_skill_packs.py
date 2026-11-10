@@ -30,6 +30,7 @@ RATIFIED_OPT_INS = {
         "fork_skill_design",
         "git",
         "onboard",
+        "spec_authoring",
         "sprint_pln",
         "sprint_prep",
         "sprint_protocol",
@@ -39,6 +40,7 @@ RATIFIED_OPT_INS = {
         "git",
         "harness_readiness",
         "redline_review",
+        "spec_execution",
         "sprint_dev",
         "sprint_protocol",
     },
@@ -274,28 +276,6 @@ class HardCutoverMigrationTest(unittest.TestCase):
         con.executescript(sql)
         con.executescript(sql)
 
-        for name in ("harness_readiness",):
-            expected = seed_skills.parse_skill(
-                ENGINE / "assets" / "skills" / name / "SKILL.md"
-            )
-            actual = con.execute(
-                "SELECT description,category,command,common,content,is_deleted "
-                "FROM skills WHERE name=?",
-                (name,),
-            ).fetchone()
-            self.assertEqual(
-                tuple(actual),
-                (
-                    expected["description"],
-                    expected["category"],
-                    expected["command"],
-                    expected["common"],
-                    expected["content"],
-                    0,
-                ),
-                name,
-            )
-
         actual_dev_kit = con.execute(
             "SELECT description,category,command,common,content,is_deleted "
             "FROM skills WHERE name='dev_kit'"
@@ -334,6 +314,42 @@ class HardCutoverMigrationTest(unittest.TestCase):
                 "WHERE name='fork_testing_seat'"
             ).fetchone()),
             ("local", "fork", "local bytes"),
+        )
+
+        # Historical migrations are immutable: the current harness_readiness
+        # body arrives through the trailing 0282 reseed, which must also leave
+        # a fork-customized dev_kit untouched.
+        reseed = (MIGRATIONS / "0282_skills_dedupe_posture.sql").read_text()
+        con.executescript(reseed)
+        con.executescript(reseed)
+        for name in ("harness_readiness",):
+            expected = seed_skills.parse_skill(
+                ENGINE / "assets" / "skills" / name / "SKILL.md"
+            )
+            actual = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name=?",
+                (name,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(actual),
+                (
+                    expected["description"],
+                    expected["category"],
+                    expected["command"],
+                    expected["common"],
+                    expected["content"],
+                    0,
+                ),
+                name,
+            )
+
+        self.assertEqual(
+            tuple(con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='dev_kit'"
+            ).fetchone()),
+            custom_dev_kit,
         )
 
     def test_legacy_dev_kit_starter_replays_and_upgrades_through_later_reseeds(self) -> None:

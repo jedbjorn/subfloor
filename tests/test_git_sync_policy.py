@@ -18,6 +18,7 @@ RECONCILIATION = ENGINE / "migrations" / "0257_guidance_reconciliation.sql"
 CLOSEOUT_SCOPE = ENGINE / "migrations" / "0260_reseed_sprint_closeout_scope.sql"
 DOCS_PASS = ENGINE / "migrations" / "0267_reseed_docs_pass_skills.sql"
 RUN_RECEIPTS = ENGINE / "migrations" / "0279_run_receipt_attachments.sql"
+DEDUPE_POSTURE = ENGINE / "migrations" / "0282_skills_dedupe_posture.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import seed_skills  # noqa: E402
@@ -112,6 +113,11 @@ class GitSyncPolicyTest(unittest.TestCase):
             receipts = RUN_RECEIPTS.read_text()
             con.executescript(receipts)
             con.executescript(receipts)
+            # 0282 replaces the receipt copy with a pointer and rewrites the
+            # trigger description.
+            dedupe = DEDUPE_POSTURE.read_text()
+            con.executescript(dedupe)
+            con.executescript(dedupe)
 
             parsed = seed_skills.parse_skill(ASSET)
             actual = con.execute(
