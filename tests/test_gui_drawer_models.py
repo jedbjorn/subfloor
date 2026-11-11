@@ -1271,3 +1271,40 @@ def test_a_lost_request_that_never_started_and_a_stuck_engine_both_stop_waiting(
     assert result["stuck"] == {"banner": "Still waiting on the engine. Check it from the CLI.",
                                "tone": "engine-banner warn", "ticks": result["limit"]}
     assert result["limit"] == 150
+
+
+@needs_node
+def test_closing_the_drawer_ends_the_engine_section():
+    script = ENGINE_HARNESS + r"""
+server.post = () => {
+  server.status = {...server.status, running: true, operation: running("restart", "2026-05-05T00:00:00Z")};
+  return json(202, {started: true, operation: server.status.operation});
+};
+(async () => {
+  // Closed while an operation is being followed: the wait ends, nothing more is read or painted.
+  const mount = el("div");
+  const cleanup = renderDrawerEngine(mount);
+  await settle();
+  let atClose = null;
+  onTick = (tick) => {
+    if (tick === 3) { cleanup(); atClose = {service: serviceRequests.length, api: apiRequests.length}; }
+  };
+  press(mount, "Restart engine");
+  await settle();
+  const followed = {ticks, banner: snap(mount).banner,
+    readsAfterClose: serviceRequests.length - atClose.service + apiRequests.length - atClose.api};
+
+  // Closed before the opening reads answer: the section stays as it was.
+  onTick = null;
+  const second = el("div");
+  renderDrawerEngine(second)();
+  await settle();
+  finish({followed, second: {banner: snap(second).banner, harnesses: snap(second).harnesses},
+    cleanupIsAFunction: typeof cleanup === "function"});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    assert run_js(script) == {
+        "followed": {"ticks": 3, "banner": "Engine restarting…", "readsAfterClose": 0},
+        "second": {"banner": "Loading…", "harnesses": []},
+        "cleanupIsAFunction": True,
+    }

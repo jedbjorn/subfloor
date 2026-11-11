@@ -3285,10 +3285,15 @@ function renderDrawerEngine(mount) {
   const last = el("div", { className: "engine-last" });
   const controls = el("div", { className: "engine-controls" });
   mount.replaceChildren(facts, harnesses, banner, last, controls);
-  const alive = () => mount.isConnected !== false;
+  // Closing the drawer ends this section: nothing paints afterwards, and a
+  // wait in progress is woken so its loop can end instead of lingering.
+  let closed = false;
+  let waitTimer = null, wake = null;
+  const alive = () => !closed;
   let following = false;
 
   const paint = (state, note = null) => {
+    if (closed) return;
     const view = engineView(state);
     facts.replaceChildren(
       el("span", { className: "engine-k" }, "Engine ref"),
@@ -3334,7 +3339,11 @@ function renderDrawerEngine(mount) {
     paint(state, waiting);
     let outcome = { text: "Still waiting on the engine. Check it from the CLI.", tone: "warn" };
     for (let tick = 1; tick <= ENGINE_FOLLOW_LIMIT && alive(); tick += 1) {
-      await new Promise((resolve) => setTimeout(resolve, ENGINE_FOLLOW_MS));
+      await new Promise((resolve) => {
+        wake = resolve;
+        waitTimer = setTimeout(resolve, ENGINE_FOLLOW_MS);
+      });
+      if (!alive()) break;
       const healthy = await api("/health").then(() => true, () => false);
       const next = healthy ? await engineOpsLoad() : {
         discovery: state.discovery,
@@ -3432,10 +3441,16 @@ function renderDrawerEngine(mount) {
         el("span", { className: "engine-v" }, `${version || "version unknown"} · ${health}`),
       ];
     });
-    harnesses.replaceChildren(...rows);
+    if (alive()) harnesses.replaceChildren(...rows);
   }, () => {
-    harnesses.replaceChildren(el("div", { className: "drawer-note" }, "Harness status unavailable."));
+    if (alive()) harnesses.replaceChildren(
+      el("div", { className: "drawer-note" }, "Harness status unavailable."));
   });
+  return () => {
+    closed = true;
+    clearTimeout(waitTimer);
+    if (wake) wake();
+  };
 }
 
 for (const [id, render] of [
