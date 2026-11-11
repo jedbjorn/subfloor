@@ -1395,7 +1395,14 @@ case "$cmd" in
   mem)          sc_project_env; exec "$PY" "$S/mem.py" "$@" ;;
   pr)           exec "$PY" "$S/pr_cli.py" "$@" ;;
   sprint)       sc_python_probe; sc_project_env; exec "$PY" "$S/sprint_cli.py" "$@" ;;
-  token)        exec "$PY" "$S/operator_token.py" "$@" ;;
+  # Retired (Feature #94). It printed an Admin shell token as a "browser
+  # sign-in token" for a paste-a-token flow that no longer exists; the GUI
+  # signs in with a password and an authenticator code, and no token a CLI can
+  # print is a browser session. Kept as a refusal so an old habit is told why.
+  token)        echo "sc token: retired — the review GUI signs in with a password and an authenticator code." >&2
+                echo "  create the GUI user:  ./sc auth user add <username>   (host terminal)" >&2
+                echo "  lost the authenticator or password:  ./sc auth user reset <username>" >&2
+                exit 2 ;;
   engine-ref)   sc_engine_ref_path="$LIVE_ROOT/.sc-state/engine.ref"
                 if [ ! -r "$sc_engine_ref_path" ]; then
                   echo "✗ sc engine-ref: no readable engine pin at $sc_engine_ref_path" >&2
@@ -2087,8 +2094,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)
                              caller identity is resolved by the engine; report and review bodies use files, and mutating retries carry stable keys where required
   ./sc browser <verb>      setup/status/open/up/down/doctor/arm/disarm — opt-in Chromium profile driving
-  ./sc token               print the browser sign-in operator token — an Admin/operator recovery capability;
-                             stdout carries only the token and failure names the supported service action
+  ./sc token               retired — the review GUI signs in with a password and an authenticator code;
+                             see ./sc auth (user add, user reset, sessions)
   sc engine-ref            print the full engine pin from the canonical live checkout — safe from any shell
                              worktree; stdout is the 40-character SHA only
   ./sc job start -- <cmd>  run a long local command (suite/bench/build) detached + supervised — it

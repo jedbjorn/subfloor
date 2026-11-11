@@ -144,8 +144,8 @@ _CRED_DIR = Path(os.environ.get("SC_MEM_CRED_DIR") or
 _DISCOVERED_FROM: "Path | None" = None  # artifact the token came from, if any
 
 
-# Refusal prefix — `sc token` overrides this so its refusals name the right
-# command (scripts/token.py reuses the discovery below).
+# Refusal prefix — a verb that reuses the discovery below (`sc models`)
+# overrides this so its refusals name the right command.
 _PROG = "mem"
 
 
