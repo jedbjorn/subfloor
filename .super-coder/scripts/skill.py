@@ -59,6 +59,7 @@ import mem
 import project_root
 import render as render_mod
 import seed_skills
+import skill_frontmatter
 import skill_projection
 import snapshot
 
@@ -323,7 +324,9 @@ def parse_local_skill_spec(text: str) -> dict:
             continue
         if ":" not in line:
             raise DraftValidationError(f"invalid frontmatter line: {line!r}")
-        key, value = (part.strip() for part in line.split(":", 1))
+        key, raw_value = line.split(":", 1)
+        key = key.strip()
+        value = skill_frontmatter.parse_scalar(raw_value)
         if key not in LOCAL_FRONTMATTER_FIELDS:
             raise DraftValidationError(f"unsupported frontmatter field {key!r}")
         if key in meta:
@@ -331,13 +334,13 @@ def parse_local_skill_spec(text: str) -> dict:
         meta[key] = value
 
     name = meta.get("name", "")
-    description = meta.get("description", "")
+    description = meta.get("description", "").strip()
     if not name or not seed_skills.SKILL_NAME_RE.fullmatch(name) or len(name) > 64:
         raise DraftValidationError(
             "frontmatter `name` must be 1-64 lowercase letters, "
             "digits, or underscores and start with a letter"
         )
-    if not description:
+    if not description or "\n" in description or "\r" in description:
         raise DraftValidationError(
             "frontmatter `description` must be a non-empty line"
         )

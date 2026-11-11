@@ -9,6 +9,7 @@ from pathlib import Path
 
 import artifact_policy
 import seed_skills
+import skill_frontmatter
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -78,8 +79,8 @@ def _skill_body(row) -> str:
     return "\n".join(
         [
             "---",
-            f"name: {row['name']}",
-            f"description: {description}",
+            f"name: {skill_frontmatter.emit_scalar(row['name'])}",
+            f"description: {skill_frontmatter.emit_scalar(description)}",
             "---",
             "",
             (row["content"] or "").strip(),
