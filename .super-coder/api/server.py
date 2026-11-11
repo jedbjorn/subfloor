@@ -4631,6 +4631,31 @@ class Handler(BaseHTTPRequestHandler):
                     "ORDER BY sort_order, feature_id"))
                 return self._send(200, {"roadmap": rm})
 
+            if len(parts) == 4 and parts[2] == "roadmap":
+                # One feature by id, RETIRED ONES INCLUDED — the board above
+                # hides them, so it cannot answer "what is feature N?" for a
+                # citation that outlived its feature. Carries what a planner
+                # otherwise assembles from three reads: the work-stream, the
+                # dependency set, and the feature's documents (no bodies).
+                fid = int(parts[3])
+                r = con.execute(
+                    "SELECT r.feature_id, r.title, r.roadmap_status, r.summary, "
+                    "r.project_id, r.sort_order, "
+                    "(SELECT p.shortname FROM projects p "
+                    " WHERE p.project_id=r.project_id) AS project "
+                    "FROM roadmap r WHERE r.feature_id=?", (fid,)).fetchone()
+                if r is None:
+                    return self._send(404, {"error": "no such feature"})
+                feature = dict(r)
+                feature["blocked_by"] = [e[0] for e in con.execute(
+                    "SELECT blocked_by FROM feature_blockers WHERE feature_id=? "
+                    "ORDER BY blocked_by", (fid,))]
+                feature["documents"] = rows(con.execute(
+                    "SELECT document_id, kind, seq, title, frozen FROM documents "
+                    "WHERE feature_id=? ORDER BY kind DESC, seq, document_id",
+                    (fid,)))
+                return self._send(200, {"feature": feature})
+
             if path == "/_sc/mem/narrative":
                 r = con.execute(
                     "SELECT a.full_narrative FROM shells s "
@@ -4651,13 +4676,18 @@ class Handler(BaseHTTPRequestHandler):
                         "JOIN shells s ON s.shell_id = m.to_shell_id "
                         "WHERE m.from_shell_id=? "
                         "AND m.kind IN ('shell','task','result') "
-                        "ORDER BY m.created_at DESC LIMIT 50", (sid,)))
+                        "ORDER BY m.created_at DESC, m.message_id DESC "
+                        "LIMIT 50", (sid,)))
                     return self._send(200, {"messages": msgs, "direction": "sent"})
                 msgs = rows(con.execute(
-                    "SELECT message_id, from_shell_id, kind, body, created_at, read_at "
-                    "FROM shell_messages WHERE to_shell_id=? "
-                    "AND kind IN ('shell','task','result') "
-                    "ORDER BY read_at IS NOT NULL, created_at DESC LIMIT 50",
+                    "SELECT m.message_id, m.from_shell_id, "
+                    "s.shortname AS from_shortname, m.kind, m.body, "
+                    "m.created_at, m.read_at FROM shell_messages m "
+                    "LEFT JOIN shells s ON s.shell_id = m.from_shell_id "
+                    "WHERE m.to_shell_id=? "
+                    "AND m.kind IN ('shell','task','result') "
+                    "ORDER BY m.read_at IS NOT NULL, m.created_at DESC, "
+                    "m.message_id DESC LIMIT 50",
                     (sid,)))
                 return self._send(200, {"messages": msgs})
 
@@ -4738,6 +4768,17 @@ class Handler(BaseHTTPRequestHandler):
                     "status, completed_date, resolution_notes FROM spec_tasks WHERE " + where +
                     " ORDER BY seq", params))
                 return self._send(200, {"tasks": ts})
+
+            if len(parts) == 4 and parts[2] == "tasks":
+                # One task by id — a task id from a message or a wake needs no
+                # prior knowledge of its spec or feature to be read.
+                r = con.execute(
+                    "SELECT task_id, feature_id, document_id, seq, title, description, "
+                    "status, completed_date, resolution_notes FROM spec_tasks "
+                    "WHERE task_id=?", (int(parts[3]),)).fetchone()
+                if r is None:
+                    return self._send(404, {"error": "no such task"})
+                return self._send(200, {"task": dict(r)})
 
             return self._send(404, {"error": "not found"})
         except ValueError:
@@ -5006,15 +5047,53 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/_sc/mem/tasks":
                 title = (body.get("title") or "").strip()
                 fid, did, seq = body.get("feature_id"), body.get("document_id"), body.get("seq")
-                if not title or fid is None or did is None or seq is None:
-                    return self._send(400, {"error": "feature_id, document_id, seq, title required"})
-                cur = con.execute(
-                    "INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (int(fid), int(did), int(seq), title,
-                     body.get("description") or None, sid))
+                if not title or did is None:
+                    return self._send(400, {"error": (
+                        "document_id and title required (feature_id and seq "
+                        "are inferred from the document when omitted)")})
+                did = int(did)
+                # The spec already names its feature: omitted, it is read off
+                # the document; given, it must agree. A frozen spec is not
+                # special here — its plan is still worked after it ships.
+                d = con.execute(
+                    "SELECT feature_id FROM documents WHERE document_id=?",
+                    (did,)).fetchone()
+                if fid is None:
+                    if d is None:
+                        return self._send(404, {"error": "no such document"})
+                    if d[0] is None:
+                        return self._send(400, {"error": (
+                            f"document #{did} has no feature — pass feature_id")})
+                    fid = d[0]
+                elif d is not None and d[0] is not None and int(fid) != d[0]:
+                    return self._send(409, {"error": (
+                        f"document #{did} belongs to feature #{d[0]}, not "
+                        f"#{int(fid)} — pass --feature {d[0]} or omit it")})
+                # One statement reads the next free slot and writes it, so two
+                # concurrent adds cannot be handed the same number.
+                try:
+                    cur = con.execute(
+                        "INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id) "
+                        "VALUES (?, ?, COALESCE(?, (SELECT COALESCE(MAX(seq), 0) + 1 "
+                        "FROM spec_tasks WHERE document_id=?)), ?, ?, ?)",
+                        (int(fid), did, int(seq) if seq is not None else None, did,
+                         title, body.get("description") or None, sid))
+                except sqlite3.IntegrityError as exc:
+                    con.rollback()
+                    if "UNIQUE" not in str(exc) or seq is None:
+                        raise
+                    free = con.execute(
+                        "SELECT COALESCE(MAX(seq), 0) + 1 FROM spec_tasks "
+                        "WHERE document_id=?", (did,)).fetchone()[0]
+                    return self._send(409, {"error": (
+                        f"seq {int(seq)} is already taken in document #{did}'s "
+                        f"plan — omit --seq for the next free slot ({free})")})
+                seq = con.execute(
+                    "SELECT seq FROM spec_tasks WHERE task_id=?",
+                    (cur.lastrowid,)).fetchone()[0]
                 con.commit()
-                return self._send(201, {"task_id": cur.lastrowid})
+                return self._send(201, {"task_id": cur.lastrowid,
+                                        "feature_id": int(fid), "seq": seq})
 
             if path == "/_sc/mem/docs":
                 # feature_id is OPTIONAL — standalone (feature-less) docs are part

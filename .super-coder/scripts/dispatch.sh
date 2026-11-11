@@ -1904,7 +1904,24 @@ case "$cmd" in
     exec docker logs -f "$CNAME" ;;
   verify)
     exec "$PY" -B "$S/verify.py" ;;
-  health)       curl -s "http://127.0.0.1:$(port)/api/health" && echo "" ;;
+  health)
+    # Exit status carries the answer: a refused connection keeps curl's own
+    # status, and an HTTP error is nonzero too — `curl -s` alone exits 0 on a
+    # 500, so a caller gating on `sc health` read a failing server as healthy.
+    health_url="http://127.0.0.1:$(port)/api/health"
+    # curl appends the status code as a last line; tail/sed split it off.
+    # This file runs under /bin/sh — no bash-only $'\n' expansion here.
+    health_out="$(curl -s -w '\n%{http_code}' "$health_url")" || {
+      health_rc=$?
+      echo "sc health: no answer from $health_url (curl exit $health_rc)" >&2
+      exit "$health_rc"
+    }
+    health_code="$(printf '%s\n' "$health_out" | tail -n 1)"
+    printf '%s\n' "$health_out" | sed '$d'
+    case "$health_code" in
+      2??) ;;
+      *) echo "sc health: $health_url answered HTTP $health_code" >&2; exit 1 ;;
+    esac ;;
   clean-db)     database="$(sc_engine_db)"
                 sc_refuse_linked clean-db "$database"
                 rm -f "$database" "$database-wal" "$database-shm" && echo "removed $database (rebuild with: ./sc rebuild)" ;;
@@ -1986,6 +2003,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (which/get/state/seed/lns/curated/retire/decision/
                              flag/roadmap/project/task/doc/narrative/message/oriented/delivery-audit);
                              already wired to this launched shell, identity resolved by the engine — no DB path, no direct-DB fallback. `./sc mem which` to orient
+                             reads are `mem get <surface> [<id>]`; every write takes --json (one object, ids included) and
+                             text bodies take --body-file PATH|- ; `./sc mem --help` carries the exit-status table
   ./sc pr subscribe --repository <owner/name> --pr <number>
                            subscribe the authenticated Developer shell to engine-wide PR event wakes
   ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)
@@ -1998,6 +2017,11 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc job start -- <cmd>  run a long local command (suite/bench/build) detached + supervised — it
                              survives your session; completion lands in YOUR inbox as a result row
                              (--label <slug> names it, --timeout <s> kills the wedged process group)
+  ./sc job start --until "<probe>" [--every <s>]
+                           repeat a quoted /bin/sh probe until it exits 0, then wake you (--every: delay
+                             between attempts, default 30, minimum 5; probes time out after 3600s by default)
+  ./sc job attach <id> (--pr <n> [--repository <owner/name>] | --work-unit <n>)
+                           link a finished run to a PR or work unit as supporting evidence
   ./sc job wait <id>       bounded foreground wait — exit 0 done · 2 still running; --for <s> sets the
                              slice (default 300, cap 550) and you drain your inbox between slices;
                              list/status/tail/kill complete the set
@@ -2213,7 +2237,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              (recreate via pg-down→pg-up to change --shm-size / SC_PG_SHM)
 
   ./sc verify              candidate-only rebuild + flat render + render-only boot; live memory untouched
-  ./sc health              curl the review layer's /api/health
+  ./sc health              curl the review layer's /api/health; exits nonzero when it is down or answers an HTTP error
   ./sc ports               show this fork's derived port
   ./sc url                 print this fork's review GUI + dev-server URLs (derived, never a fixed 8800)
                              — the recall path when the boot summary has scrolled away (subfloor url)

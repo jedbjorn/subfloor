@@ -665,13 +665,32 @@ def cmd_attach(args) -> int:
 
 # ── arg parsing ───────────────────────────────────────────────────────────────
 
+PUBLIC_VERBS = ("start", "list", "status", "tail", "wait", "kill", "attach")
+
+HELP_EPILOG = """\
+forms:
+  sc job start [--label L] [--timeout S] -- <command and args>
+      run one command detached; its completion wakes you
+  sc job start [--label L] [--timeout S] --until "<probe command>" [--every S]
+      repeat a quoted /bin/sh probe until it exits 0, then wake you; --every
+      is the delay between attempts (default 30, minimum 5) and needs --until;
+      probes time out after 3600s unless --timeout says otherwise
+  sc job attach <id> (--pr N [--repository owner/name] | --work-unit N)
+      link a finished run to a PR or a Sprint work unit as supporting evidence
+  sc job list [--all] · status <id> · tail <id> [-n N] · wait <id> [--for S] · kill <id>
+
+Service teardown/reboot may interrupt computation; recovery records lost when
+no exit evidence survives. Interrupted runs are never automatically restarted.
+TUI wakes wait out the CLI lock. Legacy job status/logs remain readable.
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sc job",
         description="Registered jobs survive harness exit and durably wake their owner.",
-        epilog="Service teardown/reboot may interrupt computation; recovery records lost "
-               "when no exit evidence survives. Interrupted runs are never automatically restarted. "
-               "TUI wakes wait out the CLI lock. Legacy job status/logs remain readable.")
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=HELP_EPILOG)
     sub = p.add_subparsers(dest="cmd_name", required=True)
 
     sp = sub.add_parser("start", help="register and detach; completion durably wakes the owner")
@@ -718,15 +737,25 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--repository", help="owner/name when a PR number is ambiguous")
     sp.set_defaults(fn=cmd_attach)
 
-    sp = sub.add_parser("_supervise", help=argparse.SUPPRESS)
-    sp.add_argument("jobdir")
-    sp.set_defaults(fn=cmd_supervise)
+    return p
+
+
+def supervisor_parser() -> argparse.ArgumentParser:
+    """The detached supervisor's own re-entry point (`job.py _supervise
+    <jobdir>`). Not a subcommand of the public parser: registered there it
+    surfaced in --help and in every invalid-choice message."""
+    p = argparse.ArgumentParser(prog="sc job _supervise")
+    p.add_argument("jobdir")
+    p.set_defaults(fn=cmd_supervise)
     return p
 
 
 def main(argv: list[str]) -> int:
     # Early-closed stdout is handled at the entrypoint (cli_entry.run_cli, #384).
-    args = build_parser().parse_args(argv)
+    if argv[:1] == ["_supervise"]:
+        args = supervisor_parser().parse_args(argv[1:])
+    else:
+        args = build_parser().parse_args(argv)
     return args.fn(args)
 
 

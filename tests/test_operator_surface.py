@@ -242,6 +242,40 @@ class EnterPreAttachPrintTest(unittest.TestCase):
         self.assertIn("could not derive", out.stderr)
 
 
+class HealthExitStatusTest(unittest.TestCase):
+    """`./sc health` is gated on by scripts: its exit status must be the answer."""
+
+    def health(self, body: str, code: str, curl_rc: int = 0):
+        with tempfile.TemporaryDirectory() as directory:
+            curl = Path(directory) / "curl"
+            # Stands in for `curl -s -w '\n%{http_code}' <url>`: the body, a
+            # newline, the status code — and curl's own exit status.
+            curl.write_text(
+                "#!/bin/sh\n"
+                f"[ {curl_rc} -eq 0 ] || exit {curl_rc}\n"
+                f"printf '%s\\n%s' '{body}' '{code}'\n"
+            )
+            curl.chmod(curl.stat().st_mode | stat.S_IEXEC)
+            return sc("health", env={"PATH": f"{directory}:{os.environ['PATH']}"})
+
+    def test_a_healthy_answer_prints_the_body_and_exits_zero(self):
+        out = self.health('{"ok": true}', "200")
+        self.assertEqual((out.returncode, out.stdout), (0, '{"ok": true}\n'), out.stderr)
+        self.assertEqual(out.stderr, "")
+
+    def test_an_http_error_still_prints_the_body_but_exits_nonzero(self):
+        out = self.health('{"error": "boom"}', "500")
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.stdout, '{"error": "boom"}\n')
+        self.assertIn("HTTP 500", out.stderr)
+
+    def test_no_answer_keeps_curls_exit_status(self):
+        out = self.health("", "000", curl_rc=7)
+        self.assertEqual(out.returncode, 7)
+        self.assertEqual(out.stdout, "")
+        self.assertIn("no answer from http://127.0.0.1:", out.stderr)
+
+
 class HelpChartTest(unittest.TestCase):
     """A live verb absent from the chart is a verb its operator cannot find."""
 
