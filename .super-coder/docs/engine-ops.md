@@ -26,29 +26,64 @@ The three verbs replace or bounce the engine, and they are host commands:
 So one small host process owns the verbs under both runtimes, and the review
 API only tells the GUI where that process is.
 
-## Boundary: host loopback TCP, not a socket in the engine directory
+## Boundary: host loopback TCP, and state the sandbox cannot write
 
 The other brokers listen on a unix socket inside the bind-mounted engine
 directory, so that a sandboxed shell can reach them. That is exactly what this
 service must not allow: every sandboxed shell can open that directory, and
 these verbs replace the engine.
 
-The service therefore listens on **its own host loopback TCP port**
+**Transport.** The service listens on its own host loopback TCP port
 (`127.0.0.1` only, never configurable). `./sc launch` publishes the review port
 and the dev port into the container and nothing else, so the sandbox has no
 route to it. The browser, which is on the host, calls it directly.
 
-On the host runtime shells already run on the host, so the port is not a
-boundary against them there. That matches the existing posture: a host shell
-holds host access.
+**State.** On the docker runtime the whole checkout is bind-mounted writable
+into the sandbox, so `instance.json`, `run/`, and `logs/` are all
+sandbox-writable. Nothing the service decides from lives there. Its state is
+in a host-private directory outside the bind mount:
 
-Every request is checked:
+    <XDG state home>/subfloor/engine-ops/<repo name>-<hash of the checkout path>/
+
+mode `0700`, owned by the host user, named from the checkout's path and from
+no file inside it. It holds:
+
+| File | What |
+|---|---|
+| `config.json` | the pinned `{port, gui_port}` |
+| `service.json` | the running service's pid, kernel start time, and port |
+| `service.log` | the service's own output |
+| `engine-op.json` | the current or last operation |
+| `engine-op-<op>.log` | that operation's output (overwritten per run) |
+
+The service never opens a path taken from a record: an operation's log is the
+fixed file for its operation name, in that directory. Files are opened with
+`O_NOFOLLOW`, and written by exclusive create plus rename.
+
+Two things are published *into* the checkout for the review API, which may be
+inside the sandbox: `engine_ops_port` in `instance.json`, and a small hint
+file, `.super-coder/run/engine-ops.json`. The service writes them (the hint
+with no symlink followed at any level) and never reads them back, so editing
+them changes only what the review API reports.
+
+On the host runtime shells already run on the host, so neither the port nor
+the private directory is a boundary against them there. That matches the
+existing posture: a host shell holds host access.
+
+**What this does not cover.** The verbs, the runner, and the service itself
+are code in the checkout, which on docker the sandbox can write. That is the
+same exposure as the operator typing `./sc restart`, and as the sibling
+brokers `./sc launch` starts from the same directory. On docker the GUI is
+also served from inside the sandbox, so the GUI origin is not a boundary
+against the sandbox either; it is one against other web origins.
+
+### Request checks
 
 | Check | Refusal |
 |---|---|
 | `Host` is `127.0.0.1:<port>` or `localhost:<port>` for this service's port | `403 loopback_host_required` |
 | No `Authorization` header at all. A shell Bearer token is refused; the browser operator carries none | `403 fnb_operator_required` |
-| `POST` and `OPTIONS`: `Origin` is present and is this install's GUI origin (`http://127.0.0.1:<review port>` or `http://localhost:<review port>`) | `403 same_origin_required` |
+| `POST` and `OPTIONS`: `Origin` is present and is the pinned GUI origin (`http://127.0.0.1:<review port>` or `http://localhost:<review port>`) | `403 same_origin_required` |
 | `GET`: `Origin` may be absent; a present `Origin` must be the GUI origin | `403 same_origin_required` |
 | `Sec-Fetch-Site` is not `cross-site` | `403 same_origin_required` |
 
@@ -57,15 +92,20 @@ are sent only when the request's `Origin` is the GUI origin; no wildcard, no
 credentials. A preflight from that origin gets `204` with `GET, POST, OPTIONS`
 and `Content-Type`; from anywhere else, `403` with no CORS headers.
 
-## Port and discovery
+## Port, GUI origin, and discovery
 
-The port is derived the way the review port is: a hash of the repository path
-into the 8800 band, bumped past this fork's other ports and every sibling
-fork's, then persisted once as `engine_ops_port` in `instance.json`
-(`scripts/ports.py`, `ensure_engine_ops_port`). An existing assignment is never
-moved while it is clear of the fork's other ports.
+Both are **pinned** in `config.json` the first time the service (or
+`./sc launch`) needs them, and are not re-read from `instance.json` afterwards.
+The accepted origins are fixed for the life of a service process.
 
-    ./sc engine-ops-port      # print it, allocating on first use
+- **Port.** Derived the way the review port is: a hash of the repository path
+  into the 8800 band, stepped past this fork's other ports and every sibling
+  fork's. `instance.json` only tells that walk which ports to step past.
+- **GUI origin.** The review port at the moment of pinning.
+
+    ./sc engine-ops-port      # print the port, pinning on first use
+    ./sc engine-ops-repin     # after a deliberate review-port change: pin the
+                              # GUI origin again, then engine-ops-down / -up
 
 The GUI finds the service through the review API:
 
@@ -80,15 +120,14 @@ The GUI finds the service through the review API:
 
 `up_source` says how `up` was decided. On the host the port is probed
 (`probe`). Inside the sandbox it cannot be, by design, so `up` is whether the
-service's state file (`.super-coder/run/engine-ops.json`, written at start,
-removed at a clean stop) names this port (`state_file`); a service killed
-without cleanup can leave that file behind. `unallocated` means no port has
-been assigned yet (`./sc launch` assigns it). The browser's own
-`GET <url>/status` is the authority either way.
+published hint names this port (`state_file`); a service killed without
+cleanup can leave that file behind. `unallocated` means no port has been
+published yet (`./sc launch` does it). The browser's own `GET <url>/status` is
+the authority either way.
 
 The review server's CSP `connect-src` names `http://127.0.0.1:<port>` and
 `http://localhost:<port>` for this one port. It is computed when the review
-server starts, which is why `./sc launch` allocates the port first.
+server starts, which is why `./sc launch` pins the port first.
 
 The review API runs none of the verbs and has no route that does.
 
@@ -129,11 +168,15 @@ GUI needs to word a confirmation:
 
 `operation` is the current or last one: `{op, state, cli, pid, started_at,
 finished_at, exit_code, ok, log, detach, error}`. `state` is `starting`,
-`running`, `finished`, or `interrupted` (the runner died without finishing);
-only the first two block a new `POST`. `log_tail` is the last 16 KiB of its
-log. `live_sessions` is `{count, browser, indeterminate}` from the OS liveness
+`running`, `finished`, or `interrupted`; only the first two block a new
+`POST`. `log_tail` is the last 16 KiB of its log.
+
+`runtime` (and so the wording fields), `engine_ref`, and `live_sessions` are
+read from the checkout and the process table, so they are advisory: they word
+the GUI and decide nothing. `runtime` is one of two values; `engine_ref` is one
+short line, read without following a link and shown only if it looks like a
+ref; `live_sessions` is `{count, browser, indeterminate}` from the OS liveness
 scan (`scripts/shell_liveness.py`), or `null` where that scan is unavailable.
-`engine_ref` is the installed pin, or `null` on an install without one.
 
 ## An operation outlives the engine it stops
 
@@ -143,21 +186,22 @@ service among them; `./sc update` stops the review server. The service is
 
 - The verb runs under a small runner (`api/engine_ops.py run …`) started in its
   **own session**, with stdio on a log file rather than inherited pipes.
-  `./sc down` stops a broker by signalling the one pid in its pidfile, which a
-  process in another session does not receive.
+  Stopping the service signals one proven pid, which a process in another
+  session does not receive.
 - Where a systemd user manager answers, the runner is also placed in its **own
   transient scope** (`systemd-run --user --scope`). Stopping a systemd unit
   kills every process left in the unit's control group, new session or not,
   and the host review server always is such a unit. `operation.detach` reports
   `systemd-scope` or `session`.
-- The runner owns the **status file**, `.super-coder/logs/engine-op.json`,
-  replaced atomically: `op`, `state`, `pid`, `started_at`, `finished_at`,
-  `exit_code`, and the log path (`.super-coder/logs/engine-op-<op>.log`,
-  overwritten per run). It is on disk, so it is readable when the engine
-  returns, by whichever service instance is then running.
-- "Running" is the status file plus a liveness check of the recorded pid and
-  its start time, so a runner that crashed, or a recycled pid, does not block
-  the next operation.
+- The runner owns the status file, replaced atomically, so the result is
+  readable when the engine returns, by whichever service instance is then
+  running.
+
+**One at a time.** "Running" is the status file plus liveness of the recorded
+runner *or* of the command it started, each checked by pid and kernel start
+time. A killed runner therefore does not open the gate while its command is
+still running; once both are gone the record reads `interrupted` and no longer
+blocks. A record from before a reboot never blocks.
 
 `restart` brings the service back itself (its `launch` step starts it), so
 after a restart the GUI is talking to a new service process reading the same
@@ -171,14 +215,24 @@ poll the review API's `/api/health` until it answers, re-read
 ## Running it (on the HOST — never in the sandbox)
 
     ./sc engine-ops          # foreground
-    ./sc engine-ops-up       # background (nohup + pidfile); no-op if already up
+    ./sc engine-ops-up       # background; no-op if already up
     ./sc engine-ops-down     # stop the backgrounded service
     ./sc engine-ops-port     # print its port
+    ./sc engine-ops-repin    # re-pin the accepted GUI origin
 
-`./sc launch` brings it up under both runtimes and `./sc down` stops it;
-`./sc restart` reports it in its health summary. It refuses to start when
-`SC_SANDBOX` is set or a container marker is present, and every `engine-ops*`
-verb refuses from a linked worktree, which has no instance of its own.
+`./sc launch` brings it up under both runtimes and `./sc down` stops it.
+`./sc restart` reports it in its health summary as an advisory line only: a
+service that does not come back never changes the restart's exit code, the
+same tolerance `launch` gives it.
+
+`engine-ops-down` stops only a process **proven** to be this service: the pid
+recorded in the private directory must be alive, have the recorded kernel
+start time, and be running the service. A pid written anywhere in the checkout
+is never read.
+
+It refuses to start when `SC_SANDBOX` is set or a container marker is present,
+and every `engine-ops*` verb refuses from a linked worktree, which has no
+instance of its own.
 
 It has no systemd install form. After a reboot, `./sc launch` starts it.
 
@@ -189,5 +243,7 @@ It has no systemd install form. After a reboot, `./sc launch` starts it.
   like the other brokers; `./sc restart` loads the new code.
 - When the service is not running the GUI cannot start it: the controls render
   disabled and show the CLI command.
+- If the review port changes, the pinned GUI origin does not follow by itself;
+  run `./sc engine-ops-repin`.
 - A browser on another machine cannot reach it. The GUI is loopback-only and
   so is this.

@@ -129,38 +129,29 @@ class HostRuntimeFixture:
                 print(port)
             elif mode == "devport":
                 print(port + 1)
-            elif mode == "engine-ops-port":
-                print(port + 2)
             elif mode == "show":
                 print(json.dumps({"repo": "hostfork", "port": port, "dev_port": port + 1}))
             """
         ))
-        # The engine-ops service `launch` always starts: a health listener on
-        # the port the fake ports.py names, enough for the dispatcher's probe.
-        (self.api / "engine_ops_service.py").write_text(textwrap.dedent(
+        # The engine-ops helper the dispatcher calls (api/engine_ops.py): a
+        # stand-in that records each call and answers as a healthy service,
+        # or as a missing one when SC_TEST_ENGINE_OPS_FAIL is set.
+        (self.engine / "api" / "engine_ops.py").write_text(textwrap.dedent(
             """\
-            import http.server
             import os
-            import socketserver
+            import sys
 
-            port = int(os.environ["SC_TEST_PORT"]) + 2
-
-
-            class Health(http.server.BaseHTTPRequestHandler):
-                def do_GET(self):
-                    body = b'{"ok": true, "service": "engine-ops"}'
-                    self.send_response(200 if self.path == "/health" else 404)
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-
-                def log_message(self, *args):
-                    pass
-
-
-            socketserver.TCPServer.allow_reuse_address = True
-            with socketserver.TCPServer(("127.0.0.1", port), Health) as server:
-                server.serve_forever()
+            command = sys.argv[1] if len(sys.argv) > 1 else ""
+            with open(os.environ["SC_TEST_LOG"], "a") as log:
+                log.write("engine_ops " + " ".join(sys.argv[1:]) + "\\n")
+            if command == "port":
+                print(18802)
+            elif os.environ.get("SC_TEST_ENGINE_OPS_FAIL") and command in ("up", "alive"):
+                raise SystemExit(1)
+            elif command == "up":
+                print("→ engine-ops up (fixture)")
+            elif command == "down":
+                print("→ engine-ops stopped (fixture)")
             """
         ))
         (self.scripts / "db_backup.py").write_text(textwrap.dedent(
@@ -303,9 +294,6 @@ class HostRuntimeFixture:
         if pid:
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
-        with contextlib.suppress(OSError, ValueError):
-            os.kill(int((self.engine / "run" / "engine-ops.pid").read_text()),
-                    signal.SIGKILL)
         self._tmp.cleanup()
 
 
@@ -371,45 +359,28 @@ class HostRuntimeLifecycleTest(unittest.TestCase):
                 self.assertNotIn("--setenv", self._systemd_run_line())
                 self.assertEqual(self.fx.run("down").returncode, 0)
 
-    def test_launch_starts_the_engine_ops_service_and_down_stops_it(self):
-        ops_port = self.fx.port + 2
-        pidfile = self.fx.engine / "run" / "engine-ops.pid"
-
-        def answers() -> bool:
-            return subprocess.run(
-                ["curl", "-fsS", f"http://127.0.0.1:{ops_port}/health"],
-                capture_output=True, text=True, check=False,
-            ).returncode == 0
-
-        result = self.fx.run("launch")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        # Host loopback TCP, never a socket in the engine directory.
-        self.assertIn(
-            f"engine-ops up (pid {pidfile.read_text().strip()}) · "
-            f"http://127.0.0.1:{ops_port} (host loopback only)", result.stdout)
-        self.assertTrue(answers())
-        self.assertFalse(list((self.fx.engine / "run").glob("engine-ops*.sock")))
-
-        again = self.fx.run("engine-ops-up")
-        self.assertEqual(again.returncode, 0, again.stderr)
-        self.assertIn("engine-ops already serving", again.stdout)
-
+    def test_launch_and_down_drive_the_engine_ops_service(self):
+        launched = self.fx.run("launch")
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        calls = self.fx.calls()
+        # Pinned before the review server (and its CSP) starts.
+        self.assertLess(
+            calls.index("engine_ops port"),
+            next(i for i, line in enumerate(calls)
+                 if line.startswith("systemd-run ")))
+        self.assertIn("engine_ops up", calls)
         down = self.fx.run("down")
         self.assertEqual(down.returncode, 0, down.stderr)
-        self.assertIn("engine-ops stopped", down.stdout)
-        self.assertFalse(pidfile.exists())
-        for _ in range(40):
-            if not answers():
-                break
-            time.sleep(0.1)
-        self.assertFalse(answers())
+        self.assertIn("engine_ops down", self.fx.calls())
+        self.assertFalse(list((self.fx.engine / "run").glob("engine-ops*")))
 
-    def test_engine_ops_does_not_start_in_the_sandbox(self):
-        self.fx.env["SC_SANDBOX"] = "1"
-        result = self.fx.run("engine-ops-up")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("engine-ops: NOT started", result.stdout)
-        self.assertFalse((self.fx.engine / "run" / "engine-ops.pid").exists())
+    def test_restart_does_not_fail_on_the_engine_ops_service(self):
+        self.assertEqual(self.fx.run("launch").returncode, 0)
+        self.fx.env["SC_TEST_ENGINE_OPS_FAIL"] = "1"
+        result = self.fx.run("restart", "-y")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("  host server: restarted", result.stdout)
+        self.assertIn("  engine-ops: not answering (advisory", result.stdout)
 
     def test_down_without_a_server_is_a_calm_no_op(self):
         result = self.fx.run("down")

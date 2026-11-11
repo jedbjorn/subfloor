@@ -29,6 +29,11 @@ has none. A POST must carry an Origin equal to this install's GUI origin; a
 GET may omit Origin, but a foreign one is refused. CORS headers are sent for
 the GUI origin and for nothing else.
 
+The port and the accepted GUI origin are fixed when the service starts, from
+its host-private state (`engine_ops.ensure_config`). Nothing in the checkout,
+which a sandbox can write, is consulted per request, and the operation status
+and logs it serves are in that private directory too.
+
 The verb table is fixed (`engine_ops.VERBS`). The path segment selects a row;
 the request body and query string are never read. An operation runs detached
 from this service (`engine_ops.start`), because `./sc restart` and `./sc down`
@@ -41,10 +46,8 @@ Run on the HOST (never in the sandbox):
 from __future__ import annotations
 
 import json
-import os
 import signal
 import sys
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -57,23 +60,7 @@ import engine_ops  # noqa: E402  (verb table, status file, detached runner)
 # put engine replacement on the network.
 BIND = engine_ops.BIND
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
-_CONTAINER_MARKERS = ("/.dockerenv", "/run/.containerenv")
 OPS_PREFIX = "/ops/"
-
-
-def gui_origins() -> frozenset[str]:
-    """The origins the review GUI of THIS install is served from."""
-    import ports  # noqa: PLC0415  (scripts/, on sys.path)
-
-    port = ports.resolve(persist=False).get("port")
-    if type(port) is not int:
-        return frozenset()
-    return frozenset(f"http://{host}:{port}" for host in LOOPBACK_HOSTS)
-
-
-def in_sandbox() -> bool:
-    return bool(os.environ.get("SC_SANDBOX")) or any(
-        os.path.exists(marker) for marker in _CONTAINER_MARKERS)
 
 
 def _error(code: str, message: str, details: dict | None = None) -> dict:
@@ -94,7 +81,7 @@ class Handler(BaseHTTPRequestHandler):
     def _cors(self) -> list[tuple[str, str]]:
         """CORS headers, only when the request's Origin is the GUI's."""
         origin = self.headers.get("Origin")
-        if not origin or origin not in gui_origins():
+        if not origin or origin not in self.server.gui_origins:
             return []
         return [
             ("Access-Control-Allow-Origin", origin),
@@ -138,7 +125,7 @@ class Handler(BaseHTTPRequestHandler):
                     "same_origin_required",
                     "engine operations require the review GUI's origin"))
                 return False
-        elif origin not in gui_origins():
+        elif origin not in self.server.gui_origins:
             self._send(403, _error(
                 "same_origin_required",
                 "engine operations require the review GUI's origin"))
@@ -211,63 +198,54 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # The origins this service accepts, fixed for its lifetime.
+    gui_origins: frozenset[str] = frozenset()
 
 
-def make_server(port: int) -> Server:
+def make_server(port: int, gui_origins: frozenset[str]) -> Server:
     """The service's listener, bound to loopback and nothing else."""
-    return Server((BIND, port), Handler)
+    srv = Server((BIND, port), Handler)
+    srv.gui_origins = frozenset(gui_origins)
+    return srv
 
 
-def _write_state(port: int) -> None:
-    engine_ops.write_status(engine_ops.STATE_FILE, {
-        "service": "engine-ops",
-        "pid": os.getpid(),
-        "port": port,
-        "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    })
-
-
-def _clear_state() -> None:
-    state = engine_ops.read_status(engine_ops.STATE_FILE) or {}
-    if state.get("pid") == os.getpid():
-        try:
-            engine_ops.STATE_FILE.unlink()
-        except OSError:
-            pass
-
-
-def serve(port: int) -> int:
+def serve(port: int, gui_origins: frozenset[str]) -> int:
     """Listen until stopped. `port` 0 asks the kernel for one (tests)."""
-    srv = make_server(port)
+    srv = make_server(port, gui_origins)
     actual = srv.server_address[1]
 
     def _stop(_signum, _frame):
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, _stop)
-    _write_state(actual)
-    sys.stderr.write(f"[engine-ops] listening on http://{BIND}:{actual}\n")
+    engine_ops.register_service(actual)
+    sys.stderr.write(
+        f"[engine-ops] listening on http://{BIND}:{actual} for "
+        f"{', '.join(sorted(srv.gui_origins)) or 'no GUI origin'}\n")
+    sys.stderr.flush()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        _clear_state()
+        engine_ops.unregister_service()
         srv.server_close()
     return 0
 
 
 def main(argv: list[str]) -> int:
-    if in_sandbox():
+    if engine_ops.in_sandbox():
         sys.exit("engine-ops must run on the HOST (it runs ./sc update, restart, "
                  "and update-harnesses there), not inside the sandbox. "
                  "Run `./sc engine-ops` on the host.")
     if argv:
         sys.exit("usage: engine_ops_service.py   (no arguments; the port is "
                  "this install's `./sc engine-ops-port`)")
-    import ports  # noqa: PLC0415  (scripts/, on sys.path)
-
-    return serve(ports.ensure_engine_ops_port())
+    try:
+        config = engine_ops.ensure_config()
+    except engine_ops.StateError as exc:
+        sys.exit(f"engine-ops: {exc}")
+    return serve(config["port"], engine_ops.gui_origins(config["gui_port"]))
 
 
 if __name__ == "__main__":
