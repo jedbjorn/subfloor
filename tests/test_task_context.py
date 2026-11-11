@@ -449,6 +449,78 @@ class ProjectorTest(unittest.TestCase):
         self.assertFalse(any("register-pr" in action for action in boundaries["actions"]))
         self.assertNotIn("review verdicts: Reviewer", boundaries["reserved"])
 
+    def link_registered_pr(self, sp, pr_number):
+        owner = self.con.execute(
+            "SELECT participant_id FROM sprint_participants WHERE sprint_id=? "
+            "AND role='developer'", (sp["sprint"],)).fetchone()[0]
+        registered = self.con.execute(
+            "INSERT INTO sprint_registered_prs (sprint_id,owner_participant_id,"
+            "repository,pr_number) VALUES (?,?,'owner/repo',?)",
+            (sp["sprint"], owner, pr_number)).lastrowid
+        self.con.execute(
+            "INSERT INTO sprint_pr_work_units (sprint_id,registered_pr_id,"
+            "work_unit_id) VALUES (?,?,?)", (sp["sprint"], registered, sp["unit"]))
+        return registered
+
+    def test_developer_actions_print_the_form_the_cli_accepts(self):
+        # `request-review` takes --registered-pr, an intent and a key; it has
+        # no --work-unit. Every printed lane action must parse.
+        import sprint_cli
+        parser = sprint_cli.build_parser()
+        ids = seed_feature(self.con)
+        sp = seed_sprint(self.con, ids, pending_assignment=False, blocker=False)
+        sid = sp["sprint"]
+
+        def actions():
+            return self.project(work_unit_id=sp["unit"])["boundaries"]["actions"]
+
+        # No PR registered yet: placeholder plus where to read the id.
+        self.assertIn(
+            f"sc sprint request-review --sprint {sid} --registered-pr <id> "
+            "--intent <submit|resubmit> --key <stable-key>"
+            f"  (<id> = registered PR id: `sc sprint show --sprint {sid}`)",
+            actions())
+        registered = self.link_registered_pr(sp, 321)
+        for disposition, intent in (("active", "<submit|resubmit>"),
+                                    ("fixing", "resubmit")):
+            with self.subTest(disposition=disposition):
+                self.con.execute(
+                    "UPDATE sprint_work_units SET disposition=? WHERE work_unit_id=?",
+                    (disposition, sp["unit"]))
+                line = (f"sc sprint request-review --sprint {sid} "
+                        f"--registered-pr {registered} --intent {intent} "
+                        "--key <stable-key>")
+                self.assertIn(line, actions())
+                self.assertFalse(any(
+                    "request-review" in a and "--work-unit" in a for a in actions()))
+                argv = line.removeprefix("sc sprint ").replace(
+                    "<submit|resubmit>", "submit").split()
+                self.assertEqual(parser.parse_args(argv).registered_pr, registered)
+
+    def test_merge_ready_action_names_the_lane_registered_pr(self):
+        ids = seed_feature(self.con)
+        sp = seed_sprint(self.con, ids, disposition="merge_ready")
+        registered = self.link_registered_pr(sp, 321)
+        actions = self.project(work_unit_id=sp["unit"])["boundaries"]["actions"]
+        self.assertIn(
+            f"sc sprint authorize-merge --sprint {sp['sprint']} "
+            f"--registered-pr {registered}", actions)
+        # Two linked PRs are ambiguous: fall back to the placeholder + hint.
+        second = self.link_registered_pr(sp, 322)
+        actions = self.project(work_unit_id=sp["unit"])["boundaries"]["actions"]
+        self.assertIn(
+            f"sc sprint authorize-merge --sprint {sp['sprint']} --registered-pr <id>"
+            f"  (<id> = registered PR id: `sc sprint show --sprint {sp['sprint']}`)",
+            actions)
+        # A superseded link no longer counts.
+        self.con.execute(
+            "UPDATE sprint_pr_work_units SET superseded_at=datetime('now') "
+            "WHERE registered_pr_id=?", (registered,))
+        actions = self.project(work_unit_id=sp["unit"])["boundaries"]["actions"]
+        self.assertIn(
+            f"sc sprint authorize-merge --sprint {sp['sprint']} "
+            f"--registered-pr {second}", actions)
+
     # ── one merge-gate statement (Feature #91 E11/F3, acceptance G7) ─────
     def test_armed_sprint_merge_gate_names_the_owning_developer(self):
         ids = seed_feature(self.con)
@@ -464,8 +536,11 @@ class ProjectorTest(unittest.TestCase):
             self.assertIn("  " + gate.format(you=you) + "\n", tc.render(p))
         dev = self.project(work_unit_id=sp["unit"])["boundaries"]
         self.assertEqual(dev["merge"], gate.format(you=" (you)"))
-        self.assertIn(f"sc sprint authorize-merge --sprint {sp['sprint']} --registered-pr <id>",
-                      dev["actions"])
+        # No PR is linked to the unit yet: placeholder plus where to read it.
+        self.assertIn(
+            f"sc sprint authorize-merge --sprint {sp['sprint']} --registered-pr <id>"
+            f"  (<id> = registered PR id: `sc sprint show --sprint {sp['sprint']}`)",
+            dev["actions"])
         reviewer = self.project(work_unit_id=sp["unit"], caller_shell_id=2)["boundaries"]
         self.assertEqual(reviewer["merge"], gate.format(you=""))
         self.assertFalse(any("authorize-merge" in a for a in reviewer["actions"]))
@@ -994,12 +1069,13 @@ class GuidanceTest(unittest.TestCase):
             "PRIMARY KEY(flavor, skill_id));")
         con.executescript(path.read_text())
         con.executescript(path.read_text())          # idempotent
-        # 0255, 0257 (F72), 0258, then 0282 re-own sprint_dev; compare once all
-        # replayed.
+        # 0255, 0257 (F72), 0258, 0282, then 0284 re-own sprint_dev; compare
+        # once all replayed.
         for later in ("0255_reseed_merge_gate_one_rule.sql",
                       "0257_guidance_reconciliation.sql",
                       "0258_reseed_non_sprint_green_wake.sql",
-                      "0282_skills_dedupe_posture.sql"):
+                      "0282_skills_dedupe_posture.sql",
+                      "0284_reseed_sprint_consistency.sql"):
             text = (ENGINE / "migrations" / later).read_text()
             con.executescript(text)
             con.executescript(text)

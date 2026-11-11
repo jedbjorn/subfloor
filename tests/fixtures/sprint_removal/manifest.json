@@ -181,6 +181,7 @@
     ".super-coder/assets/skills/spec_authoring/SKILL.md",
     ".super-coder/assets/skills/spec_execution/SKILL.md",
     ".super-coder/migrations/0282_skills_dedupe_posture.sql",
+    ".super-coder/migrations/0284_reseed_sprint_consistency.sql",
     "tests/test_spec_skills.py"
   ],
   "baseline_migration_ledger": {
