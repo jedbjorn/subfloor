@@ -50,6 +50,7 @@ import struct
 import sys
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -405,6 +406,14 @@ def _name_key(username) -> str:
     return username.strip().casefold() if isinstance(username, str) else ""
 
 
+def _visible(character: str) -> bool:
+    """A character fit for a label or a name: not a control, format,
+    surrogate, private-use or unassigned code point, nor a line or paragraph
+    separator."""
+    category = unicodedata.category(character)
+    return not category.startswith("C") and category not in ("Zl", "Zp")
+
+
 def _find_user(store: dict, username) -> dict | None:
     key = _name_key(username)
     if not key:
@@ -442,7 +451,7 @@ def _find_session(store: dict, token) -> dict | None:
 
 def _device_label(device, user_agent) -> str:
     text = device if isinstance(device, str) else ""
-    text = "".join(ch for ch in text if ch.isprintable()).strip()[:DEVICE_MAX]
+    text = "".join(ch for ch in text if _visible(ch)).strip()[:DEVICE_MAX]
     if text:
         return text
     agent = user_agent if isinstance(user_agent, str) else ""
@@ -843,7 +852,7 @@ def add_user(username: str) -> tuple[dict, str]:
     returned once and stored only as a hash.
     """
     name = username.strip() if isinstance(username, str) else ""
-    if not name or len(name) > USERNAME_MAX or not name.isprintable():
+    if not name or len(name) > USERNAME_MAX or not all(map(_visible, name)):
         raise AuthError(400, "bad_username", "a username is required")
     known = engine_users()
     match = next((row for row in known

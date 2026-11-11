@@ -296,6 +296,22 @@ class CryptoTest(unittest.TestCase):
                 n, r, p = scrypt.call_args_list[-1].args[2:5]
                 self.assertEqual((n, r, p), (2 ** 14, 8, 1))
 
+    def test_device_labels_are_plain_bounded_text(self):
+        label = host_auth._device_label
+        self.assertEqual(label("  desk\x00\x1b[31m\n‮ top  ", None),
+                         "desk[31m top")
+        self.assertEqual(len(label("x" * 500, None)), host_auth.DEVICE_MAX)
+        self.assertEqual(label("Büro – Rechner 2", None), "Büro – Rechner 2")
+        for nothing in ("", "   ", "\x00\n", None, 7, ["x"]):
+            self.assertEqual(label(nothing, None), "Browser", nothing)
+        self.assertEqual(
+            label(None, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/605.1.15 Version/17.4 Safari/605.1.15"),
+            "Safari on macOS")
+        self.assertEqual(
+            label("", "Mozilla/5.0 (Windows NT 10.0) Chrome/126.0 Safari/537.36 Edg/126.0"),
+            "Edge on Windows")
+
     def test_claim_code_is_short_and_unambiguous(self):
         code = host_auth.new_claim_code()
         self.assertRegex(code, r"^[A-HJ-NP-Z2-9]{8}$")
