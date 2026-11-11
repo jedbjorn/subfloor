@@ -98,6 +98,9 @@ Stopped anywhere, by a failed write or a crash, it fails closed:
 | after 1, before 2 | gone for both servers (the list no longer carries it) | not saved |
 | after 2, before 3 | gone for both | in the store only: accepted by neither, and never handed out |
 
+Each write is flushed to disk, file and directory entry, before the next
+begins, so the table holds across a power loss as well as a crash.
+
 A service start settles the two files by the same rule and so cannot bring a
 session back: a hash missing from the list is dropped from the store, never
 put back into the list. The consequence to know about: if `sessions.json` is

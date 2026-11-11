@@ -362,7 +362,11 @@ def write_private(path: Path, record: dict) -> None:
     """Replace a file in the private directory atomically.
 
     The temporary file is created exclusively and without following a link,
-    so even a planted name cannot redirect the write.
+    so even a planted name cannot redirect the write. The file's data and
+    then the directory entry are flushed to disk before this returns: a
+    caller that orders two writes (the sign-in store and the published
+    session list, `host_auth._commit`) relies on the first being durable
+    before the second starts, across a power loss as well as a crash.
     """
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
@@ -376,6 +380,11 @@ def write_private(path: Path, record: dict) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def read_private(path: Path) -> dict | None:

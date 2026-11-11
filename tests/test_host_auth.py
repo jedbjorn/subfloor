@@ -1375,6 +1375,34 @@ class InterruptedCommitTest(AuthFixture):
             # list changed and before the store did, and after both.
             self.assertGreaterEqual(interrupted_after_a_write, 2, name)
 
+    def test_each_write_is_on_disk_before_the_next_begins(self):
+        """The order only fails closed across a power loss if the first write
+        is durable before the second starts: the file's data, the rename, and
+        then the directory entry, for each of the three writes of a revoke."""
+        victim, keeper, _secret = self.fresh()
+        victim_id = self.session_id("victim")
+        events: list[tuple] = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(fd):
+            kind = "directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+            events.append(("fsync", kind))
+            return real_fsync(fd)
+
+        def replace(source, target, **kwargs):
+            events.append(("rename", Path(target).name))
+            return real_replace(source, target, **kwargs)
+
+        with mock.patch.object(os, "fsync", side_effect=fsync), \
+                mock.patch.object(os, "replace", side_effect=replace):
+            status, _headers, out = self.post(
+                "/auth/sessions/revoke", {"id": victim_id}, cookie=keeper)
+        self.assertEqual(status, 200, out)
+        one = lambda name: [("fsync", "file"), ("rename", name),       # noqa: E731
+                            ("fsync", "directory")]
+        self.assertEqual(
+            events, one("sessions.json") + one("auth.json") + one("sessions.json"))
+
     def test_the_cli_says_what_an_interrupted_command_left(self):
         self.victim, self.keeper, _secret = self.fresh()
         with self.write_fails(1):
