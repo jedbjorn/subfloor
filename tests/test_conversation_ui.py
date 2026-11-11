@@ -314,6 +314,7 @@ def test_stream_listeners_bind_server_types_and_non_display_events_advance_seque
     script = """
 let chatSource, chatRenderGeneration = 7;
 const chatStopStream = () => {};
+const startSessionWatch = () => ({errored() {}, opened() {}, signedOut() {}});
 class EventSource {
   constructor() { this.listeners = {}; }
   addEventListener(type, handler) { this.listeners[type] = handler; }
@@ -345,7 +346,9 @@ console.log(JSON.stringify({types: Object.keys(source.listeners), sequences,
   messageState: messages[0].state, userState: user.state}));
 """
     result = run_js(script)
-    assert set(result.pop("types")) == CONVERSATION_EVENT_TYPES
+    # Every conversation event type, plus the gate's own notice that the
+    # session has ended (spec 271), which is not a conversation event.
+    assert set(result.pop("types")) == CONVERSATION_EVENT_TYPES | {"sign_in_required"}
     assert result == {
         "sequences": [41, 42, 43], "requests": [], "itemCount": 1,
         "state": "queued", "messageState": "queued", "userState": "queued",
@@ -1424,8 +1427,8 @@ def test_connection_status_is_attached_to_transcript_without_visible_copy():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     assert 'let streamStatus = "connecting"' in interface
-    assert 'source.onopen = () => onState("connected")' in interface
-    assert 'onState("reconnecting");\n    probeSessionAfterStreamError(() => {' in interface
+    assert 'source.onopen = () => { watch.opened(); onState("connected"); };' in interface
+    assert 'source.onerror = () => { onState("reconnecting"); watch.errored(); };' in interface
     assert "transcriptHost.title = `Connection: ${connectionLabel}`" in interface
     assert "`Conversation transcript; connection ${connectionLabel.toLowerCase()}`" in interface
     assert '"stream-disconnected"' in interface

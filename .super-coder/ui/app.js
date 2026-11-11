@@ -152,55 +152,84 @@ async function sessionFetch(url, init) {
   return response;
 }
 // An EventSource reports an error with no status, and reconnects by itself,
-// so a revoked session and a network drop look the same from there. On a
-// stream error the open auth-status route is asked instead: only an explicit
-// `signed_in: false` leaves for sign-in; an unreachable server is a drop and
-// the stream keeps retrying. One probe at a time, and at most one per
-// SESSION_PROBE_MIN_MS however often the stream errors.
+// so a revoked session and a network drop look the same from there. The
+// stream therefore has one owned watch (sessionWatch) that asks the open
+// auth-status route what the error meant. Three answers, kept apart:
+//   "in"       the server answered and the session holds
+//   "out"      the server answered `signed_in: false`: go to sign-in
+//   "unknown"  anything else: unreachable, an error status, a malformed body
+// Unknown is never read as "in". The gate also says so directly, with a
+// `sign_in_required` event on the stream before it closes it; that event goes
+// to sign-in without a probe.
 //
-// An error inside that window is never dropped: it schedules one deferred
-// probe for when the window ends. That matters because a browser gives up on
-// a stream the server refuses (the EventSource closes for good), so the
-// refusal can be the last error the page ever gets. `onStillSignedIn` is
-// called once a probe has reached the server and the session still holds;
-// the stream uses it to reopen a closed connection. An unreachable server
-// keeps the waiters and probes again after the window.
+// One watch per live stream, holding at most one timer and one probe.
+// Stopping or replacing the stream cancels it, so nothing asks about a
+// stream that is gone. Probes are spaced by the watch's wait: five seconds,
+// doubling to a minute while the answer stays unknown or the server keeps
+// refusing the stream.
 const SESSION_PROBE_MIN_MS = 5000;
-let sessionProbe = null;
+const SESSION_PROBE_MAX_MS = 60000;
+const STREAM_REOPEN_LIMIT = 5;
+let sessionWatch = null;
 let sessionProbedAt = -Infinity;
-let sessionProbeTimer = null;
-const sessionProbeWaiters = new Set();
-function probeSessionAfterStreamError(onStillSignedIn = null) {
-  if (leavingForSignIn) return;
-  if (onStillSignedIn) sessionProbeWaiters.add(onStillSignedIn);
-  const wait = sessionProbedAt + SESSION_PROBE_MIN_MS - Date.now();
-  if (sessionProbe || wait > 0) {
-    if (!sessionProbeTimer) sessionProbeTimer = setTimeout(() => {
-      sessionProbeTimer = null;
-      probeSessionAfterStreamError();
-    }, wait > 0 ? wait : SESSION_PROBE_MIN_MS);
-    return;
-  }
-  sessionProbedAt = Date.now();
-  sessionProbe = sessionFetch("/api/auth/status")
-    // An engine without the route answers 404: no sign-in there, so the
-    // session "holds". null means the server could not be reached at all.
-    .then((response) => response.ok ? response.json().catch(() => ({})) : {}, () => null)
-    .then((status) => {
-      sessionProbe = null;
-      if (status === null) {
-        if (sessionProbeWaiters.size) probeSessionAfterStreamError();
-        return;
-      }
-      if (status.signed_in === false) {
-        sessionProbeWaiters.clear();
-        goToSignIn();
-        return;
-      }
-      const waiters = [...sessionProbeWaiters];
-      sessionProbeWaiters.clear();
-      for (const waiter of waiters) waiter();
-    });
+function stopSessionWatch() {
+  if (!sessionWatch) return;
+  clearTimeout(sessionWatch.timer);
+  sessionWatch = null;
+}
+async function probeSession() {
+  try {
+    const response = await sessionFetch("/api/auth/status");
+    if (!response.ok) return "unknown";
+    const status = await response.json();
+    return status?.signed_in === true ? "in" : status?.signed_in === false ? "out" : "unknown";
+  } catch { return "unknown"; }
+}
+// `closed()` says whether the browser has given up on the stream (the server
+// refused it); `reopen()` opens a fresh one. `reopens` and `wait` carry over
+// from the stream this one replaced, and reset when a stream opens.
+function startSessionWatch({ closed, reopen, reopens = 0, wait = SESSION_PROBE_MIN_MS }) {
+  stopSessionWatch();
+  const watch = { timer: null, probing: false, reopens, wait };
+  sessionWatch = watch;
+  const live = () => sessionWatch === watch && !leavingForSignIn;
+  const schedule = (delay) => {
+    if (watch.timer || watch.probing || !live()) return;   // one pending, never a queue
+    watch.timer = setTimeout(run, Math.max(0, delay));
+  };
+  const run = async () => {
+    watch.timer = null;
+    if (!live()) return;
+    watch.probing = true;
+    sessionProbedAt = Date.now();
+    const outcome = await probeSession();
+    watch.probing = false;
+    if (!live()) return;
+    if (outcome === "out") {
+      stopSessionWatch();
+      goToSignIn();
+      return;
+    }
+    if (outcome === "unknown") {
+      // Not evidence either way: back off, and keep asking only while the
+      // stream is closed, since a stream the browser is still retrying
+      // raises its own next error.
+      watch.wait = Math.min(watch.wait * 2, SESSION_PROBE_MAX_MS);
+      if (closed()) schedule(watch.wait);
+      return;
+    }
+    if (!closed()) { watch.wait = SESSION_PROBE_MIN_MS; return; }
+    // Signed in, yet the server refused the stream: reopen it, a bounded
+    // number of times and further apart each time.
+    if (watch.reopens >= STREAM_REOPEN_LIMIT) { stopSessionWatch(); return; }
+    reopen({ reopens: watch.reopens + 1, wait: Math.min(watch.wait * 2, SESSION_PROBE_MAX_MS) });
+  };
+  return {
+    // Every stream error lands here; it asks at most once per wait.
+    errored: () => schedule(sessionProbedAt + watch.wait - Date.now()),
+    opened: () => { watch.reopens = 0; watch.wait = SESSION_PROBE_MIN_MS; },
+    signedOut: () => { if (live()) { stopSessionWatch(); goToSignIn(); } },
+  };
 }
 
 function requestKey() {
@@ -4498,6 +4527,7 @@ function chatLoadConfiguration() {
 }
 
 function chatStopStream() {
+  stopSessionWatch();
   if (chatSource) chatSource.close();
   chatSource = null;
 }
@@ -5063,27 +5093,30 @@ async function chatRefreshConversation(conversationId, generation, onUpdate) {
 }
 
 function chatOpenStream(
-  conversationId, generation, afterSequence, onEvent, onState,
+  conversationId, generation, afterSequence, onEvent, onState, resumed = {},
 ) {
   chatStopStream();
   const source = new EventSource(
     `/api/conversations/${conversationId}/events?after=${afterSequence}`);
   chatSource = source;
-  source.onopen = () => onState("connected");
   // Events carry their sequence; a reopened stream resumes after the last
   // one seen here rather than replaying from where this one started.
   let resumeAfter = afterSequence;
-  source.onerror = () => {
-    onState("reconnecting");
-    probeSessionAfterStreamError(() => {
-      // The browser retries a dropped connection by itself, but closes the
-      // stream for good when the server refuses it. With the session
-      // confirmed, a closed stream that is still the current one is reopened.
-      if (chatSource === source && generation === chatRenderGeneration
-          && source.readyState === 2)
-        chatOpenStream(conversationId, generation, resumeAfter, onEvent, onState);
-    });
-  };
+  // The browser retries a dropped connection by itself, but closes the
+  // stream for good when the server refuses it. The watch is this stream's
+  // alone: chatStopStream() cancels it with the stream.
+  const watch = startSessionWatch({
+    ...resumed,
+    closed: () => source.readyState === 2,
+    reopen: (carried) => {
+      if (chatSource === source && generation === chatRenderGeneration)
+        chatOpenStream(conversationId, generation, resumeAfter, onEvent, onState, carried);
+    },
+  });
+  source.onopen = () => { watch.opened(); onState("connected"); };
+  source.onerror = () => { onState("reconnecting"); watch.errored(); };
+  // The gate names the reason on the stream before it closes it.
+  source.addEventListener("sign_in_required", () => watch.signedOut());
   const types = [
     "conversation.created", "conversation.updated", "conversation.renamed",
     "conversation.close.requested", "conversation.closed",

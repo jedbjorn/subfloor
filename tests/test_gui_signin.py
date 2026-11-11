@@ -114,10 +114,15 @@ def test_every_request_in_the_app_goes_through_the_session_aware_fetch():
                  'sessionFetch("/api/vm/validate/" + check', 'sessionFetch("/api/scripts/map"'):
         assert site in APP, site
     assert APP.count("sessionFetch(") == 10, "definition, probe and eight call sites"
+    assert "sessionFetch(" in function_source("probeSession")
     # The one event stream asks about the session when it errors.
     assert APP.count("new EventSource(") == 1
     stream = function_source("chatOpenStream")
-    assert 'onState("reconnecting");\n    probeSessionAfterStreamError(() => {' in stream
+    assert 'source.onerror = () => { onState("reconnecting"); watch.errored(); };' in stream
+    assert 'source.addEventListener("sign_in_required", () => watch.signedOut());' in stream
+    # Stopping the stream stops its watch.
+    assert function_source("chatStopStream").index("stopSessionWatch();") \
+        < function_source("chatStopStream").index("chatSource.close()")
 
 
 SESSION_ENV = r"""
@@ -218,13 +223,13 @@ const advance = async (ms) => {
   clock = end;
   await settle();
 };
-const server = {stream: "ok", session: true, reachable: true, authRoute: true};
-const probes = [], opened = [];
+const server = {stream: "ok", session: true, reachable: true, authRoute: true, authBody: null};
+const probes = [], opened = [], connections = [];
 globalThis.fetch = (url) => {
   probes.push(clock);
   if (!server.reachable) return Promise.reject(new TypeError("Failed to fetch"));
-  return Promise.resolve(server.authRoute
-    ? answer(200, {enrolled: true, signed_in: server.session}) : answer(404, {error: "not found"}));
+  return Promise.resolve(!server.authRoute ? answer(404, {error: "not found"})
+    : answer(200, server.authBody || {enrolled: true, signed_in: server.session}));
 };
 globalThis.EventSource = class {
   constructor(url) { this.url = url; this.readyState = 0; this.listeners = {}; opened.push(this); this.connect(); }
@@ -234,6 +239,7 @@ globalThis.EventSource = class {
     setTimeout(() => {
       if (this.readyState === 2) return;
       const outcome = !server.reachable ? "drop" : !server.session ? "refuse" : server.stream;
+      connections.push(clock);
       if (outcome === "ok") { this.readyState = 1; if (this.onopen) this.onopen(); return; }
       if (outcome === "refuse") { this.readyState = 2; if (this.onerror) this.onerror(); return; }
       this.readyState = 0; if (this.onerror) this.onerror(); setTimeout(() => this.connect(), 3000);
@@ -242,9 +248,18 @@ globalThis.EventSource = class {
   // The connection breaks under an open stream: error now, retry in three seconds.
   drop() { this.readyState = 0; if (this.onerror) this.onerror(); setTimeout(() => this.connect(), 3000); }
   emit(type, event) { this.listeners[type]({data: JSON.stringify(event)}); }
+  // What the gate does to an open stream whose session ends: name it, then close.
+  revoke() {
+    const named = this.listeners["sign_in_required"];
+    if (named) named({data: "{}"});
+    this.readyState = 2;
+    if (this.onerror) this.onerror();
+  }
 };
+// The watch a stream owns: null, or how much it is holding.
+const watching = () => typeof sessionWatch === "undefined" ? "n/a" : sessionWatch === null ? null
+  : {timer: Boolean(sessionWatch.timer), probing: sessionWatch.probing};
 let chatSource = null, chatRenderGeneration = 1;
-const chatStopStream = () => { if (chatSource) chatSource.close(); chatSource = null; };
 const states = [], events = [];
 const openStream = () => chatOpenStream("cv_1", 1, 7, (event) => events.push(event.sequence),
   (state) => states.push(state));
@@ -252,7 +267,7 @@ const report = (extra = {}) => console.log(JSON.stringify({
   probes: probes.map((at) => at - 1000000), navigations, urls: opened.map((s) => s.url),
   last: states[states.length - 1], pendingTimers: timers.length, ...extra}));
 """
-STREAM_SOURCE = SESSION + function_source("chatOpenStream")
+STREAM_SOURCE = SESSION + function_source("chatStopStream") + function_source("chatOpenStream")
 
 
 @needs_node
@@ -318,45 +333,167 @@ def test_a_refused_stream_is_reopened_once_the_session_is_confirmed():
 
 
 @needs_node
-def test_stream_probes_stay_bounded_and_stop_after_leaving():
+def test_an_outage_holds_one_watch_and_stopping_the_stream_ends_it():
     script = STREAM_ENV + STREAM_SOURCE + r"""
 (async () => {
   const out = {};
   openStream();
   await advance(100);
-  // The server goes away: the stream errors every three seconds for a minute.
+  // Ten minutes with the server gone: the stream errors every three seconds.
   server.reachable = false;
   opened[0].drop();
-  await advance(60000);
-  out.outage = {probes: probes.length, maxTimers: timers.length, navigations: [...navigations],
-    spacing: Math.min(...probes.slice(1).map((at, i) => at - probes[i]))};
-  // It comes back with the session intact: the stream reconnects by itself.
-  server.reachable = true;
-  await advance(10000);
-  out.recovered = {state: states[states.length - 1], streams: opened.length, navigations: [...navigations]};
-  // An engine without the auth route never sends anyone to sign-in.
-  server.authRoute = false;
-  opened[0].drop();
-  await advance(10000);
-  out.oldEngine = [...navigations];
-  // Revoked: leave once; nothing probes or reconnects afterwards.
-  server.authRoute = true; server.session = false;
-  opened[0].drop();
-  await advance(10000);
+  let peakTimers = 0;
+  for (let i = 0; i < 600; i++) { await advance(1000); peakTimers = Math.max(peakTimers, timers.length); }
+  out.outage = {probes: probes.length, watch: watching(), peakTimers, navigations: [...navigations],
+    gaps: probes.slice(1).map((at, i) => at - probes[i]),
+    waiters: typeof sessionProbeWaiters === "undefined" ? 0 : sessionProbeWaiters.size};
+  // The operator leaves Chats: the stream is stopped and the view re-rendered.
+  chatStopStream();
+  chatRenderGeneration += 1;
   const before = probes.length;
-  await advance(60000);
-  out.afterLeaving = {extraProbes: probes.length - before, navigations: [...navigations],
-    pendingTimers: timers.length};
+  await advance(600000);
+  out.afterStop = {extraProbes: probes.length - before, watch: watching(), pendingTimers: timers.length,
+    waiters: typeof sessionProbeWaiters === "undefined" ? 0 : sessionProbeWaiters.size};
+  // A new stream gets its own watch, and replacing it leaves exactly one.
+  server.reachable = true;
+  openStream(); openStream();
+  await advance(100);
+  opened[opened.length - 1].drop();
+  await advance(50);
+  out.replaced = {streams: opened.length, closedOld: opened[1].readyState === 2, watch: watching() !== null};
   console.log(JSON.stringify(out));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
     out = run_js(script)
-    assert out["outage"]["navigations"] == [], "an unreachable server is a drop, not a sign-out"
-    assert out["outage"]["probes"] <= 13 and out["outage"]["spacing"] >= 5000
-    assert out["outage"]["maxTimers"] <= 2, "one stream retry and at most one deferred probe"
-    assert out["recovered"] == {"state": "connected", "streams": 1, "navigations": []}
-    assert out["oldEngine"] == []
-    assert out["afterLeaving"] == {"extraProbes": 0, "navigations": [NEXT], "pendingTimers": 0}
+    outage = out["outage"]
+    assert outage["waiters"] == 0 and outage["navigations"] == []
+    assert outage["peakTimers"] <= 2, "the stream's own retry, and at most one probe timer"
+    # Backing off: 5 s doubling to a minute, so ten minutes cost about a dozen probes.
+    assert outage["probes"] <= 14, outage["probes"]
+    assert outage["gaps"][:5] == [10000, 20000, 40000, 60000, 60000]
+    assert max(outage["gaps"]) <= 63000
+    assert out["afterStop"] == {"extraProbes": 0, "watch": None, "pendingTimers": 0, "waiters": 0}
+    assert out["replaced"] == {"streams": 3, "closedOld": True, "watch": True}
+
+
+@needs_node
+def test_the_named_stream_event_goes_to_sign_in_without_a_probe():
+    script = STREAM_ENV + STREAM_SOURCE + r"""
+(async () => {
+  openStream();
+  await advance(100);
+  // The status route is misrouted, so a probe could not tell anyone anything.
+  server.authRoute = false;
+  server.session = false;
+  opened[0].revoke();
+  await settle();
+  const atOnce = {navigations: [...navigations], probes: probes.length, watch: watching()};
+  await advance(120000);
+  report({atOnce, streams: opened.length});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    assert result["atOnce"] == {"navigations": [NEXT], "probes": 0, "watch": None}
+    assert result["probes"] == [] and result["streams"] == 1 and result["pendingTimers"] == 0
+
+
+@needs_node
+@pytest.mark.parametrize("unknown", ["404", "500-ish body", "malformed", "unreachable"])
+def test_an_unknown_probe_answer_never_reopens_a_refused_stream(unknown):
+    # The reviewed sequence without the named event: the session is revoked,
+    # the reconnect is refused, and the status route cannot say why.
+    script = STREAM_ENV + STREAM_SOURCE + r"""
+const UNKNOWN = "__UNKNOWN__";
+(async () => {
+  openStream();
+  await advance(100);
+  server.session = false;                                   // revoked: reconnects are refused
+  if (UNKNOWN === "404") server.authRoute = false;
+  if (UNKNOWN === "500-ish body") server.authBody = {error: "internal"};
+  if (UNKNOWN === "malformed") server.authBody = {signed_in: "yes"};
+  if (UNKNOWN === "unreachable") server.reachable = false;   // the stream just keeps failing
+  opened[0].drop();                                         // otherwise the retry at +3 s is refused: closed
+  await advance(60000);
+  const minute = {probes: probes.length, streams: opened.length, navigations: [...navigations],
+    state: states[states.length - 1], watch: watching()};
+  await advance(540000);
+  const tenMinutes = {probes: probes.length, streams: opened.length};
+  // The route starts answering: the revocation is finally confirmed.
+  server.authRoute = true; server.authBody = null; server.reachable = true;
+  await advance(61000);
+  report({minute, tenMinutes});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("__UNKNOWN__", unknown))
+    minute = result["minute"]
+    assert minute["streams"] == 1, "a refused stream is not reopened on an unknown answer"
+    assert minute["navigations"] == [] and minute["state"] == "reconnecting"
+    assert minute["probes"] <= 5, "backing off, not a probe every window"
+    assert minute["watch"] == {"timer": True, "probing": False}
+    assert result["tenMinutes"]["streams"] == 1 and result["tenMinutes"]["probes"] <= 15
+    assert result["navigations"] == [NEXT], "once the route answers, the sign-out is acted on"
+    assert result["pendingTimers"] == 0
+
+
+@needs_node
+def test_reopening_a_refused_stream_is_bounded_and_backs_off():
+    script = STREAM_ENV + STREAM_SOURCE + r"""
+(async () => {
+  openStream();
+  await advance(100);
+  // Signed in, but the server refuses the stream every time.
+  server.stream = "refuse";
+  opened[0].drop();
+  await advance(3600000);
+  const refused = {streams: opened.length, probes: probes.length, navigations: [...navigations],
+    state: states[states.length - 1], watch: watching(), pendingTimers: timers.length,
+    gaps: connections.slice(2).map((at, i) => at - connections.slice(1)[i])};
+  // A stream that opens resets the count: a later refusal gets its reopens again.
+  server.stream = "ok";
+  openStream();
+  await advance(100);
+  const fresh = opened.length;
+  server.stream = "refuse";
+  opened[opened.length - 1].drop();
+  await advance(3600000);
+  report({refused, reopenedAgain: opened.length - fresh});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    refused = result["refused"]
+    assert refused["streams"] == 6, "the first stream and five reopens, then no more"
+    assert refused["navigations"] == [] and refused["state"] == "reconnecting"
+    assert refused["watch"] is None and refused["pendingTimers"] == 0
+    assert refused["gaps"] == sorted(refused["gaps"]) and refused["gaps"][-1] > refused["gaps"][0], \
+        "each reopen waits longer than the one before"
+    assert result["reopenedAgain"] == 5
+
+
+@needs_node
+def test_a_drop_with_the_session_intact_recovers_by_itself():
+    script = STREAM_ENV + STREAM_SOURCE + r"""
+(async () => {
+  openStream();
+  await advance(100);
+  server.reachable = false;
+  opened[0].drop();
+  await advance(60000);
+  server.reachable = true;
+  await advance(10000);
+  const recovered = {state: states[states.length - 1], streams: opened.length};
+  // Revoked later: leave once; nothing probes or reconnects afterwards.
+  server.session = false;
+  opened[0].drop();
+  await advance(70000);
+  const before = probes.length;
+  await advance(600000);
+  report({recovered, extraProbes: probes.length - before});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    assert result["recovered"] == {"state": "connected", "streams": 1}
+    assert result["navigations"] == [NEXT]
+    assert result["extraProbes"] == 0 and result["pendingTimers"] == 0
 
 
 # ── next ──────────────────────────────────────────────────────────────────────
