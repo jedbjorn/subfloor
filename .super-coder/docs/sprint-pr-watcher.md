@@ -10,7 +10,9 @@ numbers and shortnames below are illustrative. Exact CLI syntax remains in
 The engine's GitHub observation service. It reads pull requests the fork's
 Developer shells own, turns each state change into a durable transition, and
 delivers the fact to the owning Developer as a message and a wake — inside a
-Sprint or outside one. **Shells never poll GitHub**; this is why.
+Sprint or outside one. **Headless shells never poll GitHub**; this is why. A
+terminal seat receives wakes only at its next boot, so there a shell sets up
+its own bounded monitors for what it is waiting on.
 
 It is read-only against GitHub: it never pushes, merges, closes, re-runs checks
 or comments. The merge gate stays where the boot document puts it — an FnB

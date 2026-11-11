@@ -274,13 +274,36 @@ class StandardPromptRefreshTest(unittest.TestCase):
         # during implementation, Dev/alpha after deploy, browser driving or a
         # VM seat) is settled with the FnB before implementation, never left
         # for the Developer to discover mid-Sprint.
+        # The boot keeps the non-negotiable rule and names `spec_authoring`;
+        # the five-question walk lives in that skill.
         body = shell_factory.load_procedure("planner")
+        flat = " ".join(body.split())
         self.assertIn("## ACCEPTANCE FEASIBILITY", body)
-        self.assertIn("testable and achievable", body)
-        self.assertIn("surface and discuss with the FnB", body)
-        self.assertIn("`drive_browser`", body)
-        self.assertIn("`remote_seats`", body)
-        self.assertIn("Dev or an alpha production", body)
+        self.assertIn("testable and achievable", flat)
+        self.assertIn("a named seat, a named action, an observable result", flat)
+        self.assertIn("prerequisite to raise with the FnB", flat)
+        self.assertIn("label inference as proof", flat)
+        self.assertIn("`spec_authoring`", body)
+        skill = ENGINE / "assets" / "skills" / "spec_authoring" / "SKILL.md"
+        detail = skill.read_text()
+        self.assertIn("surface and discuss with the FnB", detail)
+        self.assertIn("`drive_browser`", detail)
+        self.assertIn("`remote_seats`", detail)
+        self.assertIn("Dev or an alpha production", detail)
+
+    def test_role_triggers_name_their_skill_under_every_moved_heading(self):
+        planner = shell_factory.load_procedure("planner")
+        for heading in ("FEATURES, SPECS, AND DOCS", "POSTURE, THEN CHALLENGE",
+                        "ACCEPTANCE FEASIBILITY", "THE SPEC CONTRACT",
+                        "REVISE, FREEZE, DOCUMENT"):
+            with self.subTest(heading=heading):
+                block = planner.split(f"## {heading}\n", 1)[1].split("\n## ", 1)[0]
+                self.assertIn("`spec_authoring`", block)
+        dev = shell_factory.load_procedure("dev")
+        for heading in ("SPEC EXECUTION", "TESTING POSTURE"):
+            with self.subTest(heading=heading):
+                block = dev.split(f"## {heading}\n", 1)[1].split("\n## ", 1)[0]
+                self.assertIn("`spec_execution`", block)
 
 
 class AdaptivePostureMigrationTest(unittest.TestCase):

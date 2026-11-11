@@ -23,7 +23,10 @@ def boot_block(flavor: str | None, seat: str | None, conversion: dict | None = N
             "\n\n## SEAT\n\n"
             "You hold a terminal. Use your harness's native background tools freely; "
             "they notify you in session. `sc job` is optional. "
-            "Wakes reach you only at your next boot."
+            "Wakes reach you only at your next boot, so nothing the engine "
+            "sends will interrupt this session: set up your own bounded "
+            "monitors for the PRs, checks, and jobs you are waiting on, and "
+            "stop them when you finish."
         )
     if seat != "gui":
         raise ValueError(f"invalid launch seat: {seat!r}")
