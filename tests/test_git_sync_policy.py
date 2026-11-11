@@ -18,6 +18,7 @@ RECONCILIATION = ENGINE / "migrations" / "0257_guidance_reconciliation.sql"
 CLOSEOUT_SCOPE = ENGINE / "migrations" / "0260_reseed_sprint_closeout_scope.sql"
 DOCS_PASS = ENGINE / "migrations" / "0267_reseed_docs_pass_skills.sql"
 RUN_RECEIPTS = ENGINE / "migrations" / "0279_run_receipt_attachments.sql"
+DEDUPE_POSTURE = ENGINE / "migrations" / "0282_skills_dedupe_posture.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import seed_skills  # noqa: E402
@@ -29,13 +30,18 @@ class GitSyncPolicyTest(unittest.TestCase):
         self.assertIn("treat `shell/<shortname>` as a disposable base", body.lower())
         self.assertIn("durable coordination lives in the control plane", body.lower())
         self.assertIn("code lives on a pushed branch with a pr", body.lower())
-        self.assertIn("`git status --short` is empty", body)
-        self.assertIn("`HEAD` equals `origin/main`", body)
         self.assertIn(
             "NEVER to a feature branch or open PR",
             body,
         )
-        self.assertIn("surface a target/identity mismatch", body)
+        # The boot carries the rule and one command; a tree/branch mismatch
+        # still stops the shell before any destructive command.
+        self.assertIn("a mismatch -> stop and surface it", body)
+        self.assertIn("never `git pull` or merge on it", body)
+        self.assertIn(
+            "pass = `git status --short` is empty + `HEAD` equals `origin/main`", body
+        )
+        self.assertIn("dirty or unpushed feature work is listed for the FnB", body)
 
     def test_boot_makes_the_base_reset_executable_and_bounded(self):
         # F72: the every-session sync gate lives in boot; the git skill keeps
@@ -52,8 +58,9 @@ class GitSyncPolicyTest(unittest.TestCase):
         self.assertIn("without asking", body)
         self.assertIn("code lives on a pushed branch with a PR", body)
         self.assertIn("NEVER to a feature branch or open PR", body)
-        self.assertIn(
-            "`git rev-parse HEAD` equals `git rev-parse origin/main`", body
+        self.assertLess(
+            body.index("with ACTIVE SESSION"),
+            body.index("`git reset --hard origin/main && git clean -fd`"),
         )
         skill = " ".join(ASSET.read_text().split())
         self.assertIn("VERSION CONTROL section carries the every-session rules", skill)
@@ -112,6 +119,11 @@ class GitSyncPolicyTest(unittest.TestCase):
             receipts = RUN_RECEIPTS.read_text()
             con.executescript(receipts)
             con.executescript(receipts)
+            # 0282 replaces the receipt copy with a pointer and rewrites the
+            # trigger description.
+            dedupe = DEDUPE_POSTURE.read_text()
+            con.executescript(dedupe)
+            con.executescript(dedupe)
 
             parsed = seed_skills.parse_skill(ASSET)
             actual = con.execute(

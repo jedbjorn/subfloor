@@ -7,25 +7,55 @@ below are illustrative and do not grant access to another fork. Exact CLI
 syntax remains in `sc help --all` and verb help.
 
 
-One host-side broker gives a shell two ways to drive a machine (decision
-#355). Posture 1, host to VM: the engine on the host owns one libvirt domain's
-lifecycle through `./sc vm`. Posture 2, VM to VM: the same broker runs SSH
-against named remotes for `./sc remote`; lifecycle there belongs to the FnB or
-the upstream instance. In both, keys stay in host-owned files and the broker
-runs `ssh`; the shell never does (decision #353). The sibling
-[tailnet broker](tailscale-broker.md) serves the separate read-only
-diagnostics tier.
+## What a seat is, and what it is not
+
+A test seat is a machine kept for testing — a VM. It is **disposable and not
+protected**: a mistake there costs a snapshot restore, so a shell may run
+anything on it and reset it to the kept snapshot without asking. Refreshing a
+shared snapshot is the owner's call (decision #434). Nothing on this page
+makes a seat safe to keep valuable state on.
+
+A machine in real use — the owner's workstations, servers, production — has no
+undo, so shells get read-only diagnostics there and nothing more. That tier
+is the [tailnet broker](tailscale-broker.md)'s `readonly_hosts`. It is a
+precaution against accidents, not distrust of the agent: the guards here are
+confusion rails, not containment (decisions #427, #428), and this page
+describes only what is actually enforced.
+
+What matters is the **class of machine, not the route** to it. A seat is
+reached three ways, and all three are the same disposable seat:
+
+| Route | Verb | Use |
+|---|---|---|
+| libvirt on this host | `./sc vm` | one domain whose lifecycle (start, snapshot, reset, bake) the engine owns |
+| SSH to a named remote | `./sc remote` | a seat whose lifecycle belongs to the owner or to another instance |
+| the tailnet | `./sc ts` with the seat in `allowed_hosts` | a seat that is only reachable over the tailnet, such as one that travels with the owner |
+
+One host-side broker serves the first two (decision #355); the tailnet has
+its sibling. `./sc vm` and `./sc remote` have **no read-only tier**: every
+verb is unrestricted, so link only test seats through them. A machine in real
+use belongs in the tailnet broker's `readonly_hosts`, and what protects it
+beyond that is the tailnet policy JSON, which decides what a node may reach
+at all.
+
+**Keys are hygiene, not a fence.** A seat key lives in one host-owned file,
+is never committed and is never copied to a guest (decision #353); the broker
+is the process that runs `ssh` with it, and a sandboxed shell has no copy.
+That keeps a key from leaking or being overwritten. It does not confine a
+bare-metal shell, which runs as the operator's own account.
 
 ## Why a broker
 
 A fork's shells run in a sandbox container with no route across libvirt NAT,
-no `virsh`, no SSH key and no known-hosts material; a bare-metal shell shares
-the operator's account and must not become a second place keys live. The
-vm-broker runs on the host, where libvirt and the keys are, and exposes verbs
-over a unix socket inside the bind-mounted engine dir
-(`.super-coder/run/vm-broker.sock`). The socket is fs-perm gated (0600); no
-network surface, no auth token, nothing copied into a container. The broker
-refuses to start under `SC_SANDBOX`.
+no `virsh`, no SSH key and no known-hosts material, so something on the host
+has to run those for them. A bare-metal shell shares the operator's account
+and uses the same verbs so that there is one path, one place a key lives and
+one set of structured errors. The vm-broker runs on the host, where libvirt
+and the keys are, and exposes verbs over a unix socket inside the
+bind-mounted engine dir (`.super-coder/run/vm-broker.sock`). The socket is
+mode 0600 (other users cannot open it); no network surface, no auth token,
+nothing copied into a container. The broker refuses to start under
+`SC_SANDBOX`.
 
 ## Two blocks, one file
 
@@ -151,12 +181,51 @@ is dropped with a note and the saved block never carries a transfer-directory ke
   --ssh-host 192.168.122.50 --ssh-user tester --ssh-key-path /home/op/.ssh/vm_tester
 ```
 
-The other two seats are one command each:
+The other two routes are one command each:
 
 ```bash
 ./sc remote add halo --host halo.internal --user jedi --key-path /home/op/.ssh/halo_shell
-./sc ts init --ssh-user ops --allowed-host build-box --readonly-host blade   # tailnet tier
+./sc ts init --ssh-user ops --allowed-host build-box --readonly-host blade   # tailnet route
 ```
+
+### Link commands test the link
+
+`./sc vm init`, `./sc remote add` and `./sc ts init` do three things, in this
+order, and report each:
+
+1. **Save** the block. It is durable before anything is tested.
+2. **Start the broker** if it is not answering — the same `./sc vm-broker-up`
+   (or `ts-broker-up`) step adoption runs, then a wait for the socket. From a
+   sandbox the broker cannot be started, so the exact host command is printed
+   instead.
+3. **Test the link** and print pass/fail per check, with the next command to
+   run for each failure:
+
+| Command | Checks |
+|---|---|
+| `./sc vm init` | `domain` (libvirt knows it) · `ssh` (the guest answers with the key) · `snapshot` (the kept snapshot exists) · `toolchain` (the fork's declared `checks`; skipped when `ssh` failed) |
+| `./sc remote add` | `ssh` (key path and mode, then one `echo ok` — this is also what pins the host key on first contact) |
+| `./sc ts init`, `./sc ts add-host` | `daemon` · `auth` · `peer` · `ssh`, for the hosts the command names only; none named means the broker alone is checked — see the [tailnet broker](tailscale-broker.md) |
+
+A failed check exits non-zero with `init_verify_failed` /
+`remote_verify_failed` / `ts_verify_failed`, and the message says the block
+**is saved**: fix the cause and re-run the same command. A sandboxed caller
+runs the checks through the broker, and reports them skipped — never passed —
+when the broker is not reachable.
+
+**A powered-off guest is not a wrong link.** `./sc vm bake` leaves a seat
+powered off, so re-linking a healthy seat meets a guest that cannot answer
+SSH. `./sc vm init` reads the domain's power state first: when it is off, the
+`domain` and `snapshot` checks still run, `ssh` and `toolchain` are reported
+`not run: the guest is powered off`, and the result is
+`init_guest_powered_off` rather than `init_verify_failed`. It still exits
+non-zero, because SSH was not proven; the message names both ways forward —
+`./sc vm start` then re-run, or `--no-verify` to link it while it is off.
+
+`--no-verify` on any link command saves without testing the link or starting
+the broker, for setting a seat up while it is offline; the result then says
+`not verified`. It still reports whether the broker is already answering (one
+read of the local socket) — no guest, remote or tailnet host is contacted.
 
 `./sc remote list`, `./sc remote remove <name>`, and the GUI `PUT /vm` wizard
 manage the blocks afterwards. `remotes` has no GUI surface yet.
@@ -197,13 +266,21 @@ undeclared remote name, a malformed name, a key with the wrong mode, or a path
 outside those roots is refused with a structured error before any `ssh` or
 `scp` runs.
 
-Three sub-trees are carved back out of those roots. `.sc-state/local/vm/` holds
-the adoption private key and the pinned known-hosts file, and is excluded from
-push sources and pull destinations alike — key material stays on the host
-(decision #353). `.super-coder/` and `.git/` are additionally refused as pull
-destinations, so guest bytes can never rewrite the running engine or the
-repository's own object store. A symlink aimed at any of them is refused too:
-the check runs on the resolved path.
+Some sub-trees are carved back out of those roots, **identically for `./sc vm`
+and `./sc remote`** — both resolve their local path through one helper
+(`vm.transfer_path`):
+
+| Sub-tree | Push source | Pull destination | Why |
+|---|---|---|---|
+| `.sc-state/local/vm/` | refused | refused | the adoption private key and the VM's pinned known-hosts file (decision #353) |
+| `.sc-state/local/remotes/` | allowed | refused | the known-hosts files pinned for named remotes |
+| `.super-coder/` | allowed | refused | seat bytes must not rewrite the running engine |
+| `.git/` | allowed | refused | nor the repository's own object store |
+
+A symlink aimed at any of them is refused too: the check runs on the resolved
+path. This is hygiene — a key is never shipped to a seat or overwritten from
+one — and it covers these directories only. A remote's `key_path` is wherever
+the operator put it; keep it outside the repository.
 
 Guest paths may be written with either separator (`C:\SubfloorTest\out.bin` or
 `C:/SubfloorTest/out.bin`). The engine normalises to forward slashes on the
@@ -216,10 +293,14 @@ Act on the code.
 
 | Code | Meaning |
 |---|---|
-| `broker_unreachable` | the vm-broker is not serving; the printed start command is the fix |
-| `remote_not_found`, `remote_name_invalid` | the named remote is undeclared or malformed |
+| `vm_not_linked` | no `vm` block exists, so a `./sc vm` verb has nothing to act on. `./sc vm-broker-up` starts nothing in this state (or is serving only `remotes`); the fix is to link a VM with `./sc vm adopt` or `./sc vm init`, not to start the broker |
+| `broker_unreachable` | a seat **is** linked but the vm-broker is not answering; `./sc vm-broker-up` on the host is the fix |
+| `init_guest_powered_off` | the block **is saved** and every check that works with the guest off passed, but the guest is powered off, so SSH was not tested — not a wrong link. `./sc vm start` and re-run `./sc vm init`, or pass `--no-verify` |
+| `init_verify_failed`, `remote_verify_failed` | the block **is saved** but a link check failed; `error.details.checks[]` carries `check`, `ok`, `skipped`, `output` and `next` (the command to run), and `details.broker` the broker state. Re-run the link command once fixed, or pass `--no-verify` to save without testing |
+| `init_write_failed`, `remote_write_failed` | the block could not be saved; nothing changed |
+| `remote_not_found`, `remote_name_invalid` | the named remote is undeclared or malformed. `./sc remote` answers `remote_not_found`, not `broker_unreachable`, when the broker is down **and** the remote was never added |
 | `remote_key_invalid`, `remote_config_invalid` | key path, mode, or block fields are wrong on the host |
-| `remote_path_not_allowed` | a push source or a pull destination resolved outside the repo and `.sc-state/local/` |
+| `remote_path_not_allowed` | a push source or a pull destination resolved outside the repo and `.sc-state/local/`, or inside one of the carved-out sub-trees above — for `./sc vm` and `./sc remote` alike |
 | `remote_unreachable`, `remote_exec_failed` | SSH failed, or the command exited non-zero |
 | `exec_failed`, `exec_validation_failed`, `exec_unavailable` | posture 1 `exec`: the guest command exited non-zero; the `vm` block is missing `ssh_host`/`ssh_user`/`ssh_key_path` or the command was empty; `ssh` itself is not installed on the host |
 | `vm_busy` | another guest-mutating call holds the broker's single mutation lock; the reply names the wait budget and nothing was attempted |
@@ -248,7 +329,8 @@ Act on the code.
 
 ```
 ./sc vm-broker            run the broker in the foreground (unix socket)
-./sc vm-broker-up         start it backgrounded (nohup + pidfile); self-skips when nothing is linked
+./sc vm-broker-up         start it backgrounded (nohup + pidfile); when nothing is linked it starts
+                          nothing and says so, with the commands that link a seat
 ./sc vm-broker-down       stop the backgrounded broker
 ./sc vm-broker-sock       print the socket path
 ./sc vm-broker-install    supervise via a systemd --user unit (survives logout/reboot)
@@ -265,8 +347,8 @@ under `~/.config/subfloor` or `~/.ssh` is mounted.
 ```
 ./sc vm adopt --domain D [--ssh-user U] [--ssh-host H] [--snapshot NAME] [--libvirt-uri URI]
               [--password-file P] [--bootstrap-url URL] [--no-provision] [--wait SECONDS] [--json]
-./sc vm init|status|start|stop [--force]|restart|snapshot list|create NAME|delete NAME|bake [NAME]|reset [NAME] (--off|--running)|push SRC [DEST]|pull SRC DEST|exec -- CMD|capture|mcp status|up|down
-./sc remote add NAME --host H --user U --key-path /abs [--port N] [--known-hosts-path /abs] | remove NAME | list | status NAME | exec NAME -- CMD | push NAME SRC DEST | pull NAME SRC DEST
+./sc vm init [--no-verify]|status|start|stop [--force]|restart|snapshot list|create NAME|delete NAME|bake [NAME]|reset [NAME] (--off|--running)|push SRC [DEST]|pull SRC DEST|exec -- CMD|capture|mcp status|up|down
+./sc remote add NAME --host H --user U --key-path /abs [--port N] [--known-hosts-path /abs] [--no-verify] | remove NAME | list | status NAME | exec NAME -- CMD | push NAME SRC DEST | pull NAME SRC DEST
 ./sc vm-mcp-relay up|down|status      in-sandbox TCP 127.0.0.1:18000 → the broker's vm-mcp.sock (run by `./sc vm mcp up`)
 ```
 
@@ -291,8 +373,8 @@ opt-in (`common: false`).
 - `windows_testing` — the Windows add-on: preparing a guest, the shell's
   authority over it, PowerShell exec conventions, capture, Windows-MCP
   transport.
-- `tailscale_diagnostics` — the read-only tailnet tier; see the
-  [tailnet broker](tailscale-broker.md).
+- `tailscale_diagnostics` — the tailnet route and its read-only tier for
+  machines in real use; see the [tailnet broker](tailscale-broker.md).
 
 ## Limits
 

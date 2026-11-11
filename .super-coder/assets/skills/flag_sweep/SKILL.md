@@ -17,10 +17,10 @@ close what's provably resolved, open what's provably missing.
 
 ## Step 1: Load the bounded delivery audit
 
-Run `sc mem delivery-audit`. The Planner-only API response contains
-`recent_flag_names`, `open_flags`, `implemented_but_unshipped`, and
-`shipped_but_undocumented`. It preserves the deterministic queries and dedup
-guards below without granting arbitrary engine SQL.
+Run `sc mem delivery-audit` (Planner-only). It returns `recent_flag_names`,
+`open_flags` (each with its feature's `roadmap_status` and `frozen_docs`),
+`implemented_but_unshipped`, and `shipped_but_undocumented`. These are the
+sweep's whole input; run no engine SQL of your own.
 
 `frozen_docs` counts ANY frozen document on the feature — kind='spec' AND
 kind='doc' both qualify, so a fork that freezes its shipped `doc` rows is
@@ -65,24 +65,20 @@ NEVER message on close. NEVER reopen a flag. A close whose evidence you had to i
 
 ## Step 3: Open the flags nobody opened
 
-Two gaps drop silently, in sequence: 3A (done but never marked shipped)
-precedes 3B (shipped but undocumented) — a feature exits 3A before 3B can
-apply. Pick `SC-###` from the highest numbered value in `recent_flag_names`.
+The audit already computed both gaps and applied the dedup guards, so open
+one flag per returned row and re-derive nothing. A feature exits 3A before 3B
+can apply. Pick `SC-###` from the highest numbered value in
+`recent_flag_names`. Open each flag in Planner's own queue.
+Do not message yourself.
 
 ### 3A — Implemented but not marked shipped (ship-drift)
 
-The dev flips the horizon to `shipped` when Verification passes — the flip
-sometimes gets missed. Deterministic signal = spec's
-**Verification task `done`** + feature **not** `shipped`. Open a durable
-`[Ship]` flag — it governs both halves of the dropped hand-off (mark shipped +
-reconcile the doc to the spec) and stays open until a planner does both.
-
-Use the `implemented_but_unshipped` rows. The projection includes only specs
-whose Verification task is done, whose feature is not shipped/retired, and
-whose open `[Ship]`/`[Docs]` or organic ship/docs-pending handoff does not
-already cover the feature.
-
-Per row, open the flag in Planner's own queue. Do not message yourself:
+Rows: `implemented_but_unshipped` — the spec's Verification task is `done`,
+the feature is not shipped or retired, and no open `[Ship]`/`[Docs]` or
+organic ship/docs-pending handoff covers it. The dev's flip to `shipped` was
+missed. The `[Ship]` flag governs both halves of the dropped handoff (mark
+shipped + reconcile the doc to the spec) and stays open until a planner does
+both:
 
 ```
 sc mem flag open "[Ship] <title> implemented, not marked shipped | Blocker for: <title> ship + doc" --name SC-### --priority Medium --feature <feature_id>
@@ -90,23 +86,17 @@ sc mem flag open "[Ship] <title> implemented, not marked shipped | Blocker for: 
 
 ### 3B — Shipped but undocumented (docs-pending)
 
-Devs open a docs-pending flag when they ship — sometimes skipped. Find
-`shipped` features with no frozen doc + no open docs-pending flag; open one
-per row. (Finished-but-not-shipped is 3A's job, not this one.)
-
-Use the `shipped_but_undocumented` rows. The projection includes only shipped
-features with no frozen document and no open `[Docs]` or organic docs-pending
-handoff.
-
-The dedup guards match the `[Docs]`/`[Ship]` tag at position zero first, then
-fall back to `'%doc%pending%'` for untagged organic wordings; the fallback's
-over-breadth only ever SKIPS an open — the conservative direction.
-
-Per row, open the flag in Planner's own queue. Do not message yourself:
+Rows: `shipped_but_undocumented` — a shipped feature with no frozen document
+and no open `[Docs]` or organic docs-pending handoff. The dev's docs-pending
+flag was skipped:
 
 ```
 sc mem flag open "[Docs] <title> shipped, doc pending | Blocker for: <title> doc" --name SC-### --priority Medium --feature <feature_id>
 ```
+
+The guards match the `[Docs]`/`[Ship]` tag at position zero, then fall back to
+`'%doc%pending%'` for untagged wordings; the fallback's over-breadth only ever
+SKIPS an open — the conservative direction.
 
 ---
 

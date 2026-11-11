@@ -299,7 +299,8 @@ class ProjectorTest(unittest.TestCase):
         self.assertEqual(bo["git"]["branch"], "feat/projection")
         self.assertEqual(bo["git"]["base"], "origin/main")
         self.assertIn(f"sc mem task start {ids['tasks'][1]}", " ".join(bo["walls"]))
-        self.assertEqual(bo["merge"], "merge gate: an explicit FnB directive naming the PR "
+        self.assertEqual(bo["merge"], "merge gate: an explicit FnB directive that identifies the PR"
+                                       ", by number or by assignment and stated condition "
                                        "(no armed Sprint covers this work)")
         self.assertEqual(bo["reserved"], [])
         self.assertEqual(bo["actions"], [])
@@ -476,7 +477,8 @@ class ProjectorTest(unittest.TestCase):
         ids = seed_feature(self.con)
         sp = seed_sprint(self.con, ids, lifecycle="paused")
         paused = (f"merge gate: Sprint {sp['sprint']} is paused — wait for resume, "
-                  "or an explicit FnB directive naming the PR")
+                  "or an explicit FnB directive that identifies the PR"
+                  ", by number or by assignment and stated condition")
         self.assertEqual(
             self.project(task_id=ids["tasks"][1])["boundaries"]["merge"], paused)
         self.assertEqual(
@@ -484,7 +486,8 @@ class ProjectorTest(unittest.TestCase):
         self.assertEqual(
             tc.merge_gate(sprint_id=7, lifecycle="completed", developer="DEV1",
                           caller_is_developer=True),
-            "merge gate: an explicit FnB directive naming the PR "
+            "merge gate: an explicit FnB directive that identifies the PR"
+            ", by number or by assignment and stated condition "
             "(Sprint 7 is completed, not armed)")
 
     def test_task_linked_to_a_unit_points_at_the_work_unit_selector(self):
@@ -938,9 +941,14 @@ class GuidanceTest(unittest.TestCase):
         self.assertNotIn("don't grep blind", dev["focus"])
         body = (ENGINE / "templates" / "shells" / "dev.md").read_text()
         self.assertIn("sc context --task <id>", body)
-        self.assertLess(body.index("sc context --task <id>"),
-                        body.index("sc mem get documents --doc <doc_id>"))
-        self.assertIn("only for an unresolved need", body)
+        self.assertIn("Never auto-pick the latest document", " ".join(body.split()))
+        self.assertIn("`spec_execution`", body)
+        # The full selection order lives in the `spec_execution` skill.
+        detail_path = ENGINE / "assets" / "skills" / "spec_execution" / "SKILL.md"
+        detail = detail_path.read_text()
+        self.assertLess(detail.index("sc context --task <id>"),
+                        detail.index("sc mem get documents --doc <doc_id>"))
+        self.assertIn("only for an unresolved need", detail)
         dev_skill = self.skill("sprint_dev")
         self.assertIn("sc context --work-unit <id>", dev_skill)
         self.assertIn("default planning context", dev_skill)
@@ -986,10 +994,12 @@ class GuidanceTest(unittest.TestCase):
             "PRIMARY KEY(flavor, skill_id));")
         con.executescript(path.read_text())
         con.executescript(path.read_text())          # idempotent
-        # 0255, 0257 (F72), then 0258 re-own sprint_dev; compare once all replayed.
+        # 0255, 0257 (F72), 0258, then 0282 re-own sprint_dev; compare once all
+        # replayed.
         for later in ("0255_reseed_merge_gate_one_rule.sql",
                       "0257_guidance_reconciliation.sql",
-                      "0258_reseed_non_sprint_green_wake.sql"):
+                      "0258_reseed_non_sprint_green_wake.sql",
+                      "0282_skills_dedupe_posture.sql"):
             text = (ENGINE / "migrations" / later).read_text()
             con.executescript(text)
             con.executescript(text)

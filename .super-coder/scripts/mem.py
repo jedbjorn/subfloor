@@ -33,23 +33,40 @@ Discovery still calls the API; it is never a direct-DB path.
 Run from the repo root, like every engine command:
 
     ./sc mem which                                 # confirm the memory API is reachable + which shell this session resolves as
-    ./sc mem get <surface>           [--json]      # read: state|seed|lns|decisions|flags|roadmap|narrative|messages
+
+  Reads — one grammar, `get <surface> [<id>]`, `--json` for the raw payload:
+    ./sc mem get <surface> [<id>]    [--json]      # state|seed|lns|decisions|flags|roadmap|narrative|messages|
+                                                   # projects|documents|tasks|shells|qaqc; singular forms
+                                                   # (flag, decision, document/doc, task, feature, …) are aliases
     ./sc mem get decisions [<id>|--all]            # default: active index (no rationale); <id> = full row; --all incl. superseded
-    ./sc mem get documents [--doc ID] [--feature ID] [--retired]
-                                                   # retired rows hidden by default; --doc always reads, retired or not
-    ./sc mem get flags [<id>] [--feature ID --resolved]
-                                                   # default: open; <id>: exact incl. resolved; history: feature-scoped only
                                                    # decisions read FLEET-WIDE (author tagged @shortname); writes stay your own
-    ./sc mem state "<text>"
-    ./sc mem seed  "<body>"          [--date YYYY-MM-DD] [--tag cc]
-    ./sc mem lns   "<body>"          (--supersedes 29,36 | --new) [--date …] [--tag …]
+    ./sc mem get documents [<id>|--doc ID] [--feature ID] [--retired]
+                                                   # <id> = one doc WITH body (retired or not); lists hide retired rows
+    ./sc mem get flags [<id>] [--feature ID [--resolved]]
+                                                   # default: every open flag; <id>: exact row incl. resolved;
+                                                   # --feature: that feature's open flags; + --resolved: its history
+    ./sc mem get roadmap [<id>]                    # the live board; <id> = one feature (retired included) + deps + docs
+    ./sc mem get tasks (<id> | --doc ID | --feature ID)
+    ./sc mem get qaqc (<spec_document_id> | --doc ID)
+
+  Writes — every write verb takes `--json`: exactly one JSON object on stdout
+  on every path, no prose — `{"ok": true, <ids>, "message"}` on success,
+  `{"ok": false, "error": {code, message, http_status}}` on failure (same
+  nonzero status, same prose on stderr; several-id verbs add
+  applied_ids/not_applied_ids). Wherever a body is text, `--body-file PATH|-` reads it
+  from a file or stdin instead of the argument:
+    ./sc mem state "<text>"          [--body-file PATH|-]
+    ./sc mem seed  "<body>"          [--date YYYY-MM-DD] [--tag cc] [--body-file PATH|-]
+    ./sc mem lns   "<body>"          (--supersedes 29,36 | --new) [--date …] [--tag …] [--body-file PATH|-]
                                                    # ≤500 chars: the RULE, not the incident
     ./sc mem curated                 # stamp a curation sweep (clears the STATUS advisory)
     ./sc mem retire <entry_id>
-    ./sc mem decision "<decision>"   [--rationale "…"] [--date …] [--parent ID] [--feature ID] [--doc ID]
-    ./sc mem flag open  "<description>" [--name CC-001] [--priority Medium] [--feature ID]
-    ./sc mem flag close <flag_id>    [--notes "…"]
-    ./sc mem flag edit  <flag_id>    [--name SC-002] [--description "…"] [--append "…"] [--priority P] [--feature ID]
+    ./sc mem decision "<decision>"   [--rationale "…" | --rationale-file PATH|-] [--date …] [--parent ID]
+                                     [--feature ID] [--doc ID] [--body-file PATH|-]
+    ./sc mem flag open  "<description>" [--name CC-001] [--priority Medium] [--feature ID] [--body-file PATH|-]
+    ./sc mem flag close <flag_id> [<flag_id> …] [--notes "…" | --notes-file PATH|-]
+    ./sc mem flag edit  <flag_id>    [--name SC-002] [--description "…"] [--append "…" | --append-file PATH|-]
+                                     [--priority P] [--feature ID]
     ./sc mem roadmap add "<title>"   [--status brainstorm] [--summary "…"] [--project <shortname|id>]
     ./sc mem roadmap status <feature_id> <status>
     ./sc mem roadmap edit <feature_id> [--title "…"] [--summary "…"]   # revise a feature's title/summary
@@ -58,23 +75,35 @@ Run from the repo root, like every engine command:
     ./sc mem project add <shortname> "<title>" [--purpose …] [--standing …] [--status active] [--role …]
     ./sc mem project standing <shortname|id> "<text>"
     ./sc mem project status <shortname|id> active|inactive|paused
-    ./sc mem task add "<title>" --feature <id> --doc <id> --seq <n> [--desc "…"]
+    ./sc mem task add "<title>" --doc <id> [--feature <id>] [--seq <n>] [--desc "…"]
+                                                   # --feature defaults to the doc's feature; --seq to the plan's next slot
     ./sc mem task start <task_id>    ./sc mem task done <task_id>
     ./sc mem task cancel <task_id>   [--notes "…"]   # work moved/rescoped — never built
     ./sc mem task edit <task_id>     [--title "…"] [--desc "…"]   # revise title/description
     ./sc mem oriented                # mark first-run complete (bootstrapped=1)
-    ./sc mem doc add "<title>" --body-file PATH [--feature ID] [--kind spec|doc] [--seq N]
-    ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH] [--render-path …]   # frozen or retired: --render-path only
+    ./sc mem doc add "<title>" --body-file PATH|- [--feature ID] [--kind spec|doc] [--seq N]
+    ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH|-] [--render-path …]   # frozen or retired: --render-path only
     ./sc mem doc move <document_id>  --feature <target_feature_id>   # unfrozen spec + plan, atomic
     ./sc mem doc freeze <document_id>
     ./sc mem doc retire <document_id>  [--superseded-by <document_id>] [--undo]   # metadata, never an edit
     ./sc mem doc qaqc <spec_document_id> --verdict pass|fail [--findings-doc ID]   # Reviewer signs the spec's current body
-    ./sc mem narrative "<line>"
+    ./sc mem narrative "<line>"      [--body-file PATH|-]
     ./sc mem delivery-audit          [--json]      # Planner-only bounded delivery reconciliation
-    ./sc mem message check [N]                         # your unread inbox (read-only)
-    ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
+    ./sc mem message check [N]                         # your unread inbox, newest N (read-only; N ≥ 1); sender shown by shortname
+    ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result] [--body-file PATH|-]
     ./sc mem message sent                              # outbound view — verify delivery
-    ./sc mem message mark-read <message_id>
+    ./sc mem message mark-read <message_id> [<message_id> …]
+
+Exit status (the same table `sc mem --help` prints):
+    0  success — including a write that LANDED but whose follow-up snapshot/
+       render failed: that is a warning (a `warning` field under --json), so a
+       retry never duplicates the row
+    1  refused or failed — the API answered an error, is unreachable or
+       unwired, or the client refused the arguments; the write did not land
+       unless the message says it MAY have (a lost receipt). A several-id
+       call that stops part-way names the ids it applied and those it did not
+    2  usage error (unknown verb/flag, missing or conflicting argument), or
+       a runtime credential outside the trust boundary
 
 Writes retry on engine-DB contention (#331): the server answers 503 when the
 shared DB is busy (nothing committed) and every method retries it; ambiguous
@@ -121,9 +150,50 @@ _PROG = "mem"
 # outside the trust boundary" without parsing stderr.
 EXIT_UNAVAILABLE = 1   # service down / artifact missing, unreadable, malformed, ambiguous
 EXIT_UNSAFE = 2        # artifact present but not an owner-only regular file
+EXIT_USAGE = 2         # the command line itself is wrong (argparse's status)
+
+# `--json`: stdout carries exactly one JSON object on EVERY path — success or
+# failure. main() sets it from argv before parsing so a usage error is covered.
+_JSON = False
+# A several-id verb records its progress here so a failure part-way reports
+# which ids were applied and which were not: {"applied_ids", "not_applied_ids"}.
+_BATCH: "dict | None" = None
 
 
-def die(msg: str, code: int = EXIT_UNAVAILABLE) -> "NoReturn":  # noqa: F821
+def _batch_begin(ids: list) -> None:
+    global _BATCH
+    _BATCH = {"applied_ids": [], "not_applied_ids": list(ids)}
+
+
+def _batch_applied(item_id: int) -> None:
+    _BATCH["applied_ids"].append(item_id)
+    _BATCH["not_applied_ids"].remove(item_id)
+
+
+def _failure_json(code: str, message: str, status: "int | None" = None) -> None:
+    out: dict = {"ok": False,
+                 "error": {"code": code, "message": message, "http_status": status}}
+    if _BATCH is not None:
+        out.update(_BATCH)
+    print(json.dumps(out, default=str))
+    sys.stdout.flush()
+
+
+def die(msg: str, code: int = EXIT_UNAVAILABLE, *, error: str = "refused",
+        status: "int | None" = None) -> "NoReturn":  # noqa: F821
+    """Refuse loudly: prose on stderr, a nonzero status — and under --json one
+    `{"ok": false, "error": {code, message, http_status}}` object on stdout.
+
+    `error` is the stable machine code: usage · refused (the client declined
+    the arguments) · api_error (the API answered `http_status`) · unreachable ·
+    no_receipt (the write MAY have landed) · unwired · credential."""
+    if _BATCH is not None:
+        def ids(key: str) -> str:
+            return ", ".join(f"#{i}" for i in _BATCH[key]) or "none"
+        msg += (f" (applied: {ids('applied_ids')}; "
+                f"not applied: {ids('not_applied_ids')})")
+    if _JSON:
+        _failure_json(error, msg, status)
     if code == EXIT_UNAVAILABLE:
         sys.exit(f"{_PROG}: {msg}")   # sys.exit(str) := stderr + status 1
     print(f"{_PROG}: {msg}", file=sys.stderr)
@@ -158,7 +228,7 @@ def _refuse_unsafe(path: Path, reason: str) -> "NoReturn":  # noqa: F821
     die(f"runtime credential {path} is {reason} — the trust boundary covers "
         "only an owner-only regular file; remove what is there and let the "
         "supervised service re-provision it with mode 0600 at boot "
-        "(`subfloor restart`).", EXIT_UNSAFE)
+        "(`subfloor restart`).", EXIT_UNSAFE, error="credential")
 
 
 def _load_runtime_credential(path: Path) -> None:
@@ -252,7 +322,8 @@ def _require_api() -> None:
         f"Boot via `./sc enter` (run.py injects them) with the server up (`./sc launch`). "
         f"On a host Admin seat, the supervised service provisions a runtime "
         f"credential at {_CRED_DIR}/<shortname>.json that `sc mem` discovers "
-        f"automatically. `./sc mem` does not fall back to direct DB.")
+        f"automatically. `./sc mem` does not fall back to direct DB.",
+        error="unwired")
 
 
 _RETRIES = 3          # extra attempts beyond the first
@@ -274,7 +345,8 @@ _SKILL_WRITE_TIMEOUT = _DOC_WRITE_TIMEOUT
 def _api(method: str, path: str, payload: "dict | None" = None,
          idempotent: "bool | None" = None,
          timeout: "float | None" = None,
-         idem_key: "str | None" = None) -> dict:
+         idem_key: "str | None" = None,
+         allow_404: bool = False) -> "dict | None":
     """POST/PATCH/GET to the engine API; die loud on any error.
 
     Retries (#331 — multi-shell write contention on the engine DB):
@@ -316,12 +388,16 @@ def _api(method: str, path: str, payload: "dict | None" = None,
                 die(f"the runtime credential {_DISCOVERED_FROM} is stale — the API "
                     "refused it (the key was rotated after the artifact was written). "
                     "The supervised service refreshes the artifact at boot: "
-                    "`subfloor restart`, then retry.")
+                    "`subfloor restart`, then retry.",
+                    error="api_error", status=401)
+            if e.code == 404 and allow_404:
+                return None       # the caller asked to see absence, not die on it
             try:
                 msg = json.loads(e.read()).get("error", e.reason)
             except Exception:
                 msg = e.reason
-            die(f"API {method} {path} → HTTP {e.code}: {msg}")
+            die(f"API {method} {path} → HTTP {e.code}: {msg}",
+                error="api_error", status=e.code)
         except Exception as exc:
             timed_out = isinstance(exc, TimeoutError) or "timed out" in str(exc)
             if timed_out and idempotent and not last:
@@ -332,14 +408,131 @@ def _api(method: str, path: str, payload: "dict | None" = None,
                 # is a lost receipt, never an unreachable API (#1507, #1379).
                 die(f"API {method} {path} gave no receipt within {timeout:g}s — "
                     "the write MAY have landed server-side; verify with a read "
-                    "before resending")
-            die(f"API unreachable ({SC_API_BASE}): {exc}")
+                    "before resending", error="no_receipt")
+            die(f"API unreachable ({SC_API_BASE}): {exc}", error="unreachable")
 
 
-def _finish_api(summary: str) -> int:
+# `--json` on a write verb (see _JSON above): on success the one object holds
+# the ids the write created or touched plus the prose summary as `message`.
+# Known keys are always present — `null` when a value does not apply — and a
+# several-id verb always reports the plural list. Reads keep their own --json.
+_STDIN_TAKEN = False   # stdin feeds at most one `-` argument per invocation
+
+EXIT_CODES = """\
+exit status:
+  0  success — including a write that landed but whose follow-up snapshot/
+     render failed (a warning; `warning` field under --json), so a retry
+     never duplicates the row
+  1  refused or failed — the API answered an error, is unreachable or
+     unwired, or the client refused the arguments; the write did not land
+     unless the message says it MAY have (a lost receipt). A several-id
+     call that stops part-way names the ids it applied and those it did not
+  2  usage error (unknown verb/flag, missing or conflicting argument), or a
+     runtime credential outside the trust boundary
+
+every verb takes --json: exactly one JSON object on stdout on every path, no
+prose. Success: {"ok": true, <ids>, "message"}. Failure: {"ok": false,
+"error": {"code", "message", "http_status"}} with the same nonzero status and
+the same prose on stderr; a several-id verb adds applied_ids/not_applied_ids.
+Text bodies also read from a file or stdin: --body-file PATH|- .
+"""
+
+_SERIALIZE_WARNING = ("post-write snapshot/render failed — the DB row is live "
+                      "but the flat file + content.sql did not refresh")
+
+
+def _say(text: str) -> None:
+    """Prose that precedes a write's summary; silent under --json."""
+    if not _JSON:
+        print(text)
+
+
+def _finish_api(summary: str, *, receipt: "dict | None" = None, **fields) -> int:
+    """Report a landed write: prose by default, one JSON object under --json.
+
+    `receipt` is the API response of a doc write; its `serialize` block is the
+    server-side snapshot+render that follows the commit (subfloor#434). A
+    failed serialize never fails the write: the row is live, so the exit is 0
+    with a warning — a nonzero exit read as "retry", and a retried `doc add`
+    wrote a second document."""
+    ser = receipt.get("serialize") if isinstance(receipt, dict) else None
+    failed = bool(ser) and not ser.get("ok")
+    if _JSON:
+        out: dict = {"ok": True}
+        out.update(fields)        # known keys stay, null when not applicable
+        out["message"] = summary
+        if failed:
+            out["warning"] = _SERIALIZE_WARNING
+            out["warning_detail"] = ser.get("output")
+        print(json.dumps(out, default=str))
+        return 0
     print(summary)
     print("  (via engine API — live in the shared engine DB)")
+    if ser and not failed:
+        print("  (local snapshot + flat render refreshed)")
+    elif failed:
+        print(f"  WARNING: {_SERIALIZE_WARNING}:\n{ser.get('output')}")
     return 0
+
+
+def _read_text_arg(raw: str, what: str) -> str:
+    """An operator-named text source: a file (relative to where `sc` was
+    typed, spec #267 U3) or `-` for stdin."""
+    global _STDIN_TAKEN
+    import project_root
+    if raw == "-":
+        if _STDIN_TAKEN:
+            die("stdin (`-`) can feed only one argument per command")
+        _STDIN_TAKEN = True
+    try:
+        return project_root.read_text(raw)
+    except (OSError, UnicodeDecodeError) as exc:
+        die(f"cannot read {what} from {raw}: {exc}")
+
+
+def _usage(msg: str) -> "NoReturn":  # noqa: F821
+    """A wrong command line found after parsing: argparse's status (2)."""
+    die(msg, EXIT_USAGE, error="usage")
+
+
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{raw}' is not a whole number")
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be a positive count")
+    return value
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse, with the --json failure contract on usage errors too."""
+
+    def error(self, message: str) -> "NoReturn":  # noqa: F821
+        if _JSON:
+            _failure_json("usage", message)
+        super().error(message)
+
+
+def _text_arg(inline: "str | None", file_arg: "str | None", what: str,
+              flag: str = "--body-file", required: bool = True) -> "str | None":
+    """One text value from its inline argument OR its file/stdin flag.
+
+    Long or quote-heavy bodies do not survive a shell command line; the file
+    form is the same value without the quoting. A file's trailing newlines are
+    not part of the body."""
+    if inline is not None and file_arg is not None:
+        _usage(f"pass the {what} inline or with {flag}, not both")
+    if file_arg is None:
+        if inline is None and required:
+            # The positional used to be required by argparse (status 2); it is
+            # optional only so the file form can replace it.
+            _usage(f"the {what} is required — pass it inline or with {flag} PATH|-")
+        return inline
+    text = _read_text_arg(file_arg, what).rstrip("\r\n")
+    if not text.strip():
+        die(f"the {what} read from {file_arg} is empty")
+    return text
 
 
 # ── commands ──────────────────────────────────────────────────────────────────
@@ -347,6 +540,9 @@ def _finish_api(summary: str) -> int:
 def cmd_which(args) -> int:
     """Diagnostic: confirm the API is reachable and report who the token is."""
     me = _api("GET", "/_sc/mem/whoami")
+    if _JSON:
+        print(json.dumps({"ok": True, "api_base": SC_API_BASE, **me}, default=str))
+        return 0
     print(f"engine API : {SC_API_BASE}")
     print(f"shell      : {me.get('display_name')} ({me.get('shortname')}) #{me.get('shell_id')}")
     if me.get("flavor") != "admin":
@@ -386,7 +582,27 @@ GET_SURFACES = ("state", "seed", "lns", "decisions", "flags",
 
 # The write surface is `sc mem doc …` and boot docs say "doc" — accept the
 # obvious short forms on the read side too instead of costing a round-trip.
-GET_SURFACE_ALIASES = {"doc": "documents", "docs": "documents"}
+# Singular forms too: the write verbs are singular (`flag close`, `task add`),
+# so the guess after one is `get flag 12`.
+GET_SURFACE_ALIASES = {"doc": "documents", "docs": "documents",
+                       "document": "documents", "decision": "decisions",
+                       "flag": "flags", "task": "tasks", "project": "projects",
+                       "shell": "shells", "message": "messages",
+                       "inbox": "messages", "feature": "roadmap",
+                       "features": "roadmap"}
+
+# Surfaces whose list payload is small and complete enough that `<id>` is a
+# client-side pick out of it: surface → (list key, id column).
+_GET_PICK = {"seed": ("entries", "entry_id"), "lns": ("entries", "entry_id"),
+             "projects": ("projects", "project_id"),
+             "shells": ("shells", "shell_id"),
+             "messages": ("messages", "message_id")}
+
+
+def _from_tag(m: dict) -> str:
+    """`from shell #2 (peer)` — the id AND the shortname a reply is sent to."""
+    who = f" ({m['from_shortname']})" if m.get("from_shortname") else ""
+    return f"from shell #{m['from_shell_id']}{who}"
 
 
 def _retired_tag(d: dict) -> str:
@@ -495,6 +711,19 @@ def _render_get(surface: str, data: dict, args=None) -> int:
             print(f"  closure notes: {f.get('resolution_notes') or '—'}")
         return 0
     if surface == "roadmap":
+        if "feature" in data:                     # one feature, deps + docs
+            x = data["feature"]
+            print(f"#{x['feature_id']} [{x.get('roadmap_status')}] {x.get('title')}")
+            if x.get("summary"):
+                print("  " + x["summary"])
+            print(f"  work-stream: {x.get('project') or 'none'}")
+            deps = ", ".join(f"#{b}" for b in x.get("blocked_by") or [])
+            print(f"  depends on: {deps or 'none'}")
+            for d in x.get("documents") or []:
+                fz = " [frozen]" if d.get("frozen") else ""
+                print(f"  {d.get('kind')} #{d['document_id']} seq {d.get('seq')}{fz}"
+                      f" — {d.get('title') or ''}")
+            return 0
         rm = data.get("roadmap", [])
         if not rm:
             print("mem: roadmap empty")
@@ -560,7 +789,10 @@ def _render_get(surface: str, data: dict, args=None) -> int:
             print(f"{hidden} retired hidden — --retired to show")
         return 0
     if surface == "tasks":
-        ts = data.get("tasks", [])
+        ts = [data["task"]] if "task" in data else data.get("tasks", [])
+        if "task" in data:
+            print(f"feature #{data['task'].get('feature_id')} · "
+                  f"doc #{data['task'].get('document_id')}")
         if not ts:
             print("mem: no tasks")
             return 0
@@ -598,19 +830,34 @@ def _render_get(surface: str, data: dict, args=None) -> int:
         print(f"mem: {len(msgs)} message(s), {len(unread)} unread:")
         for m in msgs:
             mark = "" if m.get("read_at") else " *unread*"
-            print(f"  [#{m['message_id']}]{_kind_tag(m)} from shell #{m['from_shell_id']} · {m['created_at']}{mark}")
+            print(f"  [#{m['message_id']}]{_kind_tag(m)} {_from_tag(m)} · {m['created_at']}{mark}")
             print("    " + (m.get("body") or "").replace("\n", "\n    "))
         return 0
     die(f"unknown surface '{surface}'")
 
 
 def cmd_get(args) -> int:
+    """`get <surface> [<id>]` — one grammar for every surface.
+
+    A positional id always means "this one row". Where the API has an exact
+    read it is used (decisions, flags, documents, roadmap, tasks); the small
+    list surfaces pick the row out of their own list; the two single-value
+    surfaces (state, narrative) refuse an id and say why."""
     surface = args.surface
     if args.resolved and surface != "flags":
         die("--resolved is only valid with get flags --feature <id>")
     if getattr(args, "retired", False) and surface != "documents":
         die("--retired is only valid with get documents")
+    doc = args.doc
+    if surface in ("documents", "qaqc") and args.id is not None:
+        # `get documents 44` IS `get documents --doc 44` — the positional and
+        # the flag name the same row.
+        if doc is not None and doc != args.id:
+            die(f"get {surface} {args.id} and --doc {doc} name two documents — pass one")
+        doc = args.id
     path = f"/_sc/mem/{surface}"
+    pick = None
+    feature_filter = None
     if surface == "decisions":
         if args.id is not None:                   # single decision, with rationale
             path = f"/_sc/mem/decisions/{args.id}"
@@ -626,26 +873,51 @@ def cmd_get(args) -> int:
                 die("get flags --resolved needs --feature <id>; unscoped resolved history is refused")
             path = f"/_sc/mem/flags?feature={args.feature}&resolved=1"
         elif args.feature is not None:
-            die("get flags --feature <id> needs --resolved")
-    elif args.id is not None:
-        die(f"get {surface} takes no <id> (only decisions and flags)")
-    if surface == "documents":
-        if args.doc is not None:                  # single doc, with body
-            path = f"/_sc/mem/documents/{args.doc}"
+            # One feature's OPEN flags: the open list is already complete and
+            # fleet-wide, so the scope is a pick out of it.
+            feature_filter = args.feature
+    elif surface == "roadmap":
+        if args.id is not None:
+            path = f"/_sc/mem/roadmap/{args.id}"
+    elif surface == "documents":
+        if doc is not None:                       # single doc, with body
+            path = f"/_sc/mem/documents/{doc}"
         elif args.feature is not None:            # one feature's docs
             path = f"/_sc/mem/documents?feature={args.feature}"
     elif surface == "tasks":
-        if args.doc is not None:
-            path = f"/_sc/mem/tasks?doc={args.doc}"
+        if args.id is not None:
+            if doc is not None or args.feature is not None:
+                die("get tasks <id> cannot be combined with --doc or --feature")
+            path = f"/_sc/mem/tasks/{args.id}"
+        elif doc is not None:
+            path = f"/_sc/mem/tasks?doc={doc}"
         elif args.feature is not None:
             path = f"/_sc/mem/tasks?feature={args.feature}"
         else:
-            die("get tasks needs --doc <id> or --feature <id>")
+            die("get tasks needs a scope: `get tasks <task_id>`, "
+                "`get tasks --doc <document_id>` or `get tasks --feature <feature_id>`")
     elif surface == "qaqc":
-        if args.doc is None:
-            die("get qaqc needs --doc <spec_document_id>")
-        path = f"/_sc/sprint/approvals/{args.doc}"
+        if doc is None:
+            die("get qaqc needs the spec: `get qaqc <spec_document_id>` "
+                "(or --doc <spec_document_id>)")
+        path = f"/_sc/sprint/approvals/{doc}"
+    elif args.id is not None:
+        if surface not in _GET_PICK:
+            die(f"get {surface} takes no <id> — {surface} is one value, not a "
+                f"list of rows; run `get {surface}`")
+        pick = _GET_PICK[surface]
     data = _api("GET", path)
+    if feature_filter is not None:
+        data["flags"] = [f for f in data.get("flags", [])
+                         if f.get("feature_id") == feature_filter]
+    if pick is not None:
+        key, column = pick
+        found = [row for row in data.get(key, []) if row.get(column) == args.id]
+        if not found:
+            scope = (" among your latest 50 messages" if surface == "messages"
+                     else " among the active rows")
+            die(f"no {surface} row #{args.id}{scope} — `get {surface}` lists them")
+        data[key] = found
     if args.json:
         print(json.dumps(data, indent=2, default=str))
         return 0
@@ -654,12 +926,14 @@ def cmd_get(args) -> int:
 
 def cmd_state(args) -> int:
     # Absolute overwrite — safe to retry on an ambiguous timeout.
-    _api("POST", "/_sc/mem/state", {"body": args.text}, idempotent=True)
-    return _finish_api(f"mem: current_state updated ({len(args.text)} chars)")
+    text = _text_arg(args.text, args.body_file, "state text")
+    _api("POST", "/_sc/mem/state", {"body": text}, idempotent=True)
+    return _finish_api(f"mem: current_state updated ({len(text)} chars)",
+                       chars=len(text))
 
 
 def _insert_identity(args, kind: str, extra: "dict | None" = None) -> int:
-    payload = {"body": args.body,
+    payload = {"body": _text_arg(args.body, args.body_file, f"{kind} body"),
                "entry_date": args.date or str(date.today()),
                "source_tag": args.tag}
     payload.update(extra or {})
@@ -667,7 +941,8 @@ def _insert_identity(args, kind: str, extra: "dict | None" = None) -> int:
     label = "seed" if kind == "seed" else "L&S"
     gone = r.get("retired") or []
     note = f" (superseding {', '.join('#' + str(i) for i in gone)})" if gone else ""
-    return _finish_api(f"mem: {label} entry #{r.get('entry_id', '')} added{note}")
+    return _finish_api(f"mem: {label} entry #{r.get('entry_id', '')} added{note}",
+                       entry_id=r.get("entry_id"), kind=kind, superseded=gone)
 
 
 def cmd_seed(args) -> int:
@@ -706,12 +981,14 @@ def cmd_curated(args) -> int:
     """Stamp a curation sweep. Unconditional — a sweep that retires nothing is
     still a sweep, and must clear the counter or the advisory never goes quiet."""
     _api("POST", "/_sc/mem/lns/curated", {}, idempotent=True)
-    return _finish_api("mem: L&S curation stamped — the counter restarts here")
+    return _finish_api("mem: L&S curation stamped — the counter restarts here",
+                       curated=True)
 
 
 def cmd_retire(args) -> int:
     _api("PATCH", f"/_sc/mem/identity-entries/{args.entry_id}/retire")
-    return _finish_api(f"mem: identity entry #{args.entry_id} retired (slot freed)")
+    return _finish_api(f"mem: identity entry #{args.entry_id} retired (slot freed)",
+                       entry_id=args.entry_id, retired=True)
 
 
 # Sibling verb vocabulary across `sc mem` subcommands. `decision` takes its
@@ -726,22 +1003,26 @@ _VERB_VOCAB = {"add", "edit", "open", "close", "list", "get", "set",
 
 
 def cmd_decision(args) -> int:
-    text = args.decision.strip()
+    decision = _text_arg(args.decision, args.body_file, "decision")
+    rationale = _text_arg(args.rationale, args.rationale_file, "rationale",
+                          flag="--rationale-file", required=False)
+    text = decision.strip()
     if not args.force and " " not in text and text.lower() in _VERB_VOCAB:
         die(f"'{text}' looks like a subcommand guess, not a decision — "
             f"`sc mem decision` records its positional argument verbatim in "
             f"the append-only log (no delete exists). Pass the decision text "
             f"in quotes, or --force if '{text}' really is the decision.")
     r = _api("POST", "/_sc/mem/decisions",
-             {"decision": args.decision,
-              "rationale": args.rationale,
+             {"decision": decision,
+              "rationale": rationale,
               "decision_date": args.date or str(date.today()),
               "parent_decision_id": args.parent,
               "feature_id": args.feature,
               "document_id": args.doc})
     fid = r.get("feature_id")
     link = f" → feature #{fid}" if fid else ""
-    return _finish_api(f"mem: decision #{r.get('decision_id', '')} recorded{link}")
+    return _finish_api(f"mem: decision #{r.get('decision_id', '')} recorded{link}",
+                       decision_id=r.get("decision_id"), feature_id=fid)
 
 
 def _one_line(text: "str | None", limit: int = 240) -> str:
@@ -754,56 +1035,110 @@ def cmd_flag(args) -> int:
     if args.flag_cmd == "open":
         r = _api("POST", "/_sc/mem/flags",
                  {"display_name": args.name,
-                  "description": args.description,
+                  "description": _text_arg(args.description, args.body_file,
+                                           "flag description"),
                   "priority": args.priority,
                   "feature_id": args.feature})
         return _finish_api(f"mem: flag #{r.get('flag_id', '')} opened"
-                           f"{f' ({args.name})' if args.name else ''}")
+                           f"{f' ({args.name})' if args.name else ''}",
+                           flag_id=r.get("flag_id"), display_name=args.name)
     if args.flag_cmd == "edit":
         # Long-lived tracker flags update their description progressively
         # (#316) — the API always supported the PATCH; this exposes it.
-        if args.description is not None and args.append is not None:
+        append = _text_arg(args.append, args.append_file, "appended text",
+                           flag="--append-file", required=False)
+        if args.append_file is not None and not append.startswith("\n"):
+            # A file's trailing newline is dropped and the server concatenates
+            # raw, so successive file appends glued onto one line. Each one
+            # starts on its own line; inline --append stays byte-exact.
+            append = "\n" + append
+        if args.description is not None and append is not None:
             die("--description replaces the body and --append adds to it — pick one")
         payload: dict = {}
         if args.name is not None:
             payload["display_name"] = args.name
         if args.description is not None:
             payload["description"] = args.description
-        if args.append is not None:
-            payload["append_description"] = args.append
+        if append is not None:
+            payload["append_description"] = append
         if args.priority is not None:
             payload["priority"] = args.priority
         if args.feature is not None:
             payload["feature_id"] = args.feature
         if not payload:
             die("nothing to edit — pass at least one of "
-                "--name / --description / --append / --priority / --feature")
+                "--name / --description / --append / --append-file / "
+                "--priority / --feature")
         _api("PATCH", f"/_sc/mem/flags/{args.flag_id}", payload)
-        return _finish_api(f"mem: flag #{args.flag_id} edited ({' + '.join(payload)})")
+        return _finish_api(f"mem: flag #{args.flag_id} edited ({' + '.join(payload)})",
+                           flag_id=args.flag_id, edited=list(payload))
     # close. Read the row and NAME THE TARGET BEFORE THE WRITE (#149): flag_id
     # and the SC-### display_name are both small integers drawn from two
     # counters that drift through the same range, so a stale or mistranscribed
     # reference does not fail loudly — it resolves to a different real record
     # and resolves THAT. Printing the row first is what lets a caller see it
     # holds the wrong record while the record still exists.
-    row = _api("GET", f"/_sc/mem/flags/{args.flag_id}").get("flag") or {}
-    name = row.get("display_name") or ""
-    label = f" ({name})" if name else " (unnamed)"
-    print(f"mem: closing flag #{args.flag_id}{label} "
-          f"[{row.get('priority') or '?'}, opened {row.get('created_date') or '?'}"
-          f" by {row.get('owner') or '?'}]")
-    print(f"    {_one_line(row.get('description'))}")
-    if row.get("resolved"):
-        # Closing an already-closed flag is not a no-op: it OVERWRITES the
-        # resolution notes of whoever verified it with the closer's. Refuse,
-        # and print what that write would have destroyed.
-        die(f"flag #{args.flag_id}{label} is already closed "
-            f"({row.get('resolved_date') or 'no date'}) — closing it again would "
-            f"overwrite its resolution notes: "
-            f"{_one_line(row.get('resolution_notes')) or '(none recorded)'}")
-    _api("PATCH", f"/_sc/mem/flags/{args.flag_id}",
-         {"resolved": True, "resolution_notes": args.notes})
-    return _finish_api(f"mem: flag #{args.flag_id}{label} closed")
+    #
+    # Several ids close in one call with the same notes. EVERY row is read and
+    # checked before anything is printed or written, so a wrong or
+    # already-closed id refuses the whole call instead of leaving it
+    # half-applied behind a "closing …" line.
+    notes = _text_arg(args.notes, args.notes_file, "closure notes",
+                      flag="--notes-file", required=False)
+    flag_ids = list(dict.fromkeys(args.flag_id))
+    _batch_begin(flag_ids)
+    found = {}
+    for flag_id in flag_ids:
+        got = _api("GET", f"/_sc/mem/flags/{flag_id}", allow_404=True)
+        found[flag_id] = (got or {}).get("flag")
+    missing = [i for i in flag_ids if not found[i]]
+    if missing:
+        die("no such flag " + ", ".join(f"#{i}" for i in missing)
+            + " — nothing was closed", error="api_error", status=404)
+
+    def label(row: dict) -> str:
+        name = row.get("display_name") or ""
+        return f" ({name})" if name else " (unnamed)"
+
+    for flag_id in flag_ids:
+        row = found[flag_id]
+        _say(f"mem: closing flag #{flag_id}{label(row)} "
+             f"[{row.get('priority') or '?'}, opened {row.get('created_date') or '?'}"
+             f" by {row.get('owner') or '?'}]")
+        _say(f"    {_one_line(row.get('description'))}")
+    for flag_id in flag_ids:
+        row = found[flag_id]
+        if row.get("resolved"):
+            # Closing an already-closed flag is not a no-op: it OVERWRITES the
+            # resolution notes of whoever verified it with the closer's. Refuse,
+            # and print what that write would have destroyed.
+            others = (" — none of the flags named in this call were closed"
+                      if len(flag_ids) > 1 else "")
+            die(f"flag #{flag_id}{label(row)} is already closed "
+                f"({row.get('resolved_date') or 'no date'}) — closing it again would "
+                f"overwrite its resolution notes: "
+                f"{_one_line(row.get('resolution_notes')) or '(none recorded)'}{others}")
+    for flag_id in flag_ids:
+        _api("PATCH", f"/_sc/mem/flags/{flag_id}",
+             {"resolved": True, "resolution_notes": notes})
+        _batch_applied(flag_id)
+    # The row each id resolved to rides in the JSON: it is the same target
+    # confirmation the prose prints before the write (#149).
+    rows_out = [{"flag_id": i,
+                 "display_name": found[i].get("display_name"),
+                 "priority": found[i].get("priority"),
+                 "owner": found[i].get("owner"),
+                 "created_date": found[i].get("created_date"),
+                 "feature_id": found[i].get("feature_id"),
+                 "feature_title": found[i].get("feature_title"),
+                 "description": found[i].get("description")} for i in flag_ids]
+    if len(flag_ids) == 1:
+        summary = f"mem: flag #{flag_ids[0]}{label(found[flag_ids[0]])} closed"
+    else:
+        summary = (f"mem: {len(flag_ids)} flags closed: "
+                   + ", ".join(f"#{i}{label(found[i])}" for i in flag_ids))
+    return _finish_api(summary, flag_ids=flag_ids, flags=rows_out,
+                       resolution_notes=notes)
 
 
 def cmd_roadmap(args) -> int:
@@ -812,15 +1147,18 @@ def cmd_roadmap(args) -> int:
                  {"title": args.title, "summary": args.summary,
                   "roadmap_status": args.status, "project": args.project})
         return _finish_api(f"mem: roadmap feature #{r.get('feature_id', '')} added"
-                           f" ('{args.title}', {args.status})")
+                           f" ('{args.title}', {args.status})",
+                           feature_id=r.get("feature_id"), status=args.status)
     if args.roadmap_cmd == "status":
         _api("PATCH", f"/_sc/mem/roadmap/{args.feature_id}", {"roadmap_status": args.status})
-        return _finish_api(f"mem: feature #{args.feature_id} → {args.status}")
+        return _finish_api(f"mem: feature #{args.feature_id} → {args.status}",
+                           feature_id=args.feature_id, status=args.status)
     if args.roadmap_cmd == "project":
         _api("PATCH", f"/_sc/mem/roadmap/{args.feature_id}", {"project": args.project})
         tgt = ("unassigned (no work-stream)" if str(args.project).lower() in ("none", "-", "")
                else f"work-stream '{args.project}'")
-        return _finish_api(f"mem: feature #{args.feature_id} → {tgt}")
+        return _finish_api(f"mem: feature #{args.feature_id} → {tgt}",
+                           feature_id=args.feature_id, project=args.project)
     if args.roadmap_cmd == "edit":
         payload: dict = {}
         if args.title is not None:
@@ -831,11 +1169,13 @@ def cmd_roadmap(args) -> int:
             die("nothing to edit — pass at least one of --title / --summary")
         _api("PATCH", f"/_sc/mem/roadmap/{args.feature_id}", payload)
         edited = " + ".join(payload)  # 'title', 'summary', or both
-        return _finish_api(f"mem: feature #{args.feature_id} edited ({edited})")
+        return _finish_api(f"mem: feature #{args.feature_id} edited ({edited})",
+                           feature_id=args.feature_id, edited=list(payload))
     # depends — replace the dependency set (server validates + refuses cycles)
     _api("PATCH", f"/_sc/mem/roadmap/{args.feature_id}", {"blocked_by": args.on or []})
     desc = ", ".join(f"#{d}" for d in args.on) if args.on else "— (cleared)"
-    return _finish_api(f"mem: feature #{args.feature_id} depends on {desc}")
+    return _finish_api(f"mem: feature #{args.feature_id} depends on {desc}",
+                       feature_id=args.feature_id, blocked_by=args.on or [])
 
 
 def cmd_project(args) -> int:
@@ -844,12 +1184,15 @@ def cmd_project(args) -> int:
                  {"shortname": args.shortname, "title": args.title,
                   "purpose": args.purpose, "standing": args.standing,
                   "role": args.role, "status": args.status})
-        return _finish_api(f"mem: project #{r.get('project_id', '')} ('{args.shortname}') added")
+        return _finish_api(f"mem: project #{r.get('project_id', '')} ('{args.shortname}') added",
+                           project_id=r.get("project_id"), shortname=args.shortname)
     if args.project_cmd == "standing":
         _api("PATCH", f"/_sc/mem/projects/{args.project}", {"standing": args.text})
-        return _finish_api(f"mem: standing updated for project '{args.project}'")
+        return _finish_api(f"mem: standing updated for project '{args.project}'",
+                           project=args.project)
     _api("PATCH", f"/_sc/mem/projects/{args.project}", {"status": args.status})
-    return _finish_api(f"mem: project '{args.project}' → {args.status}")
+    return _finish_api(f"mem: project '{args.project}' → {args.status}",
+                       project=args.project, status=args.status)
 
 
 def cmd_task(args) -> int:
@@ -857,7 +1200,12 @@ def cmd_task(args) -> int:
         r = _api("POST", "/_sc/mem/tasks",
                  {"title": args.title, "feature_id": args.feature,
                   "document_id": args.doc, "seq": args.seq, "description": args.desc})
-        return _finish_api(f"mem: task #{r.get('task_id', '')} added (seq {args.seq}, '{args.title}')")
+        # --feature and --seq are optional: the server reads the feature off
+        # the document and takes the plan's next free seq.
+        seq = r.get("seq", args.seq)
+        return _finish_api(f"mem: task #{r.get('task_id', '')} added (seq {seq}, '{args.title}')",
+                           task_id=r.get("task_id"), document_id=args.doc,
+                           feature_id=r.get("feature_id", args.feature), seq=seq)
     if args.task_cmd == "cancel":
         # The honest terminal state for a task overtaken by a feature split /
         # re-scope (#342): the work was never built — 'done' would be a lie,
@@ -866,7 +1214,8 @@ def cmd_task(args) -> int:
         if args.notes is not None:
             payload["resolution_notes"] = args.notes
         _api("PATCH", f"/_sc/mem/tasks/{args.task_id}", payload)
-        return _finish_api(f"mem: task #{args.task_id} → cancelled")
+        return _finish_api(f"mem: task #{args.task_id} → cancelled",
+                           task_id=args.task_id, status="cancelled")
     if args.task_cmd == "edit":
         payload = {}
         if args.title is not None:
@@ -877,15 +1226,18 @@ def cmd_task(args) -> int:
             die("nothing to edit — pass at least one of --title / --desc")
         _api("PATCH", f"/_sc/mem/tasks/{args.task_id}", payload)
         edited = " + ".join(payload)  # 'title', 'description', or both
-        return _finish_api(f"mem: task #{args.task_id} edited ({edited})")
+        return _finish_api(f"mem: task #{args.task_id} edited ({edited})",
+                           task_id=args.task_id, edited=list(payload))
     status = "in_progress" if args.task_cmd == "start" else "done"
     _api("PATCH", f"/_sc/mem/tasks/{args.task_id}", {"status": status})
-    return _finish_api(f"mem: task #{args.task_id} → {status}")
+    return _finish_api(f"mem: task #{args.task_id} → {status}",
+                       task_id=args.task_id, status=status)
 
 
 def cmd_oriented(args) -> int:
     _api("POST", "/_sc/mem/oriented", idempotent=True)
-    return _finish_api("mem: shell marked oriented (bootstrapped=1)")
+    return _finish_api("mem: shell marked oriented (bootstrapped=1)",
+                       oriented=True)
 
 
 def cmd_doc(args) -> int:
@@ -896,13 +1248,16 @@ def cmd_doc(args) -> int:
             {"feature_id": args.feature},
             timeout=_DOC_WRITE_TIMEOUT,
         )
-        rc = _finish_api(
+        return _finish_api(
             f"mem: spec document #{args.document_id} moved "
             f"feature #{r['source_feature_id']} → #{r['target_feature_id']} "
             f"as spec seq {r['target_seq']} "
-            f"({r['tasks_moved']} task(s), {r['decisions_moved']} decision(s))"
+            f"({r['tasks_moved']} task(s), {r['decisions_moved']} decision(s))",
+            receipt=r, document_id=args.document_id,
+            source_feature_id=r["source_feature_id"],
+            feature_id=r["target_feature_id"], seq=r["target_seq"],
+            tasks_moved=r["tasks_moved"], decisions_moved=r["decisions_moved"],
         )
-        return _note_serialize(r) or rc
     if args.doc_cmd == "qaqc":
         payload = {"document_id": args.document_id, "verdict": args.verdict}
         if args.findings_doc is not None:
@@ -916,7 +1271,9 @@ def cmd_doc(args) -> int:
         )
         return _finish_api(
             f"mem: QAQC approval #{review['approval_id']} → {review['verdict']} "
-            f"for spec #{args.document_id} at {review['revision_sha256']}"
+            f"for spec #{args.document_id} at {review['revision_sha256']}",
+            approval_id=review["approval_id"], document_id=args.document_id,
+            verdict=review["verdict"], revision_sha256=review["revision_sha256"],
         )
     if args.doc_cmd == "retire":
         if args.undo and args.superseded_by is not None:
@@ -935,9 +1292,9 @@ def cmd_doc(args) -> int:
         if args.undo:
             note = (" (was not retired — undo is a no-op)"
                     if r.get("already_current") else "")
-            rc = _finish_api(
-                f"mem: document #{args.document_id} un-retired{note}")
-            return _note_serialize(r) or rc
+            return _finish_api(
+                f"mem: document #{args.document_id} un-retired{note}",
+                receipt=r, document_id=args.document_id, retired=False)
         successor = r.get("superseded_by")
         pointer = f" → superseded by #{successor}" if successor else " (no successor)"
         if r.get("repointed"):
@@ -948,32 +1305,36 @@ def cmd_doc(args) -> int:
         else:
             head = (f"mem: document #{args.document_id} retired "
                     f"{r.get('retired_date') or ''}".rstrip())
-        rc = _finish_api(head + pointer)
-        return _note_serialize(r) or rc
+        return _finish_api(head + pointer, receipt=r,
+                           document_id=args.document_id, retired=True,
+                           superseded_by=successor)
     if args.doc_cmd == "freeze":
         r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}/freeze",
                  timeout=_DOC_WRITE_TIMEOUT)
         if r.get("already_frozen"):
-            print(f"mem: document #{args.document_id} was already frozen "
-                  f"(freeze is idempotent)")
-        rc = _finish_api(f"mem: document #{args.document_id} frozen")
-        return _note_serialize(r) or rc
+            _say(f"mem: document #{args.document_id} was already frozen "
+                 f"(freeze is idempotent)")
+        return _finish_api(f"mem: document #{args.document_id} frozen",
+                           receipt=r, document_id=args.document_id, frozen=True,
+                           already_frozen=bool(r.get("already_frozen")))
     if args.doc_cmd == "edit":
         payload: dict = {}
         if args.title is not None:
             payload["title"] = args.title
         if args.body_file is not None:
-            payload["body"] = _operator_file(args.body_file).read_text()
+            payload["body"] = _read_text_arg(args.body_file, "document body")
         if args.render_path is not None:
             payload["render_path"] = args.render_path
         if not payload:
             die("nothing to edit — pass at least one of --title / --body-file / --render-path")
         r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}", payload,
                  timeout=_DOC_WRITE_TIMEOUT)
-        rc = _finish_api(f"mem: document #{args.document_id} edited")
-        return _note_serialize(r) or rc
-    # A relative --body-file names a path from the operator's cwd (U3).
-    body_text = _operator_file(args.body_file).read_text()
+        return _finish_api(f"mem: document #{args.document_id} edited",
+                           receipt=r, document_id=args.document_id,
+                           edited=list(payload))
+    # A relative --body-file names a path from the operator's cwd (U3); `-`
+    # reads the body from stdin.
+    body_text = _read_text_arg(args.body_file, "document body")
     r = _api("POST", "/_sc/mem/docs",
              {"feature_id": args.feature,
               "kind": args.kind,
@@ -982,37 +1343,18 @@ def cmd_doc(args) -> int:
               "body": body_text,
               "render_path": args.render_path},
              timeout=_DOC_WRITE_TIMEOUT)
-    rc = _finish_api(f"mem: {args.kind} document #{r.get('document_id', '')} added"
-                     f" ('{args.title}', {len(body_text)} chars)")
-    return _note_serialize(r) or rc
-
-
-def _operator_file(raw: str) -> Path:
-    """An operator-named file, relative to where `sc` was typed (spec #267 U3)."""
-    import project_root
-    return project_root.invocation_path(raw)
-
-
-def _note_serialize(r: dict) -> int:
-    """Surface the server-side snapshot+render that follows a doc write
-    (subfloor#434): the ignored flat render + local content.sql refresh
-    headlessly. A failed serialize never fails the write — it prints a warning
-    and exits nonzero so the drift is visible, not silent."""
-    s = r.get("serialize") if isinstance(r, dict) else None
-    if not s:
-        return 0
-    if s.get("ok"):
-        print("  (local snapshot + flat render refreshed)")
-        return 0
-    print(f"  WARNING: post-write snapshot/render failed — the DB row is live "
-          f"but the flat file + content.sql did not refresh:\n{s.get('output')}")
-    return 1
+    return _finish_api(f"mem: {args.kind} document #{r.get('document_id', '')} added"
+                       f" ('{args.title}', {len(body_text)} chars)",
+                       receipt=r, document_id=r.get("document_id"),
+                       kind=args.kind, feature_id=args.feature,
+                       chars=len(body_text))
 
 
 def cmd_narrative(args) -> int:
-    line = f"[{datetime.now().strftime('%H:%M')}] {args.line}"
+    text = _text_arg(args.line, args.body_file, "narrative line")
+    line = f"[{datetime.now().strftime('%H:%M')}] {text}"
     _api("POST", "/_sc/mem/narrative", {"text": line})
-    return _finish_api("mem: narrative appended")
+    return _finish_api("mem: narrative appended", chars=len(text))
 
 
 def _kind_tag(m: dict) -> str:
@@ -1026,12 +1368,19 @@ def cmd_message(args) -> int:
         r = _api("GET", "/_sc/mem/messages")
         msgs = r.get("messages", [])
         unread = [m for m in msgs if not m.get("read_at")]
+        # N bounds what is SHOWN (newest first); the count stays the truth.
+        shown = unread if args.limit is None else unread[:args.limit]
+        if _JSON:
+            print(json.dumps({"ok": True, "unread": len(unread),
+                              "messages": shown}, default=str))
+            return 0
         if not unread:
             print("mem: inbox empty")
             return 0
-        print(f"mem: {len(unread)} unread:")
-        for m in unread:
-            print(f"  [#{m['message_id']}]{_kind_tag(m)} from shell #{m['from_shell_id']} · {m['created_at']}")
+        more = f" (showing the newest {len(shown)})" if len(shown) < len(unread) else ""
+        print(f"mem: {len(unread)} unread{more}:")
+        for m in shown:
+            print(f"  [#{m['message_id']}]{_kind_tag(m)} {_from_tag(m)} · {m['created_at']}")
             print("    " + (m["body"] or "").replace("\n", "\n    "))
         return 0
     if args.message_cmd == "sent":
@@ -1039,6 +1388,9 @@ def cmd_message(args) -> int:
         # delivery here instead of blind-resending.
         r = _api("GET", "/_sc/mem/messages?direction=sent")
         msgs = r.get("messages", [])
+        if _JSON:
+            print(json.dumps({"ok": True, "messages": msgs}, default=str))
+            return 0
         if not msgs:
             print("mem: nothing sent")
             return 0
@@ -1050,27 +1402,43 @@ def cmd_message(args) -> int:
             print("    " + (m.get("body") or "").replace("\n", "\n    "))
         return 0
     if args.message_cmd == "send":
-        if not args.body.strip():
+        body = _text_arg(args.body, args.body_file, "message body")
+        if not body.strip():
             die("body is empty")
         # dedupe_key makes the send idempotent (#333): the server returns the
         # original row for a repeat key, so _api may safely retry an ambiguous
         # timeout — the failure mode that used to duplicate messages fleet-wide.
         r = _api("POST", "/_sc/mem/messages",
-                 {"to": args.to, "body": args.body, "kind": args.kind,
+                 {"to": args.to, "body": body, "kind": args.kind,
                   "dedupe_key": uuid.uuid4().hex},
                  idempotent=True)
         tag = f" ({args.kind})" if args.kind != "shell" else ""
         dup = " (already delivered — deduped, no twin written)" if r.get("duplicate") else ""
-        return _finish_api(f"mem: message #{r.get('message_id', '')} sent to {args.to}{tag}{dup}")
-    # mark-read
-    _api("PATCH", f"/_sc/mem/messages/{args.message_id}/read")
-    return _finish_api(f"mem: message #{args.message_id} marked read")
+        return _finish_api(f"mem: message #{r.get('message_id', '')} sent to {args.to}{tag}{dup}",
+                           message_id=r.get("message_id"), to=args.to,
+                           kind=args.kind, duplicate=bool(r.get("duplicate")))
+    # mark-read — one or several ids. Stamping is idempotent, so a call that
+    # stops on a bad id is safe to repeat once the id is corrected.
+    message_ids = list(dict.fromkeys(args.message_id))
+    _batch_begin(message_ids)     # a failure names what was and was not stamped
+    for message_id in message_ids:
+        _api("PATCH", f"/_sc/mem/messages/{message_id}/read")
+        _batch_applied(message_id)
+    if len(message_ids) == 1:
+        summary = f"mem: message #{message_ids[0]} marked read"
+    else:
+        summary = ("mem: messages " + ", ".join(f"#{i}" for i in message_ids)
+                   + " marked read")
+    return _finish_api(summary, message_ids=message_ids)
 
 
 # ── arg parsing ───────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="sc mem", description="engine memory surface (over the API)")
+    p = _Parser(
+        prog="sc mem", description="engine memory surface (over the API)",
+        epilog=EXIT_CODES, formatter_class=argparse.RawDescriptionHelpFormatter)
+    body_file_help = "read the text from a file, or `-` for stdin, instead of the argument"
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("which", help="confirm the memory API is reachable + which shell this session resolves as") \
@@ -1083,16 +1451,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true", help="raw JSON")
     sp.set_defaults(fn=cmd_delivery_audit)
 
-    sp = sub.add_parser("get", help=f"read a memory surface ({'/'.join(GET_SURFACES)}; doc/docs = documents)")
+    sp = sub.add_parser(
+        "get",
+        help=f"read a memory surface ({'/'.join(GET_SURFACES)}; singular "
+             f"forms and doc/docs are aliases): get <surface> [<id>]")
     sp.add_argument("surface", choices=GET_SURFACES,
                     type=lambda s: GET_SURFACE_ALIASES.get(s, s))
     sp.add_argument("id", nargs="?", type=int,
-                    help="decisions: one with rationale; flags: exact row incl. resolved")
+                    help="one row by id — decisions: with rationale; flags: incl. "
+                         "resolved; documents: with body (= --doc); roadmap: one "
+                         "feature with deps + docs; qaqc: the spec document id")
     sp.add_argument("--all", action="store_true",
                     help="decisions: full log incl. superseded (default: active index)")
     sp.add_argument("--json", action="store_true", help="raw JSON instead of formatted text")
     sp.add_argument("--feature", type=int,
-                    help="scope documents/tasks; flags: required with --resolved")
+                    help="scope documents/tasks; flags: that feature's open flags "
+                         "(its resolved history with --resolved)")
     sp.add_argument("--resolved", action="store_true",
                     help="flags: resolved rows for one --feature (unscoped history refused)")
     sp.add_argument("--doc", type=int,
@@ -1102,12 +1476,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(fn=cmd_get)
 
     sp = sub.add_parser("state", help="set current_state")
-    sp.add_argument("text")
+    sp.add_argument("text", nargs="?")
+    sp.add_argument("--body-file", dest="body_file", metavar="PATH|-", help=body_file_help)
     sp.set_defaults(fn=cmd_state)
 
     for k, fn in (("seed", cmd_seed), ("lns", cmd_lns)):
         sp = sub.add_parser(k, help=f"add a {k} identity entry")
-        sp.add_argument("body")
+        sp.add_argument("body", nargs="?")
+        sp.add_argument("--body-file", dest="body_file", metavar="PATH|-", help=body_file_help)
         sp.add_argument("--date")
         sp.add_argument("--tag")
         if k == "lns":
@@ -1128,7 +1504,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(fn=cmd_retire)
 
     sp = sub.add_parser("decision", help="record a Major decision")
-    sp.add_argument("decision")
+    sp.add_argument("decision", nargs="?")
+    sp.add_argument("--body-file", dest="body_file", metavar="PATH|-", help=body_file_help)
+    sp.add_argument("--rationale-file", dest="rationale_file", metavar="PATH|-",
+                    help="read the rationale from a file, or `-` for stdin")
     sp.add_argument("--force", action="store_true",
                     help="record even a bare verb-like single word (see #311 guard)")
     sp.add_argument("--rationale")
@@ -1143,7 +1522,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("flag", help="open, edit, or close a flag")
     fsub = sp.add_subparsers(dest="flag_cmd", required=True)
     fo = fsub.add_parser("open", help="open a blocker or follow-up, linked to the feature it blocks")
-    fo.add_argument("description")
+    fo.add_argument("description", nargs="?")
+    fo.add_argument("--body-file", dest="body_file", metavar="PATH|-", help=body_file_help)
     fo.add_argument("--name")
     fo.add_argument("--priority", default="Medium", choices=["High", "Medium", "Low"])
     fo.add_argument("--feature", type=int)
@@ -1152,11 +1532,16 @@ def build_parser() -> argparse.ArgumentParser:
     fe.add_argument("--name", help="set or correct the display_name (#288)")
     fe.add_argument("--description", help="REPLACES the whole body — see --append")
     fe.add_argument("--append", help="append to the description instead of replacing it")
+    fe.add_argument("--append-file", "--body-file", dest="append_file", metavar="PATH|-",
+                    help="append text read from a file, or `-` for stdin")
     fe.add_argument("--priority", choices=["High", "Medium", "Low"])
     fe.add_argument("--feature", type=int)
     fc = fsub.add_parser("close", help="close a flag your work cleared (prints the row before it writes)")
-    fc.add_argument("flag_id", type=int)
+    fc.add_argument("flag_id", type=int, nargs="+",
+                    help="one or more flag ids; all are checked before any is closed")
     fc.add_argument("--notes")
+    fc.add_argument("--notes-file", "--body-file", dest="notes_file", metavar="PATH|-",
+                    help="read the closure notes from a file, or `-` for stdin")
     sp.set_defaults(fn=cmd_flag)
 
     ROADMAP_STATUSES = ["shipped", "in_progress", "next", "near_term",
@@ -1203,11 +1588,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("task", help="spec_tasks: add / start / done / cancel / edit")
     tsub = sp.add_subparsers(dest="task_cmd", required=True)
-    ta = tsub.add_parser("add", help="add a task to a spec's plan (feature, doc and seq required)")
+    ta = tsub.add_parser("add", help="add a task to a spec's plan (--doc required; "
+                                     "feature and seq default from the doc)")
     ta.add_argument("title")
-    ta.add_argument("--feature", type=int, required=True)
+    ta.add_argument("--feature", type=int,
+                    help="default: the feature the --doc spec belongs to")
     ta.add_argument("--doc", type=int, required=True)
-    ta.add_argument("--seq", type=int, required=True)
+    ta.add_argument("--seq", type=int,
+                    help="default: the next free slot in that spec's plan")
     ta.add_argument("--desc")
     tst = tsub.add_parser("start", help="mark a task in progress")
     tst.add_argument("task_id", type=int)
@@ -1230,7 +1618,8 @@ def build_parser() -> argparse.ArgumentParser:
     dsub = sp.add_subparsers(dest="doc_cmd", required=True)
     da = dsub.add_parser("add", help="author a spec or doc from a body file (--seq auto-advances)")
     da.add_argument("title")
-    da.add_argument("--body-file", required=True, dest="body_file")
+    da.add_argument("--body-file", required=True, dest="body_file", metavar="PATH|-",
+                    help="the document body: a file, or `-` for stdin")
     da.add_argument("--feature", type=int)
     da.add_argument("--kind", default="spec", choices=["spec", "doc"])
     da.add_argument("--seq", type=int)
@@ -1238,7 +1627,8 @@ def build_parser() -> argparse.ArgumentParser:
     de = dsub.add_parser("edit", help="revise a doc's title/body/render-path (frozen or retired: render-path only)")
     de.add_argument("document_id", type=int)
     de.add_argument("--title")
-    de.add_argument("--body-file", dest="body_file")
+    de.add_argument("--body-file", dest="body_file", metavar="PATH|-",
+                    help="the new body: a file, or `-` for stdin")
     de.add_argument("--render-path", dest="render_path")
     dm = dsub.add_parser(
         "move",
@@ -1268,25 +1658,47 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(fn=cmd_doc)
 
     sp = sub.add_parser("narrative", help="append a [HH:MM] line to the active archive")
-    sp.add_argument("line")
+    sp.add_argument("line", nargs="?")
+    sp.add_argument("--body-file", dest="body_file", metavar="PATH|-", help=body_file_help)
     sp.set_defaults(fn=cmd_narrative)
 
     sp = sub.add_parser("message", help="shell-to-shell inbox: check / send / sent / mark-read")
     msub = sp.add_subparsers(dest="message_cmd", required=True)
     mc = msub.add_parser("check", help="read-only surface of your unread inbox")
-    mc.add_argument("limit", type=int, nargs="?", default=50,
-                    help="(accepted; the API returns your latest 50)")
+    mc.add_argument("limit", type=_positive_int, nargs="?", default=None, metavar="N",
+                    help="show only the newest N unread (default: all of your "
+                         "latest 50); the unread count is always the full count")
     msub.add_parser("sent", help="your outbound view — verify delivery after a send timeout")
     ms = msub.add_parser("send", help="send one shell a message (body is one quoted argument)")
     ms.add_argument("to")
-    ms.add_argument("body")
+    ms.add_argument("body", nargs="?")
+    ms.add_argument("--body-file", dest="body_file", metavar="PATH|-", help=body_file_help)
     ms.add_argument("--kind", default="shell", choices=["shell", "task", "result"],
                     help="message kind: shell (default) | task (planner→worker) | result (worker→planner)")
     mm = msub.add_parser("mark-read", help="mark a message read — only after you have acted on it")
-    mm.add_argument("message_id", type=int)
+    mm.add_argument("message_id", type=int, nargs="+",
+                    help="one or more message ids")
     sp.set_defaults(fn=cmd_message)
 
+    _add_json_flag(p)
     return p
+
+
+def _add_json_flag(parser: argparse.ArgumentParser) -> None:
+    """Give every leaf verb `--json`. The two reads that already own one
+    (`get`, `delivery-audit`) keep theirs; every other verb gets the write
+    contract: one JSON object on stdout, no prose."""
+    subparsers = [a for a in parser._actions
+                  if isinstance(a, argparse._SubParsersAction)]
+    if subparsers:
+        for action in subparsers:
+            for child in dict.fromkeys(action.choices.values()):
+                _add_json_flag(child)
+        return
+    if "--json" not in parser._option_string_actions:
+        parser.add_argument("--json", action="store_true",
+                            help="exactly one JSON object on stdout, success or "
+                                 "failure (ids included), no prose")
 
 
 def main(argv: list[str]) -> int:
@@ -1294,7 +1706,14 @@ def main(argv: list[str]) -> int:
     # cli_entry.run_cli — one mechanism for every sc script (#384). This used to
     # restore SIG_DFL here (#299), which killed the process with signal 13
     # mid-write and cost the command its own exit status.
+    global _JSON, _STDIN_TAKEN, _BATCH
+    _STDIN_TAKEN = False
+    _BATCH = None
+    # From argv BEFORE parsing, so a usage error honours the contract too; a
+    # literal "--json" can never be a positional, argparse reads it as the flag.
+    _JSON = "--json" in argv
     args = build_parser().parse_args(argv)
+    _JSON = bool(getattr(args, "json", False))
     _require_api()  # every command goes through the API — fail loud if unwired
     return args.fn(args)
 

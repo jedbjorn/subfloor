@@ -1,6 +1,6 @@
 ---
 name: cli_orchestration
-description: Planner-run delivery from a terminal seat — the FnB names the work, you stay the oversight layer, and native or cross-harness CLI agents verify the spec, build, review, deploy to Dev, and verify. Covers the kickoff contract, agent launch per harness (Claude, Codex, Kimi), PR/CI monitors, merge/deploy authority, acceptance review, and cleanup.
+description: Planner-run delivery from a terminal seat; load when the FnB assigns work in this chat for you to orchestrate with CLI agents. You stay the oversight layer while native or cross-harness agents verify the spec, build, review, deploy to Dev, and verify. Covers the kickoff contract, agent launch per harness (Claude, Codex, Kimi), terminal-seat PR/CI monitors, the FnB's merge and deploy directives, acceptance review, and cleanup.
 category: workflow
 common: false
 ---
@@ -45,9 +45,15 @@ Tell the FnB that this work needs a terminal session and stop.
    batch:
    - Spec freshness. The spec may name sites that have moved on main. Offer
      a spec-verification agent before dev starts.
-   - Merge authority. Ask which PRs you may merge and on what condition, for
-     example "green and review clean". Without that grant you only report a
-     PR as ready.
+   - Merge authority. This loop runs outside an armed Sprint, so your boot's
+     merge gate applies in its first form: merge only on an explicit FnB
+     directive that identifies the PR. The directive may name the PR by
+     number, or name an assignment and the condition its PRs must meet (for
+     example "merge this assignment's PRs once green and review clean"); that
+     kind covers only that assignment's PRs, and only once the stated
+     condition is met. Ask for that directive here. It is not a standing
+     grant or a third form: no answer, a PR outside the assignment, or an
+     unmet condition -> report the PR as ready and wait.
    - Deploy authority. Ask for the target (Dev only, unless the FnB says
      otherwise), when to deploy, and whether a final deploy at the end
      replaces the intermediate ones.
@@ -57,9 +63,9 @@ Tell the FnB that this work needs a terminal session and stop.
      an agent takes each one.
    - What stays with the FnB, such as release, follow-up disposition, and
      production.
-4. When the FnB answers, record the grants (merge, deploy, models, gates) in
-   one `sc mem narrative` line and point `sc mem state` at it. The grants
-   last for this assignment only.
+4. When the FnB answers, record the directives (merge, deploy, models, gates)
+   in one `sc mem narrative` line and point `sc mem state` at it. They last
+   for this assignment only; cite the merge directive when you merge.
 
 ## Lanes and order
 
@@ -77,10 +83,11 @@ Run the lanes in this order. Independent lanes run in parallel.
    wherever one is available. Give the reviewer the spec and the diff, not
    your view of them. Route findings back to the developer, and repeat until
    the review is clean or the FnB rules on a disagreement.
-5. Merge and deploy, only within the granted authority. Run
-   `gh pr merge <n> --squash` (or the repo's convention) after the checks are
-   green and the review is clean. Deploy only to the granted target, using
-   the fork's dev_kit or remote-seat procedure.
+5. Merge and deploy, only under the FnB's recorded directive. Run
+   `gh pr merge <n> --squash` (or the repo's convention) on a PR the directive
+   covers, once its condition holds: checks green and review clean unless the
+   FnB said otherwise. Deploy only to the directed target, using the fork's
+   dev_kit or remote-seat procedure.
 6. Acceptance review. Before any verification run, show the FnB the method
    and pass condition for each criterion. Change them only with the FnB's
    agreement.
@@ -152,7 +159,10 @@ Each brief is self-contained. It contains:
 
 ## Monitors
 
-Set up your own monitors. No engine service does this for you on this seat.
+On the terminal seat, set up your own monitors: no engine service watches a
+PR for you here. This is specific to this loop on this seat. On the GUI seat
+and inside a Sprint the engine delivers PR facts as wakes, and your boot's
+"never poll GitHub" rule holds.
 
 - **PR checks:** `gh pr checks <n> --watch --interval 60` as a background
   command; it exits when the checks settle. Read the result with

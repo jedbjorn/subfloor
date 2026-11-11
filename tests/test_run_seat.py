@@ -36,9 +36,11 @@ def test_explicit_launch_seat_overrides_inherited_seat(flavor, headless, expecte
     if expected == "tui":
         assert "native background tools freely" in block
         assert "next boot" in block
+        assert "set up your own bounded monitors" in block
     if expected == "gui":
         assert "Long work goes through `sc job`" in block
         assert "Do not schedule in-session timers" in block
+        assert "your own bounded monitors" not in block
 
 
 def test_admin_render_ignores_even_explicit_gui_seat():

@@ -1,6 +1,6 @@
 ---
 name: curate
-description: The periodic L&S sweep. Run when the STATUS L&S line says "curation due" — resolve contradictions, merge entries stating one rule, recommend recurring processes upstream, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.
+description: The periodic L&S sweep; run it when the STATUS L&S line says "curation due". Resolve contradictions, merge entries stating one rule, recommend recurring processes upstream, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.
 category: substrate
 common: true
 ---
@@ -64,7 +64,9 @@ candidate reusable process. Follow the recommendation route in
 `skills: recommend <topic>` issue or open one. Curation never creates or
 promotes a skill. Keep one compressed L&S entry carrying the knowledge until a
 reviewed upstream skill ships **and is granted**; filing is not grounds to
-retire it. If issue search or creation is unavailable, surface the failure to
+retire it. In the Subfloor source repo "upstream" is this repo: the same
+search-then-file route applies, and an accepted skill is authored here by
+branch and PR. If issue search or creation is unavailable, surface the failure to
 the FnB, keep the L&S, and create no local skill or asset.
 
 ## Pass 4 — Category

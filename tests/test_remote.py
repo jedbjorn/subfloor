@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import shutil
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +22,13 @@ sys.path.insert(0, str(ENGINE / "api"))
 import remote
 import vm
 import vm_broker
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import seat_seam_guard  # noqa: E402
+
+# Every test in this module: no real ssh/scp/virsh/tailscale/dispatcher child
+# process and no call on a real broker socket. See tests/seat_seam_guard.py.
+seat_seam_guard.install(globals())
 
 
 class RemoteVerbTests(unittest.TestCase):
@@ -122,6 +131,224 @@ class RemoteVerbTests(unittest.TestCase):
             result = remote.do_pull("devbox", "/tmp/result", str(destination))
         self.assertEqual(result["error"], "remote_path_not_allowed")
         run.assert_not_called()
+
+
+class RemoteTransferExclusionTests(unittest.TestCase):
+    """`./sc remote` push/pull apply the SAME carved-out sub-trees as `./sc vm`.
+
+    They used to check only "inside the repo", so a remote pull could land in
+    `.git/` or the engine and a push could ship the adoption key.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name).resolve() / "repo"
+        for parts in (
+            (".sc-state", "local", "vm"), (".sc-state", "local", "remotes"),
+            (".sc-state", "local", "out"), (".super-coder",), (".git",), ("src",),
+        ):
+            self.repo.joinpath(*parts).mkdir(parents=True)
+        (self.repo / ".sc-state" / "local" / "vm" / "id_ed25519").write_text("k")
+        (self.repo / "src" / "artifact.bin").write_text("a")
+        key = Path(self.temp.name) / "key"
+        key.write_text("not-real-key")
+        key.chmod(0o600)
+        self.entry = {
+            "host": "remote.example", "user": "tester", "port": 22,
+            "key_path": str(key),
+            "known_hosts_path": str(Path(self.temp.name) / "known_hosts"),
+        }
+        for target, value in (
+            (vm, self.repo),
+        ):
+            patcher = mock.patch.object(target, "repo_root", return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(
+            remote, "read_all", return_value={"devbox": self.entry})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _refused(self, result, run):
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "remote_path_not_allowed")
+        run.assert_not_called()
+
+    def test_push_refuses_the_vm_key_directory(self):
+        with mock.patch.object(remote, "_run") as run:
+            result = remote.do_push(
+                "devbox", ".sc-state/local/vm/id_ed25519", "/tmp/k")
+        self._refused(result, run)
+
+    def test_push_refuses_a_symlink_into_the_key_directory(self):
+        link = self.repo / "src" / "innocent.txt"
+        link.symlink_to(self.repo / ".sc-state" / "local" / "vm" / "id_ed25519")
+        with mock.patch.object(remote, "_run") as run:
+            result = remote.do_push("devbox", "src/innocent.txt", "/tmp/k")
+        self._refused(result, run)
+
+    def test_pull_refuses_every_excluded_destination(self):
+        for destination in (
+            ".sc-state/local/vm/id_ed25519",
+            ".sc-state/local/remotes/devbox.known_hosts",
+            ".super-coder/scripts/vm.py",
+            ".git/hooks/pre-commit",
+        ):
+            with self.subTest(destination=destination), \
+                 mock.patch.object(remote, "_run") as run:
+                self._refused(
+                    remote.do_pull("devbox", "/tmp/x", destination), run)
+
+    def test_ordinary_transfers_still_work(self):
+        with mock.patch.object(remote, "_run", return_value=(0, "", "")) as run:
+            pushed = remote.do_push("devbox", "src/artifact.bin", "/tmp/a")
+            pulled = remote.do_pull(
+                "devbox", "/tmp/out", ".sc-state/local/out/result.txt")
+            in_repo = remote.do_pull("devbox", "/tmp/out", "src/result.txt")
+        self.assertTrue(pushed["ok"])
+        self.assertTrue(pulled["ok"])
+        self.assertTrue(in_repo["ok"])
+        self.assertEqual(run.call_count, 3)
+
+    def test_vm_and_remote_share_one_exclusion_helper(self):
+        for direction, value in (
+            ("push", ".sc-state/local/vm/id_ed25519"),
+            ("pull", ".git/config"),
+            ("pull", ".sc-state/local/remotes/x.known_hosts"),
+        ):
+            with self.subTest(direction=direction, value=value):
+                path, error = vm.transfer_path(value, direction)
+                self.assertIsNone(path)
+                self.assertEqual(error["error"], "remote_path_not_allowed")
+        with mock.patch.object(
+            vm, "read",
+            return_value={"ssh_host": "h", "ssh_user": "u", "ssh_key_path": "/k"},
+        ), mock.patch.object(vm, "_run") as run:
+            result = vm.do_pull("C:/x", ".sc-state/local/remotes/x.known_hosts")
+        self.assertEqual(result["error"], "remote_path_not_allowed")
+        run.assert_not_called()
+
+
+class RemoteLinkTests(unittest.TestCase):
+    """`./sc remote add` tests the link it just saved, and says what is next."""
+
+    ENTRY = {"host": "remote.example", "user": "tester", "port": 22,
+             "key_path": "/host/private/key"}
+
+    def setUp(self):
+        self.saved = {}
+        for target, name, kwargs in (
+            (remote, "read_all", {"side_effect": lambda: dict(self.saved)}),
+            (remote, "write_all",
+             {"side_effect": lambda value: self.saved.update(value)}),
+            # Never start a real broker from a test.
+            (vm, "_dispatch_broker_up",
+             {"side_effect": AssertionError("unexpected real broker start")}),
+        ):
+            patcher = mock.patch.object(target, name, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(remote.os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        remote.os.environ.pop("SC_SANDBOX", None)
+
+    def test_add_verifies_over_ssh_and_reports_the_passing_check(self):
+        status = {"ok": True, "error": None, "output": "ok", "reachable": True}
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             mock.patch.object(remote, "do_status", return_value=status) as check:
+            value = remote.link_remote("devbox", dict(self.ENTRY))
+        self.assertTrue(value["ok"])
+        check.assert_called_once_with("devbox")
+        self.assertTrue(value["result"]["verify"]["passed"])
+        self.assertTrue(value["result"]["broker"]["ready"])
+        self.assertNotIn("key_path", value["result"]["remote"])
+        self.assertIn("link verified", remote._human_result(value))
+
+    def test_a_failed_link_says_the_remote_is_saved_and_what_to_run_next(self):
+        status = {"ok": False, "error": "remote_key_invalid",
+                  "output": "remote key_path must be a regular mode-0600 file"}
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             mock.patch.object(remote, "do_status", return_value=status):
+            value = remote.link_remote("devbox", dict(self.ENTRY))
+        self.assertFalse(value["ok"])
+        self.assertEqual(value["error"]["code"], "remote_verify_failed")
+        self.assertIn("devbox", self.saved)
+        self.assertIn("IS saved", value["error"]["message"])
+        check = value["error"]["details"]["checks"][0]
+        self.assertFalse(check["ok"])
+        self.assertIn("chmod 600", check["next"])
+        self.assertNotIn("/host/private/key", json.dumps(value))
+        rendered = remote._human_result(value)
+        self.assertIn("✗ ssh", rendered)
+        self.assertIn("next: ", rendered)
+
+    def test_add_starts_a_down_broker_the_way_adopt_does(self):
+        started = []
+
+        def broker(method, path, body=None, timeout=130):
+            if not started:
+                raise vm.BrokerConnectionError("down", request_sent=False)
+            return {"ok": True}
+
+        def start():
+            started.append(True)
+            return True, "up"
+
+        status = {"ok": True, "error": None, "output": "ok"}
+        with mock.patch.object(vm, "broker_call", side_effect=broker), \
+             mock.patch.object(vm, "_dispatch_broker_up", side_effect=start) as up, \
+             mock.patch.object(remote, "do_status", return_value=status):
+            value = remote.link_remote("devbox", dict(self.ENTRY))
+        up.assert_called_once_with()
+        self.assertTrue(value["result"]["broker"]["started"])
+
+    def test_no_verify_saves_without_testing_or_starting_anything(self):
+        with mock.patch.object(
+            vm, "broker_call", side_effect=vm.BrokerConnectionError("down", request_sent=False)
+        ), mock.patch.object(remote, "do_status") as check, \
+             redirect_stdout(io.StringIO()) as out:
+            code = remote.client_main([
+                "add", "devbox", "--host", "remote.example", "--user", "tester",
+                "--key-path", "/host/private/key", "--no-verify",
+            ])
+        self.assertEqual(code, 0)
+        check.assert_not_called()
+        self.assertIn("devbox", self.saved)
+        self.assertIn("not verified", out.getvalue())
+        self.assertIn("./sc vm-broker-up", out.getvalue())
+
+    def test_a_sandboxed_add_verifies_through_the_broker(self):
+        remote.os.environ["SC_SANDBOX"] = "1"
+        response = {"ok": True, "output": "ok", "reachable": True}
+        with mock.patch.object(vm, "broker_call", return_value=response) as call, \
+             mock.patch.object(remote, "do_status") as direct:
+            value = remote.link_remote("devbox", dict(self.ENTRY))
+        self.assertTrue(value["ok"])
+        direct.assert_not_called()
+        call.assert_any_call("GET", "/remote/devbox/status", None, timeout=30)
+
+
+class RemoteStatusTruthTests(unittest.TestCase):
+    """A dead socket is "not declared" or "broker down" - never one for both."""
+
+    def test_an_undeclared_remote_is_not_reported_as_a_broker_problem(self):
+        with mock.patch.object(remote, "read_all", return_value={}), \
+             mock.patch.object(
+                 vm, "broker_call", side_effect=vm.BrokerConnectionError("down", request_sent=False)):
+            value = remote.run_broker_operation("status", "devbox")
+        self.assertEqual(value["error"]["code"], "remote_not_found")
+        self.assertIn("./sc remote add", value["error"]["message"])
+        self.assertNotIn("vm-broker-up", value["error"]["message"])
+
+    def test_a_declared_remote_with_no_broker_names_the_start_command(self):
+        with mock.patch.object(remote, "read_all", return_value={"devbox": {}}), \
+             mock.patch.object(
+                 vm, "broker_call", side_effect=vm.BrokerConnectionError("down", request_sent=False)):
+            value = remote.run_broker_operation("status", "devbox")
+        self.assertEqual(value["error"]["code"], "broker_unreachable")
+        self.assertIn("./sc vm-broker-up", value["error"]["message"])
 
 
 class RemoteConfigClientTests(unittest.TestCase):
@@ -238,6 +465,7 @@ class RemoteClientHelpTests(unittest.TestCase):
             ("port", ("--port",), None, False, 22, "int"),
             ("key_path", ("--key-path",), None, True, None, None),
             ("known_hosts_path", ("--known-hosts-path",), None, False, None, None),
+            ("no_verify", ("--no-verify",), 0, False, False, None),
             JSON,
         ),
         "remove": (HELP, NAME, JSON),

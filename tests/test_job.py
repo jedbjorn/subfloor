@@ -14,6 +14,8 @@ Run:
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sqlite3
@@ -149,6 +151,41 @@ class SupervisorTest(unittest.TestCase):
         self.assertIn("done", body)
         self.assertIn("exit=0", body)
         self.assertIn("sc job status", body)
+
+
+class HelpTest(unittest.TestCase):
+    """`sc job --help` charts what the verb really does — and only that."""
+
+    def test_help_documents_probes_and_attach_and_hides_the_supervisor(self):
+        parser = job.build_parser()
+        rendered = parser.format_help()
+        for needle in ("attach", "--until", "--every", "--pr", "--work-unit"):
+            self.assertIn(needle, rendered)
+        self.assertNotIn("_supervise", rendered)
+        self.assertNotIn("SUPPRESS", rendered)
+        self.assertNotIn("_supervise", parser.format_usage())
+        self.assertNotIn("_supervise", job.PUBLIC_VERBS)
+
+    def test_an_unknown_verb_does_not_advertise_the_supervisor(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            job.main(["bogus"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("invalid choice: 'bogus'", err.getvalue())
+        self.assertNotIn("_supervise", err.getvalue())
+
+    def test_the_hidden_supervisor_entry_still_dispatches(self):
+        with mock.patch.object(job, "supervise", return_value=7) as supervise:
+            self.assertEqual(job.main(["_supervise", "/tmp/jobdir"]), 7)
+        supervise.assert_called_once_with(Path("/tmp/jobdir"))
+
+    def test_every_public_verb_is_a_real_subcommand(self):
+        parser = job.build_parser()
+        choices = next(
+            action for action in parser._actions
+            if isinstance(action, job.argparse._SubParsersAction)
+        ).choices
+        self.assertEqual(set(job.PUBLIC_VERBS), set(choices))
 
 
 class StateTest(unittest.TestCase):

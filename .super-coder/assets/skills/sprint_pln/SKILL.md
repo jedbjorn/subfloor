@@ -8,8 +8,8 @@ common: false
 # sprint_pln — govern the armed Sprint
 
 Load `sprint_protocol` first; it holds the lifecycle, wake types, inbox
-commands, relay contract, body limits, artifact paths, receipt recovery, and
-authority boundary. This skill holds only the Planner's steps after
+commands, relay contract, the typed-handoff order and body limit, artifact
+paths, receipt recovery, and authority boundary. This skill holds only the Planner's steps after
 `sprint_prep` arms the Sprint.
 
 ## What you can read
@@ -101,8 +101,8 @@ sc sprint pause --sprint <id> --reason <decision-or-restructure-reason>
 
 Pause interrupts every live participant turn, and resume re-enters each
 interrupted participant automatically with one re-enter wake into their
-existing chat. Health is reporting-only: never send status-check messages on
-silence — read the board (`sc sprint show --sprint <id>`) instead.
+existing chat. For silence, read the board (`sc sprint show --sprint <id>`);
+the protocol's health rule forbids status-check messages.
 
 Resume only after recording recovery/restructure and reconciling native runs,
 unread messages, wakes, units, PRs, capacity, and spec drift:

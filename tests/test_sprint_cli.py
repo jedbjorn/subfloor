@@ -2904,6 +2904,19 @@ class SprintCliApiTest(unittest.TestCase):
             TOKENS["planner"], "monitor", "--sprint", str(self.sprint_id)
         )
         self.assertEqual([], monitor["outcomes"])
+        # `timeline` is the CLI face of the existing event-log route.
+        timeline = self.run_cli(
+            TOKENS["planner"], "timeline", "--sprint", str(self.sprint_id)
+        )
+        self.assertEqual(self.sprint_id, timeline["sprint_id"])
+        self.assertNotIn("total_events", timeline)
+        self.assertGreater(len(timeline["events"]), 1)
+        newest = self.run_cli(
+            TOKENS["planner"], "timeline", "--sprint", str(self.sprint_id),
+            "--last", "1",
+        )
+        self.assertEqual(timeline["events"][-1:], newest["events"])
+        self.assertEqual(len(timeline["events"]), newest["total_events"])
         self.assertEqual(
             {
                 "action": "none",

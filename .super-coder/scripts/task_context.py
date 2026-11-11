@@ -111,7 +111,7 @@ def merge_gate(*, sprint_id: int | None, lifecycle: str | None,
     grant), the owning Developer authorizes its own registered PR through
     `sc sprint authorize-merge` — `sprint_review_loop.authorize_merge` refuses
     every other caller. Everywhere else the gate is an explicit FnB directive
-    naming the PR.
+    that identifies the PR, by number or by assignment and stated condition.
     """
     if sprint_id is not None and lifecycle == "armed":
         who = f"the owning Developer {developer}" + (" (you)" if caller_is_developer else "")
@@ -121,10 +121,15 @@ def merge_gate(*, sprint_id: int | None, lifecycle: str | None,
                 "the FnB's grant")
     if lifecycle == "paused" and sprint_id is not None:
         return (f"merge gate: Sprint {sprint_id} is paused — wait for resume, or an "
-                "explicit FnB directive naming the PR")
+                f"explicit FnB directive that identifies the PR{DIRECTIVE_FORMS}")
     where = ("no armed Sprint covers this work" if sprint_id is None
              else f"Sprint {sprint_id} is {lifecycle or 'unknown'}, not armed")
-    return f"merge gate: an explicit FnB directive naming the PR ({where})"
+    return f"merge gate: an explicit FnB directive that identifies the PR{DIRECTIVE_FORMS} ({where})"
+
+
+# Boot VERSION CONTROL form 1: the directive names the PR by number, or names
+# an assignment and the condition its PRs must meet.
+DIRECTIVE_FORMS = ", by number or by assignment and stated condition"
 TASK_WALLS = {
     "pending": "not started — `sc mem task start {task}` before building it",
     "in_progress": "in progress — `sc mem task done {task}` when verified",

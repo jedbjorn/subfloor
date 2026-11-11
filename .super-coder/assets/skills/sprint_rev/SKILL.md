@@ -1,6 +1,6 @@
 ---
 name: sprint_rev
-description: Review Sprints v2 work and whole-Sprint conformance — own review, re-enter, abort, and conclude judgments, author the conformance and Sprint reports, and direct safety actions through durable messages.
+description: Review Sprints v2 work units and whole-Sprint conformance as Reviewer; load after sprint_protocol in every Sprint review turn. Own review, re-enter, abort, and conclude judgments, author the conformance and Sprint reports, and direct safety actions through durable messages. Inside an armed Sprint the recorded verdict replaces the Reviewer boot's FnB-gated handoff.
 category: workflow
 common: false
 ---
@@ -8,9 +8,19 @@ common: false
 # sprint_rev — independent review and conformance
 
 Load `sprint_protocol` first; it holds the lifecycle, wake types, inbox
-commands, relay contract, body limits, artifact paths, receipt recovery, and
-authority boundary. This skill holds only the Reviewer's steps: pre-declaration
-QA/QC, one work-unit review, or whole-Sprint conformance.
+commands, relay contract, the typed-handoff order and body limit, artifact
+paths, receipt recovery, and authority boundary. This skill holds only the
+Reviewer's steps: pre-declaration QA/QC, one work-unit review, or whole-Sprint
+conformance. Your typed handoffs are `record-review`, `record-conformance`,
+and a Sprint-level `decision` to the Planner; each is final and follows the
+protocol's order.
+
+Inside an armed Sprint this verdict path stands in place of the Reviewer
+boot's FnB-gated handoff. Your boot's REVIEW PROCEDURE has you draft the
+handoff, propose it to the FnB, and send only on approval; here the FnB
+already authorized the loop by arming the Sprint, so you record the verdict
+or decision directly, with its findings in the body, and wait for no
+per-review approval. Outside an armed Sprint the boot procedure governs.
 
 ## Route the entry
 
@@ -97,12 +107,8 @@ Read cited and feature-scoped resolved flag evidence through memory
 Each finding pins severity/title, violated invariant, exact location/evidence,
 reproducible consequence, and fix boundary without unnecessary architecture.
 
-Complete a unit verdict in this exact order:
-
-1. Finish every inspection, finding, and verdict body.
-2. Re-run `sc sprint inbox --sprint <id>` once; handle + `accept` new items.
-3. Run `wc -m < <path>`; require near 6,000 and below 8,000 characters.
-4. As the literal final action, run:
+Finish every inspection, finding, and the verdict body, then record the
+verdict as the final handoff:
 
 ```text
 sc sprint record-review \
@@ -110,8 +116,7 @@ sc sprint record-review \
   --verdict changes_requested|approved --body-file <path> --key <stable-key>
 ```
 
-5. Require durable judgment evidence + the Developer wake. Run no trailing
-   command; stop.
+Require durable judgment evidence + the Developer wake.
 
 Use `approved` only with no Critical/Major/Medium finding. Engine validation
 requires the accepted request. Do not message around the surface; an
@@ -161,13 +166,12 @@ Review the integrated system, not unit diffs. Classify every requirement
 spec document + work-unit ids when known.
 
 For the clean branch, write findings directly in the conformance report.
-Keep the report near 6,000 and below 8,000 characters; run `wc -m < <report>`.
 
 Before recording conformance, author the final Sprint report. Name yourself as
 author and cover governing scope/revisions, shipped units/PRs, judgments +
 ratified deviations, failures/retries/recovery/anomalies, conclusion,
-follow-ups, and evidence location. Keep it near 6,000 and below 8,000; preserve
-discrepancies.
+follow-ups, and evidence location. Preserve discrepancies. Both reports are
+handoff bodies under the protocol's limit.
 
 Record one atomic final write:
 
@@ -188,16 +192,12 @@ delivery-terminal wake arrives.
 
 ## Stop
 
-Unit review ends with the ordered `record-review` write as the literal final
-action.
+Each ending is a final handoff in the protocol's order:
 
-For closeout, first re-run `sc sprint inbox --sprint <id>`, handle + `accept`
-new messages, then confirm every artifact/body is final and below 8,000.
-
-- Clean conclude -> run the atomic `record-conformance` command above as the
-  literal final action. When it confirms completed state and all receipt
-  identities, stop immediately; the Planner is notified.
-- Re-enter/abort -> as literal final action send the Sprint-level `decision`
-  to the Planner (relay form in `sprint_protocol`), require durable write +
-  Planner wake, then stop immediately. Run no trailing command until another
-  native wake.
+- Unit review -> `record-review`.
+- Clean conclude -> the atomic `record-conformance` command above, once every
+  artifact and body is final. When it confirms completed state and all receipt
+  identities, stop; the Planner is notified.
+- Re-enter/abort -> the Sprint-level `decision` to the Planner (relay form in
+  `sprint_protocol`); require durable write + Planner wake, and run nothing
+  more until another native wake.
