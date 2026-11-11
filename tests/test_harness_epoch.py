@@ -178,11 +178,17 @@ class HarnessEpochDockerfile(unittest.TestCase):
             '"$HOME/.local/bin/codex"',
             codex_run,
         )
+        # The home bind mounts are one list (sandbox_devkit.HOME_BIND_MOUNTS)
+        # that the dispatcher's docker run names through SC_HOME_MOUNTS.
+        dispatch = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
+        devkit = (ROOT / ".super-coder" / "scripts" / "sandbox_devkit.py").read_text()
+        mounts = devkit[devkit.index("HOME_BIND_MOUNTS = ("):]
+        mounts = mounts[:mounts.index(")")]
         self.assertIn(
-            '-v "$HOME/.codex:$HOME/.codex"',
-            (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text(),
+            '"' + ".codex" + '"', mounts,
             "durable Codex state stays mounted; isolate its executable",
         )
+        self.assertIn("        SC_HOME_MOUNTS \\\n", dispatch)
 
     def test_harness_downloads_fail_before_installer_execution(self):
         """A failed curl piped into bash exits zero on an empty script."""
