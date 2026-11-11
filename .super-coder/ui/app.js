@@ -340,7 +340,9 @@ function openEditModal({ title, value, onSave }) {
 // ordered list of { id, label, render }: each becomes a labelled block whose
 // body element carries the id, so a caller (or a later lane) fills the mount
 // with replaceChildren without touching the label. render(mount, { close })
-// is optional — a section without one stays empty but labelled.
+// is optional — a section without one stays empty but labelled. A render may
+// return a function; it runs once when the drawer closes, so a section can
+// release listeners and stop late answers from painting.
 // onClose runs once, on every close path. Returns the close function.
 // Keyboard focus stays inside the panel while it is open: Tab from the last
 // control wraps to the first, Shift+Tab from the first wraps to the last, and
@@ -350,10 +352,12 @@ function openDrawer({ title, sections = [], width = 380, onClose }) {
   const priorFocus = document.activeElement;
   const overlay = el("div", { className: "modal-overlay drawer-overlay" });
   let closed = false;
+  const cleanups = [];
   const close = () => {
     if (closed) return;
     closed = true;
     overlay.remove();
+    for (const cleanup of cleanups) { try { cleanup(); } catch { /* one section's cleanup never blocks close */ } }
     if (onClose) onClose();
     if (priorFocus?.isConnected && typeof priorFocus.focus === "function") priorFocus.focus();
   };
@@ -389,7 +393,10 @@ function openDrawer({ title, sections = [], width = 380, onClose }) {
     body.append(el("section", { className: "drawer-section" },
       el("h3", { className: "drawer-label" }, section.label), mount));
     if (section.render) {
-      try { section.render(mount, { close }); }
+      try {
+        const cleanup = section.render(mount, { close });
+        if (typeof cleanup === "function") cleanups.push(cleanup);
+      }
       catch (e) { mount.replaceChildren(el("div", { className: "drawer-note" }, "error: " + e.message)); }
     }
   }
@@ -1077,8 +1084,21 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
 
 let modelCatalogue = null;
 const supersededModelCatalogueGenerations = new Set();
+// Views that display the catalogue hear every adoption, whichever request
+// caused it. Whoever adds a listener removes it when its view closes.
+const modelCatalogueListeners = new Set();
+// What a view should show for a response it received: a response whose
+// generation was superseded while it was in flight yields the page's catalogue.
+function currentCatalogue(response) {
+  return modelCatalogue
+    && supersededModelCatalogueGenerations.has(response.catalogue_generation)
+    ? modelCatalogue : response;
+}
 
-async function loadModelCatalogue(refresh = false) {
+// `announce` is asked when the answer arrives, not when the request leaves: a
+// caller whose view has gone by then still gets the catalogue adopted, but
+// the "New models available!" notice stays silent.
+async function loadModelCatalogue(refresh = false, { announce = () => true } = {}) {
   const catalog = await api(refresh ? "/models?refresh=1" : "/models");
   const generation = catalog.catalogue_generation;
   const baselineGeneration = modelCatalogue?.catalogue_generation;
@@ -1108,13 +1128,14 @@ async function loadModelCatalogue(refresh = false) {
         .filter((model) => model.availability === "available"
           && !known.has(`${harness}/${model.id}`))
         .map((model) => `${harness}: ${model.id}`));
-    if (added.length) toast(`New models available!\n${added.join("\n")}`);
+    if (added.length && announce()) toast(`New models available!\n${added.join("\n")}`);
   }
   // A failed refresh must not consume the baseline for the next successful read.
   if (!catalog.stale || !modelCatalogue) {
     if (baselineGeneration && generationChanged)
       supersededModelCatalogueGenerations.add(baselineGeneration);
     modelCatalogue = catalog;
+    for (const listener of [...modelCatalogueListeners]) listener(catalog);
   }
   return catalog;
 }
@@ -2985,6 +3006,195 @@ async function renderWorktrees(root, opts = {}) {
   if (unknown.length) sc.append(el("div", { className: "muted wt-prov" },
     `${unknown.length} branch(es) with unknown merge state (gh unavailable): ${unknown.map((b) => b.name).join(", ")}`));
   root.append(sc);
+}
+
+// ── Settings drawer: Tokens, Models, Engine (spec #270) ─────────────────────
+// Each renderer is assigned onto its DRAWER_SECTIONS entry, so the section
+// order and labels stay with the drawer and only the bodies live here.
+
+// Tokens: one read of the stored session cards, never a sweep. The drawer is
+// a quick look; the sweep that ingests new harness logs belongs to the full
+// Analytics view, which the link opens. "Today" is the local day, as in the
+// Analytics chart; the 7-day figure is the server's rolling window.
+const DRAWER_TOKEN_DAYS = 7;
+function drawerTokenSummary(sessions, now = new Date()) {
+  const today = now.toDateString();
+  const total = { today: 0, week: 0 };
+  const byHarness = new Map();
+  for (const card of sessions || []) {
+    const tokens = cardTotal(card);
+    const isToday = Boolean(card.started_at)
+      && new Date(card.started_at).toDateString() === today;
+    const name = card.harness || "unknown";
+    const row = byHarness.get(name) || { harness: name, today: 0, week: 0 };
+    row.week += tokens;
+    total.week += tokens;
+    if (isToday) { row.today += tokens; total.today += tokens; }
+    byHarness.set(name, row);
+  }
+  const harnesses = [...byHarness.values()].sort(
+    (a, b) => b.week - a.week || a.harness.localeCompare(b.harness));
+  return { total, harnesses };
+}
+
+function renderDrawerTokens(mount, { close }) {
+  const link = el("a", {
+    className: "drawer-link", href: "#analytics", textContent: "Open full analytics →",
+  });
+  link.onclick = () => close();  // the href navigates; the drawer just gets out of the way
+  const body = el("div", { className: "drawer-note" }, "Loading…");
+  mount.replaceChildren(body, link);
+  let closed = false;
+  api("/analytics/sessions?days=" + DRAWER_TOKEN_DAYS).then((data) => {
+    if (closed) return;
+    const { total, harnesses } = drawerTokenSummary(data.sessions);
+    const table = el("div", { className: "drawer-tokens" });
+    const row = (label, today, week, cls = "") => table.append(
+      el("span", { className: "drawer-tok-name " + cls }, label),
+      el("span", { className: "drawer-tok-num " + cls }, today),
+      el("span", { className: "drawer-tok-num " + cls }, week));
+    row("", "Today", `${DRAWER_TOKEN_DAYS} days`, "drawer-tok-head");
+    row("Total", fmtTok(total.today), fmtTok(total.week), "drawer-tok-total");
+    for (const h of harnesses) row(h.harness, fmtTok(h.today), fmtTok(h.week));
+    const shown = [table];
+    if (!harnesses.length) shown.push(el("div", { className: "drawer-note" },
+      `No recorded sessions in the last ${DRAWER_TOKEN_DAYS} days.`));
+    mount.replaceChildren(...shown, link);
+  }, (error) => { if (!closed) body.textContent = "token summary error: " + error.message; });
+  return () => { closed = true; };
+}
+
+// Models: what the server says about its catalogue cache, and a manual refresh.
+const MODEL_STALE_REASONS = {
+  ttl: "the cache is older than its time-to-live",
+  generation_mismatch: "the catalogue generation changed",
+  local_source_changed: "local model sources changed",
+};
+function catalogueAge(iso, now = Date.now()) {
+  const at = iso ? Date.parse(iso) : NaN;
+  if (Number.isNaN(at)) return null;
+  const minutes = Math.max(0, Math.round((now - at) / 60000));
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  if (minutes < 48 * 60) return `${Math.round(minutes / 60)} h ago`;
+  return `${Math.round(minutes / 1440)} d ago`;
+}
+// `fetched_at` is the last successful fetch. A failed refresh keeps the old
+// catalogue and still stamps `refresh_completed_at`, so that time dates the
+// attempt, never the catalogue.
+function catalogueFreshness(catalog) {
+  const age = catalogueAge(catalog.fetched_at);
+  const attempted = catalogueAge(catalog.refresh_completed_at);
+  return {
+    age: age ? `Fetched ${age} · ${new Date(catalog.fetched_at).toLocaleString()}`
+      : "Never fetched",
+    stale: Boolean(catalog.stale),
+    state: catalog.stale
+      ? "Stale — " + (MODEL_STALE_REASONS[catalog.stale_reason]
+        || catalog.stale_reason || "refresh pending")
+      : "Current",
+    attempt: catalog.stale && catalog.error
+      ? `Last refresh failed${attempted ? " " + attempted : ""}: ${catalog.error}` : "",
+  };
+}
+
+function renderDrawerModels(mount) {
+  const age = el("div", { className: "drawer-note" }, "Loading…");
+  const state = el("div", { className: "drawer-model-state" });
+  const attempt = el("div", { className: "drawer-model-state stale" });
+  const refresh = el("button", { className: "act", type: "button", textContent: "Refresh models" });
+  const paint = (catalog, refreshed = false) => {
+    const fresh = catalogueFreshness(catalog);
+    age.textContent = fresh.age;
+    state.textContent = fresh.state;
+    state.className = "drawer-model-state" + (fresh.stale ? " stale" : "");
+    attempt.textContent = fresh.attempt
+      || (refreshed && fresh.stale ? "The refresh did not complete." : "");
+  };
+  // Only this section's newest read paints its own answer, so a slow opening
+  // read cannot overwrite a refresh that finished first. Adoptions caused
+  // elsewhere (Configure, the new-chat watch) arrive through the listener.
+  // Closing the drawer removes the listener and retires every pending read.
+  let newest = 0;
+  let closed = false;
+  const read = (refreshing) => {
+    const mine = ++newest;
+    return loadModelCatalogue(refreshing).then((catalog) => {
+      if (!closed && mine === newest) paint(currentCatalogue(catalog), refreshing);
+    }, (error) => {
+      if (closed || mine !== newest) return;
+      age.textContent = "catalogue error: " + error.message;
+      state.textContent = attempt.textContent = "";
+    });
+  };
+  const adopted = (catalog) => paint(catalog);
+  modelCatalogueListeners.add(adopted);
+  refresh.onclick = async () => {
+    refresh.disabled = true;
+    refresh.textContent = "Refreshing…";
+    await read(true);
+    refresh.disabled = false;
+    refresh.textContent = "Refresh models";
+  };
+  mount.replaceChildren(age, state, attempt,
+    el("div", { className: "drawer-actions" }, refresh));
+  read(false);
+  return () => { closed = true; modelCatalogueListeners.delete(adopted); };
+}
+
+// Engine: the controls arrive with the host-side engine-ops service.
+function renderDrawerEngine(mount) {
+  mount.replaceChildren(el("div", { className: "drawer-note" },
+    "Engine controls are not available in this build."));
+}
+
+for (const [id, render] of [
+  ["drawer-tokens", renderDrawerTokens],
+  ["drawer-models", renderDrawerModels],
+  ["drawer-engine", renderDrawerEngine],
+]) DRAWER_SECTIONS.find((section) => section.id === id).render = render;
+
+// "＋ Chat" asks the server for its catalogue without waiting on the answer:
+// the GET alone makes a stale server start its own background refresh. Only
+// the server's `stale` flag is read. A stale answer earns one notice and one
+// bounded watch that reloads the catalogue when the refresh lands, then stops;
+// past the cap it gives up quietly and the next read picks the result up.
+const CATALOGUE_WATCH_MS = 3000;
+const CATALOGUE_WATCH_LIMIT = 20;
+// The watch belongs to the Chats view. Once the operator has left it, the
+// new-chat path issues no catalogue request and raises no catalogue notice:
+// the router's show() calls stopCatalogueWatch() on every other view, and
+// each step below re-checks before it reads or speaks. An answer that was
+// already in flight may still update the in-memory catalogue, silently.
+let catalogueWatch = null;   // { timer } while one watch is armed, else null
+const catalogueWatchInView = () => activeTab === "interface";
+function stopCatalogueWatch() {
+  if (!catalogueWatch) return;
+  clearTimeout(catalogueWatch.timer);
+  catalogueWatch = null;
+}
+function watchCatalogueOnNewChat() {
+  if (!catalogueWatchInView()) return;
+  loadModelCatalogue(false, { announce: catalogueWatchInView }).then((catalog) => {
+    if (!catalog.stale || catalogueWatch || !catalogueWatchInView()) return;
+    const watch = catalogueWatch = { timer: null };
+    const armed = () => catalogueWatch === watch;
+    toast("Model catalogue is stale — refreshing in the background.");
+    let polls = 0;
+    const poll = async () => {
+      if (!armed()) return;
+      polls += 1;
+      let done = polls >= CATALOGUE_WATCH_LIMIT;
+      // loadModelCatalogue adopts a fresh answer as the page's catalogue and
+      // announces new models itself, so the successful poll is the reload.
+      try { if (!(await loadModelCatalogue(false, { announce: armed })).stale) done = true; }
+      catch { /* a transient read failure spends one poll */ }
+      if (!armed()) return;   // cancelled while the read was out
+      if (done) stopCatalogueWatch();
+      else watch.timer = setTimeout(poll, CATALOGUE_WATCH_MS);
+    };
+    watch.timer = setTimeout(poll, CATALOGUE_WATCH_MS);
+  }, () => { /* chat creation never depends on the catalogue */ });
 }
 
 // ── Analytics ──────────────────────────────────────────────────────────────
@@ -5206,6 +5416,41 @@ async function chatRenderNew(host, shell, defaults, catalog) {
   modelSelect.onchange = () => paintEfforts();
   effortSelect.onchange = () => paintEfforts(effortSelect.value);
   paintModels();
+  // Refresh models: fetch a new catalogue and repaint the pickers in place.
+  // The harness and title are untouched; the model and thinking level are
+  // kept when the refreshed catalogue still offers them, else they fall back
+  // to the defaults a first paint would choose.
+  const refreshModels = el("button", {
+    className: "chat-refresh-models",
+    type: "button",
+    textContent: "Refresh models",
+  });
+  const refreshNote = el("span", { className: "chat-refresh-note", role: "status" });
+  refreshModels.onclick = async () => {
+    refreshModels.disabled = true;
+    refreshModels.textContent = "Refreshing…";
+    refreshNote.textContent = "";
+    try {
+      const refreshed = currentCatalogue(await loadModelCatalogue(true));
+      const keptModel = modelSelect.value;
+      const keptEffort = effortSelect.value;
+      catalog = refreshed;
+      chatModelOptions(modelSelect, catalog, harness, byHarness[harness]?.model);
+      const modelKept = [...modelSelect.options].some(
+        (option) => option.value === keptModel);
+      if (modelKept) modelSelect.value = keptModel;
+      modelDropdown.refresh();
+      paintEfforts(modelKept && keptEffort ? keptEffort : undefined);
+      refreshNote.textContent = refreshed.stale
+        ? "The refresh did not complete; showing the last catalogue."
+        : modelKept ? "Models refreshed."
+          : "Models refreshed — the selected model is no longer offered.";
+    } catch (error) {
+      refreshNote.textContent = "Refresh failed: " + error.message;
+    }
+    refreshModels.disabled = false;
+    refreshModels.textContent = "Refresh models";
+  };
   form.append(
     el("div", { className: "chat-new-copy" },
       el("h2", {}, `Start a chat with ${shell.display_name}`),
@@ -5213,6 +5458,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
         "This prepares the shell through its normal CLI path, then runs each turn headlessly.")),
     el("label", { className: "k" }, "Harness"), harnessSelect,
     el("label", { className: "k" }, "Model"), modelDropdown.root,
+    el("div", { className: "chat-refresh-row" }, refreshModels, refreshNote),
     el("label", { className: "k" }, "Thinking level"), effortSelect,
     routeNote,
     el("label", { className: "k" }, "Title"), title,
@@ -6636,6 +6882,7 @@ async function renderInterface(root) {
   });
   newChat.onclick = async () => {
     if (!await chatCloseForSwitch(selectedConversation)) return;
+    watchCatalogueOnNewChat();  // fire-and-forget: creation never waits on it
     newChat.disabled = true;
     configure.disabled = true;
     newChat.textContent = "Starting…";
@@ -8093,6 +8340,7 @@ function show(tab) {
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "interface") {
+    stopCatalogueWatch();
     chatStopReads();
     chatStopStream();
     chatStopHistoryPoll();

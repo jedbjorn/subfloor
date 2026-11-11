@@ -69,6 +69,7 @@ const $ = () => ({});
 const chatStopReads = () => {}, chatStopStream = () => {};
 const chatStopHistoryPoll = () => {}, chatStopReview = () => {};
 const sprintStopPolling = () => {}, setDocumentTitle = () => {};
+const stopCatalogueWatch = () => {};
 let activeTab, shellTab, chatRouteShell, chatRouteConversation, chatRouteMode;
 let chatModeController = null, renders = 0;
 const renderInterface = () => { renders++; };
@@ -833,6 +834,12 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
     assert 'textContent: "＋ Chat"' in interface
     assert 'textContent: "Configure"' in interface
     assert "() => chatCreateConversation(shell));" in interface
+    # Spec 270: "＋ Chat" reads the catalogue without waiting on it, and
+    # Configure can refresh the pickers in place.
+    assert "    watchCatalogueOnNewChat();  // fire-and-forget" in interface
+    assert "await watchCatalogueOnNewChat" not in APP
+    assert 'textContent: "Refresh models"' in interface
+    assert "const refreshed = currentCatalogue(await loadModelCatalogue(true));" in interface
     assert "{ shell_id: shell.shell_id, ...fields }" in interface
     assert "chatRouteConversation === CHAT_CONFIGURE_ROUTE" in interface
     assert "await chatRenderNew(pane, shell, defaults, catalog)" in interface
@@ -1939,10 +1946,15 @@ def test_new_chat_request_log_skips_configuration_and_closes_before_create(state
                   APP.index("function chatModeHash")]
     handler = APP[APP.index("  newChat.onclick = async"):
                   APP.index("  configure.onclick = async")]
-    script = api_helpers + catalogue + loader + close + create + release + r"""
+    # Spec 270: one catalogue read rides along, un-awaited; the configuration
+    # load (flavor defaults) still stays out of the path.
+    watch = APP[APP.index("const CATALOGUE_WATCH_MS"):
+                APP.index("// ── Analytics ──")]
+    script = api_helpers + catalogue + watch + loader + close + create + release + r"""
 const state = STATE;
 const requests = [], notices = [];
 const shell = {shell_id: "sh_dev", shortname: "DEV1"};
+let activeTab = "interface";
 const selectedConversation = state === null ? null : {
   conversation_id: "cv_old", state: state === "sprint" ? "running" : state,
   scope: state === "sprint" ? "sprint" : "interactive", version: 1,
@@ -1965,6 +1977,8 @@ globalThis.fetch = async (url, options) => {
   }
   if (url === "/api/conversations" && options.method === "POST")
     return {ok: true, json: async () => ({conversation_id: "cv_new"})};
+  if (url === "/api/models")
+    return {ok: true, json: async () => ({stale: false, harnesses: {}})};
   throw new Error("unexpected request " + url);
 };
 """ + handler + r"""
@@ -1992,6 +2006,7 @@ globalThis.fetch = async (url, options) => {
         expected.append(close_request)
         assert result["beforeClose"] == {"requests": expected, "hash": ""}
     if state != "running":
+        expected.append({"url": "/api/models", "method": "GET", "body": None})
         expected.append(create_request)
     assert result["requests"] == expected
     assert result["hash"] == ("" if state == "running" else "DEV1/cv_new")
