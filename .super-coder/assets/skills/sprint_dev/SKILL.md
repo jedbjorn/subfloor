@@ -39,10 +39,10 @@ stop at the unsafe boundary; the Reviewer decides continue/replan and the
 Planner executes the decision.
 
 Pause the Sprint yourself only for an integrity problem that makes continuing
-unsafe. First send the Planner the evidence, impact, and recommendation (the
-relay is off once paused), then run
-`sc sprint pause --sprint <id> --reason <what is unsafe>`; the pause notifies
-the Planner, who reconciles and resumes.
+unsafe, in the protocol's integrity-pause order: one `--intent information`
+message to the Planner with the evidence, impact, and recommendation, then
+`sc sprint pause --sprint <id> --reason <what is unsafe>` as the turn's last
+action.
 
 ## Build and verify
 

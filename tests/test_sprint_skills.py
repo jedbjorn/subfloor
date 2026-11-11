@@ -146,6 +146,37 @@ class SprintSkillTest(unittest.TestCase):
         # Sprint communication is by wake only: one inbox read per wake, and
         # no skill tells a participant to re-read it before a handoff.
         self.assertIn("read the inbox once per wake", flat)
+        # ... with receipt recovery as the one stated exception, named in both
+        # places.
+        self.assertIn(
+            "The one exception is receipt recovery (below): a single further "
+            "inbox read to prove a postcondition after an unconfirmed write",
+            flat)
+        self.assertIn("the one inbox re-read a turn allows", flat)
+        # A participant integrity pause has one order, stated once in the
+        # protocol: the evidence message is not final, the pause is, because
+        # the pause interrupts the pauser's own turn.
+        self.assertIn(
+            "**Integrity pause** — the one exception to stopping after a handoff",
+            flat)
+        self.assertLess(flat.index("Do not stop on it."),
+                        flat.index("as the literal last action. The pause notifies"))
+        self.assertIn("interrupts every live participant turn, yours included", flat)
+        for name in ("sprint_dev", "sprint_rev"):
+            role = " ".join(skill_text(name).split())
+            self.assertIn("in the protocol's integrity-pause order", role, name)
+            self.assertIn("as the turn's last action", role, name)
+            self.assertNotIn("A Developer does not pause", role)
+            self.assertNotIn("Never run standalone pause", role)
+        # The delivery-terminal notice is not proof of current ownership.
+        rev = " ".join(skill_text("sprint_rev").split())
+        self.assertIn("receiving it normally means you are that owner", rev)
+        self.assertIn("`sc sprint show` names a different `conformance_owner`", rev)
+        board = (ENGINE / "scripts" / "sprint_board.py").read_text()
+        self.assertIn('"conformance_owner": (', board)
+        close = (ENGINE / "scripts" / "sprint_close.py").read_text()
+        self.assertIn(
+            "only the selected conformance Reviewer may record conformance", close)
         self.assertIn("Do not run the inbox before or after it", flat)
         for name in SKILLS:
             self.assertNotIn("Re-run `sc sprint inbox", skill_text(name), name)

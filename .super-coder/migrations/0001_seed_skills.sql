@@ -1962,10 +1962,10 @@ stop at the unsafe boundary; the Reviewer decides continue/replan and the
 Planner executes the decision.
 
 Pause the Sprint yourself only for an integrity problem that makes continuing
-unsafe. First send the Planner the evidence, impact, and recommendation (the
-relay is off once paused), then run
-`sc sprint pause --sprint <id> --reason <what is unsafe>`; the pause notifies
-the Planner, who reconciles and resumes.
+unsafe, in the protocol''s integrity-pause order: one `--intent information`
+message to the Planner with the evidence, impact, and recommendation, then
+`sc sprint pause --sprint <id> --reason <what is unsafe>` as the turn''s last
+action.
 
 ## Build and verify
 
@@ -2201,8 +2201,9 @@ substitute nothing, and stop.
 
 Pause for a Reviewer decision or safe Planner restructuring; preserve partial
 artifacts, interrupt intent, judgment, and evidence. A Developer or Reviewer
-may also pause for integrity; the pause notice carries the reason — reconcile
-it, then resume as below:
+may also pause for integrity: the pause notice carries the reason and the
+pauser''s evidence message waits in the Sprint inbox — read it once, reconcile,
+then resume as below:
 
 ```text
 sc sprint pause --sprint <id> --reason <decision-or-restructure-reason>
@@ -2625,7 +2626,9 @@ sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
 Sprint communication is by wake only: read the inbox once per wake and never
-re-read it within the turn; a new message arrives as its own wake. Accepting
+re-read it within the turn; a new message arrives as its own wake. The one
+exception is receipt recovery (below): a single further inbox read to prove a
+postcondition after an unconfirmed write. Accepting
 an assignment starts ownership;
 decline only with a concrete reason. After an informational message, `accept`
 marks it read and changes no Sprint or work-unit state.
@@ -2684,12 +2687,24 @@ handoffs and add only what differs.
    turn: it is the literal last action, with no trailing Git, Sprint, inbox,
    cleanup, or status command after it. Stop and wait for the next wake.
 
+**Integrity pause** — the one exception to stopping after a handoff. Any
+participant may pause for an integrity problem that makes continuing unsafe:
+
+1. Send the Planner one `--intent information` message with the evidence,
+   impact, and recommendation. Do not stop on it.
+2. Immediately run `sc sprint pause --sprint <id> --reason <what is unsafe>`
+   as the literal last action.
+
+The pause notifies the Planner with the reason and interrupts every live
+participant turn, yours included, so nothing can follow it. Wakes are not
+delivered while paused; your message waits in the Planner''s Sprint inbox.
+
 ## Receipt recovery
 
 An unusable success receipt from idempotent bookkeeping does not stall the
 Sprint: retry the exact command once, then use its normal read surface once to
 prove the postcondition (for an informational `accept`: the message was in the
-inbox and is now absent). Continue under that proof and name the receipt
+inbox and is now absent — the one inbox re-read a turn allows). Continue under that proof and name the receipt
 defect in your next handoff. Never use this to infer assignment ownership,
 review outcome, merge authorization, a lifecycle or work-unit transition, the
 governing revision, PR head or green state, or cleanup authority; an unproved
@@ -2709,7 +2724,7 @@ Reviewers own judgments: verdicts, conformance, re-enter and abort decisions.
 The Planner owns plan structure — lanes, dependencies, waves, assignment,
 routes, pause, resume, dispatch — and executes Reviewer decisions without
 re-adjudicating them. A Developer owns one lane and its PR. Any participant
-may pause the Sprint for integrity; the role skills say when. The FnB may
+may pause the Sprint for integrity (Typed handoffs). The FnB may
 override any of it from the GUI Sprints tab; name that authority in the
 durable evidence when acting under it. A command that rejects a transition
 returns the durable state to the deciding role; substitute nothing.',
@@ -2769,10 +2784,11 @@ reroute, cancel, resume, complete, or abort actions; clean
 `record-conformance` alone performs its narrow atomic close.
 
 Pause the Sprint yourself only for an integrity problem that makes continuing
-unsafe. First send the Planner the evidence, impact, and recommendation (the
-relay is off once paused), then run
-`sc sprint pause --sprint <id> --reason <what is unsafe>`; the pause notifies
-the Planner, who reconciles and resumes.
+unsafe, in the protocol''s integrity-pause order: one `--intent information`
+message to the Planner with the evidence, impact, and recommendation, then
+`sc sprint pause --sprint <id> --reason <what is unsafe>` as the turn''s last
+action. That message is not a `decision` and is not final; the pause
+is.
 
 Base judgment on durable Sprint state, bound revisions, current work/PR facts,
 progress-carrier evidence, and ratified judgments. A decision body names:
@@ -2854,8 +2870,11 @@ unrecorded verdict cannot unlock merge.
 Retain the exact notification message id + delivered wake as this closeout
 episode''s identity. The engine sends this notification only to the selected
 conformance owner for the current ownership generation, and its body names no
-owner: receiving it means you are that owner. Inspect inbox, lifecycle, and
-units first:
+owner: receiving it normally means you are that owner. Ownership can move
+across a pause and resume while an earlier notice is still delivered: if
+`sc sprint show` names a different `conformance_owner`, or `record-conformance`
+is refused as not the selected conformance Reviewer, `accept` the notice and
+stop without sending anything. Inspect inbox, lifecycle, and units first:
 
 - Already completed/aborted -> `accept` notification and stop.
 - Any non-terminal unit visible -> the wake is stale: `accept`, stop, and

@@ -95,8 +95,9 @@ substitute nothing, and stop.
 
 Pause for a Reviewer decision or safe Planner restructuring; preserve partial
 artifacts, interrupt intent, judgment, and evidence. A Developer or Reviewer
-may also pause for integrity; the pause notice carries the reason — reconcile
-it, then resume as below:
+may also pause for integrity: the pause notice carries the reason and the
+pauser's evidence message waits in the Sprint inbox — read it once, reconcile,
+then resume as below:
 
 ```text
 sc sprint pause --sprint <id> --reason <decision-or-restructure-reason>
