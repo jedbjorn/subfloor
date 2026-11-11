@@ -29,10 +29,14 @@ has none. A POST must carry an Origin equal to this install's GUI origin; a
 GET may omit Origin, but a foreign one is refused. CORS headers are sent for
 the GUI origin and for nothing else.
 
-The port and the accepted GUI origin are fixed when the service starts, from
-its host-private state (`engine_ops.ensure_config`). Nothing in the checkout,
-which a sandbox can write, is consulted per request, and the operation status
-and logs it serves are in that private directory too.
+The port and the accepted GUI origin come from the service's host-private
+state. Nothing in the checkout, which a sandbox can write, is consulted, and
+the operation status and logs it serves are in that private directory too.
+
+The GUI origin is pinned by the operator in a host terminal
+(`./sc engine-ops-pin`). Until it is, the service starts nothing: `GET /status`
+answers `{pinned: false, reason, pin_cli}` and every `POST` is
+`409 gui_origin_unpinned`, readable by any loopback page so the GUI can say why.
 
 The verb table is fixed (`engine_ops.VERBS`). The path segment selects a row;
 the request body and query string are never read. An operation runs detached
@@ -46,6 +50,7 @@ Run on the HOST (never in the sandbox):
 from __future__ import annotations
 
 import json
+import re
 import signal
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -61,6 +66,9 @@ import engine_ops  # noqa: E402  (verb table, status file, detached runner)
 BIND = engine_ops.BIND
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
 OPS_PREFIX = "/ops/"
+# While unpinned, a refusal may be read by any loopback page (it carries no
+# state and starts nothing), so the GUI can show the reason.
+_LOOPBACK_ORIGIN = re.compile(r"^http://(127\.0\.0\.1|localhost):[0-9]{1,5}$")
 
 
 def _error(code: str, message: str, details: dict | None = None) -> dict:
@@ -78,10 +86,19 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── responses ────────────────────────────────────────────────────────────
 
+    def _allowed_origin(self, origin: str | None) -> bool:
+        """The pinned GUI origin; or, while unpinned, any loopback page."""
+        if not origin:
+            return False
+        pinned = engine_ops.pinned_gui_port()
+        if pinned is None:
+            return bool(_LOOPBACK_ORIGIN.match(origin))
+        return origin in engine_ops.gui_origins(pinned)
+
     def _cors(self) -> list[tuple[str, str]]:
-        """CORS headers, only when the request's Origin is the GUI's."""
+        """CORS headers, only when the request's Origin is an allowed one."""
         origin = self.headers.get("Origin")
-        if not origin or origin not in self.server.gui_origins:
+        if not self._allowed_origin(origin):
             return []
         return [
             ("Access-Control-Allow-Origin", origin),
@@ -125,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
                     "same_origin_required",
                     "engine operations require the review GUI's origin"))
                 return False
-        elif origin not in self.server.gui_origins:
+        elif not self._allowed_origin(origin):
             self._send(403, _error(
                 "same_origin_required",
                 "engine operations require the review GUI's origin"))
@@ -177,6 +194,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, _error(
                 "unknown_engine_op", "no such engine operation",
                 {"ops": sorted(engine_ops.VERBS)}))
+        except engine_ops.Unpinned as exc:
+            return self._send(409, _error(
+                "gui_origin_unpinned", str(exc),
+                {"pin_cli": engine_ops.PIN_CLI}))
         except engine_ops.Busy as exc:
             return self._send(409, {
                 "operation": exc.operation,
@@ -198,20 +219,16 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
-    # The origins this service accepts, fixed for its lifetime.
-    gui_origins: frozenset[str] = frozenset()
 
 
-def make_server(port: int, gui_origins: frozenset[str]) -> Server:
+def make_server(port: int) -> Server:
     """The service's listener, bound to loopback and nothing else."""
-    srv = Server((BIND, port), Handler)
-    srv.gui_origins = frozenset(gui_origins)
-    return srv
+    return Server((BIND, port), Handler)
 
 
-def serve(port: int, gui_origins: frozenset[str]) -> int:
+def serve(port: int) -> int:
     """Listen until stopped. `port` 0 asks the kernel for one (tests)."""
-    srv = make_server(port, gui_origins)
+    srv = make_server(port)
     actual = srv.server_address[1]
 
     def _stop(_signum, _frame):
@@ -220,8 +237,8 @@ def serve(port: int, gui_origins: frozenset[str]) -> int:
     signal.signal(signal.SIGTERM, _stop)
     engine_ops.register_service(actual)
     sys.stderr.write(
-        f"[engine-ops] listening on http://{BIND}:{actual} for "
-        f"{', '.join(sorted(srv.gui_origins)) or 'no GUI origin'}\n")
+        f"[engine-ops] listening on http://{BIND}:{actual}\n"
+        f"[engine-ops] {engine_ops.pin_summary(engine_ops.pinned_gui_port()).strip()}\n")
     sys.stderr.flush()
     try:
         srv.serve_forever()
@@ -245,7 +262,7 @@ def main(argv: list[str]) -> int:
         config = engine_ops.ensure_config()
     except engine_ops.StateError as exc:
         sys.exit(f"engine-ops: {exc}")
-    return serve(config["port"], engine_ops.gui_origins(config["gui_port"]))
+    return serve(config["port"])
 
 
 if __name__ == "__main__":

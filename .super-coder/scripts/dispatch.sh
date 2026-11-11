@@ -1278,7 +1278,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|engine-ops|engine-ops-up|engine-ops-down|engine-ops-port|engine-ops-repin|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|engine-ops|engine-ops-up|engine-ops-down|engine-ops-port|engine-ops-pin|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1546,8 +1546,8 @@ case "$cmd" in
                       sc_engine_ops_down ;;
   engine-ops-port)    sc_refuse_linked engine-ops-port "the engine-ops service of $LIVE_ROOT"
                       sc_engine_ops_port ;;
-  engine-ops-repin)   sc_refuse_linked engine-ops-repin "the engine-ops service of $LIVE_ROOT"
-                      sc_engine_ops repin ;;
+  engine-ops-pin)     sc_refuse_linked engine-ops-pin "the engine-ops service of $LIVE_ROOT"
+                      sc_engine_ops pin "$@" ;;
   # ── db broker (HOST-side primitive — runs where the live DSN + route live) ──
   db-broker)         exec "$PY" "$ENGINE/api/db_broker.py" "$@" ;;
   db-broker-up)      sc_db_broker_up ;;
@@ -2276,7 +2276,9 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc engine-ops-up       start it in the background; no-op if already up
   ./sc engine-ops-down     stop the backgrounded service (a running operation finishes)
   ./sc engine-ops-port     print (pinning once) its host loopback port
-  ./sc engine-ops-repin    re-pin the GUI origin it accepts after a review-port change
+  ./sc engine-ops-pin      pin the ONE GUI origin it accepts (asks you to type the review
+                           port; or: engine-ops-pin <port> · engine-ops-pin --show).
+                           Until pinned, the GUI's engine controls are refused.
 
   db broker (run on the HOST — read-only diagnostic reads of the fork's LIVE app
   DB for a sandboxed shell, without handing it a DSN or a route. Shells out to

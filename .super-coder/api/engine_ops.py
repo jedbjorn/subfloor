@@ -18,9 +18,13 @@ DECIDES from lives there:
   (`<XDG state home>/subfloor/engine-ops/<repo>-<path hash>/`, mode 0700,
   owned by the host user). The path is derived from the checkout's path, never
   from a file in it.
-* The GUI origin and the port are pinned in that directory the first time the
-  service starts and are not re-read from `instance.json` afterwards
-  (`./sc engine-ops-repin` re-pins after a deliberate port change).
+* The directory itself must resolve outside the checkout and outside every
+  directory the launcher mounts into the sandbox; otherwise nothing starts.
+* The GUI origin the service accepts is never taken from the checkout. It is
+  pinned by an explicit operator act in a host terminal (`./sc engine-ops-pin`)
+  and until then the service refuses every operation and says why. The port
+  is pinned on first use; `instance.json` only tells that walk which ports to
+  step past.
 * The service never opens a path taken from a status record, and opens the
   files it does write with O_NOFOLLOW.
 * Two things are PUBLISHED into the checkout for the review API, which may be
@@ -131,6 +135,10 @@ class StartFailed(Exception):
     """The runner process could not be started."""
 
 
+class Unpinned(Exception):
+    """No operator has pinned the GUI origin yet; nothing may be started."""
+
+
 class StateError(Exception):
     """The host-private state directory cannot be trusted or used."""
 
@@ -178,12 +186,77 @@ def _own_directory(path: Path) -> None:
         raise StateError(f"{path} is not owned by this user")
 
 
+# Host directories `./sc launch` bind-mounts into the sandbox, besides the
+# checkout and the instance state directory (dispatch.sh, the `docker run`
+# argument list). Relative to the user's home.
+_SANDBOX_HOME_MOUNTS = (
+    ".claude", ".config/opencode", ".local/share/opencode", ".codex", ".vibe",
+    ".kimi-code",
+)
+
+
+def sandbox_visible_roots() -> list[Path]:
+    """Real paths of every host directory a sandbox of this install can write.
+
+    The checkout; the owner-local instance state collection (this install's
+    directory in it is mounted, and which one is named by a file in the
+    checkout, so the whole collection is excluded); the engine DB's directory
+    when it resolves; and the harness state homes.
+    """
+    roots = [REPO_ROOT]
+    try:
+        roots.append(_state_home() / "subfloor" / "instances")
+    except StateError:
+        pass
+    try:
+        import instance_state  # noqa: PLC0415  (scripts/, on sys.path)
+
+        roots.append(Path(instance_state.active_database_path(ENGINE)).parent)
+    except Exception:  # noqa: BLE001 — advisory: it can only add a root
+        pass
+    home = Path.home()
+    roots.extend(home / part for part in _SANDBOX_HOME_MOUNTS)
+    resolved = []
+    for root in roots:
+        try:
+            resolved.append(Path(os.path.realpath(root)))
+        except OSError:
+            continue
+    return resolved
+
+
+_host_private_checked: set[tuple[str, str]] = set()
+
+
+def _require_host_private(path: Path) -> None:
+    """Refuse a state directory that a sandbox can reach.
+
+    Checked once per process for each (path, real path) pair: the mounts are
+    fixed for a process's lifetime, and a path that starts resolving somewhere
+    else is checked again.
+    """
+    real = Path(os.path.realpath(path))
+    key = (str(path), str(real))
+    if key in _host_private_checked:
+        return
+    for root in sandbox_visible_roots():
+        if real == root or root in real.parents:
+            raise StateError(
+                f"the engine-ops state directory {path} resolves to {real}, "
+                f"inside {root}, which is mounted into the sandbox. It must be "
+                "host-private: unset XDG_STATE_HOME or point it outside the "
+                "checkout and the sandbox mounts.")
+    _host_private_checked.add(key)
+
+
 def private_dir(path: Path | None = None) -> Path:
-    """The service's state directory: outside the checkout, owner-only.
+    """The service's state directory: outside the sandbox's reach, owner-only.
 
     Named from the checkout's own path. Nothing inside the checkout, which the
-    sandbox can write, takes part in choosing it. The leaf must be a real
-    directory owned by this user with no group or other access.
+    sandbox can write, takes part in choosing it. Its real path must lie
+    outside the checkout and every directory mounted into the sandbox, and the
+    leaf must be a real directory owned by this user with no group or other
+    access.
     """
     if path is None:
         path = PRIVATE_DIR
@@ -192,6 +265,7 @@ def private_dir(path: Path | None = None) -> Path:
         key = hashlib.sha256(root.encode()).hexdigest()[:16]
         name = re.sub(r"[^A-Za-z0-9_.-]", "_", REPO_ROOT.name) or "repo"
         home = _state_home()
+        _require_host_private(home / "subfloor" / "engine-ops" / f"{name}-{key}")
         try:
             home.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -201,7 +275,9 @@ def private_dir(path: Path | None = None) -> Path:
             path = path / part
             _own_directory(path)
     else:
+        _require_host_private(path)
         _own_directory(path)
+    _require_host_private(path)
     info = os.lstat(path)
     if info.st_mode & 0o077:
         os.chmod(path, 0o700)
@@ -457,6 +533,105 @@ def _cmdline(pid: int) -> list[str]:
     return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
 
 
+def runs_script(pid: int, script: Path) -> bool:
+    """Whether `pid` is a Python interpreter running exactly `script`.
+
+    The command line must be `<python> <script> ...` with the script resolving
+    to that file of this install. A process that merely carries the name as
+    some later argument, or runs a same-named file elsewhere, is not it.
+    """
+    argv = _cmdline(pid)
+    if len(argv) < 2 or not Path(argv[0]).name.startswith("python"):
+        return False
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd = "/"
+    candidate = Path(argv[1])
+    if not candidate.is_absolute():
+        candidate = Path(cwd) / candidate
+    return os.path.realpath(candidate) == os.path.realpath(script)
+
+
+def known_service_scripts() -> list[Path]:
+    """Long-lived services `./sc launch` starts and leaves running by design."""
+    api = ENGINE / "api"
+    return [api / f"{name}_broker.py" for name in ("vm", "ts", "pm2", "db")] + [
+        SERVICE_SCRIPT]
+
+
+def _cgroup_of(pid: int) -> str | None:
+    """The cgroup-v2 path of `pid`, or None."""
+    try:
+        for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines():
+            if line.startswith("0::"):
+                return line[3:].strip() or None
+    except OSError:
+        pass
+    return None
+
+
+def operation_pids(record: dict | None) -> list[int]:
+    """Live processes still doing a recorded operation's work.
+
+    Everything the operation started: processes in the runner's session, and,
+    when the runner had its own systemd scope, in that scope. Three kinds are
+    not the operation's work and are left out: zombies; the runner itself once
+    it has recorded the result; and the known long-lived services a restart's
+    `launch` step starts on purpose (the brokers and this service), told apart
+    by their exact interpreter-plus-script identity.
+    """
+    if not record:
+        return []
+    session = record.get("pid")
+    ticks = record.get("pid_start_ticks")
+    if type(session) is not int or type(ticks) is not int:
+        return []
+    recorded_boot = record.get("boot_id")
+    if recorded_boot and recorded_boot != boot_id():
+        return []
+    candidates: set[int] = set()
+    try:
+        entries = [int(name) for name in os.listdir("/proc") if name.isdigit()]
+    except OSError:
+        entries = []
+    # A live process holding the runner's pid with another start time means
+    # that pid, and so that session id, now belongs to something unrelated.
+    leader = _proc_stat(session)
+    try:
+        session_reused = bool(leader) and int(leader[19]) != ticks
+    except (IndexError, ValueError):
+        session_reused = False
+    for pid in ([] if session_reused else entries):
+        fields = _proc_stat(pid)
+        try:
+            # Same session as the runner, and not older than it (a session id
+            # is the runner's pid; an older process cannot belong to it).
+            if fields and int(fields[3]) == session and int(fields[19]) >= ticks:
+                candidates.add(pid)
+        except (IndexError, ValueError):
+            continue
+    scope = record.get("cgroup")
+    if isinstance(scope, str) and scope.endswith(".scope") and "sc-engine-op-" in scope:
+        try:
+            text = Path("/sys/fs/cgroup" + scope, "cgroup.procs").read_text()
+            candidates.update(int(line) for line in text.split())
+        except (OSError, ValueError):
+            pass
+    services = known_service_scripts()
+    live = []
+    for pid in sorted(candidates):
+        fields = _proc_stat(pid)
+        if not fields or fields[0] == "Z":
+            continue
+        if pid == session and record.get("state") == "finished":
+            continue
+        if any(runs_script(pid, script) for script in services):
+            continue
+        live.append(pid)
+    return live
+
+
 # ── operation status ─────────────────────────────────────────────────────────
 
 def _age_seconds(stamp) -> float | None:
@@ -471,25 +646,28 @@ def _age_seconds(stamp) -> float | None:
 def effective_state(record: dict | None) -> str | None:
     """`starting`, `running`, `finished`, or `interrupted` for a stored record.
 
-    `running` holds while the runner OR the command it started is alive: a
-    killed runner leaves its command running, and that is still an operation
-    in flight. `interrupted` is a record that never reached `finished` although
-    both are gone (killed, crashed, host rebooted). It does not block.
+    `running` holds while anything the operation started is still doing its
+    work (`operation_pids`): the runner, the command, or any process either
+    left behind. So a killed runner, or a killed command whose child is still
+    building, is still an operation in flight, whatever the record says.
+    `interrupted` is a record that never reached `finished` although all of
+    that is gone (killed, crashed, host rebooted). It does not block.
     """
     if not record:
         return None
     state = record.get("state")
-    if state == "finished":
-        return "finished"
     recorded_boot = record.get("boot_id")
-    if recorded_boot and recorded_boot != boot_id():
+    same_boot = not recorded_boot or recorded_boot == boot_id()
+    if state == "finished":
+        return "running" if operation_pids(record) else "finished"
+    if not same_boot:
         return "interrupted"
     if state == "running":
         if pid_alive(record.get("pid"), record.get("pid_start_ticks")):
             return "running"
         if pid_alive(record.get("cmd_pid"), record.get("cmd_start_ticks")):
             return "running"
-        return "interrupted"
+        return "running" if operation_pids(record) else "interrupted"
     if state == "starting":
         age = _age_seconds(record.get("started_at"))
         if age is not None and 0 <= age < STARTING_GRACE_SECONDS:
@@ -576,13 +754,38 @@ def live_sessions() -> dict | None:
     }
 
 
+PIN_CLI = "./sc engine-ops-pin"
+
+
+def unpinned_status() -> dict:
+    """What the service says before an operator has pinned the GUI origin."""
+    return {
+        "ok": True,
+        "service": "engine-ops",
+        "pinned": False,
+        "gui_origin": None,
+        "pin_cli": PIN_CLI,
+        "reason": (
+            "engine operations are refused until the operator confirms this "
+            f"install's GUI origin in a host terminal: {PIN_CLI}"),
+        "running": False,
+        "operation": None,
+    }
+
+
 def status() -> dict:
+    gui_port = pinned_gui_port()
+    if gui_port is None:
+        return unpinned_status()
     runtime = detect_runtime()
     record = read_status()
     tail, truncated = log_tail(record)
     return {
         "ok": True,
         "service": "engine-ops",
+        "pinned": True,
+        "gui_origin": f"http://{BIND}:{gui_port}",
+        "pin_cli": PIN_CLI,
         "runtime": runtime,
         "ops": {op: op_facts(op, runtime) for op in VERBS},
         "recovery_cli": RECOVERY_CLI,
@@ -623,10 +826,15 @@ def _allocate_port() -> int:
         ports._offset(str(REPO_ROOT) + ":engine-ops"), avoid)
 
 
-def _review_port() -> int | None:
-    import ports  # noqa: PLC0415  (scripts/, on sys.path)
+def suggested_gui_port() -> int | None:
+    """The review port `instance.json` names. A suggestion to show the
+    operator, never a value to pin by itself: the sandbox can write that file."""
+    try:
+        import ports  # noqa: PLC0415  (scripts/, on sys.path)
 
-    port = ports.resolve(persist=False).get("port")
+        port = ports.resolve(persist=False).get("port")
+    except Exception:  # noqa: BLE001 — advisory input only
+        return None
     return port if _valid_port(port) else None
 
 
@@ -641,25 +849,49 @@ def _publish_port(port: int) -> None:
         pass
 
 
-def ensure_config(*, repin: bool = False) -> dict:
-    """The pinned `{port, gui_port}`, creating it on first use.
+def _read_config() -> dict:
+    return read_private(private_dir() / CONFIG_NAME) or {}
 
-    Both values are fixed in the private directory the first time they are
-    needed and are not re-read from `instance.json` afterwards, so a sandbox
-    that edits that file later cannot move the port or change which origin is
-    accepted. `repin=True` (`./sc engine-ops-repin`, a host command) takes the
-    review port from the instance config again.
+
+def ensure_config() -> dict:
+    """The pinned `{port, gui_port}`. Allocates the port on first use.
+
+    `gui_port` is None until an operator pins it (`pin_gui_port`); this never
+    fills it in. Neither value is re-read from `instance.json`.
     """
-    path = private_dir() / CONFIG_NAME
-    stored = read_private(path) or {}
-    config = {"port": stored.get("port"), "gui_port": stored.get("gui_port")}
-    if not _valid_port(config["port"]):
+    stored = _read_config()
+    config = dict(stored)
+    if not _valid_port(config.get("port")):
         config["port"] = _allocate_port()
-    if repin or not _valid_port(config["gui_port"]):
-        config["gui_port"] = _review_port()
-    if config != {"port": stored.get("port"), "gui_port": stored.get("gui_port")}:
-        write_private(path, config)
+    if not _valid_port(config.get("gui_port")) or not config.get("pinned_at"):
+        config["gui_port"] = None
+        config.pop("pinned_at", None)
+    if config != stored:
+        write_private(private_dir() / CONFIG_NAME, config)
     _publish_port(config["port"])
+    return config
+
+
+def pinned_gui_port() -> int | None:
+    """The GUI port an operator pinned, from private state; None if unpinned."""
+    try:
+        config = _read_config()
+    except StateError:
+        return None
+    port = config.get("gui_port")
+    # Only a value an operator pinned counts; `pinned_at` is that act's mark.
+    if not _valid_port(port) or not config.get("pinned_at"):
+        return None
+    return port
+
+
+def pin_gui_port(port: int) -> dict:
+    """Record the operator's explicit choice of the GUI port. Host act only."""
+    if not _valid_port(port):
+        raise ValueError("the GUI port must be an integer from 1 to 65535")
+    config = ensure_config()
+    config.update({"gui_port": port, "pinned_at": _now()})
+    write_private(private_dir() / CONFIG_NAME, config)
     return config
 
 
@@ -785,11 +1017,13 @@ def _wait_recorded(proc: subprocess.Popen, path: Path, started_at: str,
 def start(op: str) -> dict:
     """Start one operation. Returns its public record.
 
-    Raises UnknownOp, Busy, or StartFailed. `op` only selects a row of the
-    verb table.
+    Raises UnknownOp, Unpinned, Busy, or StartFailed. `op` only selects a row
+    of the verb table.
     """
     argv = command(op)
     state_dir = private_dir()
+    if pinned_gui_port() is None:
+        raise Unpinned(unpinned_status()["reason"])
     path = state_dir / STATUS_NAME
     with _start_lock:
         current = read_status(path)
@@ -798,7 +1032,8 @@ def start(op: str) -> dict:
         started_at = _now()
         base = {
             "op": op, "state": "starting", "pid": None, "pid_start_ticks": None,
-            "cmd_pid": None, "cmd_start_ticks": None, "boot_id": boot_id(),
+            "cmd_pid": None, "cmd_start_ticks": None, "cgroup": None,
+            "boot_id": boot_id(),
             "started_at": started_at, "finished_at": None, "exit_code": None,
         }
         prefix = scope_prefix(op)
@@ -838,9 +1073,10 @@ def service_record() -> dict | None:
     """The running service's recorded identity, only if that process is it.
 
     Proven three ways: the recorded pid is alive, its kernel start time is the
-    recorded one (so the pid was not reused), and its command line is this
-    service. The record is in the private directory; a pid written anywhere in
-    the checkout is never consulted.
+    recorded one (so the pid was not reused), and it is a Python interpreter
+    running exactly this install's service script. The record is in the
+    private directory; a pid written anywhere in the checkout is never
+    consulted.
     """
     try:
         record = read_private(private_dir() / SERVICE_NAME)
@@ -853,7 +1089,7 @@ def service_record() -> dict | None:
         return None
     if not pid_alive(pid, ticks):
         return None
-    if not any(Path(arg).name == SERVICE_SCRIPT.name for arg in _cmdline(pid)):
+    if not runs_script(pid, SERVICE_SCRIPT):
         return None
     return record
 
@@ -905,8 +1141,9 @@ def service_up() -> tuple[int, str]:
     config = ensure_config()
     port = config["port"]
     url = f"http://{BIND}:{port}"
+    pin = pin_summary(pinned_gui_port())
     if service_answers(port):
-        return 0, f"→ engine-ops already serving {url}"
+        return 0, f"→ engine-ops already serving {url}\n{pin}"
     log = private_dir() / SERVICE_LOG_NAME
     fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     try:
@@ -919,13 +1156,62 @@ def service_up() -> tuple[int, str]:
     while time.monotonic() < deadline:
         if service_answers(port):
             return 0, (f"→ engine-ops up (pid {proc.pid}) · {url} "
-                       f"(host loopback only) · log {log}")
+                       f"(host loopback only) · log {log}\n{pin}")
         if proc.poll() is not None:
             break
         time.sleep(0.1)
     if proc.poll() is None:
         proc.terminate()
     return 1, f"✗ engine-ops did not start; see {log}"
+
+
+def pin_summary(gui_port) -> str:
+    if _valid_port(gui_port):
+        return f"  engine-ops accepts the GUI at http://{BIND}:{gui_port}"
+    return ("  engine-ops: GUI origin NOT pinned — the GUI's engine controls are "
+            f"refused until you run: {PIN_CLI}")
+
+
+def pin_command(argv: list[str]) -> int:
+    """`./sc engine-ops-pin [<port>|--show]` — the operator's explicit act."""
+    current = pinned_gui_port()
+    if argv[:1] == ["--show"]:
+        print(pin_summary(current).strip())
+        return 0 if current is not None else 1
+    suggestion = suggested_gui_port()
+    if argv:
+        if len(argv) != 1 or not argv[0].isdigit():
+            print("usage: ./sc engine-ops-pin [<review GUI port> | --show]",
+                  file=sys.stderr)
+            return 2
+        chosen = int(argv[0])
+    else:
+        if not sys.stdin.isatty():
+            print("✗ engine-ops-pin needs a terminal, or the port as an argument: "
+                  "./sc engine-ops-pin <review GUI port>", file=sys.stderr)
+            return 1
+        print("The engine-ops service runs ./sc update, restart, and "
+              "update-harnesses when the review GUI asks.")
+        print("It accepts those requests from ONE origin: this install's review GUI.")
+        if current is not None:
+            print(f"  currently pinned : http://{BIND}:{current}")
+        if suggestion is not None:
+            print(f"  instance.json says the review GUI is at http://{BIND}:{suggestion}")
+            print("  (that file is writable from the sandbox — check it against "
+                  "the address in your browser)")
+        answer = input("Type the review GUI's port to pin it (anything else aborts): ").strip()
+        if not answer.isdigit():
+            print("→ engine-ops-pin aborted (nothing changed)")
+            return 1
+        chosen = int(answer)
+    try:
+        config = pin_gui_port(chosen)
+    except ValueError as exc:
+        print(f"✗ engine-ops-pin: {exc}", file=sys.stderr)
+        return 1
+    print(f"→ pinned: engine-ops accepts the GUI at http://{BIND}:{config['gui_port']} "
+          "(takes effect immediately)")
+    return 0
 
 
 def service_down() -> tuple[int, str]:
@@ -983,7 +1269,12 @@ def run_wrapper(argv: list[str]) -> int:
     record = {
         "op": args.op, "state": "running", "pid": os.getpid(),
         "pid_start_ticks": pid_start_ticks(os.getpid()),
-        "cmd_pid": None, "cmd_start_ticks": None, "boot_id": boot_id(),
+        "cmd_pid": None, "cmd_start_ticks": None,
+        # Its own systemd scope, when it has one: everything the operation
+        # starts stays in it, even a process that leaves the session.
+        "cgroup": (_cgroup_of(os.getpid())
+                   if args.detach == "systemd-scope" else None),
+        "boot_id": boot_id(),
         "started_at": args.started_at, "finished_at": None, "exit_code": None,
         "detach": args.detach,
     }
@@ -1023,7 +1314,7 @@ USAGE = """usage: engine_ops.py <command>
   down    stop the service this install started
   alive   exit 0 when the service answers
   port    print the service's pinned host loopback port
-  repin   pin the accepted GUI origin to the current review port
+  pin     pin the GUI origin the service accepts (operator, host terminal)
   run     (internal) run one operation detached"""
 
 
@@ -1031,7 +1322,7 @@ def main(argv: list[str]) -> int:
     command_name = argv[0] if argv else ""
     if command_name == "run":
         return run_wrapper(argv[1:])
-    if command_name in ("up", "port", "repin", "alive", "down") and in_sandbox():
+    if command_name in ("up", "port", "pin", "alive", "down") and in_sandbox():
         if command_name == "up":
             print(service_up()[1])
             return 0
@@ -1047,11 +1338,8 @@ def main(argv: list[str]) -> int:
         elif command_name == "port":
             print(ensure_config()["port"])
             return 0
-        elif command_name == "repin":
-            config = ensure_config(repin=True)
-            print(f"→ engine-ops accepts the GUI at http://{BIND}:{config['gui_port']} "
-                  "(restart the service to apply: ./sc engine-ops-down; ./sc engine-ops-up)")
-            return 0
+        elif command_name == "pin":
+            return pin_command(argv[1:])
         else:
             print(USAGE, file=sys.stderr)
             return 2

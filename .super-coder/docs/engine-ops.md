@@ -46,11 +46,16 @@ in a host-private directory outside the bind mount:
     <XDG state home>/subfloor/engine-ops/<repo name>-<hash of the checkout path>/
 
 mode `0700`, owned by the host user, named from the checkout's path and from
-no file inside it. It holds:
+no file inside it. Its real path (links resolved) must lie outside the
+checkout and outside every directory `./sc launch` mounts into the sandbox —
+the instance state collection and the harness state homes included. If
+`XDG_STATE_HOME` points inside one of those, or is a link that resolves there,
+the service refuses to start and no `engine-ops*` verb proceeds; the error
+names the offending path. It holds:
 
 | File | What |
 |---|---|
-| `config.json` | the pinned `{port, gui_port}` |
+| `config.json` | the pinned `{port, gui_port, pinned_at}` |
 | `service.json` | the running service's pid, kernel start time, and port |
 | `service.log` | the service's own output |
 | `engine-op.json` | the current or last operation |
@@ -64,7 +69,10 @@ Two things are published *into* the checkout for the review API, which may be
 inside the sandbox: `engine_ops_port` in `instance.json`, and a small hint
 file, `.super-coder/run/engine-ops.json`. The service writes them (the hint
 with no symlink followed at any level) and never reads them back, so editing
-them changes only what the review API reports.
+them changes only what the review API reports. That includes `up`: a forged
+hint can make discovery say the service is up when it is not. Discovery's
+answer is for display only and is trusted for nothing; `GET <url>/status` on
+the service is the authority.
 
 On the host runtime shells already run on the host, so neither the port nor
 the private directory is a boundary against them there. That matches the
@@ -83,7 +91,8 @@ against the sandbox either; it is one against other web origins.
 |---|---|
 | `Host` is `127.0.0.1:<port>` or `localhost:<port>` for this service's port | `403 loopback_host_required` |
 | No `Authorization` header at all. A shell Bearer token is refused; the browser operator carries none | `403 fnb_operator_required` |
-| `POST` and `OPTIONS`: `Origin` is present and is the pinned GUI origin (`http://127.0.0.1:<review port>` or `http://localhost:<review port>`) | `403 same_origin_required` |
+| `POST` and `OPTIONS`: `Origin` is present and is the pinned GUI origin (`http://127.0.0.1:<pinned port>` or `http://localhost:<pinned port>`) | `403 same_origin_required` |
+| A GUI origin has been pinned (see below) | `POST`: `409 gui_origin_unpinned`; `GET /status`: `200 {pinned: false, reason, pin_cli}` |
 | `GET`: `Origin` may be absent; a present `Origin` must be the GUI origin | `403 same_origin_required` |
 | `Sec-Fetch-Site` is not `cross-site` | `403 same_origin_required` |
 
@@ -92,20 +101,46 @@ are sent only when the request's `Origin` is the GUI origin; no wildcard, no
 credentials. A preflight from that origin gets `204` with `GET, POST, OPTIONS`
 and `Content-Type`; from anywhere else, `403` with no CORS headers.
 
-## Port, GUI origin, and discovery
+## The GUI origin is pinned by the operator
 
-Both are **pinned** in `config.json` the first time the service (or
-`./sc launch`) needs them, and are not re-read from `instance.json` afterwards.
-The accepted origins are fixed for the life of a service process.
+The service accepts operations from exactly one origin, and it never takes
+that origin from the checkout: on docker the sandbox can write `instance.json`
+and could name its own dev server as "the GUI". It is pinned by an explicit
+act in a host terminal:
 
-- **Port.** Derived the way the review port is: a hash of the repository path
-  into the 8800 band, stepped past this fork's other ports and every sibling
-  fork's. `instance.json` only tells that walk which ports to step past.
-- **GUI origin.** The review port at the moment of pinning.
+    ./sc engine-ops-pin           # shows what instance.json suggests and asks
+                                  # you to TYPE the review GUI's port
+    ./sc engine-ops-pin 8837      # the same act, non-interactively
+    ./sc engine-ops-pin --show    # what is pinned now (exit 1 if nothing is)
+
+At a terminal the suggestion is displayed with a warning about where it came
+from; pressing Enter, or typing anything but a port, pins nothing. Without a
+terminal the port must be given as the argument. The pin takes effect
+immediately, with no service restart, and `./sc launch` / `./sc engine-ops-up`
+print what is pinned every time.
+
+**Until a pin exists** — which is the state of every install after the update
+that introduces this service — the service runs but starts nothing:
+
+- `GET /status` answers `200 {ok, service, pinned: false, gui_origin: null,
+  pin_cli: "./sc engine-ops-pin", reason, running: false, operation: null}`.
+- every `POST /ops/*` answers `409 gui_origin_unpinned` with the same reason.
+- those two answers carry no state, so any loopback page may read them; that
+  is what lets the GUI show the reason and the command.
+
+Once pinned, `GET /status` carries `pinned: true` and `gui_origin`.
+
+After a deliberate review-port change, pin again.
+
+## Port and discovery
+
+The service's own port is pinned in `config.json` the first time it is needed
+and is not re-read from `instance.json` afterwards. It is derived the way the
+review port is: a hash of the repository path into the 8800 band, stepped past
+this fork's other ports and every sibling fork's. `instance.json` only tells
+that walk which ports to step past.
 
     ./sc engine-ops-port      # print the port, pinning on first use
-    ./sc engine-ops-repin     # after a deliberate review-port change: pin the
-                              # GUI origin again, then engine-ops-down / -up
 
 The GUI finds the service through the review API:
 
@@ -138,14 +173,14 @@ On the service, all JSON:
 | Method + path | What it does |
 |---|---|
 | `GET /health` | `{ok, service: "engine-ops"}` — liveness of the service |
-| `GET /status` | `{ok, service, runtime, ops, recovery_cli, running, operation, log_tail, log_truncated, log_tail_limit, engine_ref, live_sessions}` |
+| `GET /status` | `{ok, service, pinned, gui_origin, pin_cli, runtime, ops, recovery_cli, running, operation, log_tail, log_truncated, log_tail_limit, engine_ref, live_sessions}`; before a pin, only `{ok, service, pinned: false, gui_origin, pin_cli, reason, running, operation}` |
 | `POST /ops/update` · `/ops/restart` · `/ops/update-harnesses` | start one operation, detached. `202 {started, operation}` |
 | `OPTIONS *` | CORS preflight |
 
 `POST` answers `404 unknown_engine_op` (with the list of operations) for
-anything else under `/ops/`, `409 engine_op_running` with the running
-`operation` when one is in flight, and `500 engine_op_start_failed` when the
-runner could not be started.
+anything else under `/ops/`, `409 gui_origin_unpinned` before a pin,
+`409 engine_op_running` with the running `operation` when one is in flight,
+and `500 engine_op_start_failed` when the runner could not be started.
 
 **The verb table is fixed.** The path segment selects a row; the request body
 and query string are never read, so no request field reaches a command line:
@@ -197,11 +232,27 @@ service among them; `./sc update` stops the review server. The service is
   readable when the engine returns, by whichever service instance is then
   running.
 
-**One at a time.** "Running" is the status file plus liveness of the recorded
-runner *or* of the command it started, each checked by pid and kernel start
-time. A killed runner therefore does not open the gate while its command is
-still running; once both are gone the record reads `interrupted` and no longer
-blocks. A record from before a reboot never blocks.
+**One at a time.** An operation is running while anything it started is
+still doing its work, whatever the status file says:
+
+- the runner, or the command it started, each checked by pid and kernel start
+  time; and
+- any other live process in the runner's session, and, when the runner has its
+  own systemd scope, in that scope. So a command killed after it spawned a
+  build or an install still holds the gate until that work ends, even though
+  the runner has by then recorded `finished` (the operation reads `running`
+  until it is truly over).
+
+Three things in that session or scope are not the operation's work and do not
+hold the gate: zombies; the runner itself once it has recorded the result; and
+the long-lived services a restart's `launch` step starts on purpose — the vm,
+ts, pm2, and db brokers and this service — recognised by their exact identity
+(a Python interpreter running that script of this install). A record from
+before a reboot never blocks, and neither does a session id that has since
+been reused by another process.
+
+Known limit: without a systemd scope, a process that deliberately leaves the
+session (a daemon that calls `setsid`) is no longer seen. With a scope it is.
 
 `restart` brings the service back itself (its `launch` step starts it), so
 after a restart the GUI is talking to a new service process reading the same
@@ -218,7 +269,7 @@ poll the review API's `/api/health` until it answers, re-read
     ./sc engine-ops-up       # background; no-op if already up
     ./sc engine-ops-down     # stop the backgrounded service
     ./sc engine-ops-port     # print its port
-    ./sc engine-ops-repin    # re-pin the accepted GUI origin
+    ./sc engine-ops-pin      # pin the GUI origin it accepts (see above)
 
 `./sc launch` brings it up under both runtimes and `./sc down` stops it.
 `./sc restart` reports it in its health summary as an advisory line only: a
@@ -227,8 +278,10 @@ same tolerance `launch` gives it.
 
 `engine-ops-down` stops only a process **proven** to be this service: the pid
 recorded in the private directory must be alive, have the recorded kernel
-start time, and be running the service. A pid written anywhere in the checkout
-is never read.
+start time, and be a Python interpreter whose script argument resolves to this
+install's `api/engine_ops_service.py`. A process that merely has that name
+somewhere on its command line, or runs a same-named file elsewhere, is not it.
+A pid written anywhere in the checkout is never read.
 
 It refuses to start when `SC_SANDBOX` is set or a container marker is present,
 and every `engine-ops*` verb refuses from a linked worktree, which has no
@@ -243,7 +296,8 @@ It has no systemd install form. After a reboot, `./sc launch` starts it.
   like the other brokers; `./sc restart` loads the new code.
 - When the service is not running the GUI cannot start it: the controls render
   disabled and show the CLI command.
-- If the review port changes, the pinned GUI origin does not follow by itself;
-  run `./sc engine-ops-repin`.
+- Nothing works from the GUI until the operator has run `./sc engine-ops-pin`
+  once. If the review port changes, the pin does not follow by itself; pin
+  again.
 - A browser on another machine cannot reach it. The GUI is loopback-only and
   so is this.

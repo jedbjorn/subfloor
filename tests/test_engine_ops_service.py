@@ -28,7 +28,9 @@ Run:
 """
 from __future__ import annotations
 
+import contextlib
 import http.client
+import io
 import json
 import os
 import shutil
@@ -100,6 +102,19 @@ STUB_SC = textwrap.dedent('''\
     if verb == "fail":
         print("stub failure detail", flush=True)
         sys.exit(3)
+    if verb == "spawn-child":
+        # Work the operation started that outlives the command itself.
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        (here / "child.pid").write_text(str(child.pid))
+        time.sleep(600)
+    if verb == "leave-broker":
+        # What a restart's launch step does: leave a known service running.
+        broker = here / ".super-coder" / "api" / "pm2_broker.py"
+        broker.parent.mkdir(parents=True, exist_ok=True)
+        broker.write_text("import time; time.sleep(600)")
+        child = subprocess.Popen([sys.executable, str(broker)])
+        (here / "broker.pid").write_text(str(child.pid))
+        sys.exit(0)
     if verb == "chatter":
         sys.stdout.write("x" * 70000 + "\\nlast line\\n")
         sys.exit(0)
@@ -117,6 +132,7 @@ STUB_SC = textwrap.dedent('''\
             sys.path.insert(0, (here / "engine.path").read_text() + "/scripts")
             import engine_ops
             engine_ops.PRIVATE_DIR = Path((here / "private.path").read_text())
+            engine_ops.SERVICE_SCRIPT = Path((here / "launcher.path").read_text())
             code, message = engine_ops.service_down()
             print(message, flush=True)
         else:
@@ -144,6 +160,7 @@ SERVICE_LAUNCHER = textwrap.dedent('''\
     engine_ops.REPO_ROOT = Path(root)
     engine_ops.ENGINE = Path(root) / ".super-coder"
     engine_ops.PRIVATE_DIR = Path(private)
+    engine_ops.SERVICE_SCRIPT = Path(sys.argv[0]).resolve()
     engine_ops.live_sessions = lambda: None
     engine_ops.VERBS["restart"] = tuple(json.loads(sys.argv[5]))
     if scope != "systemd":
@@ -165,8 +182,7 @@ SERVICE_LAUNCHER = textwrap.dedent('''\
     engine_ops.register_service = register
     engine_ops._valid_port = lambda value: type(value) is int and 0 <= value < 65536
     config = engine_ops.ensure_config()
-    raise SystemExit(engine_ops_service.serve(
-        config["port"], engine_ops.gui_origins(config["gui_port"])))
+    raise SystemExit(engine_ops_service.serve(config["port"]))
 ''')
 
 
@@ -186,6 +202,15 @@ def make_private(base: Path) -> Path:
     private = base / "private"
     private.mkdir(mode=0o700)
     return private
+
+
+def operator_pins(private: Path, gui_port: int = GUI_PORT, port: int | None = None) -> None:
+    """The state an operator's `./sc engine-ops-pin` leaves, written directly
+    so that no test touches a real instance config."""
+    config = {"gui_port": gui_port, "pinned_at": "2026-01-01T00:00:00Z"}
+    if port is not None:
+        config["port"] = port
+    engine_ops.write_private(private / "config.json", config)
 
 
 def wait_for(predicate, timeout: float = 15.0, step: float = 0.05):
@@ -244,6 +269,7 @@ class ServiceFixture(unittest.TestCase):
     """The real service on a kernel-chosen loopback port, in this process."""
 
     runtime = "host"
+    pinned = True
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -269,7 +295,10 @@ class ServiceFixture(unittest.TestCase):
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.service = engine_ops_service.make_server(0, GUI_ORIGINS)
+        engine_ops._host_private_checked.clear()
+        if self.pinned:
+            operator_pins(self.private)
+        self.service = engine_ops_service.make_server(0)
         self.port = self.service.server_address[1]
         thread = threading.Thread(target=self.service.serve_forever, daemon=True)
         thread.start()
@@ -458,6 +487,82 @@ class GateTest(ServiceFixture):
         status, _headers, out = self.post("update-harnesses")
         self.assertEqual(status, 202, out)
 
+    def kill_later(self, name: str) -> None:
+        def kill():
+            try:
+                os.kill(int((self.root / name).read_text()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+        self.addCleanup(kill)
+
+    def test_gate_holds_while_work_the_operation_started_is_still_running(self):
+        """Kill the command after it spawned a child: the runner records
+        `finished`, but the child is still the operation's work."""
+        self.kill_later("child.pid")
+        with mock.patch.dict(engine_ops.VERBS, {"update": ("spawn-child",)}):
+            status, _headers, out = self.post("update")
+            self.assertEqual(status, 202, out)
+            self.assertTrue(wait_for(lambda: (self.root / "child.pid").exists()))
+            child = int((self.root / "child.pid").read_text())
+            record = wait_for(lambda: (
+                (engine_ops.read_status(self.status_file) or {}).get("cmd_pid")
+                and engine_ops.read_status(self.status_file)))
+            os.kill(record["cmd_pid"], signal.SIGKILL)
+            stored = self.finished()
+            self.assertEqual(stored["exit_code"], -signal.SIGKILL)
+            self.assertTrue(wait_for(
+                lambda: not engine_ops.pid_alive(stored["pid"], stored["pid_start_ticks"])))
+            self.assertTrue(engine_ops.pid_alive(child))
+            self.assertEqual(engine_ops.operation_pids(stored), [child])
+
+            _status, _headers, out = self.status()
+            self.assertTrue(out["running"])
+            self.assertEqual(out["operation"]["state"], "running")
+            self.assertIsNone(out["operation"]["ok"])
+            for op in ("restart", "update", "update-harnesses"):
+                status, _headers, out = self.post(op)
+                self.assertEqual(status, 409, (op, out))
+                self.assertEqual(out["error"]["code"], "engine_op_running")
+
+            os.kill(child, signal.SIGKILL)
+            self.assertTrue(wait_for(lambda: not engine_ops.operation_pids(stored)))
+            _status, _headers, out = self.status()
+            self.assertFalse(out["running"])
+            self.assertEqual(out["operation"]["state"], "finished")
+            self.assertEqual(out["operation"]["exit_code"], -signal.SIGKILL)
+        status, _headers, out = self.post("update-harnesses")
+        self.assertEqual(status, 202, out)
+
+    def test_known_services_left_by_launch_do_not_hold_the_gate(self):
+        """A restart leaves brokers running by design; they are not its work."""
+        self.kill_later("broker.pid")
+        with mock.patch.dict(engine_ops.VERBS, {"restart": ("leave-broker",)}):
+            status, _headers, out = self.post("restart")
+            self.assertEqual(status, 202, out)
+            stored = self.finished()
+        broker = int((self.root / "broker.pid").read_text())
+        self.assertTrue(wait_for(
+            lambda: not engine_ops.pid_alive(stored["pid"], stored["pid_start_ticks"])))
+        self.assertTrue(engine_ops.pid_alive(broker))
+        self.assertTrue(engine_ops.runs_script(
+            broker, self.root / ".super-coder" / "api" / "pm2_broker.py"))
+        self.assertEqual(engine_ops.operation_pids(stored), [])
+        _status, _headers, out = self.status()
+        self.assertFalse(out["running"])
+        self.assertEqual(out["operation"]["state"], "finished")
+        status, _headers, out = self.post("update-harnesses")
+        self.assertEqual(status, 202, out)
+
+    def test_a_reused_session_id_is_not_the_operation(self):
+        ticks = engine_ops.pid_start_ticks(os.getpid())
+        if ticks is None:
+            self.skipTest("no /proc start time on this platform")
+        # This process and its session are alive, but with another start time.
+        record = {"op": "update", "state": "finished", "pid": os.getsid(0),
+                  "pid_start_ticks": 1, "exit_code": 0,
+                  "started_at": "2026-01-01T00:00:00Z"}
+        self.assertEqual(engine_ops.operation_pids(record), [])
+
     def test_verb_table_is_fixed_and_no_request_field_reaches_the_command(self):
         self.assertEqual(engine_ops.VERBS, {
             "update": ("update",),
@@ -493,6 +598,78 @@ class GateTest(ServiceFixture):
             self.skipTest("this host has no non-loopback address to try")
         with self.assertRaises(OSError):
             socket.create_connection((address, self.port), timeout=2).close()
+
+
+class UnpinnedTest(ServiceFixture):
+    """Until an operator pins the GUI origin, nothing starts, and it says why."""
+
+    pinned = False
+
+    def test_status_says_unpinned_and_post_is_refused_with_the_reason(self):
+        status, headers, out = self.status()
+        self.assertEqual(status, 200, out)
+        self.assertIs(out["pinned"], False)
+        self.assertIsNone(out["gui_origin"])
+        self.assertEqual(out["pin_cli"], "./sc engine-ops-pin")
+        self.assertIn("./sc engine-ops-pin", out["reason"])
+        # Readable by the GUI page so it can show the reason; carries no state.
+        self.assertEqual(headers["Access-Control-Allow-Origin"], GUI)
+        self.assertEqual(
+            sorted(out), ["gui_origin", "ok", "operation", "pin_cli", "pinned",
+                          "reason", "running", "service"])
+
+        for op in ("update", "restart", "update-harnesses"):
+            status, headers, out = self.post(op)
+            self.assertEqual(status, 409, (op, out))
+            self.assertEqual(out["error"]["code"], "gui_origin_unpinned")
+            self.assertEqual(out["error"]["details"]["pin_cli"], "./sc engine-ops-pin")
+            self.assertEqual(headers["Access-Control-Allow-Origin"], GUI)
+        # Whatever loopback page asks, the answer is the same refusal.
+        status, _headers, out = self.post("update", origin="http://127.0.0.1:8813")
+        self.assertEqual(status, 409, out)
+        status, _headers, out = self.post("update", origin="https://attacker.example")
+        self.assertEqual(status, 403, out)
+        status, _headers, out = self.call("POST", "/ops/update")
+        self.assertEqual(status, 403, out)
+        self.assert_nothing_ran()
+
+    def test_instance_config_never_becomes_the_pin(self):
+        """The reviewer's case: before the first pin the sandbox points the
+        review port at its own dev server. Nothing is authorised by that."""
+        (self.root / ".super-coder" / "instance.json").write_text(json.dumps(
+            {"repo": "root", "port": 8813, "dev_port": 8813}))
+        with mock.patch.object(ports, "REPO_ROOT", self.root), \
+                mock.patch.object(ports, "CONFIG",
+                                  self.root / ".super-coder" / "instance.json"), \
+                mock.patch.object(ports, "_free", return_value=True), \
+                mock.patch.object(ports, "_sibling_ports", return_value=set()):
+            config = engine_ops.ensure_config()
+            self.assertIsNone(config["gui_port"])
+            self.assertIsNone(engine_ops.pinned_gui_port())
+            for origin in ("http://127.0.0.1:8813", GUI):
+                status, _headers, out = self.post("update", origin=origin)
+                self.assertEqual(status, 409, (origin, out))
+                self.assertEqual(out["error"]["code"], "gui_origin_unpinned")
+            # A value with no operator act behind it (what 33157d82 stored on
+            # first use) is not a pin either.
+            engine_ops.write_private(self.private / "config.json",
+                                     {"port": config["port"], "gui_port": 8813})
+            self.assertIsNone(engine_ops.pinned_gui_port())
+            status, _headers, out = self.post("update", origin="http://127.0.0.1:8813")
+            self.assertEqual(status, 409, out)
+            self.assertIsNone(engine_ops.ensure_config()["gui_port"])
+        self.assert_nothing_ran()
+
+    def test_pin_takes_effect_without_restarting_the_service(self):
+        operator_pins(self.private)
+        status, _headers, out = self.status()
+        self.assertIs(out["pinned"], True)
+        self.assertEqual(out["gui_origin"], GUI)
+        status, _headers, out = self.post("update", origin="http://127.0.0.1:8813")
+        self.assertEqual(status, 403, out)
+        self.assertEqual(out["error"]["code"], "same_origin_required")
+        status, _headers, out = self.post("update-harnesses")
+        self.assertEqual(status, 202, out)
 
 
 class CorsTest(ServiceFixture):
@@ -802,6 +979,69 @@ class ForgedStateTest(ServiceFixture):
         engine_ops.private_dir(loose)
         self.assertEqual(stat.S_IMODE(loose.stat().st_mode), 0o700)
 
+    def test_state_directory_inside_the_sandbox_mounts_is_refused(self):
+        engine = self.root / ".super-coder"
+        before = sorted(str(p) for p in self.root.rglob("*"))
+        link = self.base / "state-link"
+        link.symlink_to(engine / "run", target_is_directory=True)
+        state_home = self.base / "state-home"
+        instance_state_dir = state_home / "subfloor" / "instances" / "abc"
+        instance_state_dir.mkdir(parents=True)
+        cases = {
+            "an XDG state home inside the checkout": (None, engine / "state"),
+            "a state home that is a link into the checkout": (None, link),
+        }
+        for label, (_override, home) in cases.items():
+            engine_ops._host_private_checked.clear()
+            with mock.patch.object(engine_ops, "PRIVATE_DIR", None), \
+                    mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(home)}):
+                with self.assertRaises(engine_ops.StateError, msg=label) as raised:
+                    engine_ops.private_dir()
+                self.assertIn("mounted into the sandbox", str(raised.exception))
+                for call in (engine_ops.ensure_config, engine_ops.status_path,
+                             lambda: engine_ops.start("update"),
+                             lambda: engine_ops.pin_gui_port(GUI_PORT)):
+                    with self.assertRaises(engine_ops.StateError, msg=label):
+                        call()
+                self.assertIsNone(engine_ops.pinned_gui_port())
+        # A directory handed in directly gets the same check, and so does the
+        # instance state directory the launcher mounts beside the checkout.
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state_home)}):
+            for bad in (engine / "run", engine / "logs" / "new", link,
+                        instance_state_dir, instance_state_dir / "engine-ops"):
+                engine_ops._host_private_checked.clear()
+                with self.assertRaises(engine_ops.StateError, msg=str(bad)):
+                    engine_ops.private_dir(bad)
+                with mock.patch.object(engine_ops, "PRIVATE_DIR", bad):
+                    with self.assertRaises(engine_ops.StateError, msg=str(bad)):
+                        engine_ops.status_path()
+            engine_ops._host_private_checked.clear()
+            with mock.patch.object(engine_ops, "PRIVATE_DIR", None):
+                good = engine_ops.private_dir()
+            self.assertEqual(good.parent, state_home / "subfloor" / "engine-ops")
+        # Nothing was created under the checkout by any refused attempt.
+        self.assertEqual(sorted(str(p) for p in self.root.rglob("*")), before)
+        self.assertFalse((instance_state_dir / "engine-ops").exists())
+
+    def test_service_refuses_to_start_with_its_state_inside_the_checkout(self):
+        state_home = ENGINE.parent / ".sc-state" / f"engine-ops-test-{os.getpid()}"
+        self.assertFalse(state_home.exists())
+        env = {**os.environ, "XDG_STATE_HOME": str(state_home)}
+        env.pop("SC_SANDBOX", None)
+        if engine_ops.in_sandbox():
+            self.skipTest("this test host is itself a container")
+        for script, args in (("engine_ops_service.py", []),
+                             ("engine_ops.py", ["up"]),
+                             ("engine_ops.py", ["port"]),
+                             ("engine_ops.py", ["pin", "8800"])):
+            result = subprocess.run(
+                [sys.executable, str(ENGINE / "api" / script), *args],
+                env=env, capture_output=True, text=True, timeout=60, check=False)
+            self.assertNotEqual(result.returncode, 0, (script, args, result.stdout))
+            self.assertIn("mounted into the sandbox", result.stderr, (script, args))
+            self.assertNotIn("listening", result.stderr)
+        self.assertFalse(state_home.exists())
+
     def test_default_private_directory_is_derived_from_the_path_not_the_checkout(self):
         home = self.base / "state-home"
         with mock.patch.object(engine_ops, "PRIVATE_DIR", None), \
@@ -861,6 +1101,56 @@ class StopIdentityTest(ServiceFixture):
             self.assertNotIn("stopped", message)
             self.assert_canary_alive()
 
+    def test_a_process_that_only_mentions_the_service_script_is_not_the_service(self):
+        """Right pid, right start time, and the script's name on its command
+        line: still not this install's service, so never signalled."""
+        real = self.base / "install" / "engine_ops_service.py"
+        real.parent.mkdir()
+        real.write_text("import time; time.sleep(600)\n")
+        elsewhere = self.base / "elsewhere" / "engine_ops_service.py"
+        elsewhere.parent.mkdir()
+        elsewhere.write_text("import time; time.sleep(600)\n")
+        impostors = [
+            # The name as a later argument.
+            [sys.executable, "-c", "import time; time.sleep(600)", str(real)],
+            [sys.executable, "-c", "import time; time.sleep(600)",
+             "engine_ops_service.py"],
+            # A same-named script that is not this install's.
+            [sys.executable, str(elsewhere)],
+            # Not an interpreter at all.
+            ["tail", "-f", "/dev/null", str(real)],
+        ]
+        path = self.private / engine_ops.SERVICE_NAME
+        with mock.patch.object(engine_ops, "SERVICE_SCRIPT", real):
+            for argv in impostors:
+                proc = subprocess.Popen(argv, start_new_session=True,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+                self.addCleanup(reap, proc)
+                ticks = wait_for(lambda: engine_ops.pid_start_ticks(proc.pid))
+                self.assertTrue(wait_for(lambda: len(engine_ops._cmdline(proc.pid)) >= 2))
+                engine_ops.write_private(path, {
+                    "pid": proc.pid, "pid_start_ticks": ticks, "port": self.port})
+                self.assertFalse(engine_ops.runs_script(proc.pid, real), argv)
+                self.assertIsNone(engine_ops.service_record(), argv)
+                code, message = engine_ops.service_down()
+                self.assertEqual(code, 0, message)
+                self.assertNotIn("stopped", message)
+                time.sleep(0.2)
+                self.assertIsNone(proc.poll(), argv)
+            # The real thing is recognised, by absolute or relative path.
+            for argv, cwd in (([sys.executable, str(real)], None),
+                              ([sys.executable, "engine_ops_service.py", "x"],
+                               str(real.parent))):
+                proc = subprocess.Popen(argv, cwd=cwd, start_new_session=True)
+                self.addCleanup(reap, proc)
+                ticks = wait_for(lambda: engine_ops.pid_start_ticks(proc.pid))
+                self.assertTrue(wait_for(lambda: engine_ops.runs_script(proc.pid, real)))
+                engine_ops.write_private(path, {
+                    "pid": proc.pid, "pid_start_ticks": ticks, "port": self.port})
+                code, message = engine_ops.service_down()
+                self.assertEqual((code, message), (0, "→ engine-ops stopped"))
+
 
 class SandboxRefusalTest(unittest.TestCase):
     """Acceptance 6: the service refuses to start with SC_SANDBOX set."""
@@ -872,7 +1162,8 @@ class SandboxRefusalTest(unittest.TestCase):
                                  ("engine_ops.py", ["port"]),
                                  ("engine_ops.py", ["alive"]),
                                  ("engine_ops.py", ["down"]),
-                                 ("engine_ops.py", ["repin"])):
+                                 ("engine_ops.py", ["pin", "8800"]),
+                                 ("engine_ops.py", ["pin", "--show"])):
                 result = subprocess.run(
                     [sys.executable, str(ENGINE / "api" / script), *args],
                     env=env, capture_output=True, text=True, timeout=60, check=False)
@@ -947,20 +1238,17 @@ class PinnedConfigTest(unittest.TestCase):
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
+        engine_ops._host_private_checked.clear()
 
     def write_instance(self, payload: dict) -> None:
         self.config.write_text(json.dumps(payload))
 
-    def test_pinned_once_and_published(self):
+    def test_port_is_pinned_once_and_published(self):
         self.assertIsNone(ports.stored_engine_ops_port())
         config = engine_ops.ensure_config()
         port = config["port"]
         self.assertTrue(8800 <= port < 8900)
         self.assertNotIn(port, (8812, 8844))
-        self.assertEqual(config["gui_port"], 8812)
-        self.assertEqual(
-            json.loads((self.private / "config.json").read_text()),
-            {"port": port, "gui_port": 8812})
         # Published for the review API …
         self.assertEqual(ports.stored_engine_ops_port(), port)
         stored = json.loads(self.config.read_text())
@@ -968,31 +1256,87 @@ class PinnedConfigTest(unittest.TestCase):
         # … and a listening service holding the port is no reason to move it.
         with mock.patch.object(ports, "_free", return_value=False):
             self.assertEqual(engine_ops.ensure_config(), config)
-        self.assertEqual(engine_ops.gui_origins(config["gui_port"]),
-                         frozenset({"http://127.0.0.1:8812", "http://localhost:8812"}))
-
-    def test_instance_config_cannot_steer_the_pin(self):
-        config = engine_ops.ensure_config()
-        # "The sandbox" points the review port at its dev server and the
-        # service port somewhere else.
-        self.write_instance({"repo": "fork", "port": 8844, "dev_port": 8844,
+        # Editing the published value moves nothing; it is put back.
+        self.write_instance({"repo": "fork", "port": 8812, "dev_port": 8844,
                              "engine_ops_port": 8899})
-        again = engine_ops.ensure_config()
-        self.assertEqual(again, config)
-        self.assertEqual(engine_ops.gui_origins(again["gui_port"]),
-                         frozenset({"http://127.0.0.1:8812", "http://localhost:8812"}))
-        # The published value is put back; it was never an input.
-        self.assertEqual(ports.stored_engine_ops_port(), config["port"])
+        self.assertEqual(engine_ops.ensure_config(), config)
+        self.assertEqual(ports.stored_engine_ops_port(), port)
         self.config.unlink()
         self.assertEqual(engine_ops.ensure_config(), config)
 
-    def test_repin_is_the_only_way_to_move_the_gui_origin(self):
+    def test_gui_origin_is_never_taken_from_the_instance_config(self):
         config = engine_ops.ensure_config()
-        self.write_instance({"repo": "fork", "port": 8830, "dev_port": 8844})
+        self.assertIsNone(config["gui_port"])
+        self.assertIsNone(engine_ops.pinned_gui_port())
+        self.assertEqual(engine_ops.gui_origins(engine_ops.pinned_gui_port()),
+                         frozenset())
+        self.assertNotIn("8812", (self.private / "config.json").read_text())
+        # It is only ever offered to the operator as a suggestion.
+        self.assertEqual(engine_ops.suggested_gui_port(), 8812)
+
+    def test_operator_pin_holds_against_the_instance_config(self):
+        pinned = engine_ops.pin_gui_port(8812)
+        self.assertEqual(pinned["gui_port"], 8812)
+        self.assertTrue(pinned["pinned_at"])
+        self.write_instance({"repo": "fork", "port": 8844, "dev_port": 8844})
         self.assertEqual(engine_ops.ensure_config()["gui_port"], 8812)
-        repinned = engine_ops.ensure_config(repin=True)
-        self.assertEqual(repinned, {"port": config["port"], "gui_port": 8830})
-        self.assertEqual(engine_ops.ensure_config(), repinned)
+        self.assertEqual(engine_ops.pinned_gui_port(), 8812)
+        self.assertEqual(engine_ops.gui_origins(8812),
+                         frozenset({"http://127.0.0.1:8812", "http://localhost:8812"}))
+        for bad in (0, 70000, "8812", True, None):
+            with self.assertRaises(ValueError):
+                engine_ops.pin_gui_port(bad)
+        self.assertEqual(engine_ops.pinned_gui_port(), 8812)
+
+    def run_pin(self, argv, *, tty=True, answer=None):
+        out, err = io.StringIO(), io.StringIO()
+        stdin = mock.Mock()
+        stdin.isatty.return_value = tty
+        answers = mock.Mock(side_effect=[answer] if answer is not None else EOFError)
+        with mock.patch.object(sys, "stdin", stdin), \
+                mock.patch("builtins.input", answers), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = engine_ops.pin_command(argv)
+        return code, out.getvalue(), err.getvalue(), answers
+
+    def test_pin_command_is_an_explicit_operator_act(self):
+        code, out, _err, _asked = self.run_pin(["--show"])
+        self.assertEqual(code, 1)
+        self.assertIn("NOT pinned", out)
+
+        # No terminal and no port: nothing is pinned, and nothing is guessed.
+        code, _out, err, asked = self.run_pin([], tty=False)
+        self.assertEqual(code, 1)
+        self.assertIn("needs a terminal", err)
+        asked.assert_not_called()
+        self.assertIsNone(engine_ops.pinned_gui_port())
+
+        # At a terminal the suggestion is shown, with where it came from, but
+        # only a typed port pins. Enter, "yes", or anything else aborts.
+        for answer in ("", "yes", "y", "8812 please"):
+            code, out, _err, _asked = self.run_pin([], answer=answer)
+            self.assertEqual(code, 1, answer)
+            self.assertIn("http://127.0.0.1:8812", out)
+            self.assertIn("writable from the sandbox", out)
+            self.assertIn("aborted", out)
+            self.assertIsNone(engine_ops.pinned_gui_port())
+
+        code, out, _err, _asked = self.run_pin([], answer="8812")
+        self.assertEqual(code, 0)
+        self.assertIn("pinned: engine-ops accepts the GUI at http://127.0.0.1:8812", out)
+        self.assertEqual(engine_ops.pinned_gui_port(), 8812)
+
+        # The operator can see what is pinned, and change it deliberately.
+        code, out, _err, _asked = self.run_pin(["--show"])
+        self.assertEqual(code, 0)
+        self.assertIn("accepts the GUI at http://127.0.0.1:8812", out)
+        code, out, _err, asked = self.run_pin(["8830"], tty=False)
+        self.assertEqual(code, 0)
+        asked.assert_not_called()
+        self.assertEqual(engine_ops.pinned_gui_port(), 8830)
+        for bad in (["abc"], ["8812", "extra"], ["0"]):
+            self.assertNotEqual(self.run_pin(bad)[0], 0)
+        self.assertEqual(engine_ops.pinned_gui_port(), 8830)
 
     def test_avoids_this_forks_other_ports_and_siblings(self):
         seed = ports.PORT_BASE + ports._offset(str(self.root) + ":engine-ops")
@@ -1010,11 +1354,13 @@ class PinnedConfigTest(unittest.TestCase):
 
     def test_an_unusable_pinned_value_is_replaced(self):
         for bad in (99999, "8850", True, None, 0):
-            engine_ops.write_private(self.private / "config.json",
-                                     {"port": bad, "gui_port": bad})
+            engine_ops.write_private(
+                self.private / "config.json",
+                {"port": bad, "gui_port": bad, "pinned_at": "2026-01-01T00:00:00Z"})
             config = engine_ops.ensure_config()
             self.assertTrue(8800 <= config["port"] < 8900, (bad, config))
-            self.assertEqual(config["gui_port"], 8812)
+            self.assertIsNone(config["gui_port"])
+            self.assertIsNone(engine_ops.pinned_gui_port())
 
 
 def build_file_db(path: Path) -> None:
@@ -1189,13 +1535,19 @@ class ServiceProcessFixture(unittest.TestCase):
         self.script.write_text(SERVICE_LAUNCHER)
         (self.root / "engine.path").write_text(str(ENGINE))
         (self.root / "private.path").write_text(str(self.private))
+        (self.root / "launcher.path").write_text(str(self.script))
+        engine_ops._host_private_checked.clear()
+        operator_pins(self.private, self.review_port)
         # The "review server": a process the stub verb stops, as the verbs do.
         self.review = sleeper()
         self.addCleanup(reap, self.review)
         (self.root / "review.pid").write_text(str(self.review.pid))
-        patcher = mock.patch.object(engine_ops, "PRIVATE_DIR", self.private)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in (
+            mock.patch.object(engine_ops, "PRIVATE_DIR", self.private),
+            mock.patch.object(engine_ops, "SERVICE_SCRIPT", self.script),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def service_argv(self, scope: str, verb: str) -> list[str]:
         return [sys.executable, str(self.script), str(ENGINE), str(self.root),
@@ -1462,8 +1814,7 @@ class ServiceLifecycleTest(ServiceProcessFixture):
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
         probe.close()
-        engine_ops.write_private(self.private / "config.json",
-                                 {"port": port, "gui_port": GUI_PORT})
+        operator_pins(self.private, GUI_PORT, port)
         return port
 
     def test_up_is_idempotent_and_down_stops_only_the_service(self):
@@ -1472,6 +1823,8 @@ class ServiceLifecycleTest(ServiceProcessFixture):
             code, message = engine_ops.service_up()
             self.assertEqual(code, 0, message)
             self.assertIn(f"http://127.0.0.1:{port} (host loopback only)", message)
+            # The operator sees what is pinned every time it starts.
+            self.assertIn(f"accepts the GUI at {GUI}", message)
             self.assertTrue(engine_ops.service_answers(port))
             record = engine_ops.service_record()
             self.assertEqual(record["port"], port)
