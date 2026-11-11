@@ -20,7 +20,8 @@ here. Exact CLI syntax remains in `sc help --all` and verb help.
 One process, one per-fork port (derived by `scripts/ports.py`), serving JSON,
 the static review UI and one SSE stream. There is no web framework: `api/`
 stays stdlib. `api/transport.py` runs an asyncio one-port HTTP+WS multiplex and
-calls `server.dispatch_http(method, path, headers, body)`, which forwards
+calls `server.dispatch_http(method, path, headers, body)`, which first puts
+the request to the sign-in gate (`browser_gate.authorize`), then forwards
 review and conversation paths to their own modules and drives everything else
 through a socketless `BaseHTTPRequestHandler` subclass (`_ShimHandler`).
 Dispatch inside that handler is an ordered chain of `if path == …` /
@@ -33,27 +34,40 @@ conversation and review modules are the exception: they match compiled
 
 ### Credential classes
 
+The gate is default deny: `dispatch_http` decides every request before a route
+is chosen, and the event stream makes the same session check when it opens and
+at every turn of its loop. The rules, and what they do and do not protect, are
+in the [browser trust boundary](interface-trust-boundary.md#the-gate).
+
 | Class | How it is presented | Enforced by |
 |---|---|---|
-| Shell token | `Authorization: Bearer <shells.api_key>` | `Handler._require_shell_auth` (401 on absent or unknown) |
+| Open | nothing; the method and path are in `browser_gate.OPEN_ROUTES` | `browser_gate.authorize` |
+| Session | this install's session cookie, verified against the hash list the host auth authority publishes, on a loopback `Host`, with the origin rule | `browser_gate.authorize`; again at `Handler._require_browser_operator` and `conversation_routes._operator` |
+| Shell token | `Authorization: Bearer <shells.api_key>` on `/_sc/*` | `Handler._require_shell_auth` (401 on absent or unknown) |
 | Planner shell token | the same, plus `shells.flavor == 'planner'` | `_resolve_planner_shell` (403 otherwise) |
-| Browser operator | **no** `Authorization` header; the first active `users` row | `Handler._require_browser_operator`, `conversation_routes._operator` |
+| CLI credential | `Authorization: Bearer` a shell token or the engine CLI token, on the two routes in `browser_gate.CLI_ROUTES` | `browser_gate.authorize` |
 | Runtime token | `X-SC-Runtime-Token` header | `runtime_flags.token_matches` |
-| None | nothing checked beyond reachability | the route itself |
 
-A presented shell token is an explicit **disqualifier** on browser-operator
-routes: `/_sc` answers a shell, the operator surfaces answer the operator, and
-crossing them returns `403 fnb_operator_required` (server.py) or
-`403 OPERATOR_REQUIRED` (conversation/review). Browser-operator *mutations*
-additionally require same-origin provenance: a supplied `Origin` must equal
-`Host`, and `Sec-Fetch-Site` must be absent, `same-origin` or `none`
-(`403 same_origin_required` / `403 NOT_SAME_ORIGIN`). Conversation and review
-requests also validate a loopback `Host`
-(`403 HOST_NOT_ALLOWED` / `HOST_FORBIDDEN`).
+Every `/api/*` route and every static file needs a **session** unless its row
+says otherwise. There is no unauthenticated class beyond the open list, and
+no `Authorization` header never means the operator.
 
-Routes marked "none" below are unauthenticated: the loopback bind is the whole
-control. That is a deliberate property of a single-operator local server, not
-an oversight — see the trust boundary doc before reasoning about it.
+Refusals at the gate:
+
+| Status + code | When |
+|---|---|
+| `401 sign_in_required` | no session and no accepted credential. Body: `{"error": {"code": "sign_in_required", "message", "details": {"sign_in": "/signin.html", "auth_status": "/api/auth/status"}}}` |
+| `302` to `/signin.html?next=…` | the same, for a `GET` of a page (never under `/api/`) |
+| `403 same_origin_required` | a session, but a mutation without this origin's `Origin`, or a cross-origin `GET /api/*` |
+| `403 fnb_operator_required` | a shell token or the engine CLI token, off the CLI routes. A credential never makes its holder the operator |
+| `503 gate_unavailable` | the check itself could not run (the engine DB was busy while a session's user or a Bearer's shell was looked up). `Retry-After: 2`. The request is refused, never let through undecided |
+
+A presented shell token is an explicit **disqualifier** on the browser's
+routes: `/_sc` answers a shell, `/api` answers the signed-in operator. A
+request that carries an `Authorization` header is never a session, whatever
+cookie it also carries. Conversation and review requests also validate a
+loopback `Host` (`403 HOST_NOT_ALLOWED` / `HOST_FORBIDDEN`), and repeat the
+same-origin check for their mutations (`403 NOT_SAME_ORIGIN`).
 
 ## Stability
 
@@ -167,66 +181,68 @@ owning Planner may call `dispatch` or `monitor`.
 
 ## `/api` — the Review GUI
 
-Engine-private. Unless a row says otherwise the credential class is **none**;
-the client is the local browser app (`ui/app.js`), tab named in the last
-column.
+Engine-private. Unless a row says otherwise the credential class is
+**session**; the client is the local browser app (`ui/app.js`), tab named in
+the last column. Every write additionally needs this origin's `Origin`.
 
 ### Reads
 
 | `GET` path | Credential | Purpose / tab |
 |---|---|---|
-| `/api/health` | none | liveness payload |
-| `/api/logs` | none | last 20 webapp events, newest first (`LOG_MAX_EVENTS`) |
-| `/api/git-state?fetch=1` | none | live git hygiene; `fetch=1` does the network fetch. `#repo` |
-| `/api/shells`, `/api/shells/{id}` | none | `{shells, repo_root}`; `404 no such shell`. `#view-shells` |
-| `/api/shell-templates`, `/api/flavor-defaults` | none | flavor catalogue and per-flavor model defaults |
-| `/api/models?refresh=1` | none | model catalogue |
-| `/api/skills`, `/api/skills/{id}` | none | skill catalogue with origin tags |
-| `/api/roadmap` | none | `#view-roadmap` |
-| `/api/docs` | none | specs and docs with feature/work-stream metadata for `#view-docs` |
-| `/api/documents/{id}` | none | full document row |
-| `/api/documents/{id}/open` | none | `302` to a rendered-markdown URL |
-| `/api/flags` | none | `#view-flags` |
-| `/api/map` | none | repo-map summary. `#view-map` |
-| `/api/analytics/{sessions,tokens,usage,filters}` | none | `#view-analytics`; all take the shared filter query |
-| `/api/analytics/quota` | none | one entry per provider — `{providers:[{provider,status,detail,captured_at,windows}], ttl_seconds, probed, notes}`. Probes only when this process's last probe *attempt* is older than the TTL; never at boot, never on a timer. Carries no operator identity by design |
-| `/api/scripts`, `/api/services` | none | `#view-scripts`, including broker/sidecar configured/running/persistent state |
-| `/api/vm`, `/api/ts`, `/api/pm2` | none | the stored `instance.json` block |
-| `/api/ts/status`, `/api/pm2/status` | none | live tailnet / process view; proxied to the host broker under `SC_SANDBOX`, `503` with the exact `./sc …-broker-up` command when that socket is absent |
-| `/api/browser`, `/api/web-search` | browser operator | config + status. The web-search key itself never crosses this boundary |
-| `/api/engine-ops` | browser operator | where the host-side engine-ops service is: `{port, url, up, up_source, runtime, ops, recovery_cli, start_cli}`. The service itself, not this API, runs update / restart / harness update — see [engine-ops.md](engine-ops.md) |
-| `/api/sprints?lifecycle=&limit=&cursor=` | browser operator | Sprint list. `#view-sprints` |
-| `/api/sprints/{id}` | browser operator | the same board projection shells read at `/_sc/sprint/{id}/board` |
-| `/api/sprints/{id}/events`, `/api/sprints/{id}/summaries` | browser operator | paged by `limit`, `cursor`, `work_unit_id` |
-| `/api/sprints/{id}/spec-revisions/{document_id}` | browser operator | FnB view of the governing revision; `404 spec_revision_not_found`, `409` on `BoundRevisionUnavailable` |
+| `/api/health` | open | liveness payload |
+| `/api/auth/status?next=` | open | `{enrolled, signed_in, user_id, authority: {url, up, up_source, start_cli}, sign_in, setup_cli, next}`; `user_id` only when signed in. `next` is the query value reduced to a same-origin relative path, or `/`. Renews a signed-in caller's cookie. See the [trust boundary](interface-trust-boundary.md#get-apiauthstatus) |
+| `/api/logs` | session | last 20 webapp events, newest first (`LOG_MAX_EVENTS`) |
+| `/api/git-state?fetch=1` | session | live git hygiene; `fetch=1` does the network fetch. `#repo` |
+| `/api/shells`, `/api/shells/{id}` | session | `{shells, repo_root}`; `404 no such shell`. `#view-shells` |
+| `/api/shell-templates`, `/api/flavor-defaults` | session | flavor catalogue and per-flavor model defaults |
+| `/api/models?refresh=1` | session, or CLI credential | model catalogue. `./sc models refresh` presents the calling shell's token |
+| `/api/skills`, `/api/skills/{id}` | session | skill catalogue with origin tags |
+| `/api/roadmap` | session | `#view-roadmap` |
+| `/api/docs` | session | specs and docs with feature/work-stream metadata for `#view-docs` |
+| `/api/documents/{id}` | session | full document row |
+| `/api/documents/{id}/open` | session | `302` to a rendered-markdown URL |
+| `/api/flags` | session | `#view-flags` |
+| `/api/map` | session | repo-map summary. `#view-map` |
+| `/api/analytics/{sessions,tokens,usage,filters}` | session | `#view-analytics`; all take the shared filter query |
+| `/api/analytics/quota` | session | one entry per provider — `{providers:[{provider,status,detail,captured_at,windows}], ttl_seconds, probed, notes}`. Probes only when this process's last probe *attempt* is older than the TTL; never at boot, never on a timer. Carries no operator identity by design |
+| `/api/scripts`, `/api/services` | session | `#view-scripts`, including broker/sidecar configured/running/persistent state |
+| `/api/vm`, `/api/ts`, `/api/pm2` | session | the stored `instance.json` block |
+| `/api/ts/status`, `/api/pm2/status` | session | live tailnet / process view; proxied to the host broker under `SC_SANDBOX`, `503` with the exact `./sc …-broker-up` command when that socket is absent |
+| `/api/browser`, `/api/web-search` | session | config + status. The web-search key itself never crosses this boundary |
+| `/api/engine-ops` | session | where the host-side engine-ops service is: `{port, url, up, up_source, runtime, ops, recovery_cli, start_cli}`. The service itself, not this API, runs update / restart / harness update — see [engine-ops.md](engine-ops.md) |
+| `/api/sprints?lifecycle=&limit=&cursor=` | session | Sprint list. `#view-sprints` |
+| `/api/sprints/{id}` | session | the same board projection shells read at `/_sc/sprint/{id}/board` |
+| `/api/sprints/{id}/events`, `/api/sprints/{id}/summaries` | session | paged by `limit`, `cursor`, `work_unit_id` |
+| `/api/sprints/{id}/spec-revisions/{document_id}` | session | FnB view of the governing revision; `404 spec_revision_not_found`, `409` on `BoundRevisionUnavailable` |
 
 ### Writes
 
 | Method + path | Credential | Notes |
 |---|---|---|
-| `POST /api/flags`, `POST /api/projects`, `POST /api/shells` | none | `201` on create, `400` on validation |
-| `POST /api/flavor-defaults` | none | set a flavor's default model route |
-| `POST /api/analytics/sweep` | none | recompute analytics |
-| `POST /api/analytics/quota/probe` | none | force a probe (the refresh button) |
-| `POST /api/snapshot` | none | `{output}` from the snapshot render. `#snapshot` |
-| `POST /api/publish` | none | **`410 Gone`** — retired |
-| `POST /api/scripts/{key}` | none | run one registered script; `404 no such script`, `500` on failure |
-| `POST /api/services/{key}/{up\|down\|install\|uninstall}` | none | sidecars accept `up`/`down` only; `{init:true}` enables-and-starts the sidecar. `404` unknown pair, `409 not_configured`, `503 host_required` (brokers are host processes) |
-| `POST /api/{vm,ts,pm2}/validate/{check}` | none | run one live check against the candidate config in the body, test-before-save. A failed check is `200 {ok:false}`, not an error; `404` unknown check, `503` when the host broker is unreachable |
-| `POST /api/browser`, `POST /api/web-search/validate` | browser operator + same-origin | `{action, config}` link/validate |
-| `PATCH /api/shells/{id}` | none | operational fields only — seed and L&S have no write endpoint at all, by law |
-| `PATCH /api/flags/{id}`, `PATCH /api/roadmap/{id}`, `PATCH /api/documents/{id}` | none | frozen documents refuse body edits |
-| `PATCH /api/sprints/{id}` | browser operator + same-origin | FnB lifecycle actions from the board |
-| `PUT /api/shells/{id}/skills/{skill_id}`, `PUT /api/flavors/{flavor}/skills/{skill_id}` | none | `{granted}`. `409` when the shell inherits from a flavor pack; `500 {ok:false, committed:true}` when the write landed but projection failed |
-| `PUT /api/roadmap/{id}/blockers` | none | `{blocked_by:[ids]}` replaces the set; empty clears it |
-| `PUT /api/vm`, `PUT /api/ts`, `PUT /api/pm2` | none | persist the block to `instance.json`; no key material |
-| `PUT /api/web-search`, `DELETE /api/web-search` | browser operator + same-origin | set/rotate or clear the stored key |
-| `DELETE /api/shells/{id}` | none | soft delete (`is_deleted=1`); `404` if already gone |
+| `POST /api/flags`, `POST /api/projects`, `POST /api/shells` | session | `201` on create, `400` on validation |
+| `POST /api/flavor-defaults` | session | set a flavor's default model route |
+| `POST /api/analytics/sweep` | session | recompute analytics |
+| `POST /api/analytics/quota/probe` | session | force a probe (the refresh button) |
+| `POST /api/snapshot` | session | `{output}` from the snapshot render. `#snapshot` |
+| `POST /api/publish` | session | **`410 Gone`** — retired |
+| `POST /api/scripts/{key}` | session; `snapshot` also takes a CLI credential | run one registered script; `404 no such script`, `500` on failure. `./sc snapshot` and `./sc update` present the engine CLI credential to `/api/scripts/snapshot` and to no other key |
+| `POST /api/services/{key}/{up\|down\|install\|uninstall}` | session | sidecars accept `up`/`down` only; `{init:true}` enables-and-starts the sidecar. `404` unknown pair, `409 not_configured`, `503 host_required` (brokers are host processes) |
+| `POST /api/{vm,ts,pm2}/validate/{check}` | session | run one live check against the candidate config in the body, test-before-save. A failed check is `200 {ok:false}`, not an error; `404` unknown check, `503` when the host broker is unreachable |
+| `POST /api/browser`, `POST /api/web-search/validate` | session | `{action, config}` link/validate |
+| `PATCH /api/shells/{id}` | session | operational fields only — seed and L&S have no write endpoint at all, by law |
+| `PATCH /api/flags/{id}`, `PATCH /api/roadmap/{id}`, `PATCH /api/documents/{id}` | session | frozen documents refuse body edits |
+| `PATCH /api/sprints/{id}` | session | FnB lifecycle actions from the board |
+| `PUT /api/shells/{id}/skills/{skill_id}`, `PUT /api/flavors/{flavor}/skills/{skill_id}` | session | `{granted}`. `409` when the shell inherits from a flavor pack; `500 {ok:false, committed:true}` when the write landed but projection failed |
+| `PUT /api/roadmap/{id}/blockers` | session | `{blocked_by:[ids]}` replaces the set; empty clears it |
+| `PUT /api/vm`, `PUT /api/ts`, `PUT /api/pm2` | session | persist the block to `instance.json`; no key material |
+| `PUT /api/web-search`, `DELETE /api/web-search` | session | set/rotate or clear the stored key |
+| `DELETE /api/shells/{id}` | session | soft delete (`is_deleted=1`); `404` if already gone |
 
 ## `/api/conversations` — browser chat
 
-Engine-private; `api/conversation_routes.py`. Browser operator on every route,
-loopback `Host` required, same-origin required on every mutation. Client:
+Engine-private; `api/conversation_routes.py`. Session on every route,
+loopback `Host` required, same-origin required on every mutation and on the
+event stream. A conversation belongs to the session's user. Client:
 the Chats rail in the GUI. Conversation ids are `cv_` + 32 hex.
 
 | Method + path | Purpose / key fields |
@@ -242,18 +258,19 @@ the Chats rail in the GUI. Conversation ids are `cv_` + 32 hex.
 | `POST /api/conversations/{cv}/uploads` | raw image bytes, not JSON — routed before the body parse; extension inferred from content |
 | `POST /api/conversations/{cv}/interruptions` | interrupt or replay the live run |
 | `POST /api/conversations/shell-release` | release a shell a CLI or browser session owns |
-| `GET /api/conversations/{cv}/events` | **SSE only.** `text/event-stream`, `id:` = event sequence, `?after=`/`Last-Event-ID` resume, `: keepalive` heartbeat. Served by `stream_events` straight off the transport; the ordinary handler answers `406 SSE_REQUIRED` |
+| `GET /api/conversations/{cv}/events` | **SSE only.** `text/event-stream`, `id:` = event sequence, `?after=`/`Last-Event-ID` resume, `: keepalive` heartbeat. Served by `stream_events` straight off the transport; the ordinary handler answers `406 SSE_REQUIRED`. The session is checked again before each batch and after each wait; when it is gone the stream sends `event: sign_in_required` and closes |
 
-Refusals: `401 UNAUTHORIZED`, `403 OPERATOR_REQUIRED` (a shell token was
-presented), `403 NOT_SAME_ORIGIN`, `403 HOST_NOT_ALLOWED`, `409` for
-shell-busy and close/reopen conflicts, `422 VALIDATION_ERROR`,
-`503 ENGINE_DB_BUSY` with `{retry_after: 2}`, `503 OPERATOR_UNAVAILABLE`,
-`500 INTERNAL_ERROR`. Event payloads are redacted of harness session refs and
+Refusals: `401 sign_in_required` (no session), `401 UNAUTHORIZED` and
+`403 OPERATOR_REQUIRED` on the event stream when a Bearer token was presented
+(elsewhere the gate answers first, with `401 sign_in_required` or
+`403 fnb_operator_required`), `403 NOT_SAME_ORIGIN`, `403 HOST_NOT_ALLOWED`,
+`409` for shell-busy and close/reopen conflicts, `422 VALIDATION_ERROR`,
+`503 ENGINE_DB_BUSY` with `{retry_after: 2}`, `500 INTERNAL_ERROR`. Event payloads are redacted of harness session refs and
 secret-shaped keys before they reach the browser.
 
 ## `/api/review-*` — Diff review
 
-Engine-private; `api/review_routes.py`. Browser operator, loopback `Host`,
+Engine-private; `api/review_routes.py`. Session, loopback `Host`,
 same-origin. Each path accepts exactly one method and answers `405` with an
 `Allow` header otherwise. Target ids are `gt_` + 32 hex; observation ids are a
 64-hex digest.
@@ -276,11 +293,18 @@ Git-layer refusals map through `_REVIEW_ERROR_STATUS`:
 
 ## Static and assets
 
-`GET /`, `/index.html`, `/app.js`, `/style.css` from `.super-coder/ui/`, with
+The sign-in page is open: `GET /signin.html`, `/signin.js`, `/signin.css`,
+`/theme.js`, `/style.css` and `GET`/`HEAD /vendor/qrcode.js`. Every other
+static file needs a session; without one a page (`/`, `/index.html`) answers
+`302` to `/signin.html?next=…` and a subresource answers `401`.
+
+`GET /`, `/index.html`, `/app.js`, `/style.css` and the sign-in files from
+`.super-coder/ui/`, with
 `Cache-Control: no-cache` plus a content-derived `ETag` (so a rebuild that
 produces identical bytes still revalidates cheaply, and an updated `app.js`
-never survives an engine update). `index.html` additionally carries the
-restrictive CSP. `GET`/`HEAD /vendor/…` resolves per request against
+never survives an engine update). `index.html` and `signin.html` additionally
+carry the restrictive CSP, and a signed-in `GET` of `index.html` re-issues the
+session cookie with a fresh lifetime. `GET`/`HEAD /vendor/…` resolves per request against
 `ui/vendor/`, so a newly vendored asset is reachable without a restart. `404`
 for a missing build; `503` for a WebSocket upgrade — the transport multiplexes
 the port but offers no WS route.
@@ -305,7 +329,9 @@ Then read `server.py`'s `do_GET` / `do_POST` / `do_PATCH` / `do_PUT` /
 `_mem_*`, `_sprint_*`, `_skills_mutation_*`, `_context_get`, `_search_post`,
 `_browser_shell_post` and `_pr_post` methods for the `/_sc` families, and
 `handle()` in each of the two route modules. `dispatch_http` at the bottom of
-`server.py` shows which prefixes are peeled off before the shim runs.
+`server.py` shows the gate and which prefixes are peeled off before the shim
+runs. `tests/test_signin_gate.py` walks every path literal in the three
+modules without a session.
 
 For the client side — which verb calls which path — grep the CLI:
 
