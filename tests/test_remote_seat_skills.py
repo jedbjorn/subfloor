@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SKILLS = ENGINE / "assets" / "skills"
 SEED = ENGINE / "migrations" / "0001_seed_skills.sql"
-RESEED = ENGINE / "migrations" / "0267_reseed_docs_pass_skills.sql"
+RESEED = ENGINE / "migrations" / "0282_skills_dedupe_posture.sql"
 README = ROOT / "docs" / "README.md"
 REMOTE_SEATS_DOC = ENGINE / "docs" / "remote-seats.md"
 TAILNET_DOC = ENGINE / "docs" / "tailscale-broker.md"
@@ -27,7 +27,7 @@ RETIRED_DOCS = (
 )
 NEW_SKILLS = ("remote_seats", "tailscale_diagnostics", "windows_testing")
 # The trailing reseed carries only the skills the latest reseed rewrote.
-RESEED_SKILLS = ("remote_seats", "tailscale_diagnostics")
+RESEED_SKILLS = NEW_SKILLS
 # `0001_seed_skills.sql` is regenerated only when the skill *set* changes, so a
 # body-only edit deliberately leaves 0001 carrying the previous text and the
 # trailing reseed carries the current one. Only skills no later reseed has
@@ -50,6 +50,8 @@ SKILL_SCHEMA = (
     "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
     "category TEXT, command TEXT, common INTEGER, content TEXT, "
     "is_deleted INTEGER DEFAULT 0);"
+    "CREATE TABLE flavor_skills (flavor TEXT, skill_id INTEGER, "
+    "PRIMARY KEY(flavor, skill_id));"
 )
 
 
@@ -120,13 +122,54 @@ class SkillAssetTests(unittest.TestCase):
         for phrase in (
             "./sc vm adopt", "bake", "./sc vm pull", "--running",
             "snapshot_live_unsupported", "remote_path_not_allowed",
-            "adopt_guest_not_found", "adopt_ssh_timeout",
-            "adopt_key_install_failed", "adopt_provision_failed",
-            "adopt_verify_failed", "adopt_sandboxed",
-            "decision #372", "decision #101",
+            "adopt_sandboxed", "any `adopt_*`",
+            "decision #434", "decision #101",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, body)
+
+    def test_seat_skills_open_with_the_recoverability_posture(self) -> None:
+        """Decision #434 and the owner's posture: the class of machine decides,
+        test seats reset freely, and key handling is described as hygiene."""
+        specs = _specs()
+        for name in ("remote_seats", "tailscale_diagnostics"):
+            body = _flat(specs[name]["content"])
+            with self.subTest(skill=name):
+                self.assertLess(body.index("## Posture"), body.index("```bash"))
+                self.assertIn("a test seat reached over the tailnet is still a test seat", body)
+                self.assertIn("The class of machine decides, not the route", body)
+                self.assertIn("precaution against accidents, not distrust", body)
+                self.assertIn("at the end of", body)
+                self.assertIn("without asking", body)
+                self.assertIn("decision #434", body)
+                self.assertIn("hygiene, not a mechanism that confines you", body)
+        windows = _flat(specs["windows_testing"]["content"])
+        self.assertIn("decision #434", windows)
+        self.assertIn("without asking", windows)
+        # Decision #434 supersedes #372 and adds the refresh proposal.
+        for name in ("remote_seats", "windows_testing"):
+            body = _flat(specs[name]["content"])
+            with self.subTest(skill=name, rule="refresh proposal"):
+                self.assertNotIn("#372", body)
+                self.assertIn("reinstalling the same dependencies", body)
+                self.assertIn("instead of absorbing the cost", body)
+        # One wording for the read-only exception, wherever it appears.
+        exception = "unless your mandate or an explicit FnB assignment covers the change"
+        self.assertEqual(_flat(specs["remote_seats"]["content"]).count(exception), 1)
+        tailnet = _flat(specs["tailscale_diagnostics"]["content"])
+        self.assertIn(exception, tailnet)
+        self.assertIn(
+            "only when your mandate or an explicit FnB assignment covers the change",
+            tailnet,
+        )
+        self.assertNotIn("changes nothing", tailnet)
+        self.assertIn(
+            "Read-only applies to machines in real use",
+            _flat(specs["tailscale_diagnostics"]["content"]),
+        )
+        for name, spec in specs.items():
+            with self.subTest(skill=name, claim="no confinement claim"):
+                self.assertNotIn("That is the whole access model", spec["content"])
 
     def test_windows_testing_carries_adoption_authority_and_mcp_recovery(self) -> None:
         """Spec #232: two-command adoption, winbox.json, authority, MCP repair."""
@@ -134,7 +177,7 @@ class SkillAssetTests(unittest.TestCase):
         for phrase in (
             "./sc vm adopt", "bootstrap.ps1", ".subfloor/winbox.json",
             "winget_manifest", "mcp_port", "C:\\SubfloorTest",
-            "## Authority", "decision #372", "decision #353",
+            "## Authority", "decision #434", "decision #353",
             "windows-mcp-server",
             "windows-mcp install --transport streamable-http",
             "./sc vm bake", "--command-file",
@@ -224,8 +267,10 @@ class ReseedMigrationTests(unittest.TestCase):
             con.close()
 
 
-# Every code the doc and the skill table must both carry. A code documented in
-# one place and not the other is how a shell ends up guessing.
+# Every code the runbook must carry. The runbook is the one full vocabulary;
+# the skill keeps only the codes a shell acts on and points at the runbook for
+# the rest, so a code the skill names and the runbook lacks is how a shell
+# ends up guessing.
 ADOPT_AND_TRANSFER_CODES = (
     "adopt_sandboxed", "adopt_guest_not_found", "adopt_ssh_timeout",
     "adopt_key_install_failed", "adopt_harden_failed", "adopt_host_key_changed",
@@ -241,13 +286,34 @@ class ErrorVocabularyTests(unittest.TestCase):
     """Spec #232: the runbook and the shell-facing skill agree, and every code
     they name is one the engine actually emits."""
 
-    def test_runbook_and_skill_document_the_same_codes(self) -> None:
+    def test_runbook_holds_every_code_and_the_skill_points_at_it(self) -> None:
         doc = _flat(REMOTE_SEATS_DOC.read_text())
-        skill = _flat(_specs()["remote_seats"]["content"])
+        skill = _specs()["remote_seats"]["content"]
         for code in ADOPT_AND_TRANSFER_CODES:
             with self.subTest(code=code):
                 self.assertIn(code, doc, "missing from docs/remote-seats.md")
-                self.assertIn(code, skill, "missing from the remote_seats skill")
+        self.assertIn("`.super-coder/docs/remote-seats.md`", skill)
+        errors = skill[skill.index("## Structured errors"):]
+        named = set(re.findall(r"`([a-z<>]+(?:_[a-z<>]+)+)`", errors))
+        self.assertGreaterEqual(len(named), 10)
+        # Argument errors are the shell's to correct; host configuration is
+        # reported.
+        flat_errors = _flat(errors)
+        self.assertLess(
+            flat_errors.index("Argument errors are yours to correct"),
+            flat_errors.index("Host-configuration errors are reported"),
+        )
+        for code in ("pull_source_invalid", "remote_name_invalid",
+                     "snapshot_name_invalid"):
+            self.assertLess(
+                flat_errors.index(f"`{code}`"),
+                flat_errors.index("Host-configuration errors are reported"),
+            )
+        # `vm_not_linked` reaches the runbook with the seat-fix change that
+        # adds the code; until then the skill is allowed to name it first.
+        for code in sorted(named - {"vm_not_linked"}):
+            with self.subTest(skill_code=code):
+                self.assertIn(f"`{code}`", doc, "skill names a code the runbook lacks")
 
     def test_every_documented_code_is_emitted_by_the_engine(self) -> None:
         sources = "\n".join(

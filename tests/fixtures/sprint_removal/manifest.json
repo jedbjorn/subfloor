@@ -176,7 +176,12 @@
     ".super-coder/migrations/0275_runs_ledger.sql",
     ".super-coder/migrations/0276_devkit_run_receipts.sql",
     ".super-coder/migrations/0279_run_receipt_attachments.sql",
-    ".super-coder/migrations/0280_remove_sprint_followups.sql"
+    ".super-coder/migrations/0280_remove_sprint_followups.sql",
+    ".super-coder/assets/skills/cli_orchestration/SKILL.md",
+    ".super-coder/assets/skills/spec_authoring/SKILL.md",
+    ".super-coder/assets/skills/spec_execution/SKILL.md",
+    ".super-coder/migrations/0282_skills_dedupe_posture.sql",
+    "tests/test_spec_skills.py"
   ],
   "baseline_migration_ledger": {
     "count": 142,
