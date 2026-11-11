@@ -6771,46 +6771,57 @@ def require_loopback_bind(bind: str) -> None:
     )
 
 
-# The port this process's listening socket actually holds, reported by the
-# transport once it is bound (`_on_bound`). Not the port that was asked for:
-# `--port 0` asks the kernel to choose. None until the bind. The engine CLI
-# credential is published under this port and no other.
-_LISTEN_PORT: int | None = None
+# Every port this process's listening sockets actually hold, reported by the
+# transport once it is bound (`_on_bound`). Not the port that was asked for,
+# and not always one: `--port 0` asks the kernel to choose, and on a
+# dual-stack bind (`SC_BIND=localhost`) it chooses one for IPv4 and another
+# for IPv6. Empty until the bind. The engine CLI credential is published
+# under each of these ports and no other.
+_LISTEN_PORTS: tuple[int, ...] = ()
 
 
-def _on_bound(port: int) -> None:
-    """The transport's `on_bound`: the port the listening socket holds."""
-    global _LISTEN_PORT
-    _LISTEN_PORT = port
+def _on_bound(ports) -> None:
+    """The transport's `on_bound`: the ports the listening sockets hold."""
+    global _LISTEN_PORTS
+    _LISTEN_PORTS = tuple(ports)
 
 
 def publish_cli_credential() -> None:
     """Publish this process's engine CLI token, owner-only, under run/, as
-    the credential of the port it bound.
+    the credential of every port it bound.
 
-    Called only after the listener is bound, and keyed by that port, so the
-    file for a port always names the token of the server holding it. A second
-    server of this checkout on another port publishes its own file and does
-    not touch this one. Nothing removes a file, at startup or at shutdown:
-    another port's may belong to a live server, and a token with no server
-    behind it opens nothing.
+    Called only after the listener is bound, and keyed by port, so the file
+    for a port always names the token of the server holding it. The same
+    token goes under each port this server holds: a caller reaches one server
+    whichever of its sockets it calls. A second server of this checkout on
+    another port publishes its own file and does not touch these. Nothing
+    removes a file, at startup or at shutdown: another port's may belong to a
+    live server, and a token with no server behind it opens nothing.
+
+    Loud, and not fatal, whatever goes wrong, and port by port: one port's
+    failure does not stop the next port's file, and none of them stops the
+    server. With no token published for a port the CLI routes still take a
+    shell token, and `./sc snapshot` says that no credential is published
+    for that port.
     """
-    token, port = browser_gate.CLI_TOKEN, _LISTEN_PORT
-    try:
-        if not token:
-            raise RuntimeError("no token was minted")
-        if port is None:
-            raise RuntimeError("the transport did not report the bound port")
-        cli_credential.publish(token, port)
-    except Exception as exc:  # noqa: BLE001 — never a reason to stop serving
-        # Loud, and not fatal, whatever went wrong: the server keeps the port
-        # and the GUI. With no token published the CLI routes still take a
-        # shell token, and `./sc snapshot` says that no credential is
-        # published for this port.
+    token, ports = browser_gate.CLI_TOKEN, _LISTEN_PORTS
+
+    def loud(port, exc) -> None:
         print("server: could NOT publish the engine CLI credential for port "
               f"{port} ({type(exc).__name__}: {exc}). The server is running; "
-              "`./sc snapshot` and `./sc update` will be refused by it until "
-              "the next restart publishes one.", flush=True)
+              "`./sc snapshot` and `./sc update` will be refused by it on "
+              "that port until the next restart publishes one.", flush=True)
+
+    if not token:
+        return loud(None, RuntimeError("no token was minted"))
+    if not ports:
+        return loud(None, RuntimeError(
+            "the transport did not report the bound port"))
+    for port in ports:
+        try:
+            cli_credential.publish(token, port)
+        except Exception as exc:  # noqa: BLE001 — never a reason to stop serving
+            loud(port, exc)
 
 
 def _on_listening() -> None:
@@ -6892,8 +6903,8 @@ def _run_server(port: int) -> int:
     # request. It is PUBLISHED only once this process holds the port
     # (`_on_listening`): a duplicate startup that loses the bind must not
     # replace the file the surviving server's callers read.
-    global _LISTEN_PORT
-    _LISTEN_PORT = None          # known only once the socket is bound
+    global _LISTEN_PORTS
+    _LISTEN_PORTS = ()           # known only once the sockets are bound
     browser_gate.CLI_TOKEN = cli_credential.mint()
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can

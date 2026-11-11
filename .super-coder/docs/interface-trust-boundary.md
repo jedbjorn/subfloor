@@ -226,7 +226,8 @@ Either request accepts either credential:
   every boot and keeps it in memory. Once it holds its port, and not before,
   it writes the token to `.super-coder/run/api/cli-token.<port>` (directory
   `0700`, file `0600`), under the gitignored `run/`, keyed by the port it
-  bound. A second server of the same checkout on another port publishes its
+  bound: the port its socket actually holds, and each of them when a
+  dual-stack bind on port 0 gives the two families different ports. A second server of the same checkout on another port publishes its
   own file and leaves this one alone, and one that fails to bind publishes
   nothing, so the file for a port names the token of the server listening on
   that port. Nothing deletes a file, at startup or at shutdown: another

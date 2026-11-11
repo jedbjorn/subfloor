@@ -380,7 +380,7 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
                 "startup did not wire browser conversation SSE to transport",
             )
             if on_bound is not None:
-                on_bound(port)
+                on_bound((port,))
             if on_started is not None:
                 on_started()
             return port

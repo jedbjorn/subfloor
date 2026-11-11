@@ -1458,7 +1458,7 @@ class ShellAndCliCredentials(GateCase):
         # starts the runtime services.
         with mock.patch.object(cli_credential, "RUN_DIR", self.run_dir), \
                 mock.patch.object(browser_gate, "CLI_TOKEN", "sccli_this-process"), \
-                mock.patch.object(server, "_LISTEN_PORT", 8811), \
+                mock.patch.object(server, "_LISTEN_PORTS", (8811,)), \
                 mock.patch.object(server, "start_runtime_services") as services:
             server._on_listening()
         services.assert_called_once_with()
@@ -1467,22 +1467,33 @@ class ShellAndCliCredentials(GateCase):
         self.assertEqual(cli_credential.read(CLI_PORT, self.run_dir), self.token)
         # The boot path does not decide the port the file is named for: the
         # transport reports it, after the bind.
-        self.assertIn("_LISTEN_PORT = None", ast.unparse(boot))
-        self.assertNotIn("_LISTEN_PORT = port", ast.unparse(boot))
-        with mock.patch.object(server, "_LISTEN_PORT", None):
-            server._on_bound(8812)
-            self.assertEqual(server._LISTEN_PORT, 8812)
+        self.assertIn("_LISTEN_PORTS = ()", ast.unparse(boot))
+        self.assertNotIn("port,)", ast.unparse(boot))
+        with mock.patch.object(server, "_LISTEN_PORTS", ()):
+            server._on_bound([8812, 8813])
+            self.assertEqual(server._LISTEN_PORTS, (8812, 8813))
 
-    def _boot(self, port: int, publish_patch=None):
+    def _boot(self, port: int, publish_patch=None, bind: str = "127.0.0.1"):
         """Run the real `_run_server(port)` on the real transport, in a
         thread, with everything outside the listener stubbed. Returns
         (bound port or None, what `_run_server` raised or None, stop)."""
         started = threading.Event()
         state: dict = {}
 
+        real_start = transport_mod.Transport.start
+
+        async def recording_start(transport):
+            # What the listener REALLY holds, read off its sockets, so the
+            # test does not take the server's word for it.
+            await real_start(transport)
+            state["bound"] = sorted(
+                {sock.getsockname()[1] for sock in transport._tcp.sockets})
+            state["sockets"] = [sock.getsockname()[:2]
+                                for sock in transport._tcp.sockets]
+
         def services():
             state["loop"] = asyncio.get_running_loop()
-            state["port"] = server._LISTEN_PORT
+            state["port"] = state["bound"][0]
             started.set()
 
         def run():
@@ -1497,7 +1508,8 @@ class ShellAndCliCredentials(GateCase):
             mock.patch.object(cli_credential, "RUN_DIR", self.run_dir),
             mock.patch.object(server, "DB_PATH", _DB_PATH),
             mock.patch.object(server, "_CSP", server._CSP),
-            mock.patch.object(server, "_LISTEN_PORT", None),
+            mock.patch.object(server, "_LISTEN_PORTS", (), create=True),
+            mock.patch.object(transport_mod.Transport, "start", recording_start),
             mock.patch.object(server, "require_current_schema"),
             mock.patch.object(server.backfill_shell_api_keys, "backfill"),
             mock.patch.object(server.mem_credentials, "provision"),
@@ -1506,7 +1518,7 @@ class ShellAndCliCredentials(GateCase):
             mock.patch.object(server, "in_container", return_value=False),
             mock.patch.object(server, "start_runtime_services", services),
             mock.patch.object(server.conversation_reaper, "stop_service"),
-            mock.patch.dict(os.environ, {"SC_BIND": "127.0.0.1"}),
+            mock.patch.dict(os.environ, {"SC_BIND": bind}),
             mock.patch("builtins.print", lambda *a, **k: state.setdefault(
                 "printed", []).append(" ".join(str(x) for x in a))),
         ]
@@ -1564,6 +1576,132 @@ class ShellAndCliCredentials(GateCase):
         ran.assert_called_once_with("snapshot")
         stop()
 
+    def _dual_stack(self):
+        """Boot on `localhost`, port 0. Skips unless that gave this host an
+        IPv4 and an IPv6 socket on two different ports."""
+        state, stop = self._boot(0, bind="localhost")
+        self.assertNotIn("raised", state, repr(state.get("raised")))
+        if len(state["bound"]) < 2:
+            stop()
+            self.skipTest(
+                "localhost with port 0 did not bind two ports here "
+                f"(sockets: {state['sockets']}): no IPv6 loopback")
+        return state, stop
+
+    def _post_snapshot(self, host: str, port: int):
+        """`POST /api/scripts/snapshot` as the CLI caller for `port` does."""
+        con = http.client.HTTPConnection(host, port, timeout=10)
+        try:
+            con.request("POST", "/api/scripts/snapshot", body=b"", headers=(
+                cli_credential.authorization(port, self.run_dir)))
+            response = con.getresponse()
+            return response.status, response.read()
+        finally:
+            con.close()
+
+    def test_every_bound_port_gets_the_credential(self) -> None:
+        """Codex pass 4: `SC_BIND=localhost --port 0` binds IPv4 and IPv6 on
+        different ephemeral ports. Both are published; both callers are
+        admitted."""
+        state, stop = self._dual_stack()
+        token = browser_gate.CLI_TOKEN
+        hosts = {port: host for host, port in state["sockets"]}
+        self.assertEqual(len(hosts), 2, state["sockets"])
+        for port in state["bound"]:
+            self.assertEqual(
+                cli_credential.read(port, self.run_dir), token,
+                f"no credential published for bound port {port} "
+                f"(sockets: {state['sockets']})")
+        self.assertEqual(
+            sorted(p.name for p in self.run_dir.iterdir()),
+            sorted([f"cli-token.{CLI_PORT}"]
+                   + [f"cli-token.{port}" for port in state["bound"]]))
+        with mock.patch.object(server, "run_script", return_value={
+                "ok": True, "output": "snapshot: wrote"}) as ran:
+            for port, host in hosts.items():
+                status, body = self._post_snapshot(host, port)
+                self.assertEqual(
+                    status, 200,
+                    f"the caller for {host} port {port} was refused: {body!r}")
+        self.assertEqual(ran.call_count, 2)
+        stop()
+
+    def test_one_ports_failure_does_not_cost_the_other_its_credential(self) -> None:
+        real = cli_credential.publish
+        failed: list[int] = []
+
+        def first_fails(token, port, run_dir=None):
+            if not failed:
+                failed.append(port)
+                raise OSError("disk full")
+            return real(token, port, run_dir)
+
+        state, stop = self._boot(0, mock.patch.object(
+            cli_credential, "publish", side_effect=first_fails), bind="localhost")
+        self.assertNotIn("raised", state, repr(state.get("raised")))
+        if len(state["bound"]) < 2:
+            stop()
+            self.skipTest("localhost with port 0 did not bind two ports here")
+        lost, kept = failed[0], next(p for p in state["bound"] if p != failed[0])
+        self.assertIsNone(cli_credential.read(lost, self.run_dir))
+        self.assertEqual(cli_credential.read(kept, self.run_dir),
+                         browser_gate.CLI_TOKEN)
+        loud = [line for line in state.get("printed", [])
+                if "could NOT publish the engine CLI credential" in line]
+        self.assertEqual(len(loud), 1, state.get("printed"))
+        self.assertIn(f"port {lost}", loud[0])
+        self.assertIn("OSError: disk full", loud[0])
+        hosts = {port: host for host, port in state["sockets"]}
+        with mock.patch.object(server, "run_script", return_value={
+                "ok": True, "output": "snapshot: wrote"}):
+            self.assertEqual(self._post_snapshot(hosts[kept], kept)[0], 200)
+            self.assertEqual(self._post_snapshot(hosts[lost], lost)[0], 401)
+        stop()
+
+    def test_a_fixed_port_on_both_families_is_one_file(self) -> None:
+        """The ordinary dual-stack case: one port number, published once."""
+        probe = __import__("socket").socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        state, stop = self._boot(port, bind="localhost")
+        if "raised" in state:
+            self.skipTest(f"could not bind localhost:{port}: {state['raised']!r}")
+        self.assertEqual(state["bound"], [port])
+        self.assertEqual(server._LISTEN_PORTS, (port,))
+        self.assertEqual(
+            sorted(p.name for p in self.run_dir.iterdir()),
+            sorted([f"cli-token.{CLI_PORT}", f"cli-token.{port}"]))
+        stop()
+
+    def test_the_transport_reports_every_distinct_port(self) -> None:
+        async def main():
+            seen = []
+
+            async def no_ws(reader, writer, head_raw):  # pragma: no cover
+                writer.close()
+
+            task = asyncio.ensure_future(transport_mod.serve(
+                "localhost", 0, server.dispatch_http, no_ws,
+                log=lambda *_: None, on_bound=seen.append))
+            for _ in range(200):
+                if seen:
+                    break
+                await asyncio.sleep(0.01)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return seen
+
+        seen = asyncio.run(main())
+        self.assertEqual(len(seen), 1)
+        ports = seen[0]
+        self.assertIsInstance(ports, tuple)
+        self.assertEqual(list(ports), sorted(set(ports)))
+        self.assertTrue(all(type(port) is int and port > 0 for port in ports))
+
     def test_a_publication_that_fails_is_loud_and_the_server_runs(self) -> None:
         """Any failure, not only OSError: the listener and the runtime
         services start, the failure is printed, and the caller is told that
@@ -1603,7 +1741,7 @@ class ShellAndCliCredentials(GateCase):
     def test_no_bound_port_reported_is_loud_not_fatal(self) -> None:
         printed: list[str] = []
         with mock.patch.object(cli_credential, "RUN_DIR", self.run_dir), \
-                mock.patch.object(server, "_LISTEN_PORT", None), \
+                mock.patch.object(server, "_LISTEN_PORTS", ()), \
                 mock.patch.object(server, "start_runtime_services") as services, \
                 mock.patch("builtins.print",
                            lambda *a, **k: printed.append(" ".join(map(str, a)))):
@@ -1627,7 +1765,7 @@ class ShellAndCliCredentials(GateCase):
 
         with mock.patch.object(cli_credential, "RUN_DIR", self.run_dir), \
                 mock.patch.object(browser_gate, "CLI_TOKEN", cli_credential.mint()), \
-                mock.patch.object(server, "_LISTEN_PORT", port), \
+                mock.patch.object(server, "_LISTEN_PORTS", (port,)), \
                 mock.patch.object(server, "start_runtime_services") as services:
             loser = browser_gate.CLI_TOKEN
             with self.assertRaises(OSError):
@@ -1739,7 +1877,7 @@ class AuditedCliCallers(GateCase):
         self.addCleanup(self._stop)
         self.base = f"http://127.0.0.1:{self.port}"
         # As `_on_listening` does: published once the port is held, under it.
-        with mock.patch.object(server, "_LISTEN_PORT", self.port), \
+        with mock.patch.object(server, "_LISTEN_PORTS", (self.port,)), \
                 mock.patch.object(server, "start_runtime_services"):
             server._on_listening()
 
@@ -1826,7 +1964,7 @@ class AuditedCliCallers(GateCase):
         second = _Listener(self)                       # a second real listener
         second_token = cli_credential.mint()
         with mock.patch.object(browser_gate, "CLI_TOKEN", second_token), \
-                mock.patch.object(server, "_LISTEN_PORT", second.port), \
+                mock.patch.object(server, "_LISTEN_PORTS", (second.port,)), \
                 mock.patch.object(server, "start_runtime_services"):
             server._on_listening()
         self.assertNotEqual(first_port, second.port)
@@ -1855,7 +1993,7 @@ class AuditedCliCallers(GateCase):
         # token under its own port): the first caller is still served.
         third_token = cli_credential.mint()
         with mock.patch.object(browser_gate, "CLI_TOKEN", third_token), \
-                mock.patch.object(server, "_LISTEN_PORT", second.port), \
+                mock.patch.object(server, "_LISTEN_PORTS", (second.port,)), \
                 mock.patch.object(server, "start_runtime_services"):
             server._on_listening()
         self.assertEqual(snapshot(first_port, first_token),
