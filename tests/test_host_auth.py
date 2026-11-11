@@ -49,6 +49,7 @@ import test_engine_ops_service as base  # noqa: E402  (the service fixture)
 from test_host_runtime import HostRuntimeFixture  # noqa: E402
 
 import auth_sessions  # noqa: E402
+import browser_gate  # noqa: E402
 import engine_ops  # noqa: E402
 import engine_ops_service  # noqa: E402
 import host_auth  # noqa: E402
@@ -2092,11 +2093,135 @@ class CliTest(AuthFixture):
         self.assertEqual(self.cli("origin")[0], 1)            # no terminal
         self.assertEqual(engine_ops.pinned_gui_port(), 8830)
 
+    def gate(self, method: str, path: str, cookie: str, origin: bool = True):
+        """The review server's own decision for a request with this cookie."""
+        headers = {"Host": f"127.0.0.1:{GUI_PORT}", "Cookie": cookie}
+        if origin:
+            headers["Origin"] = GUI
+        return browser_gate.authorize(
+            method, path, headers, shell_exists=lambda _token: False,
+            user_active=lambda user_id: user_id == 1)
+
+    def test_mint_gives_a_tool_a_labelled_session_like_any_other(self):
+        # Nobody to mint for: refused, and nothing is written.
+        code, out, err = self.cli("sessions", "mint", "--label", "docs capture")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("no GUI user yet", err)
+        self.assertIn("./sc auth user add <username>", err)
+        self.assertFalse((self.private / "auth.json").exists())
+
+        browser, _secret = self.enrol(device="desk")
+        code, out, err = self.cli("sessions", "mint", "--label", "docs capture",
+                                  "--json")
+        self.assertEqual(code, 0, err)
+        minted = json.loads(out)
+        self.assertEqual(sorted(minted), ["cookie_name", "cookie_value", "id", "kind",
+                                          "label", "user_id", "username"])
+        self.assertEqual(
+            (minted["kind"], minted["label"], minted["username"], minted["user_id"]),
+            ("tool", "docs capture", "Operator", 1))
+        self.assertEqual(minted["cookie_name"], host_auth.cookie_name())
+        token = minted["cookie_value"]
+        cookie = f"{minted['cookie_name']}={token}"
+        # Said once, on stdout. stderr names the session, never the cookie.
+        self.assertIn(minted["id"], err)
+        self.assertNotIn(token, err)
+        # The same record a sign-in leaves, plus its kind and label: only the
+        # hash is on disk, in the store and in the published list.
+        self.assert_nowhere_on_disk(token)
+        stored = self.store()["sessions"][-1]
+        self.assertEqual(
+            {key: stored[key] for key in ("id", "user_id", "kind", "label", "device")},
+            {"id": minted["id"], "user_id": 1, "kind": "tool",
+             "label": "docs capture", "device": "docs capture"})
+        self.assertEqual(stored["token_sha256"], auth_sessions.token_hash(token))
+        self.assertNotIn("kind", self.store()["sessions"][0])       # the browser's
+        self.assertIn(stored["token_sha256"],
+                      [entry["hash"] for entry in self.published()["sessions"]])
+
+        # Both servers take it, and the gate holds it to a browser's rules.
+        self.assertEqual(self.accepted_by(cookie), (True, True))
+        self.assertEqual(self.gate("GET", "/api/shells", cookie).kind, "session")
+        self.assertEqual(self.gate("POST", "/api/conversations", cookie).kind,
+                         "session")
+        refused = self.gate("POST", "/api/conversations", cookie, origin=False)
+        self.assertEqual((refused.kind, refused.response[0]), ("deny", 403))
+
+        # Listed with its label and kind, beside the browser's.
+        code, out, _err = self.cli("sessions", "list")
+        rows = {row[0]: row for row in
+                (line.split("\t") for line in out.strip().splitlines())}
+        self.assertEqual(rows[minted["id"]][1:4], ["Operator", "docs capture", "tool"])
+        self.assertEqual([row[3] for row in rows.values() if row[2] == "desk"],
+                         ["browser"])
+        self.assertNotIn(token, out)
+        listed = {row["id"]: row for row in host_auth.all_sessions()}
+        self.assertEqual((listed[minted["id"]]["kind"], listed[minted["id"]]["label"]),
+                         ("tool", "docs capture"))
+
+        # Revoked like any other; the browser's session is not touched.
+        code, out, _err = self.cli("sessions", "revoke", minted["id"])
+        self.assertEqual(code, 0, out)
+        denied = self.gate("GET", "/api/shells", cookie)
+        self.assertEqual((denied.kind, denied.response[0]), ("deny", 401))
+        self.assertEqual(self.accepted_by(cookie), (False, False))
+        self.assertEqual(self.accepted_by(browser), (True, True))
+
+        # The plain form: one line, `name=value`, ready for a Cookie header.
+        code, out, err = self.cli("sessions", "mint", "--label", "canary")
+        self.assertEqual(code, 0, err)
+        name, _, value = out.strip().partition("=")
+        self.assertEqual((name, len(out.splitlines())), (host_auth.cookie_name(), 1))
+        self.assertTrue(auth_sessions.well_formed(value))
+        self.assertEqual(self.accepted_by(out.strip()), (True, True))
+        self.assertNotIn(value, err)
+
+    def test_mint_names_its_user_and_takes_a_plain_label(self):
+        self.add_user("Operator")
+        for argv in (("sessions", "mint"), ("sessions", "mint", "--label"),
+                     ("sessions", "mint", "tool"),
+                     ("sessions", "mint", "--label", "a", "--label", "b"),
+                     ("sessions", "mint", "--label", "a", "--password", "x")):
+            self.assertEqual(self.cli(*argv)[0], 2, argv)
+        for label in ("", "   ", "x" * 81, "two\nlines"):
+            code, out, err = self.cli("sessions", "mint", "--label", label)
+            self.assertEqual((code, out), (1, ""), label)
+            self.assertIn("label", err)
+        code, out, err = self.cli("sessions", "mint", "--label", "t", "--user", "nobody")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("no GUI user named", err)
+        self.assertEqual(self.store()["sessions"], [])
+
+        # A user still awaiting first sign-in (a tool's own disposable
+        # install): the review server takes the session; the host authority,
+        # which runs engine operations, does not.
+        code, out, err = self.cli("sessions", "mint", "--label", "t", "--json")
+        self.assertEqual(code, 0, err)
+        minted = json.loads(out)
+        cookie = f"{minted['cookie_name']}={minted['cookie_value']}"
+        self.assertEqual(self.store()["users"][0]["state"], "awaiting")
+        self.assertEqual(self.gate("GET", "/api/shells", cookie).kind, "session")
+        self.assertEqual(self.accepted_by(cookie), (False, True))
+        # The claim code still works once, and a reset ends the tool session.
+        self.assertEqual(self.cli("user", "reset", "Operator")[0], 0)
+        self.assertEqual(self.gate("GET", "/api/shells", cookie).kind, "deny")
+
+        # With two users, one must be named.
+        self.add_user("Second")
+        code, out, err = self.cli("sessions", "mint", "--label", "t")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("--user", err)
+        code, out, err = self.cli("sessions", "mint", "--label", "t", "--user",
+                                  "second", "--json")
+        self.assertEqual((code, json.loads(out)["user_id"]), (0, 2), err)
+
     def test_every_verb_refuses_inside_the_sandbox(self):
         with mock.patch.object(engine_ops, "in_sandbox", return_value=True):
             for argv in (("user", "add", "Operator", "--port", "8800"),
                          ("user", "reset", "Operator"), ("user", "list"),
                          ("sessions",), ("sessions", "revoke", "--all"),
+                         ("sessions", "mint", "--label", "a tool"),
+                         ("sessions", "mint", "--label", "a tool", "--json"),
                          ("unlock",), ("origin", "8800"), ("origin", "--show")):
                 code, out, err = self.cli(*argv)
                 self.assertEqual(code, 1, argv)
@@ -2112,6 +2237,7 @@ class CliTest(AuthFixture):
         env = {**os.environ, "SC_SANDBOX": "1", "HOME": str(self.base / "home"),
                "XDG_STATE_HOME": str(state)}
         for argv in (["user", "add", "Operator", "--port", "8800"], ["user", "list"],
+                     ["sessions", "mint", "--label", "a tool", "--json"],
                      ["unlock"]):
             done = subprocess.run(
                 [sys.executable, str(ENGINE / "api" / "host_auth.py"), *argv],
@@ -2237,7 +2363,8 @@ class DispatcherTest(unittest.TestCase):
     def test_the_real_dispatcher_help_names_the_verbs(self):
         text = (ENGINE / "scripts" / "dispatch.sh").read_text()
         for verb in ("./sc auth user add <username>", "./sc auth user reset <username>",
-                     "./sc auth user list", "./sc auth sessions", "./sc auth unlock",
+                     "./sc auth user list", "./sc auth sessions",
+                     "./sc auth sessions mint --label <text>", "./sc auth unlock",
                      "./sc auth origin"):
             self.assertIn(verb, text)
         self.assertEqual(host_auth.SETUP_CLI, engine_ops.SETUP_CLI)

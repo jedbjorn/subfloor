@@ -12,6 +12,8 @@ is its core and the `./sc auth` verbs. It owns three things:
   parameters, TOTP secret, the last accepted TOTP step, and the hash of the
   one-time claim code. Sessions hold the SHA-256 of the token, a device
   label, and created / last-seen times; the token itself is never stored.
+  A session a host-side tool was given (`./sc auth sessions mint`) also
+  carries `kind: "tool"` and its label; one without a kind is a browser's.
   The failed-attempt counter is in the same file, so it survives a restart.
   Nothing secret is written to the engine DB, the checkout, `.sc-state/`, or
   `run/`.
@@ -71,6 +73,11 @@ STORE_VERSION = 1
 
 AWAITING = "awaiting"
 ACTIVE = "active"
+
+# What a session is. A browser's record carries no `kind`; a session minted
+# on the host for a tool (`mint_tool_session`) says so and keeps its label.
+KIND_BROWSER = "browser"
+KIND_TOOL = "tool"
 
 # scrypt cost for new hashes; each stored hash carries the parameters it was
 # made with, so these can be raised without invalidating anything.
@@ -511,9 +518,11 @@ def _device_label(device, user_agent) -> str:
     return f"{browser} on {system}" if system else browser
 
 
-def _new_session(store: dict, user: dict, device, user_agent) -> tuple[str, dict]:
+def _new_session(store: dict, user: dict, device, user_agent,
+                 kind: str = KIND_BROWSER) -> tuple[str, dict]:
     """Add a session for `user`. Returns (token, record); only the token's
-    hash is in the record."""
+    hash is in the record. THE one place a session is made: a browser's
+    sign-in and a tool's mint differ only in the `kind` and label recorded."""
     token = secrets.token_urlsafe(32)
     now = _clock()
     record = {
@@ -524,6 +533,9 @@ def _new_session(store: dict, user: dict, device, user_agent) -> tuple[str, dict
         "created": now,
         "last_seen": now,
     }
+    if kind != KIND_BROWSER:
+        record["kind"] = kind
+        record["label"] = record["device"]
     store["sessions"].append(record)
     own = [s for s in store["sessions"] if s.get("user_id") == user["user_id"]]
     if len(own) > SESSIONS_MAX:
@@ -541,6 +553,10 @@ def _public_session(session: dict, current_id=None) -> dict:
         "last_seen_at": _stamp(session.get("last_seen")),
         "current": session.get("id") == current_id,
     }
+
+
+def _session_kind(session: dict) -> str:
+    return KIND_TOOL if session.get("kind") == KIND_TOOL else KIND_BROWSER
 
 
 def _public_user(user: dict) -> dict:
@@ -967,8 +983,61 @@ def all_sessions() -> list[dict]:
         names = {user.get("user_id"): user.get("username") for user in store["users"]}
         rows = sorted(store["sessions"], key=lambda s: s.get("last_seen") or 0,
                       reverse=True)
-        return [{**_public_session(s), "username": names.get(s.get("user_id"))}
+        return [{**_public_session(s), "username": names.get(s.get("user_id")),
+                 "kind": _session_kind(s),
+                 "label": s.get("label") if _session_kind(s) == KIND_TOOL else None}
                 for s in rows]
+
+
+def mint_tool_session(label, username=None) -> tuple[str, dict]:
+    """A session for a host-side tool, with no password and no code.
+    Returns (token, payload); the token is returned once and never stored.
+
+    Only the host CLI calls this: no route of the service or of the review
+    server does. It grants nothing the caller lacks. Whoever can run it can
+    already read this store and reset any user (`reset_user`).
+
+    The session is made and committed exactly as a sign-in's is
+    (`_new_session`, `_commit`), marked `kind: "tool"` with its label, so it
+    is listed, and revoked, like any other. The user must already exist:
+    `username`, or the only GUI user when none is named. A user still
+    awaiting first sign-in may be given one; the review server takes it (its
+    rule is a published hash of an active ENGINE user), and this service's
+    own session routes and engine operations do not (`_find_session` wants
+    a completed user).
+    """
+    text = label if isinstance(label, str) else ""
+    text = text.strip()
+    if not text or len(text) > DEVICE_MAX or not all(map(_visible, text)):
+        raise AuthError(
+            400, "bad_label",
+            f"a label of 1 to {DEVICE_MAX} visible characters is required: it "
+            "is what names this session in ./sc auth sessions")
+    with _locked():
+        store = load()
+        if username is not None:
+            user = _find_user(store, username)
+            if user is None:
+                raise AuthError(404, "unknown_user", f"no GUI user named {username!r}")
+        elif not store["users"]:
+            raise AuthError(
+                409, "no_user",
+                "no GUI user yet, so there is nobody to mint a session for. "
+                f"Create one with {SETUP_CLI}")
+        elif len(store["users"]) > 1:
+            names = ", ".join(str(u.get("username")) for u in store["users"])
+            raise AuthError(
+                400, "user_required",
+                f"more than one GUI user ({names}); name one with --user")
+        else:
+            user = store["users"][0]
+        token, session = _new_session(store, user, text, None, kind=KIND_TOOL)
+        _commit(store)
+        return token, {
+            "id": session["id"], "kind": KIND_TOOL, "label": session["label"],
+            "username": user.get("username"), "user_id": user.get("user_id"),
+            "cookie_name": cookie_name(), "cookie_value": token,
+        }
 
 
 def revoke_sessions(session_id: str | None) -> int:
@@ -1004,8 +1073,12 @@ USAGE = """usage: ./sc auth <command>      (host terminal, main checkout)
   user reset <username>    clear the password, the authenticator, and every
                            session; prints a new claim code
   user list                each user's state
-  sessions [list]          signed-in devices
+  sessions [list]          signed-in devices and tool sessions
   sessions revoke <id>     sign one device out (--all: every device)
+  sessions mint --label <text> [--user <username>] [--json]
+                           give a host-side tool an operator session: prints
+                           the cookie once (name=value, or JSON); it is
+                           listed with its label and revoked like any other
   unlock                   clear the failed-attempt delay
   origin [<port>|--show]   confirm or show the GUI origin the host accepts"""
 
@@ -1097,7 +1170,32 @@ def _cli_sessions(argv: list[str]) -> int:
             return 0
         for row in rows:
             print(f"{row['id']}\t{row['username']}\t{row['device']}\t"
+                  f"{row['kind']}\t"
                   f"last seen {row['last_seen_at']}\tsince {row['created_at']}")
+        return 0
+    if argv[0] == "mint":
+        options = {"--label": None, "--user": None}
+        as_json = False
+        rest = argv[1:]
+        while rest:
+            if rest[0] == "--json":
+                as_json, rest = True, rest[1:]
+            elif rest[0] in options and len(rest) > 1 and options[rest[0]] is None:
+                options[rest[0]], rest = rest[1], rest[2:]
+            else:
+                return _usage()
+        if options["--label"] is None:
+            return _usage()
+        token, minted = mint_tool_session(options["--label"], options["--user"])
+        # The cookie goes to stdout, once, and nowhere else; what a person
+        # needs to find and end the session goes to stderr.
+        if as_json:
+            print(json.dumps(minted))
+        else:
+            print(f"{minted['cookie_name']}={token}")
+        print(f"→ tool session {minted['id']} ({minted['label']}) minted for "
+              f"{minted['username']}. The cookie is shown once. To end it: "
+              f"./sc auth sessions revoke {minted['id']}", file=sys.stderr)
         return 0
     if argv[0] == "revoke" and len(argv) == 2:
         target = None if argv[1] == "--all" else argv[1]

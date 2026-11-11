@@ -2315,6 +2315,9 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                            session; prints a new claim code (lost-device recovery)
   ./sc auth user list      each GUI user's state
   ./sc auth sessions       signed-in devices · auth sessions revoke <id> | --all
+  ./sc auth sessions mint --label <text> [--user <username>] [--json]
+                           give a host-side tool a labelled operator session;
+                           prints its cookie once; listed and revoked like any
   ./sc auth unlock         clear the delay that follows repeated failed sign-ins
   ./sc auth origin         confirm the ONE GUI origin the host accepts (asks you to
                            type the review port; or: auth origin <port> · --show)
