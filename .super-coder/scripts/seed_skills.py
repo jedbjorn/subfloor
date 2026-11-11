@@ -295,6 +295,9 @@ def parse_skill(path: Path) -> dict:
     for line in fm.strip().splitlines():
         if ":" in line:
             k, v = line.split(":", 1)
+            # Taken whole, quote characters included: an asset is read only
+            # by the engine, and unquoting here would change stored values
+            # on the next reseed. The render quotes for YAML readers.
             meta[k.strip()] = v.strip()
     if "name" not in meta:
         sys.exit(f"seed_skills: {path} frontmatter missing `name`")
