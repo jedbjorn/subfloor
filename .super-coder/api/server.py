@@ -159,11 +159,11 @@ _STATIC = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     # The sign-in page and the files it loads (Feature #94). These, and
     # `/vendor/qrcode.js`, are the only static files `browser_gate.OPEN_ROUTES`
-    # serves to a visitor who has not signed in; `/style.css` is shared.
+    # serves to a visitor who has not signed in; `/style.css` and `/theme.js`
+    # above are shared with the app shell.
     "/signin.html": ("signin.html", "text/html; charset=utf-8"),
     "/signin.js": ("signin.js", "application/javascript; charset=utf-8"),
     "/signin.css": ("signin.css", "text/css; charset=utf-8"),
-    "/theme.js": ("theme.js", "application/javascript; charset=utf-8"),
 }
 # The pages: each carries the CSP, and the app shell renews the session cookie.
 _PAGES = frozenset(("index.html", "signin.html"))
