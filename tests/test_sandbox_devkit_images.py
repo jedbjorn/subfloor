@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -331,6 +332,13 @@ class SandboxImagePlanTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
+        # `docker_run` creates the session-hash directory under the owner's
+        # state home before it mounts it. Keep that out of the real one.
+        environment = mock.patch.dict(
+            os.environ, {"HOME": str(self.base / "operator-home")})
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("XDG_STATE_HOME", None)
 
     def test_two_installations_share_exact_base_but_not_extension_tag(self):
         left = ImageFixture(self.base, "left").plan()
@@ -1650,6 +1658,10 @@ class LauncherGrammarParityTest(unittest.TestCase):
             # Every optional piece: namespace tmpfs, instance state, the
             # interpreter mount, and the optional environment.
             "every optional mount": ("fork", "home", True),
+            # A comma in the operator's home: the session-hash mount's source
+            # is then one quoted CSV field, which Docker and the guard both
+            # read as that path.
+            "comma in the home": ("fork", "home, of operator", False),
         }
         for label, (name, home_name, optional) in cases.items():
             with self.subTest(label):
@@ -1673,10 +1685,27 @@ class LauncherGrammarParityTest(unittest.TestCase):
                     volumes += ["--mount",
                                 f"type=volume,src={volume.volume_name},dst={target}"]
                 self.assertTrue(volumes)
+                # The one mount of the host auth authority's: the session-hash
+                # directory, read-only, at its fixed place in the sandbox.
+                sessions = (home / ".local" / "state" / "subfloor" / "auth-sessions"
+                            / sandbox_devkit.install_key(fixture.root))
+                source = f"src={sessions}"
+                if "," in source:
+                    source = '"' + source + '"'
+                auth = ["--mount",
+                        f"type=bind,{source},dst=/run/super-coder/auth-sessions,readonly"]
                 self.assertEqual(list(run), [
                     "docker", "run", *expanded[:marker],
                     "--memory", memory, "--memory-swap", memory,
-                    *volumes, *expanded[marker + 1:]])
+                    *volumes, *auth, *expanded[marker + 1:]])
+                # The launcher made it, owner-only, before Docker could (as
+                # root), and the guard reads the mount back as exactly that.
+                self.assertEqual(stat.S_IMODE(sessions.stat().st_mode), 0o700)
+                self.assertIn((str(sessions), True, "/run/super-coder/auth-sessions"),
+                              sandbox_devkit.bind_mounts(run))
+                self.assertEqual(
+                    [target for _s, _ro, target in sandbox_devkit.bind_mounts(run)
+                     ].count("/run/super-coder/auth-sessions"), 1)
                 if "," in name:
                     self.assertIn(',dst="', " ".join(volumes))
                 for relative in sandbox_devkit.HOME_BIND_MOUNTS:

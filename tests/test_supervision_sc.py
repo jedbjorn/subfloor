@@ -814,6 +814,21 @@ class RestrictedLaunchTests(unittest.TestCase):
                          ".local/share/opencode", ".codex", ".vibe", ".kimi-code"):
             self.assertIn(f" -v {home}/{relative}:{home}/{relative} ",
                           calls[run_call], relative)
+        # Of the host auth authority's state the sandbox gets exactly one
+        # thing: the session-hash directory, read-only, at its fixed place.
+        # The launcher made it, as the operator's, before Docker could. The
+        # private state beside it (credentials, sessions) is not mounted.
+        sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
+        import sandbox_devkit
+
+        sessions = sandbox_devkit.auth_sessions_dir(self.fx.root, {"HOME": str(home)})
+        self.assertIn(
+            f" --mount type=bind,src={sessions},dst=/run/super-coder/auth-sessions,"
+            "readonly ", calls[run_call])
+        self.assertEqual(calls[run_call].count("auth-sessions"), 2)
+        self.assertNotIn("/subfloor/engine-ops", calls[run_call])
+        self.assertTrue(sessions.is_dir())
+        self.assertEqual(sessions.stat().st_mode & 0o777, 0o700)
         self.assertGreater(calls.index("engine_ops up"), run_call)
         self.assertIn("→ engine-ops up (fixture)", launched.stdout)
 
