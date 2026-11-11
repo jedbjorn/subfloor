@@ -194,6 +194,7 @@ column.
 | `/api/vm`, `/api/ts`, `/api/pm2` | none | the stored `instance.json` block |
 | `/api/ts/status`, `/api/pm2/status` | none | live tailnet / process view; proxied to the host broker under `SC_SANDBOX`, `503` with the exact `./sc …-broker-up` command when that socket is absent |
 | `/api/browser`, `/api/web-search` | browser operator | config + status. The web-search key itself never crosses this boundary |
+| `/api/engine-ops` | browser operator | where the host-side engine-ops service is: `{port, url, up, up_source, runtime, ops, recovery_cli, start_cli}`. The service itself, not this API, runs update / restart / harness update — see [engine-ops.md](engine-ops.md) |
 | `/api/sprints?lifecycle=&limit=&cursor=` | browser operator | Sprint list. `#view-sprints` |
 | `/api/sprints/{id}` | browser operator | the same board projection shells read at `/_sc/sprint/{id}/board` |
 | `/api/sprints/{id}/events`, `/api/sprints/{id}/summaries` | browser operator | paged by `limit`, `cursor`, `work_unit_id` |
