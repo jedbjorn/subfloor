@@ -473,3 +473,72 @@ const catalogue = (...ids) => ({stale: false, harnesses: {
     assert result["failed"]["title"] == "My chat"
     # first paint, harness change, then one repaint per successful refresh
     assert result["dropdownRefreshes"] == 5
+
+
+# ── Acceptance criterion 5: a forced-stale cache file, end to end ─────────────
+
+@needs_node
+def test_forced_stale_cache_file_reports_stale_and_new_chat_does_not_wait(tmp_path):
+    """The server half and the client half of criterion 5, joined on one payload.
+
+    A cache file older than its TTL is written to temporary state; the function
+    GET /api/models serves answers `stale: true` and asks for a background
+    refresh (stubbed: no network, no live instance). That exact answer is then
+    handed, late, to the real "＋ Chat" handler.
+    """
+    import sys
+    from unittest import mock
+
+    sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
+    sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
+    import model_catalog as mc
+
+    cache = tmp_path / "model_catalog.json"
+    cache.write_text(json.dumps({
+        "v": mc.PAYLOAD_VERSION, "fetched_at": "2020-01-01T00:00:00+00:00",
+        "stale": False, "sources": [], "harnesses": {
+            "codex": {"models": [{"id": "gpt-old", "availability": "available"}]}},
+    }))
+    with mock.patch.object(mc, "CACHE", cache), \
+            mock.patch.object(mc, "_start_background_refresh") as refresh:
+        served = mc.catalog(env={}, opencode_provider=lambda: [])
+    assert served["stale"] is True
+    assert served["stale_reason"] == "ttl"
+    assert refresh.call_count == 1, "a stale read starts the server's own refresh"
+    assert json.loads(cache.read_text())["stale"] is False, "the read does not rewrite the cache"
+
+    script = FAKE_DOM + API + CATALOGUE + WATCH + r"""
+const SERVED = __SERVED__;
+const calls = [], notices = [], timers = [];
+let answerModels;
+function toast(message) { notices.push(message); }
+globalThis.setTimeout = (fn, ms) => { timers.push(ms); };
+globalThis.fetch = (url) => {
+  calls.push(url);
+  return new Promise((resolve) => { answerModels = () => resolve({ok: true, json: async () => SERVED}); });
+};
+const location = {};
+const shell = {shortname: "DEV1"};
+const selectedConversation = null;
+const newChat = {disabled: false, textContent: "＋ Chat"};
+const configure = {disabled: false};
+const chatCloseForSwitch = async () => true;
+const chatWithShellRelease = (run) => run();
+const chatCreateConversation = async () => { calls.push("create"); return {conversation_id: "cv_1"}; };
+const chatHash = (shortname, id) => `interface/${shortname}/${id}`;
+const chatBusyToast = (error) => { throw error; };
+""" + NEW_CHAT + r"""
+(async () => {
+  await newChat.onclick();
+  const created = {calls: [...calls], hash: location.hash, notices: [...notices]};
+  answerModels();                       // the catalogue answers only now
+  for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+  console.log(JSON.stringify({created, notices, timers, adopted: modelCatalogue.stale}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("__SERVED__", json.dumps(served)))
+    assert result["created"] == {"calls": ["/api/models", "create"],
+                                 "hash": "interface/DEV1/cv_1", "notices": []}
+    assert result["notices"] == ["Model catalogue is stale — refreshing in the background."]
+    assert result["timers"] == [3000], "one bounded watch is armed"
+    assert result["adopted"] is True
