@@ -585,6 +585,20 @@ class ShellFactoryTest(unittest.TestCase):
             ).fetchone()[0],
         )
 
+    def test_flavor_prefix_is_reserved_for_pack_references(self) -> None:
+        for shortname in ("flavor:devops", " Flavor:dev "):
+            with self.subTest(shortname=shortname):
+                with self.assertRaisesRegex(ValueError, "flavor:"):
+                    shell_factory.create_shell(
+                        self.con, flavor=None, name="Odd", shortname=shortname
+                    )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM shells WHERE shortname LIKE 'flavor:%'"
+            ).fetchone()[0],
+            0,
+        )
+
     def test_standard_shell_stores_no_per_shell_grants(self) -> None:
         sid = shell_factory.create_shell(
             self.con, flavor="dev", name="Builder"

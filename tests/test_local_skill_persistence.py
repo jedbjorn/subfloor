@@ -326,6 +326,32 @@ class SkillCommandTest(unittest.TestCase):
             self.assertIn("no shell 'devops'", str(raised.exception.code))
         self.assertEqual(self.flavor_grants(), [])
 
+    def test_shell_named_like_a_flavor_ref_is_refused_as_ambiguous(self):
+        """A shell created before the prefix was reserved may be named
+        `flavor:devops`; that ref must not silently move to the pack."""
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO shells (shell_id, shortname, api_key) "
+            "VALUES (7, 'flavor:devops', 'odd-token')")
+        con.commit()
+        con.close()
+        with self.patch_flavors("dev", "devops"):
+            for verb in ("grant", "revoke"):
+                with self.assertRaises(SystemExit) as raised:
+                    skill_mod.main([verb, "loc_b", "flavor:devops"])
+                message = str(raised.exception.code)
+                self.assertIn("ambiguous", message)
+                self.assertIn("'devops' flavor pack", message)
+                self.assertIn("shell 7", message)
+            self.assertEqual(self.flavor_grants(), [])
+            self.assertEqual(self.grants(), [])
+            # The shell stays reachable by id; other flavors are unaffected.
+            self.assertEqual(skill_mod.main(["grant", "loc_b", "7"]), 0)
+            self.assertEqual(self.grants(), [(7, "loc_b")])
+            self.assertEqual(
+                skill_mod.main(["grant", "loc_b", "flavor:dev"]), 0)
+            self.assertEqual(self.flavor_grants(), [("dev", "loc_b")])
+
     def test_one_bad_ref_refuses_the_whole_call(self):
         with self.patch_flavors("dev", "devops"):
             with self.assertRaises(SystemExit):

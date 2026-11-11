@@ -70,6 +70,10 @@ naming a Bespoke shell changes only that shell; `flavor:<name>`, the spelling
 `sc skill list` prints, changes a flavor pack directly, including one with no
 shell. Creation grants nothing.
 
+Frontmatter values in a draft are read as YAML scalars: a quoted description
+is stored without its quotes, a bare one is taken whole, and the stored line
+is what every projection renders.
+
 Planner owns fork-local skill operations via the API lane: on a launched seat
 every `sc skill` verb runs through the engine API, the single writer, with
 identical validation and persistence; if the API is down they refuse rather

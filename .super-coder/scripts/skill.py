@@ -11,6 +11,12 @@ Naming a standard shell targets its shared flavor pack; naming a Bespoke shell
 targets only that shell; `flavor:<name>` targets a flavor pack directly, with
 or without a member shell.
 
+A draft's frontmatter values are read as YAML scalars: a quoted description
+(`description: "Probe for Spec #116"`) is stored without its quotes. A bare
+value is still taken whole. The stored description is one stripped line, and
+every managed projection renders exactly that string, quoted where a YAML
+reader needs it.
+
 The lane is chosen by identity, not by whether the DB happens to open. A
 launched shell (it carries SC_API_TOKEN) always goes through the authenticated
 `/_sc/skills/*` routes on the review API, which run the same validation and
@@ -189,8 +195,23 @@ def known_flavors(con) -> list[str]:
 
 
 def resolve_flavor(con, ref: str) -> str:
-    """`flavor:<name>` → the flavor name. Loud on an unknown flavor."""
+    """`flavor:<name>` → the flavor name. Loud on an unknown flavor.
+
+    A shell whose shortname is literally the ref (shell creation accepted the
+    `flavor:` prefix before it was reserved) makes the ref ambiguous; it is
+    refused rather than silently retargeted from that shell to the pack.
+    """
     name = ref[len(FLAVOR_REF_PREFIX):].strip()
+    clash = con.execute(
+        "SELECT shell_id, shortname FROM shells "
+        "WHERE shortname=? COLLATE NOCASE AND COALESCE(is_deleted,0)=0",
+        (ref,)).fetchone()
+    if clash:
+        sys.exit(
+            f"sc skill: '{ref}' is ambiguous — it names both the '{name}' "
+            f"flavor pack and shell {clash[0]} (shortname '{clash[1]}'). "
+            f"Address the shell by its id ({clash[0]}), or rename the shell "
+            "to address the flavor pack.")
     have = known_flavors(con)
     if name in have:
         return name

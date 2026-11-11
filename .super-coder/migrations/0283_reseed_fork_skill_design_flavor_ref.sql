@@ -1,4 +1,5 @@
--- 0283 — fork_skill_design: `sc skill grant|revoke` accepts `flavor:<name>`.
+-- 0283 — fork_skill_design: `sc skill grant|revoke` accepts `flavor:<name>`;
+-- draft frontmatter values are read as YAML scalars.
 -- Reseed the engine skill body edited after 0001 was applied. No schema
 -- change; the UPDATE by name keeps skill_id and grants. Idempotent.
 
@@ -68,6 +69,10 @@ projections reconcile. Naming a standard shell changes its shared flavor pack;
 naming a Bespoke shell changes only that shell; `flavor:<name>`, the spelling
 `sc skill list` prints, changes a flavor pack directly, including one with no
 shell. Creation grants nothing.
+
+Frontmatter values in a draft are read as YAML scalars: a quoted description
+is stored without its quotes, a bare one is taken whole, and the stored line
+is what every projection renders.
 
 Planner owns fork-local skill operations via the API lane: on a launched seat
 every `sc skill` verb runs through the engine API, the single writer, with
