@@ -1915,3 +1915,30 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .run-receipt { display: grid; gap: .2rem; font-size: .8rem; overflow-wrap: anywhere; }
 .chat-pr-panel { margin-top: .75rem; padding: .5rem; border-top: 1px solid var(--border); }
 .chat-pr-row { padding: .6rem 0; overflow-wrap: anywhere; }
+
+/* ── Drawer contents and model refresh (spec 270) ─────────────────────────
+   Tokens and Models sections of the settings drawer, and the Configure
+   "Refresh models" row. Theme tokens only, so both themes follow. */
+.drawer-tokens {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+  column-gap: var(--space-4); row-gap: var(--space-1); font-size: var(--fs-sm);
+}
+.drawer-tok-name { color: var(--text-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drawer-tok-num { color: var(--ink); text-align: right; font-variant-numeric: tabular-nums; }
+.drawer-tok-head { color: var(--text-low); font-size: var(--fs-label); }
+.drawer-tok-total { color: var(--text-strong); font-weight: 600; }
+.drawer-link { color: var(--accent); font-size: var(--fs-sm); text-decoration: none; justify-self: start; }
+.drawer-link:hover { text-decoration: underline; }
+.drawer-link:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--r-sm); }
+.drawer-model-state { color: var(--ok); font-size: var(--fs-sm); }
+.drawer-model-state.stale { color: var(--warn); }
+.drawer-model-state:empty { display: none; }
+.drawer-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.chat-refresh-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-top: .4rem; }
+.chat-refresh-models {
+  background: none; border: 1px solid var(--line); border-radius: var(--r-sm);
+  color: var(--text-mid); cursor: pointer; font: inherit; font-size: .72rem; padding: .2rem .55rem;
+}
+.chat-refresh-models:hover { border-color: var(--tint-4); color: var(--ink); }
+.chat-refresh-models:disabled { opacity: .5; cursor: default; }
+.chat-refresh-note { color: var(--dim); font-size: .72rem; }
