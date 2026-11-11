@@ -13,6 +13,11 @@ spec #270). A sibling of the [VM and remotes broker](remote-seats.md), the
 [db broker](db-broker.md): a host process with fixed verbs that refuses to run
 in the sandbox. Its boundary is different from theirs, on purpose.
 
+It is also the **host auth authority** (Feature #94, spec #271): it signs the
+operator in to the review GUI and keeps the credentials and sessions, and it
+runs an engine operation only for a signed-in browser. Sign-in is described in
+[auth.md](auth.md); this page covers the service and the engine operations.
+
 ## Why a separate host service
 
 The three verbs replace or bounce the engine, and they are host commands:
@@ -35,8 +40,18 @@ these verbs replace the engine.
 
 **Transport.** The service listens on its own host loopback TCP port
 (`127.0.0.1` only, never configurable). `./sc launch` publishes the review port
-and the dev port into the container and nothing else, so the sandbox has no
-route to it. The browser, which is on the host, calls it directly.
+and the dev port into the container and nothing else, so on the launcher's own
+network the sandbox has no route to it. The browser, which is on the host,
+calls it directly.
+
+**Reaching the port is not enough.** That isolation is the launcher's default,
+not a guarantee: a sandbox launched on the host's network (`SC_NET=host`)
+shares the host's loopback and can connect, and it can write any `Host` and
+`Origin` header it likes. So the service does not rely on it. `GET /status`
+and every `POST /ops/*` need a signed-in session, checked against the private
+state below, and the sandbox only ever sees hashes of session tokens
+([auth.md](auth.md#where-credentials-live)). Such a request without the
+session is `401 sign_in_required` and starts nothing.
 
 **State.** On the docker runtime the whole checkout is bind-mounted writable
 into the sandbox, so `instance.json`, `run/`, and `logs/` are all
@@ -95,6 +110,7 @@ names the offending path. It holds:
 | File | What |
 |---|---|
 | `config.json` | the pinned `{port, gui_port, pinned_at}` |
+| `auth.json`, `auth.lock` | the sign-in credential store and its lock ([auth.md](auth.md#where-credentials-live)) |
 | `service.json` | the running service's pid, kernel start time, and port |
 | `service.log` | the service's own output |
 | `engine-op.json` | the current or last operation |
@@ -131,46 +147,67 @@ against the sandbox either; it is one against other web origins.
 | `Host` is `127.0.0.1:<port>` or `localhost:<port>` for this service's port | `403 loopback_host_required` |
 | No `Authorization` header at all. A shell Bearer token is refused; the browser operator carries none | `403 fnb_operator_required` |
 | `POST` and `OPTIONS`: `Origin` is present and is the pinned GUI origin (`http://127.0.0.1:<pinned port>` or `http://localhost:<pinned port>`) | `403 same_origin_required` |
-| A GUI origin has been pinned (see below) | `POST`: `409 gui_origin_unpinned`; `GET /status`: `200 {pinned: false, reason, pin_cli}` |
+| A GUI origin has been pinned (see below) | `POST`: `409 gui_origin_unpinned`; `GET /status`: `200 {pinned: false, reason, pin_cli, setup_cli}` |
 | `GET`: `Origin` may be absent; a present `Origin` must be the GUI origin | `403 same_origin_required` |
 | `Sec-Fetch-Site` is not `cross-site` | `403 same_origin_required` |
+| `GET /status`, `POST /ops/*`, and the session routes under `/auth/`: a valid session cookie, on a request whose `Origin` is the pinned GUI origin | `401 sign_in_required` |
+
+The checks run in that order, so a foreign origin is refused before any
+cookie is looked at, and a request with no session learns nothing: not the
+status, and not whether an operation name exists.
 
 CORS headers (`Access-Control-Allow-Origin: <the GUI origin>`, `Vary: Origin`)
-are sent only when the request's `Origin` is the GUI origin; no wildcard, no
-credentials. A preflight from that origin gets `204` with `GET, POST, OPTIONS`
-and `Content-Type`; from anywhere else, `403` with no CORS headers.
+are sent only when the request's `Origin` is the GUI origin; no wildcard.
+`Access-Control-Allow-Credentials: true` is added for the pinned GUI origin
+and never for the answers any loopback page may read while unpinned. A
+preflight from the GUI origin gets `204` with `GET, POST, OPTIONS` and
+`Content-Type`; from anywhere else, `403` with no CORS headers.
 
 ## The GUI origin is pinned by the operator
 
 The service accepts operations from exactly one origin, and it never takes
 that origin from the checkout: on docker the sandbox can write `instance.json`
 and could name its own dev server as "the GUI". It is pinned by an explicit
-act in a host terminal:
+act in a host terminal. Creating the GUI user is that act, so an install gets
+its pin and its first user in one step:
 
-    ./sc engine-ops-pin           # shows what instance.json suggests and asks
-                                  # you to TYPE the review GUI's port
-    ./sc engine-ops-pin 8837      # the same act, non-interactively
-    ./sc engine-ops-pin --show    # what is pinned now (exit 1 if nothing is)
+    ./sc auth user add <username>             # shows what instance.json suggests,
+                                              # asks you to TYPE the review GUI's
+                                              # port, then creates the user
+    ./sc auth user add <username> --port 8837 # the same, non-interactively
+
+and the origin can be confirmed again by itself, after a review-port change:
+
+    ./sc auth origin           # asks you to type the review GUI's port
+    ./sc auth origin 8837      # the same act, non-interactively
+    ./sc auth origin --show    # what is pinned now (exit 1 if nothing is)
+
+`./sc engine-ops-pin` is `./sc auth origin` under its first name and still
+works.
 
 At a terminal the suggestion is displayed with a warning about where it came
-from; pressing Enter, or typing anything but a port, pins nothing. Without a
-terminal the port must be given as the argument. The pin takes effect
-immediately, with no service restart, and `./sc launch` / `./sc engine-ops-up`
-print what is pinned every time.
+from; typing anything but a port pins nothing (in `auth user add`, Enter keeps
+a port that is already pinned). Without a terminal the port must be given.
+The pin takes effect immediately, with no service restart, and `./sc launch` /
+`./sc engine-ops-up` print what is pinned every time.
 
 **Until a pin exists** — which is the state of every install after the update
 that introduces this service — the service runs but starts nothing:
 
 - `GET /status` answers `200 {ok, service, pinned: false, gui_origin: null,
-  pin_cli: "./sc engine-ops-pin", reason, running: false, operation: null}`.
-- every `POST /ops/*` answers `409 gui_origin_unpinned` with the same reason.
-- those two answers carry no state, so any loopback page may read them; that
-  is what lets the GUI show the reason and the command.
+  pin_cli: "./sc auth origin", setup_cli: "./sc auth user add <username>",
+  reason, running: false, operation: null}`.
+- every `POST`, under `/ops/` and under `/auth/`, answers
+  `409 gui_origin_unpinned` with the same reason. Nobody can sign in.
+- those answers carry no state, so any loopback page may read them (without
+  credentials); that is what lets the GUI show the reason and the command.
 
 Being answered is not being authorised. Whether an operation starts, and
 whether the full status is returned, is decided in one place
 (`engine_ops.start`, `engine_ops.status`, both through
-`engine_ops.origin_allowed`) against the pin as it is at that moment. A request
+`engine_ops.origin_allowed`) against the pin as it is at that moment, and
+then against the session: both functions ask the caller's `signed_in` after
+the origin decision and refuse when it is missing or says no. A request
 that arrived before the pin and reaches that point after it is judged against
 the pin like any other: a foreign origin gets `403 same_origin_required` and
 starts nothing.
@@ -219,18 +256,27 @@ On the service, all JSON:
 
 | Method + path | What it does |
 |---|---|
-| `GET /health` | `{ok, service: "engine-ops"}` — liveness of the service |
-| `GET /status` | `{ok, service, pinned, gui_origin, pin_cli, runtime, ops, recovery_cli, running, operation, log_tail, log_truncated, log_tail_limit, engine_ref, live_sessions}`; before a pin, only `{ok, service, pinned: false, gui_origin, pin_cli, reason, running, operation}` |
-| `POST /ops/update` · `/ops/restart` · `/ops/update-harnesses` | start one operation, detached. `202 {started, operation}` |
+| `GET /health` | `{ok, service: "engine-ops"}` — liveness of the service. No session needed |
+| `GET /auth/status` and the other `/auth/*` routes | sign-in, first sign-in, sign-out, devices: [auth.md](auth.md#routes). `GET /auth/status` needs no session and is how the GUI learns whether to show the sign-in page |
+| `GET /status` | **session.** `{ok, service, pinned, gui_origin, pin_cli, runtime, ops, recovery_cli, running, operation, log_tail, log_truncated, log_tail_limit, engine_ref, live_sessions}`; before a pin, only `{ok, service, pinned: false, gui_origin, pin_cli, setup_cli, reason, running, operation}` |
+| `POST /ops/update` · `/ops/restart` · `/ops/update-harnesses` | **session.** Start one operation, detached. `202 {started, operation}` |
 | `OPTIONS *` | CORS preflight |
 
+`GET /status` and `POST /ops/*` answer `401 sign_in_required` (with
+`details.auth_status: "/auth/status"`) without a valid session. With one,
 `POST` answers `404 unknown_engine_op` (with the list of operations) for
 anything else under `/ops/`, `409 gui_origin_unpinned` before a pin,
 `409 engine_op_running` with the running `operation` when one is in flight,
 and `500 engine_op_start_failed` when the runner could not be started.
 
-**The verb table is fixed.** The path segment selects a row; the request body
-and query string are never read, so no request field reaches a command line:
+A caller sends the session cookie by making the request with credentials
+(`fetch(url, {credentials: "include"})`); nothing else about the two routes
+changed. No fresh authenticator code is asked for an operation: a signed-in
+session and the GUI's typed confirmation are enough.
+
+**The verb table is fixed.** The path segment selects a row; for `/ops/*` the
+request body and query string are never read, so no request field reaches a
+command line:
 
 | Operation | Command, run from the main checkout |
 |---|---|
@@ -325,7 +371,8 @@ poll the review API's `/api/health` until it answers, re-read
     ./sc engine-ops-up       # background; no-op if already up
     ./sc engine-ops-down     # stop the backgrounded service
     ./sc engine-ops-port     # print its port
-    ./sc engine-ops-pin      # pin the GUI origin it accepts (see above)
+    ./sc auth origin         # pin the GUI origin it accepts (see above;
+                             # `./sc engine-ops-pin` is the same verb)
 
 `./sc launch` brings it up under both runtimes and `./sc down` stops it.
 `./sc restart` reports it in its health summary as an advisory line only: a
@@ -348,8 +395,8 @@ manual step. There is no signal-by-number fallback.
 with its own exit code unchanged; the service is left running.
 
 It refuses to start when `SC_SANDBOX` is set or a container marker is present,
-and every `engine-ops*` verb refuses from a linked worktree, which has no
-instance of its own.
+and every `engine-ops*` and `auth` verb refuses from a linked worktree, which
+has no instance of its own.
 
 It has no systemd install form. After a reboot, `./sc launch` starts it.
 
@@ -360,8 +407,8 @@ It has no systemd install form. After a reboot, `./sc launch` starts it.
   like the other brokers; `./sc restart` loads the new code.
 - When the service is not running the GUI cannot start it: the controls render
   disabled and show the CLI command.
-- Nothing works from the GUI until the operator has run `./sc engine-ops-pin`
-  once. If the review port changes, the pin does not follow by itself; pin
-  again.
+- Nothing works from the GUI until the operator has run
+  `./sc auth user add <username>` once and signed in. If the review port
+  changes, the pin does not follow by itself; run `./sc auth origin`.
 - A browser on another machine cannot reach it. The GUI is loopback-only and
   so is this.
