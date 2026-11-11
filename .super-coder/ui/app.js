@@ -333,6 +333,127 @@ function openEditModal({ title, value, onSave }) {
   ta.focus();
 }
 
+// Slide-over drawer (spec #270): one panel entering from the right, the
+// sibling of openModal. Its overlay is a .modal-overlay carrying closeModal,
+// so the single Esc handler at boot closes it topmost-first with no second
+// listener; a mousedown on the backdrop closes it too. `sections` is an
+// ordered list of { id, label, render }: each becomes a labelled block whose
+// body element carries the id, so a caller (or a later lane) fills the mount
+// with replaceChildren without touching the label. render(mount, { close })
+// is optional — a section without one stays empty but labelled.
+// onClose runs once, on every close path. Returns the close function.
+// Keyboard focus stays inside the panel while it is open: Tab from the last
+// control wraps to the first, Shift+Tab from the first wraps to the last, and
+// a Tab that starts outside the panel is pulled in.
+const DRAWER_FOCUSABLE = "button, [href], input, select, textarea, [tabindex]";
+function openDrawer({ title, sections = [], width = 380, onClose }) {
+  const priorFocus = document.activeElement;
+  const overlay = el("div", { className: "modal-overlay drawer-overlay" });
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    overlay.remove();
+    if (onClose) onClose();
+    if (priorFocus?.isConnected && typeof priorFocus.focus === "function") priorFocus.focus();
+  };
+  overlay.closeModal = close;
+  overlay.onmousedown = (e) => { if (e.target === overlay) close(); };
+  const panel = el("aside", { className: "drawer" });
+  overlay.onkeydown = (e) => {
+    if (e.key !== "Tab") return;
+    const stops = [...panel.querySelectorAll(DRAWER_FOCUSABLE)].filter((node) =>
+      !node.disabled && node.tabIndex !== -1 && !node.closest?.("[hidden]"));
+    const first = stops[0], last = stops[stops.length - 1];
+    const active = document.activeElement;
+    let target = null;
+    if (!stops.length) target = panel;
+    else if (!panel.contains(active)) target = e.shiftKey ? last : first;
+    else if (e.shiftKey && active === first) target = last;
+    else if (!e.shiftKey && active === last) target = first;
+    if (!target) return;
+    e.preventDefault();
+    target.focus();
+  };
+  panel.tabIndex = -1;
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", "drawer-title");
+  panel.style.width = width + "px";
+  const dismiss = el("button", { className: "drawer-close", type: "button", textContent: "✕" });
+  dismiss.setAttribute("aria-label", "Close drawer");
+  dismiss.onclick = close;
+  const body = el("div", { className: "drawer-body" });
+  for (const section of sections) {
+    const mount = el("div", { className: "drawer-mount", id: section.id });
+    body.append(el("section", { className: "drawer-section" },
+      el("h3", { className: "drawer-label" }, section.label), mount));
+    if (section.render) {
+      try { section.render(mount, { close }); }
+      catch (e) { mount.replaceChildren(el("div", { className: "drawer-note" }, "error: " + e.message)); }
+    }
+  }
+  panel.append(
+    el("div", { className: "drawer-head" },
+      el("div", { className: "drawer-title", id: "drawer-title" }, title), dismiss),
+    body);
+  overlay.append(panel);
+  document.body.append(overlay);
+  dismiss.focus();
+  return close;
+}
+
+// The operator's settings drawer: four mounts in a fixed order. This lane
+// fills Appearance; Tokens, Models and Engine are filled by assigning a
+// render(mount, { close }) function to their entry in DRAWER_SECTIONS.
+const DRAWER_SECTIONS = [
+  { id: "drawer-appearance", label: "Appearance", render: renderDrawerAppearance },
+  { id: "drawer-tokens", label: "Tokens", render: null },
+  { id: "drawer-models", label: "Models", render: null },
+  { id: "drawer-engine", label: "Engine", render: null },
+];
+// The header button toggles: a second press closes the open drawer.
+let closeSettingsDrawer = null;
+function openSettingsDrawer() {
+  if (closeSettingsDrawer) { closeSettingsDrawer(); return; }
+  closeSettingsDrawer = openDrawer({
+    title: "Settings", sections: DRAWER_SECTIONS,
+    onClose: () => { closeSettingsDrawer = null; },
+  });
+}
+
+// Appearance: System | Light | Dark. theme.js owns storage and the pre-paint
+// application (window.scTheme); this is only the control.
+const THEME_CHOICES = [["system", "System"], ["light", "Light"], ["dark", "Dark"]];
+function renderDrawerAppearance(mount) {
+  const theme = window.scTheme;
+  const group = el("div", { className: "filters seg theme-choice" });
+  group.setAttribute("role", "radiogroup");
+  group.setAttribute("aria-label", "Theme");
+  const note = el("div", { className: "drawer-note" });
+  const paint = () => {
+    const picked = theme ? theme.choice() : "system";
+    for (const b of group.children) {
+      const on = b.dataset.theme === picked;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-checked", String(on));
+    }
+    note.textContent = !theme ? "Theme control unavailable: theme.js did not load."
+      : picked === "system" ? `Following the system setting (${theme.resolved()}).`
+      : "Saved in this browser.";
+  };
+  for (const [value, label] of THEME_CHOICES) {
+    const b = el("button", { className: "chip", type: "button", textContent: label });
+    b.dataset.theme = value;
+    b.setAttribute("role", "radio");
+    b.disabled = !theme;
+    b.onclick = () => { theme.set(value); paint(); };
+    group.append(b);
+  }
+  paint();
+  mount.replaceChildren(group, note);
+}
+
 // Read-only skill-content viewer — 800×650, rendered markdown with a raw
 // toggle bottom-left, char/~token readout in the header.
 async function openSkillContentModal(skill) {
@@ -7959,7 +8080,16 @@ function setDocumentTitle(tab) {
 }
 function show(tab) {
   activeTab = tab;
-  for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b.dataset.tab === tab);
+  // A view in the More group marks its trigger too, so the header always
+  // shows where you are while the menu is closed.
+  let inMore = false;
+  for (const b of document.querySelectorAll("nav button")) {
+    const on = b.dataset.tab === tab;
+    b.classList.toggle("active", on);
+    if (on && b.closest(".nav-more")) inMore = true;
+  }
+  for (const b of document.querySelectorAll(".nav-more-btn")) b.classList.toggle("active", inMore);
+  setNavMore(false);
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "interface") {
@@ -7972,6 +8102,12 @@ function show(tab) {
   if (tab !== "sprints") sprintStopPolling();
   setDocumentTitle(tab);
   load(tab);
+}
+// The More group: a popover of the secondary views. It is a .gmenu, so the
+// outside-click handler at boot closes it; this keeps aria-expanded honest.
+function setNavMore(open) {
+  for (const menu of document.querySelectorAll(".nav-more-menu")) menu.hidden = !open;
+  for (const b of document.querySelectorAll(".nav-more-btn")) b.setAttribute("aria-expanded", String(open));
 }
 // Hash routing: the active tab lives in the URL (#roadmap), so a refresh stays
 // put (and re-fetches that tab) instead of snapping back to Shells. Tabs set the
@@ -8045,6 +8181,7 @@ document.addEventListener("visibilitychange", () => {
 document.addEventListener("mousedown", (e) => {
   for (const m of document.querySelectorAll(".gmenu:not([hidden])"))
     if (!m.parentElement.contains(e.target)) m.hidden = true;
+  if ($("#nav-more-menu").hidden) $("#nav-more").setAttribute("aria-expanded", "false");
 });
 // Esc dismisses the topmost modal.
 document.addEventListener("keydown", (e) => {
@@ -8063,6 +8200,16 @@ $("#snapshot").onclick = async () => {
   }
   catch (e) { toast("error: " + e.message); }
 };
+// Header chrome (spec #270): the More trigger and the settings drawer button.
+// The More trigger has no data-tab, so the nav-wide handler above is replaced.
+$("#nav-more").onclick = () => setNavMore($("#nav-more-menu").hidden);
+$("#nav-more-menu").addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  e.stopPropagation();
+  setNavMore(false);
+  $("#nav-more").focus();
+});
+$("#drawer-open").onclick = openSettingsDrawer;
 (async () => {
   try {
     const h = await api("/health");

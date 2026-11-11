@@ -4,6 +4,8 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Subfloor — review</title>
+  <meta name="color-scheme" content="dark light" />
+  <script src="/theme.js"></script>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -13,20 +15,24 @@
       <button data-tab="interface">Chats</button>
       <button data-tab="sprints">Sprints</button>
       <button data-tab="shells" class="active">Shells</button>
-      <span class="navsep"></span>
       <button data-tab="roadmap">Roadmap</button>
       <button data-tab="docs">Documents</button>
       <button data-tab="flags">Flags</button>
       <span class="navsep"></span>
-      <button data-tab="worktrees">Worktrees</button>
-      <button data-tab="map">Repo Map</button>
-      <span class="navsep"></span>
-      <button data-tab="analytics">Analytics</button>
-      <button data-tab="scripts">Scripts</button>
+      <div class="nav-more">
+        <button type="button" id="nav-more" class="nav-more-btn" aria-haspopup="true" aria-expanded="false" aria-controls="nav-more-menu">More<span aria-hidden="true">▾</span></button>
+        <div id="nav-more-menu" class="gmenu nav-more-menu" hidden>
+          <button data-tab="worktrees">Worktrees</button>
+          <button data-tab="map">Repo Map</button>
+          <button data-tab="analytics">Analytics</button>
+          <button data-tab="scripts">Scripts</button>
+        </div>
+      </div>
     </nav>
     <div class="tools">
       <span id="status" class="status"></span>
       <button id="snapshot" title="save the DB snapshot and flat renders under ignored .sc-state/local/">save locally ⤓</button>
+      <button type="button" id="drawer-open" aria-haspopup="dialog" aria-label="Open settings drawer" title="Settings: appearance, tokens, models, engine">☰</button>
     </div>
   </header>
   <main>

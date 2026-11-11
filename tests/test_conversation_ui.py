@@ -703,7 +703,8 @@ console.log(JSON.stringify({ future, expired, malformed }));
         STYLE.index(".chat-shell-wake {"):
         STYLE.index("}", STYLE.index(".chat-shell-wake {")) + 1
     ]
-    assert "color: #ef545f" in wake_style
+    assert "color: var(--danger-strong)" in wake_style
+    assert "--danger-strong: #ef545f;" in STYLE
 
 
 def test_pending_wake_indicator_refreshes_without_a_new_polling_loop():
@@ -2458,7 +2459,8 @@ def test_history_card_has_independent_durable_star_button():
     assert 'button.textContent = starred ? "★" : "☆"' in interface
     assert 'button.setAttribute("aria-pressed", String(starred))' in interface
     assert ".chat-history-star:hover, .chat-history-star.starred" in STYLE
-    assert "color: #f4cf4a; opacity: 1;" in STYLE
+    assert "color: var(--star); opacity: 1;" in STYLE
+    assert "--star: #f4cf4a;" in STYLE
 
 
 def test_working_state_is_plain_animated_transcript_text_not_a_header_pill():
@@ -2493,7 +2495,8 @@ def test_shell_accent_colors_cover_idle_working_waiting_and_error_states():
     assert ".chat-shell.state-queued," in STYLE
     assert ".chat-shell.state-running," in STYLE
     assert ".chat-shell.state-waiting { --shell-state-color: var(--accent); }" in STYLE
-    assert ".chat-shell.state-error { --shell-state-color: #ef7d86; }" in STYLE
+    assert ".chat-shell.state-error { --shell-state-color: var(--danger); }" in STYLE
+    assert "--danger: #ef7d86;" in STYLE
 
 
 def test_redline_chat_text_is_one_pixel_larger():

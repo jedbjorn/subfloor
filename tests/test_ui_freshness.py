@@ -47,6 +47,7 @@ class ServedAssetTestCase(unittest.TestCase):
         self.ui = Path(self.tmp.name)
         (self.ui / "app.js").write_text("console.log('v1');\n")
         (self.ui / "style.css").write_text("body { color: red; }\n")
+        (self.ui / "theme.js").write_text("document.documentElement.dataset.theme = 'dark';\n")
         (self.ui / "index.html").write_text("<!doctype html><title>v1</title>")
         patch = mock.patch.object(server, "UI_DIR", self.ui)
         patch.start()
@@ -98,7 +99,7 @@ class ServedAssetFreshnessTest(ServedAssetTestCase):
     # -- the validator exists at all -----------------------------------------
 
     def test_every_served_asset_carries_a_validator_and_must_revalidate(self):
-        for path in ("/", "/index.html", "/app.js", "/style.css"):
+        for path in ("/", "/index.html", "/app.js", "/theme.js", "/style.css"):
             with self.subTest(path=path):
                 status, headers, body = self.get(path)
                 self.assertEqual(status, 200)
@@ -151,6 +152,7 @@ class ServedAssetFreshnessTest(ServedAssetTestCase):
         rewrites a file byte-identically must not force a re-download."""
         _, first, _ = self.get("/style.css")
         (self.ui / "style.css").write_text("body { color: red; }\n")
+        (self.ui / "theme.js").write_text("document.documentElement.dataset.theme = 'dark';\n")
         status, _, _ = self.get("/style.css",
                                 {"If-None-Match": first["ETag"]})
         self.assertEqual(status, 304)
