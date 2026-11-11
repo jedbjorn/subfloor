@@ -21,6 +21,7 @@ import sprint_board
 import route_bindings
 from github_pull_requests import PullRequest
 from sprint_route_binding_support import candidate as route_candidate
+from signin_fixture import sign_in
 
 _DYNAMIC_EVENT_CALLS = {
     ("sprint_domain.py", "f'lifecycle.{target}'"): {"lifecycle.completed"},
@@ -91,6 +92,7 @@ class SprintBoardApiCase(unittest.TestCase):
             con.row_factory = sqlite3.Row
             apply_schema(con)
             self.ids = self._seed(con)
+        self.browser = sign_in(self)
 
     @staticmethod
     def _seed(con: sqlite3.Connection) -> dict[str, int]:
@@ -321,8 +323,8 @@ class SprintBoardApiCase(unittest.TestCase):
         con.execute("PRAGMA foreign_keys=ON")
         return con
 
-    @staticmethod
     def _headers(
+        self,
         authorization: str | None = None,
         *,
         body: bytes = b"",
@@ -331,6 +333,9 @@ class SprintBoardApiCase(unittest.TestCase):
         lines = ["Host: 127.0.0.1:8800", f"Content-Length: {len(body)}"]
         if authorization:
             lines.append(f"Authorization: Bearer {authorization}")
+        else:
+            # The operator is a signed-in browser (Feature #94).
+            lines.append(f"Cookie: {self.browser.cookie}")
         for name, value in (extra or {}).items():
             lines.append(f"{name}: {value}")
         return "\r\n".join(lines) + "\r\n"
@@ -1074,9 +1079,10 @@ class SprintBoardApiCase(unittest.TestCase):
         self.assertEqual(status, 403, body)
         self.assertEqual("fnb_operator_required", body["error"]["code"])
 
+        # A credential nobody issued is no credential: the gate's one answer.
         status, _, body = self.request("GET", "/api/sprints", "wrong-token")
         self.assertEqual(status, 401, body)
-        self.assertEqual("unauthorized", body["error"]["code"])
+        self.assertEqual("sign_in_required", body["error"]["code"])
 
     def test_browser_reads_exact_bound_revision_without_current_substitution(self):
         with self.connect() as con:

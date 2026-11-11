@@ -55,6 +55,8 @@ from unittest import mock
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "api"))
 import server  # noqa: E402  (adds scripts/ to the path on import)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from signin_fixture import sign_in  # noqa: E402
 import auth_sessions  # noqa: E402
 import engine_ops  # noqa: E402
 import engine_ops_service  # noqa: E402
@@ -2115,6 +2117,7 @@ class ReviewApiDiscoveryTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("SC_SANDBOX", None)
+        self.browser = sign_in(self)
 
     def connect(self):
         con = sqlite3.connect(self.db_path)
@@ -2125,6 +2128,9 @@ class ReviewApiDiscoveryTest(unittest.TestCase):
         lines = ["Host: 127.0.0.1:8800", "Content-Length: 0"]
         if token:
             lines.append(f"Authorization: Bearer {token}")
+        else:
+            # The operator is a signed-in browser (Feature #94).
+            lines.append(f"Cookie: {self.browser.cookie}")
         status, _headers, out = server.dispatch_http(
             "GET", path, "\r\n".join(lines), b"")
         return status, json.loads(out)
@@ -2191,8 +2197,15 @@ class ReviewApiDiscoveryTest(unittest.TestCase):
             status, _headers, _out = server.dispatch_http(
                 method, path,
                 "Host: 127.0.0.1:8800\r\nContent-Length: 0\r\n"
+                f"Cookie: {self.browser.cookie}\r\n"
                 "Origin: http://127.0.0.1:8800", b"")
             self.assertEqual(status, 404, (method, path))
+            # And without a session the gate answers before any route could.
+            status, _headers, _out = server.dispatch_http(
+                method, path,
+                "Host: 127.0.0.1:8800\r\nContent-Length: 0\r\n"
+                "Origin: http://127.0.0.1:8800", b"")
+            self.assertEqual(status, 401, (method, path))
 
     def test_csp_names_the_service_origin_and_nothing_wider(self):
         base = server._csp(8800)

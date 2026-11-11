@@ -107,6 +107,9 @@ To reproduce after provisioning the dedicated clone:
 4. Run `python maintainer/capture_public_docs.py --port 8824 --output <gallery>`
    using the isolated Playwright interpreter. The helper verifies the fixture's
    health identity, waits for real page content, and expands the Board feature.
+   The helper cannot capture an instance that requires GUI sign-in: it has no
+   operator session, so it stops with a message naming flag SC-1602 before
+   opening a page.
 5. Review the gallery and terminal frames before copying the five browser PNGs
    into `docs/images`. Never substitute another running fork's private data.
 

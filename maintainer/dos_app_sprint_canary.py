@@ -18,6 +18,12 @@ The command is intentionally conservative:
 
 The live canary is intentionally not run in CI.  Hermetic tests inject the
 backend at the controller boundary and prove orchestration and failure cleanup.
+
+Limitation (flag SC-1602): the canary plays the browser operator over HTTP
+with no session.  An install that requires GUI sign-in (Feature #94) refuses
+that, so the canary stops as soon as the isolated runtime answers, with
+``CANARY_SIGN_IN_REQUIRED``, and cleans up.  It cannot run against such a
+candidate until it is given an operator session.
 """
 
 from __future__ import annotations
@@ -41,6 +47,9 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import signin_guard  # noqa: E402  (one message for every maintainer tool)
 
 RECEIPT_VERSION = 1
 WORKSPACE_PREFIX = "subfloor-dos-app-canary-"
@@ -402,6 +411,21 @@ class CommandRunner:
         return result
 
 
+def sign_in_required_error() -> CanaryError:
+    """The one failure for an install that requires GUI sign-in (SC-1602)."""
+    return CanaryError(
+        "CANARY_SIGN_IN_REQUIRED",
+        signin_guard.message("dos-app Sprint canary"),
+        details={"flag": signin_guard.FLAG},
+    )
+
+
+def require_operator_api(base_url: str, *, opener=urllib.request.urlopen) -> None:
+    """Stop before any operator route is called on an install with sign-in."""
+    if signin_guard.requires_sign_in(base_url, opener=opener):
+        raise sign_in_required_error()
+
+
 class JsonHttp:
     def __init__(self, base_url: str, deadline: Deadline) -> None:
         self.base_url = base_url.rstrip("/")
@@ -429,6 +453,8 @@ class JsonHttp:
                 decoded = json.loads(response.read() or b"{}")
         except urllib.error.HTTPError as exc:
             payload = exc.read().decode(errors="replace")
+            if exc.code == 401 and '"sign_in_required"' in payload:
+                raise sign_in_required_error() from exc
             raise CanaryError(
                 "CANARY_API_FAILED",
                 f"{method} {path} returned HTTP {exc.code}",
@@ -947,6 +973,9 @@ class HostBackend:
                 pass
             self.deadline.remaining()
             self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
+        # The runtime answers. Before anything is created in it: can this
+        # canary act as its operator at all? (flag SC-1602)
+        require_operator_api(api.base_url)
         status = self._run(
             [str(facts.workspace / "sc"), "harness-status"],
             cwd=facts.workspace,

@@ -32,8 +32,11 @@ ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 SCRIPTS = ENGINE / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+if str(ENGINE / "api") not in sys.path:
+    sys.path.insert(0, str(ENGINE / "api"))
 
 import active_chat_registry
+import browser_gate
 import conversation_broker
 import conversation_events
 import conversation_git_targets
@@ -54,10 +57,7 @@ _SIGNAL_GROUP = os.killpg
 _ALLOWED_HOST_SET = frozenset(("127.0.0.1", "localhost", "::1"))
 # The confusion every shell-facing browser refusal prevents, named first
 # (Feature #91 E5/E6); server.py reuses it for the browser profile routes.
-BROWSER_OWNERSHIP_CONFUSION = (
-    "the browser profile and its chats belong to the operator; a shell drives, "
-    "it does not own"
-)
+BROWSER_OWNERSHIP_CONFUSION = browser_gate.BROWSER_OWNERSHIP_CONFUSION
 _BROWSER_HARNESSES = tuple(sorted(ADAPTER_TYPES))
 _BROWSER_HARNESS_SQL = ",".join("?" for _ in _BROWSER_HARNESSES)
 _CONVERSATION_STATES = frozenset(
@@ -232,11 +232,21 @@ def _operator(con, headers) -> dict:
             f"{BROWSER_OWNERSHIP_CONFUSION}: conversations are owned by the "
             "browser operator",
         )
-    row = con.execute(
-        "SELECT user_id,username FROM users WHERE is_active=1 ORDER BY user_id LIMIT 1"
+    # No Authorization header proves nothing (Feature #94): the operator is
+    # the user a verified session cookie belongs to, and nobody else.
+    session = browser_gate.operator_session(
+        headers,
+        lambda user_id: con.execute(
+            "SELECT 1 FROM users WHERE user_id=? AND is_active=1", (user_id,)
+        ).fetchone() is not None,
+    )
+    row = None if session is None else con.execute(
+        "SELECT user_id,username FROM users WHERE user_id=?",
+        (session["user_id"],),
     ).fetchone()
     if row is None:
-        raise ApiError(503, "OPERATOR_UNAVAILABLE", "no active operator exists")
+        payload = browser_gate.sign_in_required_payload()["error"]
+        raise ApiError(401, payload["code"], payload["message"], payload["details"])
     return {"user_id": int(row["user_id"]), "username": row["username"]}
 
 
@@ -3154,10 +3164,51 @@ def _stream_authorize(headers_raw: str, conversation_id: str):
     con = _db()
     try:
         operator = _operator(con, headers)
+        # The stream bypasses `dispatch_http`, so the gate's origin rule for
+        # a signed-in `GET /api/*` is applied here.
+        if not browser_gate.site_ok("GET", "/api/conversations", headers):
+            raise ApiError(
+                403, "NOT_SAME_ORIGIN", "cross-site conversation stream rejected"
+            )
         _require_conversation(con, conversation_id, operator["user_id"])
     finally:
         con.close()
     return headers
+
+
+def _active_user(user_id: int) -> bool:
+    """Whether a session's user is an active engine user (for the gate)."""
+    con = _db()
+    try:
+        return con.execute(
+            "SELECT 1 FROM users WHERE user_id=? AND is_active=1", (user_id,)
+        ).fetchone() is not None
+    finally:
+        con.close()
+
+
+def _stream_still_signed_in(headers) -> bool:
+    """An open stream's authorisation point (Feature #94).
+
+    A stream outlives the request that opened it, so the gate's one decision
+    (`browser_gate.operator_session`: the cookie still verifies AND its user
+    is still an active engine user) is made again at every turn of the loop:
+    before each batch of events is read, and after each wait. A revoked
+    session or a deactivated user therefore ends an open stream at its next
+    event or its next heartbeat, whichever comes first. If the check cannot
+    run, the stream ends: undecided is refused.
+    """
+    try:
+        return browser_gate.operator_session(headers, _active_user) is not None
+    except Exception:  # noqa: BLE001 — undecided is refused
+        return False
+
+
+_STREAM_SIGNED_OUT = (
+    "event: " + browser_gate.SIGN_IN_REQUIRED + "\ndata: "
+    + json.dumps(browser_gate.sign_in_required_payload(), separators=(",", ":"))
+    + "\n\n"
+).encode()
 
 
 def _after_sequence(query, headers) -> int:
@@ -3267,6 +3318,12 @@ async def stream_events(
     await writer.drain()
     try:
         while True:
+            if not await asyncio.to_thread(_stream_still_signed_in, headers):
+                # Named, so the page can tell "signed out" from "offline";
+                # its reconnect then meets the gate's 401.
+                writer.write(_STREAM_SIGNED_OUT)
+                await writer.drain()
+                break
             observed = conversation_events.generation(conversation_id)
             events = await asyncio.to_thread(_event_batch, conversation_id, after)
             if events:

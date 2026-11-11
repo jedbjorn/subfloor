@@ -14,8 +14,9 @@ Two halves, one contract:
 
 The trust boundary is the real artifact, never a path: neither half may follow
 a symlink planted at the artifact name — discovery refuses it, provisioning
-replaces it — and `./sc token` gives the two refusal classes distinct nonzero
-exit statuses (1 nothing-to-read, 2 unsafe artifact; spec doc #30 req 23).
+replaces it — and discovery gives the two refusal classes distinct nonzero
+exit statuses (1 nothing-to-read, 2 unsafe artifact). `./sc token`, which
+printed the artifact's token for a browser paste, is retired (Feature #94).
 
 Discovery tests stand up the real `server.Handler` against a throwaway engine
 DB (same harness as test_mem — the token is the only identity), so a
@@ -52,7 +53,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mem  # noqa: E402
 import mem_credentials  # noqa: E402
 import server  # noqa: E402
-import operator_token as sc_token  # noqa: E402
 from test_mem import TOKEN, PEER_TOKEN, build_engine_db  # noqa: E402
 
 
@@ -393,186 +393,41 @@ class DiscoveryTest(unittest.TestCase):
         self.assertIn("runtime", str(cm.exception))  # …and names the new path
 
 
-class TokenCommandTest(unittest.TestCase):
-    """`./sc token` (spec doc #30 req 23) — artifact-only read of the Admin
-    runtime credential: stdout carries ONLY the token; missing/unreadable/
-    insecure artifacts refuse on stderr with the service action; help labels
-    the value without printing it. No API needed — the artifact is the
-    contract, so these tests run without a server."""
+class TokenVerbRetiredTest(unittest.TestCase):
+    """`./sc token` is retired (Feature #94, spec #271).
 
-    def setUp(self):
-        self.cred_dir = Path(tempfile.mkdtemp())
-        self._saved = (mem.SC_API_TOKEN, mem.SC_API_BASE,
-                       mem._CRED_DIR, mem._DISCOVERED_FROM, mem._PROG)
-        mem.SC_API_TOKEN = ""
-        mem.SC_API_BASE = ""
-        mem._CRED_DIR = self.cred_dir
-        mem._DISCOVERED_FROM = None
-        self.addCleanup(self._restore)
+    It printed an Admin shell token as a "browser sign-in token". The GUI now
+    signs in with a password and an authenticator code, and the review API
+    refuses a shell token on every operator route, so nothing the verb could
+    print is a browser session. The artifact it read is still `sc mem`'s
+    (DiscoveryTest above holds its trust boundary)."""
 
-    def _restore(self):
-        (mem.SC_API_TOKEN, mem.SC_API_BASE,
-         mem._CRED_DIR, mem._DISCOVERED_FROM, mem._PROG) = self._saved
+    DISPATCH = ENGINE / "scripts" / "dispatch.sh"
 
-    def write_artifact(self, shortname, token, mode=0o600):
-        p = self.cred_dir / f"{shortname}.json"
-        p.write_text(json.dumps({
-            "shell_id": 1, "shortname": shortname,
-            "api_base": "http://127.0.0.1:8800",
-            "token": token,
-        }))
-        p.chmod(mode)
-        return p
+    def test_the_script_is_gone(self):
+        self.assertFalse((ENGINE / "scripts" / "operator_token.py").exists())
+        self.assertNotIn("operator_token", self.DISPATCH.read_text())
 
-    def run_token(self, argv=()):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            rc = sc_token.main(list(argv))
-        return rc, out.getvalue()
+    def test_the_verb_refuses_and_points_at_sign_in(self):
+        source = self.DISPATCH.read_text()
+        start = source.index("\n  token)")
+        arm = source[start:source.index(";;", start)]
+        self.assertIn("retired", arm)
+        self.assertIn("./sc auth user add <username>", arm)
+        self.assertIn("exit 2", arm)
+        self.assertNotIn("exec", arm)
+        # Every line it prints goes to stderr: stdout was the paste channel.
+        for line in arm.splitlines():
+            if line.strip().startswith("echo") or "echo " in line:
+                self.assertTrue(line.rstrip().endswith(">&2"), line)
 
-    def test_prints_exactly_the_token(self):
-        self.write_artifact("TC", TOKEN)
-        rc, out = self.run_token()
-        self.assertEqual(rc, 0)
-        self.assertEqual(out, TOKEN + "\n")   # stdout purity — nothing else
-
-    def test_sc_mem_as_selects_among_admins(self):
-        self.write_artifact("TC", TOKEN)
-        self.write_artifact("PEER", PEER_TOKEN)
-        with mock.patch.dict(os.environ, {"SC_MEM_AS": "peer"}):
-            rc, out = self.run_token()
-        self.assertEqual(rc, 0)
-        self.assertEqual(out, PEER_TOKEN + "\n")
-
-    def test_ambiguity_refuses_without_printing(self):
-        self.write_artifact("TC", TOKEN)
-        self.write_artifact("PEER", PEER_TOKEN)
-        with self.assertRaises(SystemExit) as cm:
-            self.run_token()
-        self.assertIn("ambiguous", str(cm.exception))
-        self.assertIn("SC_MEM_AS", str(cm.exception))
-        self.assertNotIn(TOKEN, str(cm.exception))
-        self.assertNotIn(PEER_TOKEN, str(cm.exception))
-
-    def test_missing_artifact_names_the_service_action(self):
-        with self.assertRaises(SystemExit) as cm:
-            self.run_token()
-        msg = str(cm.exception)
-        self.assertIn("sc token:", msg)            # refusal names this command
-        self.assertIn("subfloor restart", msg)
-
-    def test_insecure_artifact_is_refused(self):
-        self.write_artifact("TC", TOKEN, mode=0o644)
-        code, err = refuse(self.run_token)
-        self.assertEqual(code, mem.EXIT_UNSAFE)
-        self.assertIn("owner-only", err)
-        self.assertNotIn(TOKEN, err)                # refusal never leaks the value
-
-    def test_symlinked_artifact_is_refused(self):
-        outside = Path(tempfile.mkdtemp()) / "planted.json"
-        outside.write_text(json.dumps({
-            "shell_id": 1, "shortname": "TC",
-            "api_base": "http://127.0.0.1:8800", "token": TOKEN,
-        }))
-        outside.chmod(0o600)
-        before = outside.read_text()
-        (self.cred_dir / "TC.json").symlink_to(outside)
-        code, err = refuse(self.run_token)
-        self.assertEqual(code, mem.EXIT_UNSAFE)
-        self.assertIn("symbolic link", err)
-        self.assertNotIn(TOKEN, err)
-        self.assertEqual(outside.read_text(), before)
-
-    def test_malformed_artifact_is_refused(self):
-        p = self.cred_dir / "TC.json"
-        p.write_text("not json")
-        p.chmod(0o600)
-        with self.assertRaises(SystemExit) as cm:
-            self.run_token()
-        self.assertIn("malformed", str(cm.exception))
-
-    def test_env_wiring_never_substitutes_for_the_artifact(self):
-        # An injected SC_API_TOKEN must not bypass the artifact contract:
-        # insecure artifact still refuses even when env is fully wired.
-        self.write_artifact("TC", TOKEN, mode=0o644)
-        mem.SC_API_TOKEN = "env-token"
-        mem.SC_API_BASE = "http://127.0.0.1:8800"
-        code, err = refuse(self.run_token)
-        self.assertEqual(code, mem.EXIT_UNSAFE)
-        self.assertIn("owner-only", err)
-
-    def test_help_labels_without_printing(self):
-        self.write_artifact("TC", TOKEN)
-        rc, out = self.run_token(["--help"])
-        self.assertEqual(rc, 0)
-        self.assertIn("operator capability", out)
-        self.assertIn("./sc token", out)
-        self.assertNotIn(TOKEN, out)
-
-    def run_script(self):
-        """Real interpreter, real process — the only place the exit *status*
-        (as opposed to the SystemExit payload) is observable."""
-        env = dict(os.environ, SC_MEM_CRED_DIR=str(self.cred_dir))
-        env.pop("SC_MEM_AS", None)
-        return subprocess.run(
-            [sys.executable, str(ENGINE / "scripts" / "operator_token.py")],
-            capture_output=True, text=True, env=env, timeout=30)
-
-    def test_script_end_to_end(self):
-        """Real interpreter, real artifact: stdout is the token and only the
-        token. (The `token)` line in ./sc is the same one-line exec pattern as
-        every other verb; a bash-dispatcher subprocess test would resolve the
-        engine at the MAIN worktree root and break in linked dev worktrees.)"""
-        self.write_artifact("TC", TOKEN)
-        proc = self.run_script()
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout, TOKEN + "\n")
-
-    def test_script_exit_status_unavailable(self):
-        """Nothing to read (service not running / no artifact) → status 1."""
-        proc = self.run_script()
-        self.assertEqual(proc.returncode, mem.EXIT_UNAVAILABLE)
-        self.assertEqual(proc.stdout, "")
-        self.assertIn("subfloor restart", proc.stderr)
-
-    def test_script_exit_status_unsafe_artifact(self):
-        """An artifact that fails the trust boundary is a DIFFERENT nonzero
-        status from 'nothing to read' (spec doc #30 req 23) — a caller can
-        branch on it without parsing stderr."""
-        self.write_artifact("TC", TOKEN, mode=0o644)
-        proc = self.run_script()
-        self.assertEqual(proc.returncode, mem.EXIT_UNSAFE)
-        self.assertNotEqual(mem.EXIT_UNSAFE, mem.EXIT_UNAVAILABLE)
-        self.assertEqual(proc.stdout, "")
-        self.assertIn("owner-only", proc.stderr)
-        self.assertNotIn(TOKEN, proc.stderr)
-
-    def test_script_fifo_artifact_refuses_bounded(self):
-        """The FIFO case, in a real process: `./sc token` must exit 2 promptly
-        with empty stdout. A regression blocks in open() forever, which the
-        subprocess timeout turns into a failure rather than a hung CI job."""
-        os.mkfifo(self.cred_dir / "TC.json", 0o600)
-        proc = self.run_script()
-        self.assertEqual(proc.returncode, mem.EXIT_UNSAFE)
-        self.assertEqual(proc.stdout, "")
-        self.assertIn("not a regular file", proc.stderr)
-
-    def test_script_symlinked_artifact_refuses_without_printing(self):
-        outside = Path(tempfile.mkdtemp()) / "planted.json"
-        outside.write_text(json.dumps({
-            "shell_id": 1, "shortname": "TC",
-            "api_base": "http://127.0.0.1:8800", "token": TOKEN,
-        }))
-        outside.chmod(0o600)
-        before = outside.read_text()
-        (self.cred_dir / "TC.json").symlink_to(outside)
-        proc = self.run_script()
-        self.assertEqual(proc.returncode, mem.EXIT_UNSAFE)
-        self.assertEqual(proc.stdout, "")            # the planted token stays unread
-        self.assertIn("symbolic link", proc.stderr)
-        self.assertNotIn(TOKEN, proc.stderr)
-        self.assertEqual(outside.read_text(), before)
-
+    def test_help_and_the_guide_say_so(self):
+        help_line = next(line for line in self.DISPATCH.read_text().splitlines()
+                         if line.startswith("  ./sc token"))
+        self.assertIn("retired", help_line)
+        guide = (ENGINE.parent / "docs" / "README.md").read_text()
+        self.assertIn("`./sc token` is retired", guide)
+        self.assertNotIn("paste-it-by-hand", guide)
 
 if __name__ == "__main__":
     unittest.main()

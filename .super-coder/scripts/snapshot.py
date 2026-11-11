@@ -30,6 +30,7 @@ import urllib.request
 from pathlib import Path
 
 import artifact_policy
+import cli_credential
 import db_driver
 import instance_state
 import map_db
@@ -681,13 +682,25 @@ def _snapshot_via_runtime_api() -> str | None:
             "serializing this checkout offline instead"
         )
         return None
+    # The review API answers `/api/*` only to a signed-in browser or to a
+    # credential it accepts (Feature #94). This verb presents the engine CLI
+    # credential THIS checkout's runtime published for the port being called,
+    # never another port's and never an ambient `SC_API_TOKEN`, which may
+    # belong to another installation (see above).
+    # No credential on disk means a runtime from before sign-in, which asks
+    # for none.
     request = urllib.request.Request(
-        base + "/api/scripts/snapshot", data=b"", method="POST"
+        base + "/api/scripts/snapshot", data=b"", method="POST",
+        headers=cli_credential.authorization(port),
     )
     try:
         with urllib.request.urlopen(request, timeout=185) as response:
             raw_payload = response.read()
     except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise SystemExit(
+                "snapshot: " + cli_credential.refused(port, exc.code)
+            ) from exc
         try:
             payload = json.loads(exc.read())
             detail = payload.get("output") or payload.get("error") or str(exc)
