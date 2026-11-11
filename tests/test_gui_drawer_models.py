@@ -32,10 +32,11 @@ def between(start: str, end: str) -> str:
 
 
 API = between("async function api(", "function requestKey()")
-TOKEN_HELPERS = between("const fmtTok =", "const localDay =")
+# The quota helpers the drawer shares with the Analytics → Provider Quota view.
+QUOTA_HELPERS = between("const AN_PROVIDER_LABEL =", "function anWindowRow(")
 CATALOGUE = between("let modelCatalogue = null;", "async function renderDefaultModels")
 DRAWER_BLOCK = between("// ── Settings drawer: Tokens, Models, Engine", "// ── Analytics ──")
-TOKENS = DRAWER_BLOCK[DRAWER_BLOCK.index("const DRAWER_TOKEN_DAYS"):
+TOKENS = DRAWER_BLOCK[DRAWER_BLOCK.index("// Tokens: how close each provider"):
                       DRAWER_BLOCK.index("// Models: what the server says")]
 MODELS = DRAWER_BLOCK[DRAWER_BLOCK.index("// Models: what the server says"):
                       DRAWER_BLOCK.index("// Engine: version facts")]
@@ -126,15 +127,30 @@ def test_drawer_sections_are_filled_by_assignment_in_this_lane():
     assert "DRAWER_SECTIONS.find((section) => section.id === id).render = render" in DRAWER_BLOCK
 
 
-def test_token_section_reads_stored_sessions_and_never_sweeps():
-    assert 'api("/analytics/sessions?days=" + DRAWER_TOKEN_DAYS)' in TOKENS
-    assert "const DRAWER_TOKEN_DAYS = 7;" in TOKENS
-    assert "cardTotal(card)" in TOKENS and "fmtTok(total.week)" in TOKENS
-    # The only sweep stays in the full Analytics view.
-    assert "sweep" not in DRAWER_BLOCK.replace("never a sweep", "").replace("the sweep that", "")
+def test_token_section_reads_the_stored_quota_and_never_probes_or_sweeps():
+    assert 'api("/analytics/quota").then(' in TOKENS
+    # The forced probe and the sweep both stay in the full Analytics view.
+    assert "/analytics/quota/probe" not in DRAWER_BLOCK
+    assert APP.count('api("/analytics/quota/probe", "POST")') == 1
+    assert "/analytics/sessions" not in DRAWER_BLOCK
+    assert "/analytics/sweep" not in DRAWER_BLOCK
     assert APP.count('api("/analytics/sweep", "POST")') == 1
-    assert 'href: "#analytics"' in TOKENS
+    assert 'href: "#analytics-quota"' in TOKENS
     assert "link.onclick = () => close();" in TOKENS
+    # The retired token-count table leaves nothing behind.
+    for retired in ("drawerTokenSummary", "DRAWER_TOKEN_DAYS", "drawer-tok-"):
+        assert retired not in APP and retired not in STYLE
+
+
+def test_drawer_thresholds_are_its_own_and_the_full_view_keeps_80_and_95():
+    assert ('const drawerQuotaClass = (pct) => pct == null ? "" '
+            ': pct >= 90 ? " red" : pct >= 75 ? " amber" : "";') in TOKENS
+    assert ('const anQuotaClass = (pct) => pct == null ? "" '
+            ': pct >= 95 ? " red" : pct >= 80 ? " amber" : "";') in APP
+    assert "anQuotaClass(" not in TOKENS
+    # Amber and red are the existing theme tokens, so both themes follow.
+    assert ".drawer-quota-pct.amber { color: var(--warn); }" in STYLE
+    assert ".drawer-quota-pct.red { color: var(--danger-strong); }" in STYLE
 
 
 def test_models_section_shows_server_freshness_and_refreshes_on_demand():
@@ -192,7 +208,7 @@ def test_lane_css_block_closes_the_stylesheet_and_uses_tokens_only():
     block = STYLE[STYLE.index("/* ── Drawer contents and model refresh (spec 270)"):]
     assert block.count("\n/* ") == 2, "the lane block, its Engine part and Account close style.css"
     assert not LITERAL.search(block)
-    for selector in (".drawer-tokens", ".drawer-tok-num", ".drawer-link",
+    for selector in (".drawer-quota", ".drawer-quota-pct", ".drawer-link",
                      ".drawer-model-state.stale", ".chat-refresh-models", ".chat-refresh-note",
                      ".engine-banner.warn", ".engine-log pre", ".engine-cli", ".engine-confirm"):
         assert selector + " " in block or selector + ":" in block
@@ -203,21 +219,28 @@ def test_lane_css_block_closes_the_stylesheet_and_uses_tokens_only():
 # ── Behaviour under node ──────────────────────────────────────────────────────
 
 @needs_node
-def test_token_section_renders_today_and_week_per_harness_from_one_get():
-    script = FAKE_DOM + API + TOKEN_HELPERS + TOKENS + r"""
+def test_token_section_renders_weekly_percent_used_per_provider_from_one_get():
+    script = FAKE_DOM + API + QUOTA_HELPERS + TOKENS + r"""
 const calls = [];
-const now = new Date();
-const earlier = new Date(now.getTime() - 3 * 864e5);
-const sessions = [
-  {harness: "claude", started_at: now.toISOString(), input_tokens: 1000, output_tokens: 500,
-   cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 9999},
-  {harness: "claude", started_at: earlier.toISOString(), input_tokens: 2000000},
-  {harness: "codex", started_at: earlier.toISOString(), output_tokens: 250},
-  {harness: null, started_at: null, input_tokens: 5},
+const soon = new Date(Date.now() + 3 * 3600e3 + 30e3).toISOString();
+const win = (window_kind, used_percent, extra = {}) => ({window_kind, used_percent, ...extra});
+const providers = [
+  // Two weekly windows, listed out of order, beside non-weekly ones.
+  {provider: "anthropic", status: "ok", captured_at: new Date(Date.now() - 5 * 60e3).toISOString(),
+   windows: [win("weekly_scoped", 91.26, {scope: "opus"}), win("five_hour", 99),
+             win("weekly", 74.94, {resets_at: soon}), win("session", 100)]},
+  // A weekly window whose percent the provider did not report.
+  {provider: "openai", status: "ok", captured_at: new Date(Date.now() - 2 * 3600e3).toISOString(),
+   windows: [win("weekly", null), win("five_hour", 97)]},
+  // Kimi: percent USED here, not the full view's "% left".
+  {provider: "moonshot", status: "ok", captured_at: null, windows: [win("weekly", 28)]},
+  // No weekly window at all, and an unlabelled provider with no windows.
+  {provider: "other", status: "unauth", windows: [win("five_hour", 96)]},
+  {provider: "idle", status: "na"},
 ];
 globalThis.fetch = async (url, init) => {
   calls.push([init.method, url]);
-  return {ok: true, json: async () => ({sessions, next_before: null})};
+  return {ok: true, json: async () => ({providers})};
 };
 (async () => {
   const mount = el("div");
@@ -227,38 +250,67 @@ globalThis.fetch = async (url, init) => {
   await tick(); await tick();
   const table = mount.children[0];
   const cells = table.children.map(text);
+  const pctClasses = table.children.filter((n) => n.className.includes("drawer-quota-pct"))
+    .slice(1).map((n) => n.className);
   const link = mount.children[mount.children.length - 1];
   link.onclick();
-  const fixed = drawerTokenSummary(
-    [{harness: "kimi", started_at: "2026-03-04T12:00:00", input_tokens: 7},
-     {harness: "kimi", started_at: "2026-03-02T12:00:00", input_tokens: 3}],
-    new Date("2026-03-04T18:00:00"));
-  console.log(JSON.stringify({calls, loading, tableClass: table.className, cells,
-    href: link.href, linkText: text(link), closed, fixed}));
+  const classes = [null, undefined, 0, 74.9, 75, 89.9, 90, 100, 140].map(drawerQuotaClass);
+  console.log(JSON.stringify({calls, loading, tableClass: table.className, cells, pctClasses,
+    note: text(mount.children[1]), sections: mount.children.length,
+    href: link.href, linkText: text(link), closed, classes}));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
     assert run_js(script) == {
-        "calls": [["GET", "/api/analytics/sessions?days=7"]],
+        "calls": [["GET", "/api/analytics/quota"]],
         "loading": "Loading…",
-        "tableClass": "drawer-tokens",
-        "cells": ["", "Today", "7 days",
-                  "Total", "1.5k", "2.0M",
-                  "claude", "1.5k", "2.0M",
-                  "codex", "0", "250",
-                  "unknown", "0", "5"],
-        "href": "#analytics", "linkText": "Open full analytics →", "closed": 1,
-        "fixed": {"total": {"today": 7, "week": 10},
-                  "harnesses": [{"harness": "kimi", "today": 7, "week": 10}]},
+        "tableClass": "drawer-quota",
+        "cells": ["Weekly limit", "Resets", "Used",
+                  "Claude", "in 3h", "74.9%",
+                  "Claude · opus", "—", "91.3%",
+                  "Codex", "—", "n/a",
+                  "Kimi", "—", "28%",
+                  "other", "—", "n/a",
+                  "idle", "—", "n/a"],
+        "pctClasses": ["drawer-quota-pct", "drawer-quota-pct red", "drawer-quota-pct",
+                       "drawer-quota-pct", "drawer-quota-pct", "drawer-quota-pct"],
+        # The oldest reading's age stands for the whole section.
+        "note": "as of 2h ago", "sections": 3,
+        "href": "#analytics-quota", "linkText": "Open full analytics →", "closed": 1,
+        "classes": ["", "", "", "", " amber", " amber", " red", " red", " red"],
     }
 
 
 @needs_node
-def test_token_section_reports_an_empty_window_and_a_failed_read():
-    script = FAKE_DOM + API + TOKEN_HELPERS + TOKENS + r"""
+def test_drawer_weekly_rows_label_scopes_and_never_invent_a_number():
+    script = FAKE_DOM + QUOTA_HELPERS + TOKENS + r"""
+const rows = drawerWeeklyRows([
+  {provider: "anthropic", windows: [
+    {window_kind: "weekly_scoped", used_percent: 80}, {window_kind: "weekly", used_percent: 0},
+    {window_kind: "weekly", used_percent: 12, scope: "sonnet", resets_at: "2026-03-04T12:00:00Z"}]},
+  {provider: "moonshot", windows: [{window_kind: "short", used_percent: 50}]},
+  {provider: "openai", windows: [{window_kind: "weekly"}]},
+]);
+console.log(JSON.stringify({rows, none: drawerWeeklyRows(undefined)}));
+"""
+    assert run_js(script) == {
+        "rows": [
+            {"name": "Claude", "pct": 0, "resets_at": None},
+            {"name": "Claude · sonnet", "pct": 12, "resets_at": "2026-03-04T12:00:00Z"},
+            {"name": "Claude · scoped", "pct": 80, "resets_at": None},
+            {"name": "Kimi", "pct": None, "resets_at": None},
+            {"name": "Codex", "pct": None, "resets_at": None},
+        ],
+        "none": [],
+    }
+
+
+@needs_node
+def test_token_section_reports_no_reading_and_a_failed_read():
+    script = FAKE_DOM + API + QUOTA_HELPERS + TOKENS + r"""
 let fail = false;
 globalThis.fetch = async () => fail
   ? {ok: false, statusText: "boom", json: async () => ({error: "db locked"})}
-  : {ok: true, json: async () => ({sessions: [], next_before: null})};
+  : {ok: true, json: async () => ({providers: []})};
 (async () => {
   const empty = el("div");
   renderDrawerTokens(empty, {close() {}});
@@ -271,9 +323,8 @@ globalThis.fetch = async () => fail
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
     assert run_js(script) == {
-        "empty": ["Today7 daysTotal00", "No recorded sessions in the last 7 days.",
-                  "Open full analytics →"],
-        "failed": ["token summary error: db locked", "Open full analytics →"],
+        "empty": ["No probe has run yet.", "Open full analytics →"],
+        "failed": ["quota error: db locked", "Open full analytics →"],
     }
 
 
@@ -693,14 +744,15 @@ DRAWER_HELPER = between("const DRAWER_FOCUSABLE", "// The operator's settings dr
 
 @needs_node
 def test_closing_the_drawer_releases_catalogue_listeners_and_pending_paints():
-    script = FAKE_DOM + API + TOKEN_HELPERS + CATALOGUE + TOKENS + MODELS + DRAWER_HELPER + r"""
+    script = FAKE_DOM + API + QUOTA_HELPERS + CATALOGUE + TOKENS + MODELS + DRAWER_HELPER + r"""
 globalThis.document = {body: el("body"), activeElement: null};
 function toast() {}
 let hold = false;
 const held = [];
 const payload = (url) => url.startsWith("/api/models")
   ? {catalogue_generation: "g1", stale: false, fetched_at: new Date().toISOString(), harnesses: {}}
-  : {sessions: [{harness: "claude", started_at: new Date().toISOString(), input_tokens: 5}]};
+  : {providers: [{provider: "anthropic", status: "ok", captured_at: new Date().toISOString(),
+      windows: [{window_kind: "weekly", used_percent: 5}]}]};
 globalThis.fetch = (url) => new Promise((resolve) => {
   const deliver = () => resolve({ok: true, json: async () => payload(url)});
   if (hold) held.push(deliver); else deliver();

@@ -30,8 +30,9 @@ THEME = (UI / "theme.js").read_text()
 
 needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
 
-PRIMARY = ["interface", "sprints", "shells", "roadmap", "docs", "flags"]
-MORE = ["worktrees", "map", "analytics", "scripts"]
+NAV_GROUPS = [["interface", "sprints", "shells"], ["roadmap", "docs", "flags"],
+              ["worktrees", "map"], ["analytics", "scripts"]]
+NAV_TABS = [tab for group in NAV_GROUPS for tab in group]
 DRAWER_MOUNTS = ["drawer-appearance", "drawer-tokens", "drawer-models", "drawer-engine",
                  "drawer-account"]
 LITERAL = re.compile(r"#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?)\(")
@@ -56,43 +57,73 @@ def hex_tokens(block: str) -> dict[str, str]:
 
 # ── Navigation ────────────────────────────────────────────────────────────────
 
-def test_navigation_groups_six_primary_views_and_a_more_group_of_four():
-    nav = INDEX[INDEX.index("<nav>"):INDEX.index("</nav>")]
-    more_at = nav.index('class="nav-more"')
-    menu = nav[nav.index('id="nav-more-menu"'):]
-    tabs = re.findall(r'<button data-tab="([^"]+)"', nav)
-    assert tabs == PRIMARY + MORE
-    assert re.findall(r'<button data-tab="([^"]+)"', nav[:more_at]) == PRIMARY
-    assert re.findall(r'<button data-tab="([^"]+)"', menu) == MORE
-    # The trigger is a nav button without a data-tab: it opens the group and
-    # is never itself a route.
-    assert 'id="nav-more" class="nav-more-btn" aria-haspopup="true"' in nav
-    assert 'aria-controls="nav-more-menu"' in nav
-    assert 'id="nav-more-menu" class="gmenu nav-more-menu" hidden' in nav
+def test_navigation_shows_all_ten_views_in_four_groups_with_three_separators():
+    nav = INDEX[INDEX.index("<nav>") + len("<nav>"):INDEX.index("</nav>")]
+    # Every child of <nav> is a tab button or a separator: nothing is nested
+    # behind a trigger, so every view is one click away.
+    children = re.findall(r"<(\w+)([^>]*)>", nav)
+    kinds = []
+    for tag, attrs in children:
+        tab = re.search(r'data-tab="([^"]+)"', attrs)
+        if tag == "button" and tab:
+            kinds.append(tab.group(1))
+        else:
+            assert (tag, attrs.strip()) == ("span", 'class="navsep"'), (tag, attrs)
+            kinds.append("|")
+    expected = []
+    for group in NAV_GROUPS:
+        expected += group + ["|"]
+    assert kinds == expected[:-1]
+    assert len(NAV_TABS) == 10 and kinds.count("|") == 3
+    assert [label for label in re.findall(r">([^<>]+)</button>", nav)] == [
+        "Chats", "Sprints", "Shells", "Roadmap", "Documents", "Flags",
+        "Worktrees", "Repo Map", "Analytics", "Scripts"]
+
+
+def test_the_more_group_is_gone_from_markup_script_and_styles():
+    for served in (INDEX, APP, STYLE):
+        assert "nav-more" not in served
+    assert "setNavMore" not in APP
+    assert ">More<" not in INDEX and "aria-haspopup=\"true\"" not in INDEX
 
 
 def test_every_nav_entry_is_a_view_and_every_view_has_a_nav_entry_and_section():
     views = re.findall(r'^  (\w+): \["#view-(\w+)", render\w+\],$',
                        APP[APP.index("const VIEWS = {"):APP.index("async function load(tab)")],
                        re.MULTILINE)
-    assert sorted(key for key, _ in views) == sorted(PRIMARY + MORE)
+    assert sorted(key for key, _ in views) == sorted(NAV_TABS)
     for key, section in views:
         assert key == section
         assert INDEX.count(f'id="view-{key}"') == 1
         assert INDEX.count(f'data-tab="{key}"') == 1
 
 
-def test_more_group_marks_its_trigger_and_dissolves_inline_when_the_nav_scrolls():
+def test_flat_nav_marks_the_active_tab_routes_by_hash_and_scrolls_when_narrow():
     show = APP[APP.index("function show(tab)"):APP.index("// Hash routing:")]
-    assert 'if (on && b.closest(".nav-more")) inMore = true;' in show
-    assert 'b.classList.toggle("active", inMore)' in show
-    assert "setNavMore(false);" in show
-    assert 'b.setAttribute("aria-expanded", String(open))' in show
-    assert '$("#nav-more").onclick = () => setNavMore($("#nav-more-menu").hidden);' in APP
+    assert ('for (const b of document.querySelectorAll("nav button")) '
+            'b.classList.toggle("active", b.dataset.tab === tab);') in show
+    # Every nav button is a route: one handler, no trigger to special-case.
+    assert ('document.querySelectorAll("nav button").forEach((b) => '
+            '(b.onclick = () => { location.hash = b.dataset.tab; }));') in APP
     narrow = STYLE[STYLE.index("@media (max-width: 760px) {"):]
     narrow = narrow[:narrow.index("\n}\n")]
-    assert ".nav-more, .nav-more-menu, .nav-more-menu[hidden] { display: contents; }" in narrow
-    assert ".nav-more-btn { display: none; }" in narrow
+    # Narrow widths scroll the nav sideways, so no tab is clipped out of reach.
+    assert "nav { flex: 1 1 0; min-width: 35%; overflow-x: auto;" in narrow
+    assert "nav > * { flex: none; white-space: nowrap; }" in narrow
+    # Ten tabs outgrow the header well above phone width: from 1320px down the
+    # nav is the part that scrolls, and the tools zone never shrinks or wraps.
+    mid = STYLE[STYLE.index("@media (max-width: 1320px) {"):]
+    mid = mid[:mid.index("\n}\n")]
+    assert STYLE.index("@media (max-width: 1320px) {") < STYLE.index("@media (max-width: 760px) {")
+    assert "nav { flex: 1 1 0; min-width: 0; gap: .8rem; overflow-x: auto;" in mid
+    assert "nav > * { flex: none; white-space: nowrap; }" in mid
+    assert ".tools { flex: 0 0 auto; }" in mid
+    assert "#snapshot { flex: none; white-space: nowrap; }" in mid
+    # A scrolled nav keeps the active tab in view and answers a plain wheel.
+    assert ('document.querySelector("nav button.active")?.scrollIntoView?.('
+            '{ block: "nearest", inline: "nearest" });') in show
+    assert 'document.querySelector("nav").addEventListener("wheel", (e) => {' in APP
+    assert "if (nav.scrollWidth <= nav.clientWidth || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;" in APP
 
 
 def test_header_keeps_status_and_snapshot_and_gains_one_drawer_button():

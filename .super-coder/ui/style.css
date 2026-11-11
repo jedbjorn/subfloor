@@ -132,29 +132,6 @@ nav button.active::after {
   content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
   background: var(--accent);
 }
-/* The More group (spec 270): the four secondary views behind one trigger.
-   The trigger is a nav button, so it carries the same active underline when
-   the open view lives in its menu. The popover styling is desktop-only: at
-   narrow widths the nav scrolls sideways and would clip a popover, so the
-   group dissolves and its views sit inline (see the 760px block). */
-.nav-more { position: relative; display: flex; align-self: stretch; }
-.nav-more-btn > span { margin-left: .3em; letter-spacing: 0; }
-@media (min-width: 761px) {
-  .nav-more-menu {
-    left: auto; right: -.6rem; margin-top: .4rem; min-width: 11rem;
-    border-radius: var(--r); padding: .35rem 0;
-  }
-  .nav-more-menu button {
-    display: block; width: 100%; height: auto; padding: .6rem 1.1rem; text-align: left;
-  }
-  .nav-more-menu button:hover { background: var(--tint-1); }
-  .nav-more-menu button.active {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    box-shadow: inset 2px 0 0 0 var(--accent);
-  }
-  .nav-more-menu button.active::after { content: none; }
-  .nav-more-menu button:focus-visible { box-shadow: inset var(--focus-ring); }
-}
 /* brand + tools are equal-flex side zones so nav centers on the window
    midpoint — i.e. over the centered .view content column below it. */
 .tools { flex: 1 1 0; justify-content: flex-end; display: flex; align-items: center; gap: .8rem; }
@@ -295,6 +272,26 @@ main { padding: 1.2rem; flex: 1 0 auto; min-height: 0; }
 .sprint-action-form { flex: 1; display: grid; align-content: start; gap: .55rem; }
 .sprint-action-form textarea { min-height: 7rem; resize: vertical; }
 .sprint-abort-note { color: var(--warn); }
+/* The flat nav shows all ten views, which stop fitting beside two equal-flex
+   side zones below about 1320px. From there down the side zones shrink to
+   their content and the nav takes the rest, scrolling sideways within itself
+   once even that is too little — so no tab wraps out of the 52px row and the
+   tools on the right are never pushed off the page. The auto margins keep the
+   tabs centred while there is room and collapse to nothing when there is not
+   (unlike justify-content: center, which would clip the first tabs). */
+@media (max-width: 1320px) {
+  h1 { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tools { flex: 0 0 auto; }
+  #snapshot { flex: none; white-space: nowrap; }
+  nav { flex: 1 1 0; min-width: 0; gap: .8rem; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+  nav::-webkit-scrollbar { display: none; }
+  nav > * { flex: none; white-space: nowrap; }
+  nav > :first-child { margin-left: auto; }
+  nav > :last-child { margin-right: auto; }
+  nav button.active::after { bottom: 0; }
+  /* overflow-y: hidden (forced beside overflow-x: auto) clips the outset ring. */
+  nav button:focus-visible { box-shadow: inset var(--focus-ring); }
+}
 @media (max-width: 760px) {
   /* The header stays ONE 52px row (the chat layout and the sticky sub-bars
      are measured against that height), so the nav scrolls within itself
@@ -322,11 +319,7 @@ main { padding: 1.2rem; flex: 1 0 auto; min-height: 0; }
      Swipe and wheel still scroll it. */
   nav { flex: 1 1 0; min-width: 35%; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
   nav::-webkit-scrollbar { display: none; }
-  nav > *, .nav-more-menu > button { flex: none; white-space: nowrap; }
-  /* A popover would be clipped by the scrolling nav: dissolve the More group
-     so its four views scroll inline with the rest ([hidden] included). */
-  .nav-more, .nav-more-menu, .nav-more-menu[hidden] { display: contents; }
-  .nav-more-btn { display: none; }
+  nav > * { flex: none; white-space: nowrap; }
   nav button.active::after { bottom: 0; }
   /* overflow-y: hidden (forced beside overflow-x: auto) clips the outset ring. */
   nav button:focus-visible { box-shadow: inset var(--focus-ring); }
@@ -1919,14 +1912,21 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 /* ── Drawer contents and model refresh (spec 270) ─────────────────────────
    Tokens and Models sections of the settings drawer, and the Configure
    "Refresh models" row. Theme tokens only, so both themes follow. */
-.drawer-tokens {
-  display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+.drawer-quota {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: baseline;
   column-gap: var(--space-4); row-gap: var(--space-1); font-size: var(--fs-sm);
 }
-.drawer-tok-name { color: var(--text-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.drawer-tok-num { color: var(--ink); text-align: right; font-variant-numeric: tabular-nums; }
-.drawer-tok-head { color: var(--text-low); font-size: var(--fs-label); }
-.drawer-tok-total { color: var(--text-strong); font-weight: 600; }
+.drawer-quota-name { color: var(--text-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drawer-quota-reset { color: var(--text-low); font-size: var(--fs-label); white-space: nowrap; }
+.drawer-quota-pct {
+  color: var(--ink); text-align: right; font-weight: 600; font-size: var(--fs-base);
+  font-variant-numeric: tabular-nums;
+}
+.drawer-quota-pct.amber { color: var(--warn); }
+.drawer-quota-pct.red { color: var(--danger-strong); }
+.drawer-quota-head, .drawer-quota-head.drawer-quota-pct {
+  color: var(--text-low); font-size: var(--fs-label); font-weight: 400;
+}
 .drawer-link { color: var(--accent); font-size: var(--fs-sm); text-decoration: none; justify-self: start; }
 .drawer-link:hover { text-decoration: underline; }
 .drawer-link:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--r-sm); }
