@@ -1529,11 +1529,13 @@ since it discards un-snapshotted DB edits). Beside them sit the configuration
 cards — Windows Test VM, Browser, Web Search — and the **Services** panel
 described under [Opt-in features](#opt-in-features).
 
-Browser sign-in normally attaches its own credential. `./sc token` prints the
-current operator token for the paste-it-by-hand recovery path and nothing else
-on stdout; it never rotates the credential, and a missing or insecurely
-permissioned artifact refuses with the supported service action rather than
-printing anything.
+The GUI asks you to sign in with a password and an authenticator code. Create
+the GUI user once on the host with `./sc auth user add <username>`, then
+finish in the browser; `./sc auth user reset <username>` is the recovery path
+for a lost password or authenticator. `./sc token` is retired: no token a CLI
+prints is a browser session. See
+[GUI sign-in](../.super-coder/docs/auth.md) and the
+[browser trust boundary](../.super-coder/docs/interface-trust-boundary.md).
 
 The live engine DB, canonical snapshot and backups live in the private XDG
 instance-state root. See the [engine reference](../.super-coder/README.md) for

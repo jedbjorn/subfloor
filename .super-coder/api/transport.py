@@ -79,6 +79,7 @@ class Transport:
                  clock=time.perf_counter):
         self.host = host
         self.port = port
+        self.ports: tuple[int, ...] = ()
         self.http_handler = http_handler
         self.ws_handler = ws_handler
         self.stream_handler = stream_handler
@@ -101,6 +102,11 @@ class Transport:
         self._tcp = await asyncio.start_server(
             self._on_connection, self.host, self.port)
         self.port = self._tcp.sockets[0].getsockname()[1]
+        # Every distinct port the listener holds. One, almost always. A name
+        # that resolves to both families (`localhost`) with port 0 gets an
+        # IPv4 and an IPv6 socket, and the kernel picks a port for each.
+        self.ports = tuple(sorted({
+            sock.getsockname()[1] for sock in self._tcp.sockets}))
 
     async def stop(self) -> None:
         if self._tcp:
@@ -247,7 +253,8 @@ class Transport:
 
 
 async def serve(host: str, port: int, http_handler, ws_handler,
-                log=print, on_started=None, stream_handler=None) -> int:
+                log=print, on_started=None, stream_handler=None,
+                on_bound=None) -> int:
     """Start the multiplex and block forever (until cancelled). Returns the
     bound port after start for callers that passed port=0 — via `log` line and
     the Transport object; this coroutine simply runs until shutdown.
@@ -256,6 +263,13 @@ async def serve(host: str, port: int, http_handler, ws_handler,
     listening service is advertised. Background workers that can cause external
     side effects belong behind that boundary: a second process must lose the
     bind race before it can dispatch work, and failed readiness must stay quiet.
+
+    ``on_bound(ports)`` runs first, right after the bind, with every distinct
+    port the listening sockets ACTUALLY hold, as a sorted tuple. That is not
+    always the port asked for, nor always one port: port 0 asks the kernel to
+    choose, and it chooses separately for the IPv4 and the IPv6 socket of a
+    dual-stack name. A fixed port on both families is one port. Anything that
+    names this server by its port takes the numbers from here.
     """
     transport = Transport(
         host,
@@ -267,6 +281,8 @@ async def serve(host: str, port: int, http_handler, ws_handler,
     )
     await transport.start()
     try:
+        if on_bound is not None:
+            on_bound(transport.ports)
         if on_started is not None:
             on_started()
         log(f"transport: listening on {host}:{transport.port}")

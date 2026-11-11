@@ -133,6 +133,30 @@ class HostRuntimeFixture:
                 print(json.dumps({"repo": "hostfork", "port": port, "dev_port": port + 1}))
             """
         ))
+        # The engine-ops helper the dispatcher calls (api/engine_ops.py): a
+        # stand-in that records each call and answers as a healthy service,
+        # or as a missing one when SC_TEST_ENGINE_OPS_FAIL is set.
+        (self.engine / "api" / "engine_ops.py").write_text(textwrap.dedent(
+            """\
+            import os
+            import sys
+
+            command = sys.argv[1] if len(sys.argv) > 1 else ""
+            with open(os.environ["SC_TEST_LOG"], "a") as log:
+                log.write("engine_ops " + " ".join(sys.argv[1:]) + "\\n")
+            if command == "port":
+                print(18802)
+            elif os.environ.get("SC_TEST_ENGINE_OPS_FAIL") and command in ("up", "alive"):
+                raise SystemExit(1)
+            elif command == "up":
+                print("→ engine-ops up (fixture)")
+            elif command == "down" and os.environ.get("SC_TEST_ENGINE_OPS_DOWN_FAIL"):
+                print("✗ engine-ops (pid 1) could not be stopped safely", file=sys.stderr)
+                raise SystemExit(1)
+            elif command == "down":
+                print("→ engine-ops stopped (fixture)")
+            """
+        ))
         (self.scripts / "db_backup.py").write_text(textwrap.dedent(
             """\
             import os
@@ -337,6 +361,47 @@ class HostRuntimeLifecycleTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("--setenv", self._systemd_run_line())
                 self.assertEqual(self.fx.run("down").returncode, 0)
+
+    def test_launch_and_down_drive_the_engine_ops_service(self):
+        launched = self.fx.run("launch")
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        calls = self.fx.calls()
+        # Pinned before the review server (and its CSP) starts.
+        self.assertLess(
+            calls.index("engine_ops port"),
+            next(i for i, line in enumerate(calls)
+                 if line.startswith("systemd-run ")))
+        self.assertIn("engine_ops up", calls)
+        down = self.fx.run("down")
+        self.assertEqual(down.returncode, 0, down.stderr)
+        self.assertIn("engine_ops down", self.fx.calls())
+        self.assertFalse(list((self.fx.engine / "run").glob("engine-ops*")))
+
+    def test_a_failed_engine_ops_stop_is_shown_and_fails_only_its_own_verb(self):
+        self.assertEqual(self.fx.run("launch").returncode, 0)
+        self.fx.env["SC_TEST_ENGINE_OPS_DOWN_FAIL"] = "1"
+        # Asked for by name: the verb's exit code is the stop's.
+        direct = self.fx.run("engine-ops-down")
+        self.assertEqual(direct.returncode, 1, direct.stdout + direct.stderr)
+        self.assertIn("could not be stopped safely", direct.stderr)
+        # Inside the lifecycle verbs it is reported, and their exit codes are
+        # what they were before the service existed.
+        down = self.fx.run("down")
+        self.assertEqual(down.returncode, 0, down.stdout + down.stderr)
+        self.assertIn("could not be stopped safely", down.stderr)
+        self.assertIn("host review server stopped", down.stdout)
+        self.assertEqual(self.fx.run("launch").returncode, 0)
+        restart = self.fx.run("restart", "-y")
+        self.assertEqual(restart.returncode, 0, restart.stdout + restart.stderr)
+        self.assertIn("could not be stopped safely", restart.stderr)
+
+    def test_restart_does_not_fail_on_the_engine_ops_service(self):
+        self.assertEqual(self.fx.run("launch").returncode, 0)
+        self.fx.env["SC_TEST_ENGINE_OPS_FAIL"] = "1"
+        result = self.fx.run("restart", "-y")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("  host server: restarted", result.stdout)
+        self.assertIn("  engine-ops: not answering (advisory", result.stdout)
 
     def test_down_without_a_server_is_a_calm_no_op(self):
         result = self.fx.run("down")

@@ -29,6 +29,8 @@ sys.path.insert(0, str(ENGINE / "api"))
 
 import server  # noqa: E402
 import transport as transport_mod  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from signin_fixture import sign_in  # noqa: E402
 
 
 class ServedAssetTestCase(unittest.TestCase):
@@ -50,6 +52,14 @@ class ServedAssetTestCase(unittest.TestCase):
         (self.ui / "theme.js").write_text("document.documentElement.dataset.theme = 'dark';\n")
         (self.ui / "index.html").write_text("<!doctype html><title>v1</title>")
         patch = mock.patch.object(server, "UI_DIR", self.ui)
+        patch.start()
+        self.addCleanup(patch.stop)
+        # Static files are served to a signed-in browser (Feature #94): every
+        # request this fixture makes carries the session cookie. There is no
+        # engine DB here, so the gate's lookup of the session's user is
+        # answered directly.
+        self.browser = sign_in(self)
+        patch = mock.patch.object(server, "_active_user", return_value=True)
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -83,7 +93,8 @@ class ServedAssetTestCase(unittest.TestCase):
     def request(self, method, path, headers=None):
         con = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         try:
-            con.request(method, path, headers=headers or {})
+            con.request(method, path, headers={
+                "Cookie": self.browser.cookie, **(headers or {})})
             resp = con.getresponse()
             return resp.status, dict(resp.getheaders()), resp.read()
         finally:

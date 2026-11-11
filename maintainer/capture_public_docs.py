@@ -3,6 +3,11 @@
 
 Provision and seed the dedicated dos-app instance first. This reads live UI;
 it never replaces API responses or fabricates conversation/PR evidence.
+
+Limitation (flag SC-1602): the capture loads the GUI in a browser with no
+session. An instance that requires GUI sign-in (Feature #94) would hand it the
+sign-in page for every route, so the tool stops first and says so. It cannot
+capture such an instance until it is given an operator session.
 """
 from __future__ import annotations
 
@@ -14,6 +19,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / '.super-coder' / 'scripts'))
+sys.path.insert(0, str(ROOT / 'maintainer'))
+import signin_guard  # noqa: E402  (one message for every maintainer tool)
 from visual_qa import PlaywrightCapture, capture_gallery, write_gallery
 
 
@@ -57,6 +64,11 @@ def main() -> int:
         health = json.load(response)
     if health.get('repo') != 'subfloor-docs-f73-dos-app':
         parser.error('capture requires the dedicated disposable documentation instance')
+    try:
+        signin_guard.refuse_if_sign_in_required(base, 'capture_public_docs')
+    except signin_guard.SignInRequired as exc:
+        print(exc, file=sys.stderr)
+        return 2
     config = {
         'routes': ['/#roadmap', '/#roadmap-flow', '/#worktrees', '/#interface', '/#sprints'],
         'viewports': [{'name': 'desktop', 'width': 1440, 'height': 1000}],

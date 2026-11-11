@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import test_run_attachments as attachment_fixture
+from signin_fixture import sign_in
 
 ROOT = Path(__file__).resolve().parents[1]
 PLAYWRIGHT = ROOT / '.super-coder/browser/node_modules/playwright'
@@ -16,13 +17,19 @@ pytestmark = pytest.mark.skipif(not PLAYWRIGHT.exists() or not shutil.which('chr
 def test_receipt_attachment_browser():
     case = attachment_fixture.AttachmentsTest()
     case.setUp()
+    # The operator is a signed-in browser (Feature #94): the page carries the
+    # session cookie, as a browser that signed in would.
+    operator = case.con.execute(
+        'SELECT user_id FROM users WHERE is_active=1 ORDER BY user_id LIMIT 1').fetchone()[0]
+    signed_in = sign_in(user_id=operator)
     try:
         current = case.receipt(case.base)
         stale = case.receipt()
         case.attachments.attach(stale, 1, {'work_unit': case.unit})
         case.observe(case.base)
         payload = {'base': f'http://127.0.0.1:{case.httpd.server_port}', 'sprint': case.fixture.sprint_id,
-                   'unit': case.unit, 'current': current, 'out': os.environ.get('SC_RUNS_SCREENSHOTS')}
+                   'unit': case.unit, 'current': current, 'out': os.environ.get('SC_RUNS_SCREENSHOTS'),
+                   'cookie': {'name': signed_in.cookie_name, 'value': signed_in.token}}
         script = r'''
 const {chromium} = require(process.argv[1]);
 const config = JSON.parse(process.argv[2]);
@@ -30,6 +37,7 @@ const config = JSON.parse(process.argv[2]);
  const browser = await chromium.launch({headless:true, executablePath:process.argv[3]});
  try {
   const page = await browser.newPage({viewport:{width:1500,height:1100}});
+  await page.context().addCookies([{name:config.cookie.name, value:config.cookie.value, url:config.base}]);
   const errors=[]; page.on('pageerror', e => errors.push(String(e)));
   const shells=[{shell_id:1,shortname:'DEV1',display_name:'Receipt owner',flavor:'dev',skills:[]}];
   await page.route('**/api/**', async route => {
@@ -71,4 +79,5 @@ const config = JSON.parse(process.argv[2]);
         assert result.returncode == 0, result.stdout + result.stderr
         assert json.loads(result.stdout)['passed']
     finally:
+        signed_in.restore()
         case.doCleanups()

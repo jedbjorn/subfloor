@@ -61,6 +61,7 @@ MANAGED_KEYS = frozenset({
     "browser",
     "browser_port",
     "browser_proxy_port",
+    "engine_ops_port",
 })
 PORT_KEYS = frozenset({"repo", "port", "dev_port"})
 
@@ -121,7 +122,8 @@ def _sibling_ports() -> set[int]:
             sibling = json.loads(candidate.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        for key in ("port", "dev_port", "browser_port", "browser_proxy_port"):
+        for key in ("port", "dev_port", "browser_port", "browser_proxy_port",
+                    "engine_ops_port"):
             value = sibling.get(key)
             if isinstance(value, int):
                 occupied.add(value)
@@ -185,7 +187,8 @@ def resolve(persist: bool = False) -> dict:
     cfg = None
     occupied = _sibling_ports()
     loaded = _load_config()
-    occupied.update(loaded[key] for key in ("browser_port", "browser_proxy_port")
+    occupied.update(loaded[key] for key in ("browser_port", "browser_proxy_port",
+                                            "engine_ops_port")
                     if type(loaded.get(key)) is int)
     if "port" in loaded:
         cfg = _runtime_view(loaded)
@@ -219,6 +222,8 @@ def ensure_browser_ports() -> dict:
     """Allocate the opt-in server and gate without moving existing assignments."""
     cfg = resolve()
     occupied = _sibling_ports() | {cfg['port'], cfg['dev_port']}
+    if type(cfg.get('engine_ops_port')) is int:
+        occupied.add(cfg['engine_ops_port'])
     changes = {}
     for key, suffix in (('browser_port', ':browser'), ('browser_proxy_port', ':browser-proxy')):
         value = cfg.get(key)
@@ -228,6 +233,17 @@ def ensure_browser_ports() -> dict:
         changes[key] = value
     update(changes)
     return {**cfg, **changes}
+
+
+def stored_engine_ops_port() -> int | None:
+    """The engine-ops service port published for the review API, if any.
+
+    A pure read of a value the host service writes here after pinning its port
+    in its own private state (api/engine_ops.py). The service never reads it
+    back, so editing it cannot move the service.
+    """
+    value = _load_config().get("engine_ops_port")
+    return value if type(value) is int else None
 
 
 def main(argv: list[str]) -> int:

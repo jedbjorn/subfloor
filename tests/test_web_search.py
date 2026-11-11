@@ -34,6 +34,8 @@ sys.path.insert(0, str(ENGINE / "api"))
 sys.path.insert(0, str(ENGINE / "scripts"))
 import server
 import web_search
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from signin_fixture import sign_in
 
 KEY = "tvly-secret-key-1234abcd"
 NEW_KEY = "tvly-rotated-key-9999wxyz"
@@ -261,6 +263,7 @@ class ApiRouteTest(unittest.TestCase):
         patcher = mock.patch.object(web_search, "store_path", return_value=self.store)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.browser = sign_in(self)
 
     def connect(self):
         con = sqlite3.connect(self.db_path)
@@ -273,6 +276,9 @@ class ApiRouteTest(unittest.TestCase):
         lines = ["Host: 127.0.0.1:8800", f"Content-Length: {len(raw)}"]
         if token:
             lines.append(f"Authorization: Bearer {token}")
+        else:
+            # The operator is a signed-in browser (Feature #94).
+            lines.append(f"Cookie: {self.browser.cookie}")
         if origin:
             lines.append(f"Origin: {origin}")
             lines.append("Sec-Fetch-Site: same-origin")
@@ -359,7 +365,8 @@ class ApiRouteTest(unittest.TestCase):
             return _Resp(json.dumps(TAVILY_OK).encode())
 
         status, out = self.request("POST", "/api/web-search/validate",
-                                   body={"api_key": NEW_KEY}, opener=opener)
+                                   body={"api_key": NEW_KEY}, opener=opener,
+                                   origin=self.SAME)
         self.assertEqual(status, 200)
         self.assertTrue(out["ok"])
         self.assertEqual(seen, [f"Bearer {NEW_KEY}"])
@@ -367,14 +374,14 @@ class ApiRouteTest(unittest.TestCase):
 
         web_search.write(KEY, self.store)
         status, out = self.request("POST", "/api/web-search/validate", body={},
-                                   opener=opener)
+                                   opener=opener, origin=self.SAME)
         self.assertTrue(out["ok"])
         self.assertEqual(seen[-1], f"Bearer {KEY}")
 
         def bad(req, timeout=None):
             raise urllib.error.HTTPError(req.full_url, 401, "x", {}, io.BytesIO(b"{}"))
         status, out = self.request("POST", "/api/web-search/validate", body={},
-                                   opener=bad)
+                                   opener=bad, origin=self.SAME)
         self.assertEqual(status, 200)
         self.assertFalse(out["ok"])
         self.assertNotIn(KEY, out["output"])

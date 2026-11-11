@@ -16,6 +16,8 @@ INDEX_HTML = ENGINE / "ui" / "index.html"
 
 sys.path.insert(0, str(ENGINE / "api"))
 import server  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from signin_fixture import sign_in  # noqa: E402
 
 
 class RemovedHttpSurfaceTest(unittest.TestCase):
@@ -34,16 +36,19 @@ class RemovedHttpSurfaceTest(unittest.TestCase):
             ("POST", "/_sc/watches"),
             ("POST", "/_sc/watches/reconcile"),
         )
+        # As the signed-in operator (Feature #94): the gate lets the request
+        # through, and what is left to find is that the route is gone.
+        browser = sign_in(self)
         for method, path in routes:
             with self.subTest(method=method, path=path), mock.patch.object(
                 server,
                 "db",
                 side_effect=lambda: sqlite3.connect(":memory:"),
-            ):
+            ), mock.patch.object(server, "_active_user", return_value=True):
                 status, _headers, body = server.dispatch_http(
                     method,
                     path,
-                    "Host: 127.0.0.1:8800\r\n",
+                    browser.add_to("Host: 127.0.0.1:8800\r\n"),
                     b"{}",
                 )
             self.assertEqual(status, 404)

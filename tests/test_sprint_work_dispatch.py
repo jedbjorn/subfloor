@@ -2647,9 +2647,17 @@ class ProductionPulseTest(SprintWorkDispatchCase):
         runtime.wait_ready.assert_called_once()
         runtime.is_alive.assert_called_once_with()
         watcher_start.assert_called_once_with(server.DB_PATH, repo_root=server.REPO_ROOT)
+        # The production callback is `_on_listening`: what may happen only
+        # once the port is held. It publishes the engine CLI credential and
+        # then runs this combined startup function.
         self.assertIn(
-            "on_started=start_runtime_services",
-            inspect.getsource(server.main),
+            "on_started=_on_listening",
+            inspect.getsource(server._run_server),
+            "the combined startup function must remain the production callback",
+        )
+        self.assertIn(
+            "start_runtime_services()",
+            inspect.getsource(server._on_listening),
             "the combined startup function must remain the production callback",
         )
 

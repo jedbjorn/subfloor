@@ -74,7 +74,7 @@ function addCopyButton(pre) {
 }
 
 async function api(path, method = "GET", body, extraHeaders = {}) {
-  const r = await fetch("/api" + path, {
+  const r = await sessionFetch("/api" + path, {
     method, headers: {
       ...(body ? { "Content-Type": "application/json" } : {}),
       ...extraHeaders,
@@ -95,6 +95,183 @@ async function api(path, method = "GET", body, extraHeaders = {}) {
   return data;
 }
 
+// ── Session loss (spec #271) ────────────────────────────────────────────────
+// The review server answers a request without a valid session with
+// `401 {"error":"sign_in_required"}`; the host authority answers
+// `401 {"error":{"code":"sign_in_required"}}`. Either means the session was
+// revoked or has gone: the operator is sent to the sign-in screen with the
+// place they were at as `next`, instead of seeing "offline" or an error toast.
+const SIGN_IN_PATH = "/signin.html";
+let leavingForSignIn = false;
+// `next` is honoured only as a path on this origin, and what is validated is
+// the value that will be navigated to, after the URL parser has normalised
+// it: "/a/..//host" and "/%2e//host" both normalise to "//host", which a
+// browser reads as another origin. The result must start with exactly one
+// "/", hold no backslash or control character, and parse back to itself on
+// this origin. Anything else falls back to "/".
+const NEXT_UNSAFE = /[\\\u0000-\u001f\u007f]/;
+const NEXT_LOCAL = /^\/(?![\/\\])/;
+function safeNext(raw, origin) {
+  if (typeof raw !== "string" || NEXT_UNSAFE.test(raw) || !NEXT_LOCAL.test(raw)) return "/";
+  let url;
+  try { url = new URL(raw, origin); } catch { return "/"; }
+  if (url.origin !== origin) return "/";
+  const path = url.pathname + url.search + url.hash;
+  if (NEXT_UNSAFE.test(path) || !NEXT_LOCAL.test(path)) return "/";
+  let again;
+  try { again = new URL(path, origin); } catch { return "/"; }
+  if (again.origin !== origin || again.pathname + again.search + again.hash !== path) return "/";
+  return again.pathname === "/signin.html" ? "/" : path;
+}
+function signInUrl() {
+  return SIGN_IN_PATH + "?next=" + encodeURIComponent(
+    safeNext(location.pathname + location.search + location.hash, location.origin));
+}
+function goToSignIn() {
+  if (leavingForSignIn) return;   // many requests can fail at once; leave once
+  leavingForSignIn = true;
+  location.assign(signInUrl());
+}
+function isSignInRequired(status, data) {
+  const error = data?.error;
+  return status === 401
+    && (error === "sign_in_required" || error?.code === "sign_in_required");
+}
+// Every request this page makes goes through here: it is the only fetch call
+// in the file. On sign_in_required the page is leaving, so the caller is left
+// waiting rather than handed an error to report.
+async function sessionFetch(url, init) {
+  const response = await fetch(url, init);
+  if (response.status === 401) {
+    const data = await response.clone().json().catch(() => null);
+    if (isSignInRequired(401, data)) {
+      goToSignIn();
+      return new Promise(() => {});
+    }
+  }
+  return response;
+}
+// An EventSource reports an error with no status, and reconnects by itself,
+// so a revoked session and a network drop look the same from there. The
+// stream therefore has one owned watch (sessionWatch) that asks the open
+// auth-status route what the error meant. Three answers, kept apart:
+//   "in"       the server answered and the session holds
+//   "out"      the server answered `signed_in: false`: go to sign-in
+//   "unknown"  anything else: unreachable, an error status, a malformed body
+// Unknown is never read as "in". The gate also says so directly, with a
+// `sign_in_required` event on the stream before it closes it; that event goes
+// to sign-in without a probe.
+//
+// One watch per live stream, holding at most one timer and one probe.
+// Stopping or replacing the stream cancels it, so nothing asks about a
+// stream that is gone. Probes are spaced by the watch's wait: five seconds,
+// doubling to a minute while the answer stays unknown or the server keeps
+// refusing the stream.
+//
+// The watch never gives up while its stream is the live one. A stream the
+// server refuses while the session holds is reopened at that growing wait,
+// which settles at one attempt a minute, so a server that recovers is picked
+// up within a minute with no reload. A closed stream therefore always has an
+// attempt scheduled, which is what the "Reconnecting" label claims. Three
+// wake-ups bring the next attempt forward instead of adding a timer: the tab
+// becoming visible, the browser coming back online, and the operator sending
+// a message.
+//
+// The probe belongs to the watch too. Stopping or replacing the stream aborts
+// a probe that is still out, so there is never more than one status request
+// in flight for the page; and a probe that gets no answer within
+// SESSION_PROBE_TIMEOUT_MS is aborted and counted as "unknown", so a stalled
+// route cannot hold the one probe slot.
+const SESSION_PROBE_MIN_MS = 5000;
+const SESSION_PROBE_MAX_MS = 60000;
+const SESSION_PROBE_TIMEOUT_MS = 10000;
+let sessionWatch = null;
+let sessionProbedAt = -Infinity;
+function stopSessionWatch() {
+  if (!sessionWatch) return;
+  const watch = sessionWatch;
+  sessionWatch = null;
+  clearTimeout(watch.timer);
+  if (watch.abortProbe) watch.abortProbe();
+}
+async function probeSession(signal) {
+  try {
+    const response = await sessionFetch("/api/auth/status", { signal });
+    if (!response.ok) return "unknown";
+    const status = await response.json();
+    return status?.signed_in === true ? "in" : status?.signed_in === false ? "out" : "unknown";
+  } catch { return "unknown"; }
+}
+function wakeSessionWatch() {
+  if (sessionWatch) sessionWatch.wake();
+}
+// `closed()` says whether the browser has given up on the stream (the server
+// refused it); `reopen()` opens a fresh one. `wait` carries over from the
+// stream this one replaced, and resets when a stream opens.
+function startSessionWatch({ closed, reopen, wait = SESSION_PROBE_MIN_MS }) {
+  stopSessionWatch();
+  const watch = { timer: null, probing: false, wait };
+  sessionWatch = watch;
+  const live = () => sessionWatch === watch && !leavingForSignIn;
+  const schedule = (delay) => {
+    if (watch.timer || watch.probing || !live()) return;   // one pending, never a queue
+    watch.timer = setTimeout(run, Math.max(0, delay));
+  };
+  const run = async () => {
+    watch.timer = null;
+    if (!live()) return;
+    watch.probing = true;
+    sessionProbedAt = Date.now();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SESSION_PROBE_TIMEOUT_MS);
+    watch.abortProbe = () => { clearTimeout(timeout); controller.abort(); };
+    const outcome = await probeSession(controller.signal);
+    clearTimeout(timeout);
+    watch.abortProbe = null;
+    watch.probing = false;
+    if (!live()) return;   // stopped or replaced meanwhile: its answer is nobody's
+    if (outcome === "out") {
+      stopSessionWatch();
+      goToSignIn();
+      return;
+    }
+    if (outcome === "unknown") {
+      // Not evidence either way: back off, and keep asking only while the
+      // stream is closed, since a stream the browser is still retrying
+      // raises its own next error.
+      watch.wait = Math.min(watch.wait * 2, SESSION_PROBE_MAX_MS);
+      if (closed()) schedule(watch.wait);
+      return;
+    }
+    if (!closed()) { watch.wait = SESSION_PROBE_MIN_MS; return; }
+    // Signed in, yet the server refused the stream: reopen it, further apart
+    // each time up to the ceiling, for as long as this stream is the live one.
+    reopen({ wait: Math.min(watch.wait * 2, SESSION_PROBE_MAX_MS) });
+  };
+  // Bring the pending attempt forward (never sooner than the minimum gap
+  // since the last probe). Only a stream the browser has given up on needs
+  // it: an open stream has nothing pending, and one the browser is still
+  // retrying comes back by itself.
+  watch.wake = () => {
+    if (!live() || watch.probing || !closed()) return;
+    clearTimeout(watch.timer);
+    watch.timer = null;
+    schedule(sessionProbedAt + SESSION_PROBE_MIN_MS - Date.now());
+  };
+  return {
+    // Every stream error lands here; it asks at most once per wait.
+    errored: () => schedule(sessionProbedAt + watch.wait - Date.now()),
+    // An open stream has nothing pending: a probe timer left from before it
+    // connected is dropped with the back-off.
+    opened: () => {
+      clearTimeout(watch.timer);
+      watch.timer = null;
+      watch.wait = SESSION_PROBE_MIN_MS;
+    },
+    signedOut: () => { if (live()) { stopSessionWatch(); goToSignIn(); } },
+  };
+}
+
 function requestKey() {
   return globalThis.crypto?.randomUUID?.()
     || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -107,7 +284,7 @@ async function chatApi(path, method = "GET", body, idempotencyKey, signal) {
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   let response;
   try {
-    response = await fetch("/api" + path, {
+    response = await sessionFetch("/api" + path, {
       method, headers, signal,
       body: body === undefined || raw ? body : JSON.stringify(body),
     });
@@ -410,7 +587,7 @@ function openDrawer({ title, sections = [], width = 380, onClose }) {
   return close;
 }
 
-// The operator's settings drawer: four mounts in a fixed order. This lane
+// The operator's settings drawer: five mounts in a fixed order. This lane
 // fills Appearance; Tokens, Models and Engine are filled by assigning a
 // render(mount, { close }) function to their entry in DRAWER_SECTIONS.
 const DRAWER_SECTIONS = [
@@ -418,6 +595,7 @@ const DRAWER_SECTIONS = [
   { id: "drawer-tokens", label: "Tokens", render: null },
   { id: "drawer-models", label: "Models", render: null },
   { id: "drawer-engine", label: "Engine", render: null },
+  { id: "drawer-account", label: "Account", render: null },
 ];
 // The header button toggles: a second press closes the open drawer.
 let closeSettingsDrawer = null;
@@ -2472,7 +2650,7 @@ async function renderScripts(view) {
       if (s.danger && !confirm(`Run "${s.name}"?\n\n${s.desc}`)) return;
       run.disabled = true; setStatus("running " + s.key + "…");
       try {
-        const r = await fetch("/api/scripts/" + s.key, { method: "POST" });
+        const r = await sessionFetch("/api/scripts/" + s.key, { method: "POST" });
         const data = await r.json();
         out.hidden = false; out.textContent = data.output || "(done)";
         setStatus(data.ok ? s.key + " ✓" : s.key + " failed (" + data.code + ")");
@@ -2544,7 +2722,7 @@ function serviceRow(s, hostLifecycle) {
     setStatus(`${s.name}: ${action}…`);
     row.classList.add("busy");
     try {
-      const r = await fetch(`/api/services/${s.key}/${action}`, {
+      const r = await sessionFetch(`/api/services/${s.key}/${action}`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
       const data = await r.json();
       out.hidden = false; out.textContent = data.output || "(done)";
@@ -2742,7 +2920,7 @@ async function openWinVmModal() {
       row.append(head, out);
       results.append(row);
       try {
-        const r = await fetch("/api/vm/validate/" + check,
+        const r = await sessionFetch("/api/vm/validate/" + check,
           { method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ vm }) });
         const data = await r.json();
@@ -2890,7 +3068,7 @@ async function renderMap(root) {
   const remap = el("button", { className: "act", textContent: "re-map ↻" });
   remap.onclick = async () => {
     remap.disabled = true; setStatus("mapping…");
-    try { await fetch("/api/scripts/map", { method: "POST" }); setStatus("mapped"); renderMap(root); }
+    try { await sessionFetch("/api/scripts/map", { method: "POST" }); setStatus("mapped"); renderMap(root); }
     finally { remap.disabled = false; }
   };
   head.append(remap);
@@ -3142,16 +3320,494 @@ function renderDrawerModels(mount) {
   return () => { closed = true; modelCatalogueListeners.delete(adopted); };
 }
 
-// Engine: the controls arrive with the host-side engine-ops service.
+// Engine: version facts and the three engine controls. The verbs run in the
+// host-side engine-ops service, never in the review API: this page finds the
+// service through GET /api/engine-ops and then talks to it directly. The
+// service's own GET /status is the authority on whether it is up, and its
+// `ops` facts word every confirmation, so nothing here is keyed on runtime.
+const ENGINE_OPS = [
+  ["update", "Update engine"],
+  ["restart", "Restart engine"],
+  ["update-harnesses", "Update harnesses"],
+];
+// Shown when the engine cannot describe its own operations (an engine
+// without the discovery route, or an unreachable review API).
+const ENGINE_CLI_FALLBACK = {
+  update: "./sc update", restart: "./sc restart", "update-harnesses": "./sc update-harnesses",
+};
+const ENGINE_FOLLOW_MS = 2000;
+const ENGINE_FOLLOW_LIMIT = 150;   // five minutes, then stop and say so
+const ENGINE_NOT_STARTED_AFTER = 5;
+
+// The host authority (the engine-ops service) is reached directly, on the
+// hostname this page was loaded from: the session cookie is bound to that
+// exact host, and cookies ignore ports, so the authority receives it only
+// when both use the same name.
+function authorityBase(url) {
+  if (!url) return null;
+  try {
+    const target = new URL(url);
+    target.hostname = location.hostname;
+    return target.origin;
+  } catch { return null; }
+}
+// Every request to the host authority goes through here: sign-in state,
+// devices, engine status and the engine operations. It sends the session
+// cookie and never an Authorization header; a POST carries a JSON object
+// (the authority reads no field of it for /ops/). sign_in_required is
+// handled by sessionFetch.
+async function engineOpsRequest(base, path, method = "GET", body = {}) {
+  const init = { method, credentials: "include" };
+  if (method === "POST") {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  const response = await sessionFetch(base + path, init);
+  const data = await response.json().catch(() => ({}));
+  return { status: response.status, ok: response.ok, data };
+}
+
+const ENGINE_PIN_CLI = "./sc auth origin";
+// discovery: where the service is. auth: its /auth/status, asked first
+// because it needs no session and says whether a GUI origin is pinned.
+// status: /status, which needs the session. refusal: the error the service
+// gave instead of an answer (for example this page's origin is not the
+// pinned one).
+async function engineOpsLoad() {
+  let discovery = null;
+  try { discovery = await api("/engine-ops"); } catch { /* no route, or the engine is down */ }
+  const base = authorityBase(discovery?.url);
+  let auth = null, status = null, refusal = null;
+  if (base) {
+    try {
+      const answer = await engineOpsRequest(base, "/auth/status");
+      if (answer.ok) auth = answer.data;
+      else refusal = answer.data.error || null;
+      if (auth && auth.pinned !== false) {
+        if (auth.signed_in === false) {
+          goToSignIn();
+          return new Promise(() => {});
+        }
+        const read = await engineOpsRequest(base, "/status");
+        if (read.ok && read.data.pinned !== false) status = read.data;
+        else if (!read.ok) refusal = read.data.error || null;
+      }
+    } catch { /* the service is not running */ }
+  }
+  return { discovery, base, auth, status, refusal };
+}
+
+function engineView({ discovery, auth = null, status, refusal = null }) {
+  const described = status?.ops || discovery?.ops;
+  const ops = {};
+  for (const [op] of ENGINE_OPS)
+    ops[op] = described?.[op] || { cli: ENGINE_CLI_FALLBACK[op] };
+  return {
+    known: Boolean(discovery),
+    up: Boolean(status),
+    unpinned: auth && auth.pinned === false ? {
+      reason: auth.reason || "No GUI origin is pinned for this install.",
+      setupCli: auth.setup_cli || null, pinCli: auth.pin_cli || ENGINE_PIN_CLI,
+    } : null,
+    refusal,
+    runtime: status?.runtime || discovery?.runtime || null,
+    ops,
+    recoveryCli: status?.recovery_cli || discovery?.recovery_cli || null,
+    startCli: discovery?.start_cli || null,
+    engineRef: status?.engine_ref || null,
+    running: Boolean(status?.running),
+    operation: status?.operation || null,
+    logTail: status?.log_tail || "",
+    logTruncated: Boolean(status?.log_truncated),
+    liveSessions: status?.live_sessions || null,
+  };
+}
+
+// The confirmation text, from the operation's facts alone.
+function engineConfirmLines(op, facts, view) {
+  const lines = [`Runs ${facts.cli} on the host.`];
+  if (facts.stops_engine)
+    lines.push("The engine stops while this runs. This page reconnects when it returns.");
+  const live = view.liveSessions;
+  // A missing count is said, never guessed.
+  const count = (n, noun) => typeof n === "number"
+    ? `${n} ${noun}${n === 1 ? "" : "s"} live now.` : "The live count is unavailable.";
+  if (facts.ends_sessions === "all")
+    lines.push("All live sessions end. " + count(live?.count, "session"));
+  else if (facts.ends_sessions === "browser")
+    lines.push("Browser chats end; terminal sessions keep running. "
+      + count(live?.browser, "browser chat"));
+  if (live?.indeterminate && facts.ends_sessions && facts.ends_sessions !== "none")
+    lines.push(`${live.indeterminate} more harness processes could not be attributed.`);
+  if (facts.takes_effect === "next_restart")
+    lines.push("The change takes effect at the next restart; the running engine is unchanged until then.");
+  if (op === "update")
+    lines.push("A failed update leaves the engine stopped."
+      + (view.recoveryCli ? ` Recover with ${view.recoveryCli}.` : ""));
+  return lines;
+}
+
+// An operation that stops the engine needs its name typed; the rest need a
+// plain confirm. Resolves true only on the confirm button.
+function engineConfirm(op, label, facts, view) {
+  return new Promise((resolve) => {
+    const typed = Boolean(facts.stops_engine);
+    const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+    const confirm = el("button", {
+      className: "act primary" + (typed ? " danger" : ""), type: "button",
+      textContent: label, disabled: typed,
+    });
+    const body = el("div", { className: "engine-confirm" });
+    for (const line of engineConfirmLines(op, facts, view)) body.append(el("p", {}, line));
+    if (typed) {
+      const input = el("input", {
+        type: "text", className: "engine-confirm-input", autocomplete: "off",
+        ariaLabel: `Type ${op} to confirm`,
+      });
+      input.oninput = () => { confirm.disabled = input.value.trim() !== op; };
+      body.append(el("label", { className: "k" }, `Type ${op} to confirm`), input);
+    }
+    let answer = false;
+    const close = openActionModal({
+      title: label, bodyNode: body, dismissNode: cancel, actionNode: confirm,
+      width: 460, height: 380,
+    });
+    // Esc and the backdrop go through the overlay's closeModal: wrap it so
+    // every way out answers.
+    const overlay = body.closest ? body.closest(".modal-overlay") : null;
+    const finish = () => { close(); resolve(answer); };
+    if (overlay) {
+      overlay.closeModal = finish;
+      overlay.onmousedown = (event) => { if (event.target === overlay) finish(); };
+    }
+    if (typed) body.querySelector?.("input")?.focus();
+    cancel.onclick = finish;
+    confirm.onclick = () => { if (!confirm.disabled) { answer = true; finish(); } };
+  });
+}
+
+const engineOutcome = (operation) => operation.state === "finished"
+  ? (operation.ok ? "finished, exit 0" : `failed, exit ${operation.exit_code ?? "unknown"}`)
+  : operation.state;
+function engineOperationLine(operation) {
+  if (!operation) return "No operation has run yet.";
+  const outcome = engineOutcome(operation);
+  const when = operation.finished_at || operation.started_at;
+  return `${operation.op} — ${outcome}` + (when ? ` · ${new Date(when).toLocaleString()}` : "")
+    + (operation.error ? ` · ${operation.error}` : "");
+}
+
 function renderDrawerEngine(mount) {
-  mount.replaceChildren(el("div", { className: "drawer-note" },
-    "Engine controls are not available in this build."));
+  const facts = el("div", { className: "engine-facts" });
+  const harnesses = el("div", { className: "engine-harnesses" });
+  const banner = el("div", { className: "engine-banner", role: "status" });
+  const last = el("div", { className: "engine-last" });
+  const controls = el("div", { className: "engine-controls" });
+  mount.replaceChildren(facts, harnesses, banner, last, controls);
+  // Closing the drawer ends this section: nothing paints afterwards, and a
+  // wait in progress is woken so its loop can end instead of lingering.
+  let closed = false;
+  let waitTimer = null, wake = null;
+  const alive = () => !closed;
+  let following = false;
+
+  const paint = (state, note = null) => {
+    if (closed) return;
+    const view = engineView(state);
+    facts.replaceChildren(
+      el("span", { className: "engine-k" }, "Engine ref"),
+      el("span", { className: "engine-v" }, view.engineRef || "unavailable"),
+      el("span", { className: "engine-k" }, "Runtime"),
+      el("span", { className: "engine-v" }, view.runtime || "unavailable"));
+    banner.className = "engine-banner" + (note?.tone ? " " + note.tone : "");
+    banner.textContent = note ? note.text
+      : !view.known ? "Engine controls are unavailable on this engine. Use the CLI:"
+      : view.unpinned ? `${view.unpinned.reason} On the host, run ${view.unpinned.pinCli}`
+        + (view.unpinned.setupCli ? ` (or ${view.unpinned.setupCli} if no GUI user exists yet).` : ".")
+      : view.refusal ? "The host authority refused this page: "
+        + [view.refusal.code, view.refusal.message].filter(Boolean).join(": ")
+      : !view.up ? "The engine-ops service is not running."
+        + (view.startCli ? ` Start it with ${view.startCli}.` : "")
+      : "";
+    const tail = [];
+    if (view.up) {
+      tail.push(el("div", { className: "drawer-note" }, engineOperationLine(view.operation)));
+      if (view.logTail) tail.push(el("details", {
+        className: "engine-log", open: note?.tone === "warn" },
+        el("summary", {}, view.logTruncated ? "Log tail (truncated)" : "Log tail"),
+        el("pre", {}, view.logTail)));
+    }
+    last.replaceChildren(...tail);
+    const busy = following || view.running;
+    controls.replaceChildren(...ENGINE_OPS.map(([op, label]) => {
+      const button = el("button", {
+        className: "act", type: "button", textContent: label,
+        disabled: !view.up || busy,
+      });
+      button.onclick = () => request(op, label, view);
+      const row = el("div", { className: "engine-control" }, button);
+      if (!view.up) row.append(el("code", { className: "engine-cli" }, view.ops[op].cli));
+      return row;
+    }));
+    return view;
+  };
+
+  // Wait for an operation to end and for the engine to answer again. The
+  // review API is expected to disappear when the engine stops, and the
+  // service too on a restart, so a failed read here is a tick, not an error.
+  const follow = async (state, op, previous) => {
+    following = true;
+    const stops = Boolean(engineView(state).ops[op]?.stops_engine);
+    const waiting = { text: stops ? "Engine restarting…" : `${op} running…`, tone: "busy" };
+    paint(state, waiting);
+    let outcome = { text: "Still waiting on the engine. Check it from the CLI.", tone: "warn" };
+    for (let tick = 1; tick <= ENGINE_FOLLOW_LIMIT && alive(); tick += 1) {
+      await new Promise((resolve) => {
+        wake = resolve;
+        waitTimer = setTimeout(resolve, ENGINE_FOLLOW_MS);
+      });
+      if (!alive()) break;
+      const healthy = await api("/health").then(() => true, () => false);
+      const next = healthy ? await engineOpsLoad() : {
+        discovery: state.discovery, base: state.base, auth: state.auth, refusal: null,
+        status: state.base
+          ? await engineOpsRequest(state.base, "/status")
+            .then((answer) => answer.ok ? answer.data : null, () => null)
+          : null,
+      };
+      state = { ...next, discovery: next.discovery || state.discovery, base: next.base || state.base };
+      const operation = next.status?.operation;
+      if (!next.status || next.status.running) continue;
+      const fresh = operation && operation.op === op
+        && operation.started_at !== previous?.started_at;
+      if (!fresh) {
+        if (healthy && tick >= ENGINE_NOT_STARTED_AFTER) {
+          outcome = { text: `${op} did not start. Try again.`, tone: "warn" };
+          break;
+        }
+        continue;
+      }
+      if (!operation.ok) {
+        const view = engineView(state);
+        outcome = {
+          text: `${op} did not complete (${engineOutcome(operation)}).`
+            + (stops && !healthy && view.recoveryCli
+              ? ` The engine is stopped; recover with ${view.recoveryCli}.` : ""),
+          tone: "warn",
+        };
+        break;
+      }
+      if (!healthy) continue;   // finished cleanly; the engine is still coming up
+      outcome = {
+        text: `${op} finished.` + (engineView(state).ops[op]?.takes_effect === "next_restart"
+          ? " It takes effect at the next restart." : ""),
+        tone: "ok",
+      };
+      break;
+    }
+    following = false;
+    if (!alive()) return;
+    paint(state, outcome);
+  };
+
+  // Closing the drawer withdraws a confirmation that has not been sent yet:
+  // after every wait between the confirm button and the POST, a closed
+  // section stops, so nothing is posted from a drawer the operator has left.
+  const request = async (op, label, view) => {
+    if (!await engineConfirm(op, label, view.ops[op], view) || closed) return;
+    const state = await engineOpsLoad();
+    if (closed) return;
+    const url = state.base;
+    if (!state.status || !url) { paint(state); return; }
+    const previous = state.status.operation;
+    following = true;
+    paint(state, { text: `Starting ${op}…`, tone: "busy" });
+    let answer = null;
+    try { answer = await engineOpsRequest(url, "/ops/" + op, "POST"); }
+    catch { /* no answer: handled below */ }
+    following = false;
+    if (answer?.status === 202) return follow(state, op, previous);
+    if (answer?.status === 409 && answer.data.operation) {
+      // Someone else's operation is in flight: show it and wait on it.
+      const running = answer.data.operation;
+      state.status = { ...state.status, running: true, operation: running };
+      return follow(state, running.op, null);
+    }
+    if (!answer && view.ops[op].stops_engine)
+      return follow(state, op, previous);   // the engine going down can cut the answer off
+    const problem = answer?.data?.error;
+    const fix = problem?.code === "gui_origin_unpinned"
+      ? ` On the host, run ${problem.details?.pin_cli || ENGINE_PIN_CLI}.` : "";
+    paint(await engineOpsLoad(), {
+      text: `${op} was not started: ` + (problem
+        ? [problem.code, problem.message].filter(Boolean).join(": ") + fix
+        : "the engine-ops service did not answer."),
+      tone: "warn",
+    });
+  };
+
+  paint({ discovery: null, status: null }, { text: "Loading…" });
+  engineOpsLoad().then((state) => {
+    if (!alive()) return;
+    if (state.status?.running && state.status.operation)
+      follow(state, state.status.operation.op, null);
+    else paint(state);
+  });
+  // Harness versions: the browser-surface status the Configure form already
+  // reads, plus the version the model catalogue last verified, when it has one.
+  Promise.all([
+    api("/flavor-defaults"),
+    loadModelCatalogue().catch(() => null),
+  ]).then(([defaults, catalog]) => {
+    const verified = catalog?.verification?.harnesses || {};
+    const rows = Object.entries(defaults.harness_status || {}).flatMap(([name, status]) => {
+      const version = status.version || verified[name]?.observed_version
+        || verified[name]?.version || status.conversion?.version;
+      const health = !status.installed ? "not installed" : !status.enabled ? "disabled"
+        : status.healthy ? "ready" : status.unavailable_reason || "unavailable";
+      return [
+        el("span", { className: "engine-k" }, name),
+        el("span", { className: "engine-v" }, `${version || "version unknown"} · ${health}`),
+      ];
+    });
+    if (alive()) harnesses.replaceChildren(...rows);
+  }, () => {
+    if (alive()) harnesses.replaceChildren(
+      el("div", { className: "drawer-note" }, "Harness status unavailable."));
+  });
+  return () => {
+    closed = true;
+    clearTimeout(waitTimer);
+    if (wake) wake();
+  };
+}
+
+// Account (spec #271): who is signed in, this device, the other devices, sign
+// out and revoke. All of it is the host authority's: the review server only
+// says where the authority is. A revoked device is returned to the sign-in
+// screen by its own next request.
+const ACCOUNT_SESSIONS_CLI = "./sc auth sessions";
+const accountWhen = (iso) => iso ? new Date(iso).toLocaleString() : "unknown";
+const accountDevice = (session) => session?.device || "Unnamed device";
+
+async function accountLoad() {
+  let where = null;
+  try { where = await api("/auth/status"); } catch { /* an engine without sign-in, or down */ }
+  const base = authorityBase(where?.authority?.url);
+  if (!base) return { base: null, down: true };
+  try {
+    const status = await engineOpsRequest(base, "/auth/status");
+    if (!status.ok) return { base, refusal: status.data.error || { code: String(status.status) } };
+    if (status.data.signed_in === false) {
+      goToSignIn();
+      return new Promise(() => {});
+    }
+    const listed = await engineOpsRequest(base, "/auth/sessions");
+    return { base, user: status.data.user, current: status.data.session,
+      sessions: listed.ok ? listed.data.sessions || [] : null };
+  } catch { return { base, down: true }; }
+}
+
+// Plain confirmation for revoking one device. Resolves true only on confirm.
+function accountConfirmRevoke(session) {
+  return new Promise((resolve) => {
+    const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+    const confirm = el("button", {
+      className: "act primary danger", type: "button", textContent: "Revoke",
+    });
+    const body = el("div", { className: "engine-confirm" },
+      el("p", {}, `Revoke ${accountDevice(session)}, last seen ${accountWhen(session.last_seen_at)}?`),
+      el("p", {}, "That browser is returned to the sign-in screen on its next request."));
+    let answer = false;
+    const close = openActionModal({
+      title: "Revoke device", bodyNode: body, dismissNode: cancel, actionNode: confirm,
+      width: 440, height: 260,
+    });
+    const finish = () => { close(); resolve(answer); };
+    const overlay = body.closest ? body.closest(".modal-overlay") : null;
+    if (overlay) {
+      overlay.closeModal = finish;
+      overlay.onmousedown = (event) => { if (event.target === overlay) finish(); };
+    }
+    cancel.onclick = finish;
+    confirm.onclick = () => { answer = true; finish(); };
+  });
+}
+
+function renderDrawerAccount(mount) {
+  let closed = false;
+  const note = (text, tone = "") =>
+    el("div", { className: "drawer-note" + (tone ? " " + tone : ""), role: "status" }, text);
+  const paint = (state, message = null) => {
+    if (closed) return;
+    if (state.down) {
+      mount.replaceChildren(
+        note("The host authority is not running, so this page cannot list devices, "
+          + "revoke one, or sign out. Start it with ./sc launch."),
+        el("div", { className: "drawer-note" }, "From the host: ",
+          el("code", { className: "engine-cli" }, ACCOUNT_SESSIONS_CLI)));
+      return;
+    }
+    if (state.refusal) {
+      mount.replaceChildren(note("The host authority refused this page: "
+        + [state.refusal.code, state.refusal.message].filter(Boolean).join(": ")));
+      return;
+    }
+    const signOut = el("button", { className: "act", type: "button", textContent: "Sign out" });
+    signOut.onclick = async () => {
+      signOut.disabled = true;
+      try {
+        const answer = await engineOpsRequest(state.base, "/auth/sign-out", "POST", {});
+        if (answer.ok) { location.assign(SIGN_IN_PATH); return; }
+        paint(state, "Sign-out failed: " + (answer.data.error?.message || answer.status));
+      } catch { paint(state, "Sign-out failed: the host authority did not answer."); }
+    };
+    const others = (state.sessions || []).filter((session) => !session.current);
+    const list = el("div", { className: "account-devices" });
+    for (const session of others) {
+      const revoke = el("button", { className: "act", type: "button", textContent: "Revoke" });
+      revoke.setAttribute("aria-label", `Revoke ${accountDevice(session)}`);
+      revoke.onclick = async () => {
+        if (!await accountConfirmRevoke(session) || closed) return;
+        revoke.disabled = true;
+        try {
+          const answer = await engineOpsRequest(
+            state.base, "/auth/sessions/revoke", "POST", { id: session.id });
+          if (answer.ok && answer.data.current) { location.assign(SIGN_IN_PATH); return; }
+          const failed = answer.ok ? null
+            : "Revoke failed: " + (answer.data.error?.message || answer.status);
+          const next = await accountLoad();
+          paint(next, failed);
+        } catch { paint(state, "Revoke failed: the host authority did not answer."); }
+      };
+      list.append(el("div", { className: "account-device" },
+        el("div", { className: "account-device-name" }, accountDevice(session)),
+        el("div", { className: "drawer-note" }, `Last seen ${accountWhen(session.last_seen_at)}`),
+        revoke));
+    }
+    mount.replaceChildren(
+      el("div", { className: "engine-facts" },
+        el("span", { className: "engine-k" }, "Signed in as"),
+        el("span", { className: "engine-v" }, state.user?.username || "unknown"),
+        el("span", { className: "engine-k" }, "This device"),
+        el("span", { className: "engine-v" },
+          `${accountDevice(state.current)} · since ${accountWhen(state.current?.created_at)}`)),
+      el("div", { className: "drawer-actions" }, signOut),
+      el("div", { className: "account-heading" }, "Other devices"),
+      state.sessions === null ? note("The device list could not be read.")
+        : others.length ? list : note("No other device is signed in."),
+      ...(message ? [note(message, "warn")] : []));
+  };
+  mount.replaceChildren(note("Loading…"));
+  accountLoad().then((state) => paint(state));
+  return () => { closed = true; };
 }
 
 for (const [id, render] of [
   ["drawer-tokens", renderDrawerTokens],
   ["drawer-models", renderDrawerModels],
   ["drawer-engine", renderDrawerEngine],
+  ["drawer-account", renderDrawerAccount],
 ]) DRAWER_SECTIONS.find((section) => section.id === id).render = render;
 
 // "＋ Chat" asks the server for its catalogue without waiting on the answer:
@@ -3911,6 +4567,7 @@ function chatLoadConfiguration() {
 }
 
 function chatStopStream() {
+  stopSessionWatch();
   if (chatSource) chatSource.close();
   chatSource = null;
 }
@@ -4476,14 +5133,30 @@ async function chatRefreshConversation(conversationId, generation, onUpdate) {
 }
 
 function chatOpenStream(
-  conversationId, generation, afterSequence, onEvent, onState,
+  conversationId, generation, afterSequence, onEvent, onState, resumed = {},
 ) {
   chatStopStream();
   const source = new EventSource(
     `/api/conversations/${conversationId}/events?after=${afterSequence}`);
   chatSource = source;
-  source.onopen = () => onState("connected");
-  source.onerror = () => onState("reconnecting");
+  // Events carry their sequence; a reopened stream resumes after the last
+  // one seen here rather than replaying from where this one started.
+  let resumeAfter = afterSequence;
+  // The browser retries a dropped connection by itself, but closes the
+  // stream for good when the server refuses it. The watch is this stream's
+  // alone: chatStopStream() cancels it with the stream.
+  const watch = startSessionWatch({
+    ...resumed,
+    closed: () => source.readyState === 2,
+    reopen: (carried) => {
+      if (chatSource === source && generation === chatRenderGeneration)
+        chatOpenStream(conversationId, generation, resumeAfter, onEvent, onState, carried);
+    },
+  });
+  source.onopen = () => { watch.opened(); onState("connected"); };
+  source.onerror = () => { onState("reconnecting"); watch.errored(); };
+  // The gate names the reason on the stream before it closes it.
+  source.addEventListener("sign_in_required", () => watch.signedOut());
   const types = [
     "conversation.created", "conversation.updated", "conversation.renamed",
     "conversation.close.requested", "conversation.closed",
@@ -4497,7 +5170,12 @@ function chatOpenStream(
   for (const type of types) {
     source.addEventListener(type, (raw) => {
       if (generation !== chatRenderGeneration) return;
-      try { onEvent(JSON.parse(raw.data)); } catch { /* malformed frames reconnect */ }
+      try {
+        const event = JSON.parse(raw.data);
+        const sequence = Number(event.sequence);
+        if (Number.isFinite(sequence) && sequence > resumeAfter) resumeAfter = sequence;
+        onEvent(event);
+      } catch { /* malformed frames reconnect */ }
     });
   }
   return source;
@@ -4703,7 +5381,7 @@ async function reviewObservationApi(path, { method = "GET", key = "" } = {}) {
   const headers = key ? { "Idempotency-Key": key } : {};
   let response;
   try {
-    response = await fetch("/api" + path, { method, headers });
+    response = await sessionFetch("/api" + path, { method, headers });
   } catch (cause) {
     const error = new Error("Diff observation could not be reached.");
     error.code = "REVIEW_TARGET_UNAVAILABLE";
@@ -6335,6 +7013,7 @@ async function chatRenderOpen(
       conversation.close_requested_at = null;
       paint();
       refresh();
+      wakeSessionWatch();   // a closed event stream is retried now, not at its next slot
     } catch (error) {
       pending.hidden = false;
       pending.textContent = `${error.code} — retry keeps this exact send`;
@@ -8425,6 +9104,10 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) sprintStopPolling();
   else if (activeTab === "sprints") load("sprints");
 });
+// A tab coming back, or the network returning, is a good moment to retry a
+// closed event stream: both bring the stream watch's next attempt forward.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) wakeSessionWatch(); });
+window.addEventListener("online", () => wakeSessionWatch());
 // Close any open popover menu on an outside click (one handler for all .gmenu).
 document.addEventListener("mousedown", (e) => {
   for (const m of document.querySelectorAll(".gmenu:not([hidden])"))

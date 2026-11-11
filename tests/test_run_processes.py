@@ -223,9 +223,14 @@ def test_operator_filters_before_limit_and_shell_credentials_cannot_observe(brok
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
 
+    # The operator is a signed-in browser (Feature #94).
+    from signin_fixture import sign_in
+    browser = sign_in()
+
     def get(path, token=None):
         req = urllib.request.Request(f'http://127.0.0.1:{httpd.server_port}' + path,
-                                     headers={'Authorization': f'Bearer {token}'} if token else {})
+                                     headers={'Authorization': f'Bearer {token}'} if token
+                                     else {'Cookie': browser.cookie})
         with urllib.request.urlopen(req, timeout=5) as response:
             return json.load(response)
 
@@ -242,8 +247,14 @@ def test_operator_filters_before_limit_and_shell_credentials_cannot_observe(brok
             get(f'/api/runs/processes?conversation_id={cid}', 'runs-ui-owner')
         assert error.value.code == 403
         assert get(f'/api/runs/processes?conversation_id={cid}')['processes']
+        # No header is not the operator, and neither is a revoked session.
+        browser.revoke()
+        with pytest.raises(urllib.error.HTTPError) as error:
+            get('/api/runs')
+        assert error.value.code == 401
     finally:
         httpd.shutdown()
+        browser.restore()
         httpd.server_close()
         thread.join(5)
 

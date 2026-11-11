@@ -40,6 +40,8 @@ MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "api"))
 import server  # noqa: E402  (server.py adds scripts/ to the path on import)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from signin_fixture import sign_in  # noqa: E402
 import models as routes_cli  # noqa: E402
 
 
@@ -1263,6 +1265,7 @@ class InboxDrainRouteTest(unittest.TestCase):
         patcher = mock.patch.object(server, "DB_PATH", self.db_path)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.browser = sign_in(self)
 
     def post(self, path, body, *, token=None, origin=SAME):
         raw = json.dumps(body).encode()
@@ -1270,6 +1273,9 @@ class InboxDrainRouteTest(unittest.TestCase):
                  "Content-Type: application/json"]
         if token:
             lines.append(f"Authorization: Bearer {token}")
+        else:
+            # The operator is a signed-in browser (Feature #94).
+            lines.append(f"Cookie: {self.browser.cookie}")
         if origin:
             lines += [f"Origin: {origin}", "Sec-Fetch-Site: same-origin"]
         status, _headers, out = server.dispatch_http(
@@ -1499,14 +1505,18 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
                 for harness in ("opencode",)
             },
         }
+        browser = sign_in(self, host="127.0.0.1")
         with (
             mock.patch.object(server, "db", side_effect=self.connect) as opened,
+            # The gate's own lookup of the session's user is not the route's
+            # DB use this test is about.
+            mock.patch.object(server, "_active_user", return_value=True),
             mock.patch.object(
                 server.model_catalog, "catalog", return_value=payload
             ) as catalogue,
         ):
             status, _headers, raw = server.dispatch_http(
-                "GET", "/api/models", "Host: 127.0.0.1", b""
+                "GET", "/api/models", browser.raw(), b""
             )
 
         self.assertEqual(status, 200)
@@ -1559,6 +1569,7 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
                         "cli_version": f"codex-cli {version}"}
                 with (
                     mock.patch.object(server, "db", side_effect=connect) as opened,
+                    mock.patch.object(server, "_active_user", return_value=True),
                     mock.patch.object(server.model_catalog, "catalog", side_effect=catalog)
                     as catalogue,
                     mock.patch.object(server.model_catalog, "harness_runtime_status",
@@ -1567,7 +1578,7 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
                                       return_value=[live]),
                 ):
                     status, _headers, raw = server.dispatch_http(
-                        "GET", path, "Host: 127.0.0.1", b""
+                        "GET", path, sign_in(self, host="127.0.0.1").raw(), b""
                     )
                 body = json.loads(raw)
                 self.assertEqual(status, 200, body)

@@ -19,9 +19,11 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path.insert(0, str(ENGINE / "api"))
 sys.path.insert(0, str(ENGINE / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import conversation_broker
 import conversation_routes
+from signin_fixture import sign_in
 from conversation_adapters import (
     ConversationContext,
     InterruptResult,
@@ -302,6 +304,7 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
             )
 
     def setUp(self) -> None:
+        self.browser = sign_in(self, host="localhost:8800")
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
         self.db_path = self.root / "shell.db"
@@ -402,9 +405,9 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
         self.assertTrue(broker.wait_started())
         return broker
 
-    @staticmethod
-    def headers(*, key: str | None = None) -> str:
-        values = {"Host": "localhost:8800"}
+    def headers(self, *, key: str | None = None) -> str:
+        # The operator is a signed-in browser (Feature #94).
+        values = {"Host": "localhost:8800", "Cookie": self.browser.cookie}
         if key is not None:
             values["Idempotency-Key"] = key
         return "\r\n".join(f"{name}: {value}" for name, value in values.items())
