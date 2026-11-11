@@ -6227,7 +6227,23 @@ class Handler(BaseHTTPRequestHandler):
                 tsb = self._body().get("ts")
                 if tsb is not None and not isinstance(tsb, dict):
                     return self._send(400, {"error": "ts must be an object"})
-                return self._send(200, {"ok": True, "ts": ts_mod.write(tsb)})
+                # Same replies as the ts-broker's PUT /ts: a bad host or user
+                # name is the caller's error (400, nothing saved), and a save
+                # that fails says so by code instead of a bare 500 string.
+                try:
+                    saved = ts_mod.write(tsb)
+                except ts_mod.BlockInvalid as exc:
+                    return self._send(400, {
+                        "ok": False, "error": "ts_block_invalid",
+                        "message": f"the ts block was not saved: {exc}"})
+                except Exception as exc:  # noqa: BLE001 — report, keep serving
+                    traceback.print_exc()
+                    return self._send(500, {
+                        "ok": False, "error": "ts_write_failed",
+                        "message": ("the ts block was not saved "
+                                    f"({type(exc).__name__}: {exc}); the "
+                                    "previous block is still in effect")})
+                return self._send(200, {"ok": True, "ts": saved})
             if path == "/api/pm2":
                 pb = self._body().get("pm2")
                 if pb is not None and not isinstance(pb, dict):

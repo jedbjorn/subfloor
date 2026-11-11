@@ -709,7 +709,12 @@ sc_vm_broker_alive() {
 }
 sc_vm_broker_up() {
   if ! "$PY" "$S/vm.py" configured; then
-    echo "→ vm-broker: no VM or remotes linked — nothing to serve"; return 0
+    # Not a failure (launch calls this on every fork), but not a start either:
+    # say that the broker is NOT running and what links a seat, so a caller
+    # sent here by a status hint is not left with a no-op.
+    echo "→ vm-broker: NOT started — no VM or remotes linked, so there is nothing to serve"
+    echo "  link a seat first: ./sc vm adopt --domain <domain> --ssh-user <user> · ./sc vm init … · ./sc remote add <name> …"
+    return 0
   fi
   if sc_vm_broker_alive; then echo "→ vm-broker already serving $("$PY" "$S/vm.py" sock)"; return 0; fi
   sc_broker_preflight vm-broker "$VM_BROKER_PID" "$ENGINE/run/vm-broker.log" "$("$PY" "$S/vm.py" sock)" || return 1
@@ -787,7 +792,9 @@ sc_ts_broker_alive() {
 }
 sc_ts_broker_up() {
   if ! "$PY" "$S/ts.py" configured; then
-    echo "→ ts-broker: no tailnet linked (instance.json has no \`ts\` block) — nothing to serve"; return 0
+    echo "→ ts-broker: NOT started — no tailnet linked (instance.json has no \`ts\` block), so there is nothing to serve"
+    echo "  link one first: ./sc ts init --ssh-user <user> --allowed-host <host>"
+    return 0
   fi
   if sc_ts_broker_alive; then echo "→ ts-broker already serving $("$PY" "$S/ts.py" sock)"; return 0; fi
   sc_broker_preflight ts-broker "$TS_BROKER_PID" "$ENGINE/run/ts-broker.log" "$("$PY" "$S/ts.py" sock)" || return 1
@@ -2087,9 +2094,11 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc vm init --domain DOMAIN --snapshot NAME
        --ssh-host HOST --ssh-user USER --ssh-key-path PATH
        [--libvirt-uri URI] [--ssh-port N] [--mcp-port N]
-       [--workspace 'C:\SubfloorTest'] [--known-hosts-path PATH]
+       [--workspace 'C:\SubfloorTest'] [--known-hosts-path PATH] [--no-verify]
                            hand-link an already-prepared guest: write only the vm
-                           block and report broker health
+                           block, start the broker and test the link (domain, ssh,
+                           snapshot, declared checks) with pass/fail per check;
+                           --no-verify saves without testing (offline setup)
   ./sc vm status [--json] read broker, VM, SSH, and MCP-tunnel state without mutation;
                            includes relay, endpoint, and active-adapter state
   ./sc vm start [--json]  start only when off, then wait within a bounded SSH-readiness budget
@@ -2127,7 +2136,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              against libvirt in this process, with no broker in the path.
                              Use `./sc vm bake` normally (broker route, shell-legal); use
                              this when the broker is down. Host-only, never in the sandbox.
-  ./sc vm-broker-up        start it in the background (nohup + pidfile); self-skips if unlinked/already up
+  ./sc vm-broker-up        start it in the background (nohup + pidfile); starts nothing and
+                             says so when no VM or remote is linked
   ./sc vm-broker-down      stop the backgrounded broker
   ./sc vm-broker-sock      print the broker's socket path
   ./sc vm-broker-install   supervise via a systemd --user unit (survives logout/reboot)
@@ -2138,7 +2148,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              `./sc vm mcp up` brings the endpoint online
 
   Named remotes (SSH and key material stay behind the host vm-broker):
-  ./sc remote add NAME --host HOST --user USER --key-path ABSOLUTE [OPTIONS]
+  ./sc remote add NAME --host HOST --user USER --key-path ABSOLUTE [OPTIONS] [--no-verify]
+                           save the remote, start the broker and test the link over SSH
   ./sc remote remove NAME | ./sc remote list | ./sc remote status NAME
   ./sc remote exec NAME [--command-file FILE] [--json] -- COMMAND...
   ./sc remote push NAME SRC DEST | ./sc remote pull NAME SRC DEST
@@ -2148,9 +2159,17 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   See .super-coder/docs/tailscale-broker.md). `launch` brings it up when a tailnet is linked:
   ./sc ts status|exec HOST -- COMMAND
                            observe the tailnet or run a policy-checked diagnostic command
-  ./sc ts init             write the ts block from flags and show broker health
+  ./sc ts init [--ssh-user U] [--allowed-host [USER@]HOST]... [--readonly-host [USER@]HOST]...
+       [--replace-hosts] [--no-verify]
+                           write the ts block; named hosts are ADDED to the saved lists
+                           (--replace-hosts replaces them), then the broker is started and
+                           the link tested with pass/fail per check
+  ./sc ts add-host [USER@]HOST [--readonly] [--no-verify]
+  ./sc ts remove-host HOST
+                           declare or drop one host without touching the others
   ./sc ts-broker           run the broker in the foreground (unix socket)
-  ./sc ts-broker-up        start it in the background (nohup + pidfile); self-skips if unlinked/already up
+  ./sc ts-broker-up        start it in the background (nohup + pidfile); starts nothing and
+                             says so when no tailnet is linked
   ./sc ts-broker-down      stop the backgrounded broker
   ./sc ts-broker-sock      print the broker's socket path
   ./sc ts-broker-install   supervise via a systemd --user unit (survives logout/reboot)
