@@ -7,6 +7,7 @@ native capability never make the proven core engine baseline unavailable.
 from __future__ import annotations
 
 import base64
+import csv
 import fcntl
 import hashlib
 import io
@@ -1806,44 +1807,149 @@ def paths_overlap(first: str | os.PathLike[str], second: str | os.PathLike[str])
     return a == b or a in b.parents or b in a.parents
 
 
-def bind_sources(arguments: Sequence[str]) -> list[str]:
-    """Every host path a `docker run` argument list bind-mounts.
+# `--mount` types Docker knows. Only `bind` names a host path.
+_MOUNT_TYPES = frozenset({"bind", "volume", "tmpfs", "npipe", "cluster", "image"})
+_MOUNT_SOURCE_KEYS = ("source", "src")
+_MOUNT_TARGET_KEYS = ("target", "dst", "destination")
+_MOUNT_BARE_KEYS = frozenset({
+    "readonly", "ro", "volume-nocopy", "bind-nonrecursive", "bind-create-src",
+    "tmpfs-noexec",
+})
+_SHORT_CLUSTER = re.compile(r"^-[A-Za-z]{2,}$")
 
-    `-v`/`--volume SRC:DST[:opts]` (a source that is not an absolute path is a
-    named volume, not a bind) and `--mount type=bind,src=…`, in both the
-    two-argument and the `=` forms. Read-only binds count: a read still leaks.
+
+def _unclassified(what: str) -> SandboxImageError:
+    return SandboxImageError(
+        f"refusing to launch: cannot tell what {what} mounts, so it cannot be "
+        "checked against the engine-ops service's private state directory. "
+        "Use an absolute path with -v SRC:DST or --mount type=bind,src=SRC,dst=DST."
+    )
+
+
+def _host_path(source: str, cwd: str | os.PathLike[str], what: str) -> str:
+    """A bind source as an absolute host path; relative ones are against `cwd`."""
+    if not source or "\0" in source:
+        raise _unclassified(what)
+    path = Path(source)
+    if not path.is_absolute():
+        path = Path(cwd) / path
+    return os.path.normpath(path)
+
+
+def _mount_source(value: str, cwd: str | os.PathLike[str]) -> str | None:
+    """The host path of one `--mount` value, or None when it binds none.
+
+    Read the way Docker reads it: the value is one CSV record; each field is
+    `key=value` or a bare key; keys and the type are case-insensitive; `src`
+    is `source`; a missing type is `volume`. Anything this cannot read the way
+    Docker would is refused rather than passed through.
     """
+    what = f"--mount {value!r}"
+    try:
+        records = list(csv.reader([value], strict=True))
+    except csv.Error as exc:
+        raise _unclassified(what) from exc
+    if len(records) != 1 or not records[0]:
+        raise _unclassified(what)
+    fields: dict[str, str] = {}
+    bare: list[str] = []
+    for field in records[0]:
+        key, separator, content = field.partition("=")
+        key = key.strip().lower()
+        if not separator:
+            bare.append(key)
+        fields[key] = content          # a repeated key: the last one wins, as in Docker
+    explicit = "type" in fields and bool(fields["type"])
+    kind = fields.get("type", "").strip().lower() or "volume"
+    if kind not in _MOUNT_TYPES:
+        raise _unclassified(what)
+    if explicit and kind != "bind":
+        # Stated not to be a bind: it names no host path, whatever else the
+        # value carries (the dev-kit volumes are spelled this way).
+        return None
+    # A bind, or a value that leaves the type to the default: it must read
+    # cleanly. Docker takes a few options as bare words and requires a
+    # target; anything else is an error there, and here.
+    if any(key not in _MOUNT_BARE_KEYS for key in bare):
+        raise _unclassified(what)
+    if not any(fields.get(key) for key in _MOUNT_TARGET_KEYS):
+        raise _unclassified(what)
+    if kind != "bind":
+        return None
+    sources = [fields[key] for key in _MOUNT_SOURCE_KEYS if key in fields]
+    if len(sources) != 1:
+        raise _unclassified(what)
+    return _host_path(sources[0], cwd, what)
+
+
+def _volume_source(value: str, cwd: str | os.PathLike[str]) -> str | None:
+    """The host path of one `-v`/`--volume` value, or None when it binds none.
+
+    Docker's rule: `SRC:DST[:opts]`; a source that starts with `/` or `.` is a
+    host path (a relative one is against the working directory), any other
+    source is a named volume, and a value with no `:` is an anonymous volume.
+    """
+    what = f"-v {value!r}"
+    if not value or "\0" in value:
+        raise _unclassified(what)
+    parts = value.split(":")
+    if len(parts) == 1:
+        if not value.startswith("/"):
+            raise _unclassified(what)      # an anonymous volume needs a container path
+        return None
+    source = parts[0]
+    if not source:
+        raise _unclassified(what)
+    if source.startswith(("/", ".", "~")):
+        if source.startswith("~"):
+            raise _unclassified(what)      # Docker does not expand it; a shell might have
+        return _host_path(source, cwd, what)
+    return None
+
+
+def bind_sources(
+    arguments: Sequence[str],
+    cwd: str | os.PathLike[str] | None = None,
+) -> list[str]:
+    """Every host path a `docker run` argument list bind-mounts, absolute.
+
+    `-v`/`--volume` and `--mount`, in the two-argument, `=`, and attached
+    (`-vSRC:DST`) forms, each read the way Docker reads it. Read-only binds
+    count: a read still leaks. An argument that mounts something this cannot
+    classify raises SandboxImageError: a malformed value, a flag with no
+    value, `--volumes-from`, or `-v` hidden in a cluster of short flags.
+    """
+    base = os.getcwd() if cwd is None else cwd
     sources: list[str] = []
-    index = 0
     arguments = list(arguments)
+    index = 0
     while index < len(arguments):
         argument = arguments[index]
+        index += 1
         value = None
         kind = None
         for flag in ("-v", "--volume", "--mount"):
-            if argument == flag and index + 1 < len(arguments):
-                value, kind = arguments[index + 1], flag
+            if argument == flag:
+                if index >= len(arguments):
+                    raise _unclassified(f"{flag} with no value")
+                value, kind = arguments[index], flag
                 index += 1
                 break
             if argument.startswith(flag + "="):
                 value, kind = argument[len(flag) + 1:], flag
                 break
-        if kind is None and argument.startswith("-v") and len(argument) > 2 \
-                and not argument.startswith("--"):
-            value, kind = argument[2:], "-v"
-        index += 1
-        if value is None:
+        if kind is None:
+            if argument == "--volumes-from" or argument.startswith("--volumes-from="):
+                raise _unclassified(argument)
+            if argument.startswith("-v") and not argument.startswith("--"):
+                value, kind = argument[2:], "-v"
+            elif _SHORT_CLUSTER.match(argument) and "v" in argument:
+                raise _unclassified(f"the short-flag cluster {argument!r}")
+        if kind is None:
             continue
-        if kind == "--mount":
-            fields = dict(
-                part.split("=", 1) if "=" in part else (part, "")
-                for part in value.split(","))
-            if fields.get("type", "volume") != "bind":
-                continue
-            source = fields.get("src") or fields.get("source") or ""
-        else:
-            source = value.split(":", 1)[0]
-        if source.startswith("/"):
+        source = (_mount_source(value, base) if kind == "--mount"
+                  else _volume_source(value, base))
+        if source is not None:
             sources.append(source)
     return sources
 

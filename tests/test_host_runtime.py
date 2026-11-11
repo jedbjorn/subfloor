@@ -150,6 +150,9 @@ class HostRuntimeFixture:
                 raise SystemExit(1)
             elif command == "up":
                 print("→ engine-ops up (fixture)")
+            elif command == "down" and os.environ.get("SC_TEST_ENGINE_OPS_DOWN_FAIL"):
+                print("✗ engine-ops (pid 1) could not be stopped safely", file=sys.stderr)
+                raise SystemExit(1)
             elif command == "down":
                 print("→ engine-ops stopped (fixture)")
             """
@@ -373,6 +376,24 @@ class HostRuntimeLifecycleTest(unittest.TestCase):
         self.assertEqual(down.returncode, 0, down.stderr)
         self.assertIn("engine_ops down", self.fx.calls())
         self.assertFalse(list((self.fx.engine / "run").glob("engine-ops*")))
+
+    def test_a_failed_engine_ops_stop_is_shown_and_fails_only_its_own_verb(self):
+        self.assertEqual(self.fx.run("launch").returncode, 0)
+        self.fx.env["SC_TEST_ENGINE_OPS_DOWN_FAIL"] = "1"
+        # Asked for by name: the verb's exit code is the stop's.
+        direct = self.fx.run("engine-ops-down")
+        self.assertEqual(direct.returncode, 1, direct.stdout + direct.stderr)
+        self.assertIn("could not be stopped safely", direct.stderr)
+        # Inside the lifecycle verbs it is reported, and their exit codes are
+        # what they were before the service existed.
+        down = self.fx.run("down")
+        self.assertEqual(down.returncode, 0, down.stdout + down.stderr)
+        self.assertIn("could not be stopped safely", down.stderr)
+        self.assertIn("host review server stopped", down.stdout)
+        self.assertEqual(self.fx.run("launch").returncode, 0)
+        restart = self.fx.run("restart", "-y")
+        self.assertEqual(restart.returncode, 0, restart.stdout + restart.stderr)
+        self.assertIn("could not be stopped safely", restart.stderr)
 
     def test_restart_does_not_fail_on_the_engine_ops_service(self):
         self.assertEqual(self.fx.run("launch").returncode, 0)

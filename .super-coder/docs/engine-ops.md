@@ -61,6 +61,14 @@ pin, the status, and the logs. This is enforced in two places:
   is resolved and compared with the directory. An overlap stops the launch
   with a message naming both paths. It needs no list of mounts to be kept in
   step, and it does not need the directory to exist yet.
+  Values are read the way Docker reads them: a `--mount` value is one CSV
+  record with case-insensitive keys and type, `src` for `source`, and
+  `volume` when no type is given; a `-v` source starting with `/` or `.` is a
+  path, relative ones against the launch directory. What the guard cannot
+  classify it refuses rather than passes through: a malformed `--mount`, a
+  bind with no or an empty source, a flag with no value, `--volumes-from`, or
+  `-v` inside a cluster of short flags. Named volumes, `--tmpfs`, and
+  `type=volume` mounts name no host path and are left alone.
 - **In the service**, for what it can know without a launch: the checkout,
   the instance state collection, the interpreter mount, and the home mounts
   (`sandbox_devkit.HOME_BIND_MOUNTS`, the list the launcher's arguments are
@@ -320,6 +328,9 @@ The proof and the signal use one process handle (a pidfd), so the pid cannot
 be reused between them. If no handle can be had, nothing is signalled: the
 verb reports that the service could not be stopped safely and names the
 manual step. There is no signal-by-number fallback.
+`./sc engine-ops-down` then exits non-zero. Inside `./sc down` and
+`./sc restart` the same message is printed on stderr and the verb carries on
+with its own exit code unchanged; the service is left running.
 
 It refuses to start when `SC_SANDBOX` is set or a container marker is present,
 and every `engine-ops*` verb refuses from a linked worktree, which has no

@@ -941,7 +941,9 @@ sc_engine_ops() { "$PY" "$ENGINE/api/engine_ops.py" "$@"; }
 sc_engine_ops_port() { sc_engine_ops port; }
 sc_engine_ops_alive() { sc_engine_ops alive >/dev/null 2>&1; }
 sc_engine_ops_up() { sc_engine_ops up; }
-# `down` reports its own failure; it never fails the verb that called it.
+# Inside `./sc down` and `./sc restart` a failed stop is reported on stderr
+# and never fails the verb: those verbs' exit codes are what they were before
+# this service existed.
 sc_engine_ops_down() { sc_engine_ops down || true; }
 
 # ── db broker (HOST-side; read-only diagnostic access to the LIVE app DB) ─────
@@ -1542,8 +1544,10 @@ case "$cmd" in
                       exec "$PY" "$ENGINE/api/engine_ops_service.py" "$@" ;;
   engine-ops-up)      sc_refuse_linked engine-ops-up "the engine-ops service of $LIVE_ROOT"
                       sc_engine_ops_up ;;
+  # Asked for by name, so its own result is the verb's: non-zero when the
+  # service could not be stopped safely. (`down` and `restart` only report it.)
   engine-ops-down)    sc_refuse_linked engine-ops-down "the engine-ops service of $LIVE_ROOT"
-                      sc_engine_ops_down ;;
+                      sc_engine_ops down ;;
   engine-ops-port)    sc_refuse_linked engine-ops-port "the engine-ops service of $LIVE_ROOT"
                       sc_engine_ops_port ;;
   engine-ops-pin)     sc_refuse_linked engine-ops-pin "the engine-ops service of $LIVE_ROOT"
