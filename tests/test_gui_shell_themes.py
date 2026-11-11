@@ -113,7 +113,7 @@ def test_settings_drawer_declares_the_four_mounts_in_order():
 
 @needs_node
 def test_drawer_builds_labelled_mounts_and_closes_on_escape_backdrop_and_button():
-    drawer = APP[APP.index("function openDrawer({"):APP.index("// The operator's settings drawer")]
+    drawer = APP[APP.index("const DRAWER_FOCUSABLE"):APP.index("// The operator's settings drawer")]
     escape = APP[APP.index("// Esc dismisses the topmost modal."):APP.index('$("#snapshot")')]
     script = r"""
 class FakeElement {
@@ -136,6 +136,11 @@ class FakeElement {
   }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   focus() { this.focusCount += 1; document.activeElement = this; }
+  contains(node) { return all(this, (n) => n === node).length > 0; }
+  querySelectorAll(selector) {
+    const tags = selector.split(",").map((part) => part.trim());
+    return all(this, (n) => n !== this && tags.includes(n.tagName));
+  }
 }
 function connect(node, value) {
   if (node?.nodeType !== 1) return;
@@ -156,6 +161,13 @@ globalThis.document = {
   querySelectorAll: (selector) => selector === ".modal-overlay"
     ? all(body, (node) => node.className.split(" ").includes("modal-overlay")) : [],
 };
+// One Tab press as the browser delivers it to the overlay: returns where focus
+// ends up and whether the drawer took the move over from the browser.
+function tab(overlay, shiftKey = false) {
+  let prevented = false;
+  overlay.onkeydown({ key: "Tab", shiftKey, preventDefault: () => { prevented = true; } });
+  return [document.activeElement.textContent || document.activeElement.className, prevented];
+}
 function el(tag, props = {}, ...kids) {
   const node = document.createElement(tag);
   Object.assign(node, props);
@@ -170,7 +182,11 @@ const open = (closes) => openDrawer({
   title: "Settings",
   sections: [
     { id: "one", label: "One", render: (mount, ctx) => {
-        mount.append(el("div", {}, "filled")); closes.ctx = ctx.close; } },
+        mount.append(el("div", {}, "filled"),
+          el("button", { textContent: "first-control" }),
+          el("button", { textContent: "disabled-control", disabled: true }),
+          el("button", { textContent: "last-control" }));
+        closes.ctx = ctx.close; } },
     { id: "two", label: "Two", render: null },
     { id: "three", label: "Three", render: () => { throw new Error("boom"); } },
   ],
@@ -191,7 +207,21 @@ const result = {
   filled: mounts[0].children.length, empty: mounts[1].children.length,
   failed: text(mounts[2].children[0]),
   closeIsShared: first.ctx === close,
+  initialFocus: document.activeElement.className,
 };
+// Focus trap: the close button is the first stop, last-control the last, and
+// the disabled control is never a stop.
+result.shiftTabFromFirst = tab(overlay, true);
+result.tabFromLast = tab(overlay);
+result.tabInTheMiddle = tab(overlay);
+opener.focus();
+result.tabFromOutside = tab(overlay);
+opener.focus();
+result.shiftTabFromOutside = tab(overlay, true);
+let otherKeyPrevented = false;
+overlay.onkeydown({ key: "a", preventDefault: () => { otherKeyPrevented = true; } });
+result.otherKeysPass = !otherKeyPrevented;
+opener.focus();
 // Escape
 listeners.keydown({ key: "Escape" });
 result.afterEscape = body.children.length;
@@ -218,8 +248,15 @@ console.log(JSON.stringify(result));
         "labelledby": "drawer-title", "titleId": "drawer-title",
         "mountIds": ["one", "two", "three"],
         "labels": ["One", "Two", "Three"],
-        "filled": 1, "empty": 0, "failed": "error: boom",
+        "filled": 4, "empty": 0, "failed": "error: boom",
         "closeIsShared": True,
+        "initialFocus": "drawer-close",
+        "shiftTabFromFirst": ["last-control", True],
+        "tabFromLast": ["✕", True],
+        "tabInTheMiddle": ["✕", False],
+        "tabFromOutside": ["✕", True],
+        "shiftTabFromOutside": ["last-control", True],
+        "otherKeysPass": True,
         "afterEscape": 1, "focusRestored": True, "onCloseOnce": 1,
         "insideKeepsOpen": 2, "afterBackdrop": 1, "afterButton": 1,
         "closes": [1, 1, 1],
@@ -372,6 +409,88 @@ def test_text_tokens_meet_wcag_aa_on_the_surfaces_they_are_drawn_on(theme):
         for fg, bg in pairs if _contrast(tokens[fg], tokens[bg]) < 4.5
     ]
     assert failures == []
+
+
+def _resolve(name: str, raw: dict[str, str], surface: str) -> str:
+    """A token's painted colour over an opaque surface, following var() and
+    compositing `color-mix(in srgb, <colour> N%, transparent)` as alpha N."""
+    value = raw[name].strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        return value
+    alias = re.fullmatch(r"var\((--[\w-]+)\)", value)
+    if alias:
+        return _resolve(alias.group(1), raw, surface)
+    mix = re.fullmatch(
+        r"color-mix\(in srgb, var\((--[\w-]+)\) (\d+)%, transparent\)", value)
+    assert mix, f"{name}: cannot composite {value!r}"
+    top = _resolve(mix.group(1), raw, surface)
+    alpha = int(mix.group(2)) / 100
+    channels = [
+        round(int(top[i:i + 2], 16) * alpha + int(surface[i:i + 2], 16) * (1 - alpha))
+        for i in (1, 3, 5)
+    ]
+    return "#" + "".join(f"{c:02x}" for c in channels)
+
+
+def _raw_tokens(theme: str) -> dict[str, str]:
+    raw = dict(re.findall(r"(--[\w-]+):\s*([^;]+);", token_block(DARK_OPEN)))
+    if theme == "light":
+        raw.update(re.findall(r"(--[\w-]+):\s*([^;]+);", token_block(LIGHT_OPEN)))
+    return raw
+
+
+# WCAG 1.4.11: graphics that carry meaning without text hold 3:1 against the
+# surface they are drawn on. Each entry is (token, surfaces it is drawn on).
+ALL_SURFACES = ["--bg", "--panel", "--panel2", "--menu-bg"]
+GRAPHICS = [
+    ("--scroll-thumb", ALL_SURFACES),          # any scrollable region
+    ("--scroll-thumb-hover", ALL_SURFACES),
+    ("--wire", ["--bg", "--panel"]),           # roadmap flow dependency wires
+    ("--wire-soft", ["--bg", "--panel"]),      # sprint board dependency wires
+    ("--control-border", ALL_SURFACES),        # input, select, switch outlines
+    ("--accent", ALL_SURFACES),                # focus ring, chart line, lit wires
+    ("--dim", ["--panel", "--panel2"]),        # chart crosshair, switch knob
+    ("--tint-6", ["--panel2"]),                # resting switch knob on its track
+    ("--ok", ["--bg", "--panel"]),             # status dots and meter fills
+    ("--warn", ["--bg", "--panel", "--panel2"]),
+    ("--task-open", ["--bg", "--panel"]),
+    ("--danger-strong", ["--bg", "--panel", "--panel2"]),
+]
+
+
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_graphical_tokens_meet_wcag_non_text_contrast_when_composited(theme):
+    raw = _raw_tokens(theme)
+    failures = []
+    for token, surfaces in GRAPHICS:
+        for surface in surfaces:
+            base = _resolve(surface, raw, "#000000")
+            ratio = _contrast(_resolve(token, raw, base), base)
+            if ratio < 3.0:
+                failures.append(f"{token} on {surface}: {ratio:.2f}")
+    assert failures == []
+
+
+def test_graphical_rules_draw_from_the_tokens_the_contrast_test_covers():
+    assert "scrollbar-color: var(--scroll-thumb) transparent;" in STYLE
+    assert "::-webkit-scrollbar-thumb { background: var(--scroll-thumb);" in STYLE
+    assert "::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-hover); }" in STYLE
+    assert ":focus-visible { outline: none; box-shadow: var(--focus-ring); }" in STYLE
+    assert "--focus-ring: 0 0 0 2px var(--accent);" in token_block(DARK_OPEN)
+    assert "--focus-ring" not in token_block(LIGHT_OPEN)
+    assert ("textarea:focus, input:focus, select:focus "
+            "{ outline: none; border-color: var(--accent); }") in STYLE
+    assert ".chat-composer-field:focus-within { border-color: var(--accent); }" in STYLE
+    fields = STYLE[STYLE.index("textarea, input[type=text], select {"):]
+    assert "border: 1px solid var(--control-border);" in fields[:fields.index("}")]
+    for at in [m.start() for m in re.finditer(r"^\.switch \.slider \{", STYLE, re.MULTILINE)]:
+        assert "border: 1px solid var(--control-border);" in STYLE[at:STYLE.index("}", at)]
+    assert ".an-line { fill: none; stroke: var(--accent);" in STYLE
+    assert ".an-cross { stroke: var(--dim);" in STYLE
+    # No focus indicator or scrollbar still rides the faint neutral ramp.
+    for line in STYLE.splitlines():
+        if "focus" in line or "scrollbar" in line:
+            assert "var(--tint-" not in line, line
 
 
 def test_svg_wires_and_charts_draw_from_tokens():

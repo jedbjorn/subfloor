@@ -43,9 +43,15 @@
   --shadow-color: rgba(0, 0, 0, .4);
   --menu-shadow: 0 8px 32px rgba(0, 0, 0, .5);
   /* dependency wires (work-unit board, roadmap flow): resting strokes */
-  --wire: color-mix(in srgb, var(--accent) 42%, transparent);
-  --wire-soft: color-mix(in srgb, var(--accent) 22%, transparent);
-  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 65%, transparent);
+  --wire: color-mix(in srgb, var(--accent) 75%, transparent);
+  --wire-soft: color-mix(in srgb, var(--accent) 60%, transparent);
+  /* Graphics that carry meaning without text — control outlines, scrollbar
+     thumbs, wires, the focus ring — hold 3:1 against every surface they sit
+     on (WCAG 1.4.11), in both themes. Alpha tokens are judged composited. */
+  --control-border: #7a7a88;                     /* input, select and switch outlines */
+  --scroll-thumb: color-mix(in srgb, var(--tint) 38%, transparent);
+  --scroll-thumb-hover: color-mix(in srgb, var(--tint) 55%, transparent);
+  --focus-ring: 0 0 0 2px var(--accent);
   /* ── Non-colour scale: radii, spacing, type. */
   --r: 14px; --r-sm: 8px; --r-pill: 99px;
   --space-1: .25rem; --space-2: .5rem; --space-3: .8rem; --space-4: 1.2rem;
@@ -78,8 +84,11 @@
   --tint-5: color-mix(in srgb, var(--tint) 40%, transparent);
   --tint-6: color-mix(in srgb, var(--tint) 55%, transparent);
   --diff-add-ink: #14592f; --diff-del-ink: #8f1f27; --diff-hunk-ink: #1a4a9e;
-  --wire: color-mix(in srgb, var(--accent) 60%, transparent);
-  --wire-soft: color-mix(in srgb, var(--accent) 45%, transparent);
+  --wire: color-mix(in srgb, var(--accent) 88%, transparent);
+  --wire-soft: color-mix(in srgb, var(--accent) 74%, transparent);
+  --control-border: #7d7d88;
+  --scroll-thumb: color-mix(in srgb, var(--tint) 50%, transparent);
+  --scroll-thumb-hover: color-mix(in srgb, var(--tint) 65%, transparent);
   --menu-bg: #ffffff; --menu-border: #cfcfd8;
   --overlay: rgba(20, 20, 28, .40); --overlay-soft: rgba(20, 20, 28, .22);
   --shadow-color: rgba(20, 20, 28, .18);
@@ -94,11 +103,11 @@ body {
 /* thin scrollbars — on EVERY scrollable element, never the browser default.
    The `*` selector (not html) catches textareas/pres/popovers that don't
    inherit the Firefox scrollbar-* props from the root. */
-* { scrollbar-width: thin; scrollbar-color: var(--tint-3) transparent; }
+* { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent; }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--tint-3); border-radius: 999px; }
-::-webkit-scrollbar-thumb:hover { background: var(--tint-4); }
+::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-hover); }
 :focus-visible { outline: none; box-shadow: var(--focus-ring); }
 input:focus-visible, textarea:focus-visible, select:focus-visible { box-shadow: none; }
 header {
@@ -707,9 +716,9 @@ body.interface-view main {
   border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent);
 }
 .chat-composer-field {
-  border: 1px solid var(--line); border-radius: 12px; background: var(--panel2);
+  border: 1px solid var(--control-border); border-radius: 12px; background: var(--panel2);
 }
-.chat-composer-field:focus-within { border-color: var(--tint-4); }
+.chat-composer-field:focus-within { border-color: var(--accent); }
 .chat-composer-field .chat-composer-input {
   display: block; min-height: 72px; max-height: 220px; resize: vertical;
   border: 0; border-radius: 12px; padding: .7rem .8rem;
@@ -749,11 +758,11 @@ body.interface-view main {
 .chat-model-trigger {
   width: 100%; display: flex; justify-content: space-between; align-items: center; gap: .6rem;
   text-align: left; cursor: pointer; background: var(--panel2); color: var(--ink);
-  border: 1px solid var(--line); border-radius: 8px; padding: .5rem .6rem; font: inherit;
+  border: 1px solid var(--control-border); border-radius: 8px; padding: .5rem .6rem; font: inherit;
 }
 .chat-model-trigger::after { content: "▾"; color: var(--dim); flex: none; }
 .chat-model-trigger[aria-expanded="true"], .chat-model-trigger:focus-visible {
-  outline: none; border-color: var(--tint-4);
+  outline: none; border-color: var(--accent);
 }
 .chat-model-panel {
   position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 20;
@@ -1119,10 +1128,10 @@ body.interface-view main {
 .grid2 > .k { color: var(--dim); }
 label.k { color: var(--dim); display: block; margin: .6rem 0 .2rem; font-size: .85rem; }
 textarea, input[type=text], select {
-  width: 100%; background: var(--panel2); color: var(--ink); border: 1px solid var(--line);
+  width: 100%; background: var(--panel2); color: var(--ink); border: 1px solid var(--control-border);
   border-radius: 8px; padding: .5rem .6rem; font: inherit; resize: vertical;
 }
-textarea:focus, input:focus, select:focus { outline: none; border-color: color-mix(in srgb, var(--accent) 70%, transparent); }
+textarea:focus, input:focus, select:focus { outline: none; border-color: var(--accent); }
 button.act {
   background: none; color: var(--ink); border: 1px solid var(--tint-3);
   padding: .4rem 1rem; border-radius: 99px; cursor: pointer; font: inherit;
@@ -1296,7 +1305,7 @@ details.feature.shipped-bar { border-left-color: var(--lock); }
 .switch input { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; }
 .switch .slider {
   position: absolute; inset: 0; border-radius: 99px;
-  background: var(--panel2); border: 1px solid var(--line);
+  background: var(--panel2); border: 1px solid var(--control-border);
   transition: background .15s, border-color .15s;
 }
 .switch .slider::before {
@@ -1858,7 +1867,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .switch input { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; }
 .switch .slider {
   position: absolute; inset: 0; cursor: pointer; border-radius: 999px;
-  background: var(--panel2); border: 1px solid var(--line); transition: background .15s, border-color .15s;
+  background: var(--panel2); border: 1px solid var(--control-border); transition: background .15s, border-color .15s;
 }
 .switch .slider::before {
   content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%;

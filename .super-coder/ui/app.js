@@ -342,6 +342,10 @@ function openEditModal({ title, value, onSave }) {
 // with replaceChildren without touching the label. render(mount, { close })
 // is optional — a section without one stays empty but labelled.
 // onClose runs once, on every close path. Returns the close function.
+// Keyboard focus stays inside the panel while it is open: Tab from the last
+// control wraps to the first, Shift+Tab from the first wraps to the last, and
+// a Tab that starts outside the panel is pulled in.
+const DRAWER_FOCUSABLE = "button, [href], input, select, textarea, [tabindex]";
 function openDrawer({ title, sections = [], width = 380, onClose }) {
   const priorFocus = document.activeElement;
   const overlay = el("div", { className: "modal-overlay drawer-overlay" });
@@ -356,6 +360,22 @@ function openDrawer({ title, sections = [], width = 380, onClose }) {
   overlay.closeModal = close;
   overlay.onmousedown = (e) => { if (e.target === overlay) close(); };
   const panel = el("aside", { className: "drawer" });
+  overlay.onkeydown = (e) => {
+    if (e.key !== "Tab") return;
+    const stops = [...panel.querySelectorAll(DRAWER_FOCUSABLE)].filter((node) =>
+      !node.disabled && node.tabIndex !== -1 && !node.closest?.("[hidden]"));
+    const first = stops[0], last = stops[stops.length - 1];
+    const active = document.activeElement;
+    let target = null;
+    if (!stops.length) target = panel;
+    else if (!panel.contains(active)) target = e.shiftKey ? last : first;
+    else if (e.shiftKey && active === first) target = last;
+    else if (!e.shiftKey && active === last) target = first;
+    if (!target) return;
+    e.preventDefault();
+    target.focus();
+  };
+  panel.tabIndex = -1;
   panel.setAttribute("role", "dialog");
   panel.setAttribute("aria-modal", "true");
   panel.setAttribute("aria-labelledby", "drawer-title");
