@@ -222,7 +222,7 @@ def test_lane_css_block_closes_the_stylesheet_and_uses_tokens_only():
 def test_token_section_renders_weekly_percent_used_per_provider_from_one_get():
     script = FAKE_DOM + API + QUOTA_HELPERS + TOKENS + r"""
 const calls = [];
-const soon = new Date(Date.now() + 3 * 3600e3 + 30e3).toISOString();
+const soon = new Date(Date.now() + 3 * 3600e3 + 10 * 60e3 + 20e3).toISOString();
 const win = (window_kind, used_percent, extra = {}) => ({window_kind, used_percent, ...extra});
 const providers = [
   // Two weekly windows, listed out of order, beside non-weekly ones.
@@ -230,7 +230,7 @@ const providers = [
    windows: [win("weekly_scoped", 91.26, {scope: "opus"}), win("five_hour", 99),
              win("weekly", 74.94, {resets_at: soon}), win("session", 100)]},
   // A weekly window whose percent the provider did not report.
-  {provider: "openai", status: "ok", captured_at: new Date(Date.now() - 2 * 3600e3).toISOString(),
+  {provider: "openai", status: "ok", captured_at: new Date(Date.now() - 2 * 3600e3 - 20e3).toISOString(),
    windows: [win("weekly", null), win("five_hour", 97)]},
   // Kimi: percent USED here, not the full view's "% left".
   {provider: "moonshot", status: "ok", captured_at: null, windows: [win("weekly", 28)]},
@@ -265,7 +265,7 @@ globalThis.fetch = async (url, init) => {
         "loading": "Loading…",
         "tableClass": "drawer-quota",
         "cells": ["Weekly limit", "Resets", "Used",
-                  "Claude", "in 3h", "74.9%",
+                  "Claude", "in 3h 10m", "74.9%",
                   "Claude · opus", "—", "91.3%",
                   "Codex", "—", "n/a",
                   "Kimi", "—", "28%",

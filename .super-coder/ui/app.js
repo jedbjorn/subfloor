@@ -9021,9 +9021,12 @@ function setDocumentTitle(tab) {
 }
 function show(tab) {
   activeTab = tab;
-  for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b.dataset.tab === tab);
-  // Where the nav scrolls sideways (narrower windows), keep the active tab in view.
-  document.querySelector("nav button.active")?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  for (const b of document.querySelectorAll("nav button")) {
+    const on = b.dataset.tab === tab;
+    b.classList.toggle("active", on);
+    // Where the nav scrolls sideways (narrower windows), keep the active tab in view.
+    if (on) b.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "interface") {
@@ -9100,15 +9103,6 @@ function routeFromHash() {
   show(VIEWS[raw] ? raw : "shells");
 }
 document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => { location.hash = b.dataset.tab; }));
-// In a window too narrow for all ten tabs the nav scrolls sideways with no
-// scrollbar; a plain mouse wheel has no sideways axis, so turn it into one
-// there. A nav that fits, or a gesture that is already sideways, is left alone.
-document.querySelector("nav").addEventListener("wheel", (e) => {
-  const nav = e.currentTarget;
-  if (nav.scrollWidth <= nav.clientWidth || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
-  nav.scrollLeft += e.deltaY;
-  e.preventDefault();
-}, { passive: false });
 window.addEventListener("hashchange", routeFromHash);
 window.addEventListener("popstate", routeFromHash);
 document.addEventListener("visibilitychange", () => {
@@ -9141,6 +9135,15 @@ $("#snapshot").onclick = async () => {
   }
   catch (e) { toast("error: " + e.message); }
 };
+// In a window too narrow for all ten tabs the nav scrolls sideways with no
+// scrollbar; a plain mouse wheel has no sideways axis, so turn it into one
+// there. A nav that fits, or a gesture that is already sideways, is left alone.
+document.querySelector("nav").addEventListener("wheel", (e) => {
+  const nav = e.currentTarget;
+  if (nav.scrollWidth <= nav.clientWidth || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+  nav.scrollLeft += e.deltaY;
+  e.preventDefault();
+}, { passive: false });
 // Header chrome (spec #270): the settings drawer button.
 $("#drawer-open").onclick = openSettingsDrawer;
 (async () => {

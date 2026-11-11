@@ -100,8 +100,8 @@ def test_every_nav_entry_is_a_view_and_every_view_has_a_nav_entry_and_section():
 
 def test_flat_nav_marks_the_active_tab_routes_by_hash_and_scrolls_when_narrow():
     show = APP[APP.index("function show(tab)"):APP.index("// Hash routing:")]
-    assert ('for (const b of document.querySelectorAll("nav button")) '
-            'b.classList.toggle("active", b.dataset.tab === tab);') in show
+    assert 'for (const b of document.querySelectorAll("nav button")) {' in show
+    assert 'const on = b.dataset.tab === tab;\n    b.classList.toggle("active", on);' in show
     # Every nav button is a route: one handler, no trigger to special-case.
     assert ('document.querySelectorAll("nav button").forEach((b) => '
             '(b.onclick = () => { location.hash = b.dataset.tab; }));') in APP
@@ -120,8 +120,7 @@ def test_flat_nav_marks_the_active_tab_routes_by_hash_and_scrolls_when_narrow():
     assert ".tools { flex: 0 0 auto; }" in mid
     assert "#snapshot { flex: none; white-space: nowrap; }" in mid
     # A scrolled nav keeps the active tab in view and answers a plain wheel.
-    assert ('document.querySelector("nav button.active")?.scrollIntoView?.('
-            '{ block: "nearest", inline: "nearest" });') in show
+    assert 'if (on) b.scrollIntoView?.({ block: "nearest", inline: "nearest" });' in show
     assert 'document.querySelector("nav").addEventListener("wheel", (e) => {' in APP
     assert "if (nav.scrollWidth <= nav.clientWidth || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;" in APP
 
