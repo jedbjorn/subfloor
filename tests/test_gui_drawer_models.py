@@ -38,7 +38,9 @@ DRAWER_BLOCK = between("// ── Settings drawer: Tokens, Models, Engine", "// 
 TOKENS = DRAWER_BLOCK[DRAWER_BLOCK.index("const DRAWER_TOKEN_DAYS"):
                       DRAWER_BLOCK.index("// Models: what the server says")]
 MODELS = DRAWER_BLOCK[DRAWER_BLOCK.index("// Models: what the server says"):
-                      DRAWER_BLOCK.index("// Engine: the controls arrive")]
+                      DRAWER_BLOCK.index("// Engine: version facts")]
+ENGINE = DRAWER_BLOCK[DRAWER_BLOCK.index("// Engine: version facts"):
+                      DRAWER_BLOCK.index("for (const [id, render] of [")]
 WATCH = DRAWER_BLOCK[DRAWER_BLOCK.index("const CATALOGUE_WATCH_MS"):]
 NEW_CHAT = between("  newChat.onclick = async () => {", "  configure.onclick = async () => {")
 RENDER_NEW = between("async function chatRenderNew(", "function chatTranscriptPageItems")
@@ -146,11 +148,23 @@ def test_models_section_shows_server_freshness_and_refreshes_on_demand():
     assert 'refresh ? "/models?refresh=1" : "/models"' in CATALOGUE
 
 
-def test_engine_section_holds_a_neutral_placeholder():
-    engine = DRAWER_BLOCK[DRAWER_BLOCK.index("function renderDrawerEngine"):
-                          DRAWER_BLOCK.index("for (const [id, render]")]
-    assert "Engine controls are not available in this build." in engine
-    assert "api(" not in engine and "fetch(" not in engine
+def test_engine_section_talks_to_the_service_without_credentials_or_headers():
+    request = ENGINE[ENGINE.index("async function engineOpsRequest"):
+                     ENGINE.index("async function engineOpsLoad")]
+    assert 'fetch(base + path, { method, credentials: "omit" })' in request
+    assert "headers" not in request and "body" not in request
+    assert "Authorization" not in ENGINE.replace("no Authorization header", "")
+    # Discovery goes through the review API; the verbs never do.
+    assert 'api("/engine-ops")' in ENGINE
+    assert 'engineOpsRequest(url, "/ops/" + op, "POST")' in ENGINE
+    assert 'api("/ops' not in APP and "/api/ops" not in APP
+    assert 'api("/health")' in ENGINE
+    for op, cli in [("update", "./sc update"), ("restart", "./sc restart"),
+                    ("update-harnesses", "./sc update-harnesses")]:
+        assert f'"{cli}"' in ENGINE and f'["{op}", "' in ENGINE
+    # Wording comes from the ops facts; nothing branches on the runtime name.
+    assert '"docker"' not in ENGINE and '"host"' not in ENGINE
+    assert "const typed = Boolean(facts.stops_engine);" in ENGINE
 
 
 def test_configure_refresh_and_new_chat_use_only_the_server_stale_flag():
@@ -171,10 +185,11 @@ def test_configure_refresh_and_new_chat_use_only_the_server_stale_flag():
 
 def test_lane_css_block_closes_the_stylesheet_and_uses_tokens_only():
     block = STYLE[STYLE.index("/* ── Drawer contents and model refresh (spec 270)"):]
-    assert "\n/* " not in block[3:], "the lane block is the last block in style.css"
+    assert block.count("\n/* ") == 1, "the lane block (and its Engine part) closes style.css"
     assert not LITERAL.search(block)
     for selector in (".drawer-tokens", ".drawer-tok-num", ".drawer-link",
-                     ".drawer-model-state.stale", ".chat-refresh-models", ".chat-refresh-note"):
+                     ".drawer-model-state.stale", ".chat-refresh-models", ".chat-refresh-note",
+                     ".engine-banner.warn", ".engine-log pre", ".engine-cli", ".engine-confirm"):
         assert selector + " " in block or selector + ":" in block
     declared = set(re.findall(r"(--[\w-]+):", STYLE))
     assert set(re.findall(r"var\((--[\w-]+)\)", block)) <= declared
@@ -863,3 +878,396 @@ responses.push(good, failed);
                                "Last refresh failed just now: catalog offline"]
     assert result["noAttempt"] == ""
     assert result["undated"] == "Last refresh failed: catalog offline"
+
+
+# ── Engine section ────────────────────────────────────────────────────────────
+
+HOST_OPS = {
+    "update": {"cli": "./sc update", "stops_engine": True,
+               "ends_sessions": "browser", "takes_effect": "now"},
+    "restart": {"cli": "./sc restart", "stops_engine": True,
+                "ends_sessions": "browser", "takes_effect": "now"},
+    "update-harnesses": {"cli": "./sc update-harnesses", "stops_engine": False,
+                         "ends_sessions": "none", "takes_effect": "now"},
+}
+DOCKER_OPS = {
+    "update": {**HOST_OPS["update"], "ends_sessions": "all"},
+    "restart": {**HOST_OPS["restart"], "ends_sessions": "all"},
+    "update-harnesses": {**HOST_OPS["update-harnesses"], "takes_effect": "next_restart"},
+}
+RUNS = {op: f"Runs {facts['cli']} on the host." for op, facts in HOST_OPS.items()}
+STOPS = "The engine stops while this runs. This page reconnects when it returns."
+FAILED_UPDATE = "A failed update leaves the engine stopped. Recover with ./sc launch."
+
+
+@needs_node
+def test_confirmation_text_follows_the_ops_facts():
+    script = ENGINE + r"""
+const HOST = __HOST__, DOCKER = __DOCKER__;
+const view = (liveSessions) => ({liveSessions, recoveryCli: "./sc launch"});
+const live = {count: 4, browser: 1, indeterminate: 0};
+const lines = (ops, op, liveSessions) => engineConfirmLines(op, ops[op], view(liveSessions));
+console.log(JSON.stringify({
+  hostUpdate: lines(HOST, "update", live),
+  hostRestart: lines(HOST, "restart", live),
+  hostHarness: lines(HOST, "update-harnesses", live),
+  dockerUpdate: lines(DOCKER, "update", live),
+  dockerRestart: lines(DOCKER, "restart", {count: 4, browser: 1, indeterminate: 2}),
+  dockerHarness: lines(DOCKER, "update-harnesses", live),
+  hostRestartNoCount: lines(HOST, "restart", null),
+  dockerRestartNoCount: lines(DOCKER, "restart", null),
+  noRecovery: engineConfirmLines("update", HOST.update, {liveSessions: live, recoveryCli: null}),
+}));
+"""
+    result = run_js(script.replace("__HOST__", json.dumps(HOST_OPS))
+                    .replace("__DOCKER__", json.dumps(DOCKER_OPS)))
+    browser = "Browser chats end; terminal sessions keep running. 1 browser chat live now."
+    assert result == {
+        "hostUpdate": [RUNS["update"], STOPS, browser, FAILED_UPDATE],
+        "hostRestart": [RUNS["restart"], STOPS, browser],
+        "hostHarness": [RUNS["update-harnesses"]],
+        "dockerUpdate": [RUNS["update"], STOPS, "All live sessions end. 4 sessions live now.",
+                         FAILED_UPDATE],
+        "dockerRestart": [RUNS["restart"], STOPS, "All live sessions end. 4 sessions live now.",
+                          "2 more harness processes could not be attributed."],
+        "dockerHarness": [RUNS["update-harnesses"],
+                          "The change takes effect at the next restart; "
+                          "the running engine is unchanged until then."],
+        "hostRestartNoCount": [RUNS["restart"], STOPS,
+                               "Browser chats end; terminal sessions keep running. "
+                               "The live count is unavailable."],
+        "dockerRestartNoCount": [RUNS["restart"], STOPS,
+                                 "All live sessions end. The live count is unavailable."],
+        "noRecovery": [RUNS["update"], STOPS, browser,
+                       "A failed update leaves the engine stopped."],
+    }
+
+
+@needs_node
+def test_engine_stopping_operations_need_the_name_typed_and_others_a_plain_confirm():
+    script = FAKE_DOM + ENGINE + r"""
+const HOST = __HOST__;
+let modal = null, closes = 0;
+function openActionModal(options) { modal = options; return () => { closes += 1; }; }
+const view = {liveSessions: null, recoveryCli: "./sc launch"};
+(async () => {
+  const out = {};
+  for (const [op, text, expected] of [["restart", "restart", true], ["update", " update ", true],
+                                      ["restart", "RESTART", null], ["update-harnesses", null, true]]) {
+    const answer = engineConfirm(op, "Label " + op, HOST[op], view);
+    const input = all(modal.bodyNode, (n) => n.tagName === "INPUT")[0] || null;
+    const row = {title: modal.title, typed: Boolean(input), initiallyDisabled: modal.actionNode.disabled,
+      danger: modal.actionNode.className, prompt: input ? input.ariaLabel : null,
+      paragraphs: all(modal.bodyNode, (n) => n.tagName === "P").length};
+    if (input) { input.value = text; input.oninput(); }
+    row.afterTyping = modal.actionNode.disabled;
+    modal.actionNode.onclick();              // ignored while disabled
+    if (expected === null) modal.dismissNode.onclick();
+    row.answer = await answer;
+    out[op + ":" + text] = row;
+  }
+  console.log(JSON.stringify({out, closes}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("__HOST__", json.dumps(HOST_OPS)))
+    assert result["closes"] == 4
+    out = result["out"]
+    assert out["restart:restart"] == {
+        "title": "Label restart", "typed": True, "initiallyDisabled": True,
+        "danger": "act primary danger", "prompt": "Type restart to confirm",
+        "paragraphs": 3, "afterTyping": False, "answer": True}
+    assert out["update: update "]["answer"] is True and out["update: update "]["paragraphs"] == 4
+    assert out["restart:RESTART"]["afterTyping"] is True
+    assert out["restart:RESTART"]["answer"] is False
+    assert out["update-harnesses:null"] == {
+        "title": "Label update-harnesses", "typed": False, "initiallyDisabled": False,
+        "danger": "act primary", "prompt": None, "paragraphs": 1,
+        "afterTyping": False, "answer": True}
+
+
+ENGINE_HARNESS = FAKE_DOM + API + ENGINE + r"""
+const SERVICE = "http://127.0.0.1:8857";
+const HOST = __HOST__;
+const finished = (op, code, startedAt) => ({op, state: "finished", cli: HOST[op].cli, pid: 7,
+  started_at: startedAt, finished_at: startedAt, exit_code: code, ok: code === 0,
+  log: "x.log", detach: "session", error: null});
+const running = (op, startedAt) => ({...finished(op, null, startedAt), state: "running",
+  finished_at: null, ok: null});
+const server = {
+  health: true, route: true, serviceUp: true, post: null,
+  discovery: {port: 8857, url: SERVICE, up: true, up_source: "probe", runtime: "host",
+    ops: HOST, recovery_cli: "./sc launch", start_cli: "./sc launch"},
+  status: {ok: true, service: "engine-ops", runtime: "host", ops: HOST, recovery_cli: "./sc launch",
+    running: false, operation: finished("update-harnesses", 0, "2026-01-01T00:00:00Z"),
+    log_tail: "old log", log_truncated: false, log_tail_limit: 16384,
+    engine_ref: "abc123", live_sessions: {count: 3, browser: 1, indeterminate: 0}},
+};
+const serviceRequests = [], apiRequests = [], notices = [];
+let ticks = 0, onTick = null, confirmAnswer = true, confirms = [];
+function toast(message) { notices.push(message); }
+async function loadModelCatalogue() {
+  return {verification: {harnesses: {claude: {observed_version: "2.1.0"}}}};
+}
+engineConfirm = async (op, label, facts, view) => { confirms.push(op); return confirmAnswer; };
+globalThis.setTimeout = (fn) => { ticks += 1; if (onTick) onTick(ticks); Promise.resolve().then(fn); };
+const json = (status, data) => ({ok: status >= 200 && status < 300, status,
+  statusText: String(status), json: async () => data});
+globalThis.fetch = async (url, init = {}) => {
+  if (url.startsWith(SERVICE)) {
+    serviceRequests.push({path: url.slice(SERVICE.length), method: init.method || "GET",
+      keys: Object.keys(init).sort()});
+    if (!server.serviceUp) throw new TypeError("Failed to fetch");
+    if (url.endsWith("/status")) return json(200, server.status);
+    return server.post(url.slice(SERVICE.length));
+  }
+  apiRequests.push(url);
+  if (!server.health) throw new TypeError("Failed to fetch");
+  if (url === "/api/health") return json(200, {ok: true});
+  if (url === "/api/engine-ops")
+    return server.route ? json(200, server.discovery) : json(404, {error: "not found"});
+  if (url === "/api/flavor-defaults") return json(200, {harness_status: {
+    claude: {installed: true, enabled: true, healthy: true},
+    kimi: {installed: false, enabled: false, healthy: false}}});
+  throw new Error("unexpected request " + url);
+};
+const settle = async () => { for (let i = 0; i < 400; i++) await new Promise((r) => setImmediate(r)); };
+const snap = (mount) => {
+  const [facts, harnesses, banner, last, controls] = mount.children;
+  const details = all(last, (n) => n.tagName === "DETAILS")[0];
+  return {
+    facts: facts.children.map(text), harnesses: harnesses.children.map(text),
+    banner: banner.textContent, tone: banner.className,
+    last: last.children.length ? text(last.children[0]) : null,
+    log: details ? {open: Boolean(details.open), summary: text(details.children[0]),
+      text: text(details.children[1])} : null,
+    controls: controls.children.map((row) => ({label: row.children[0].textContent,
+      disabled: row.children[0].disabled, cli: row.children[1] ? text(row.children[1]) : null})),
+  };
+};
+const press = (mount, label) => all(mount, (n) => n.tagName === "BUTTON")
+  .find((button) => button.textContent === label).onclick();
+const open = async () => { const mount = el("div"); renderDrawerEngine(mount); await settle(); return mount; };
+const finish = (value) => console.log(JSON.stringify(value));
+""".replace("__HOST__", json.dumps(HOST_OPS))
+
+LOCAL_TIME = r" · [^·]+$"
+
+
+@needs_node
+def test_engine_section_shows_facts_and_enables_controls_when_the_service_answers():
+    script = ENGINE_HARNESS + r"""
+(async () => {
+  const mount = await open();
+  finish({view: snap(mount), serviceRequests, apiRequests: [...new Set(apiRequests)].sort()});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    view = result["view"]
+    assert view["facts"] == ["Engine ref", "abc123", "Runtime", "host"]
+    assert view["harnesses"] == ["claude", "2.1.0 · ready", "kimi", "version unknown · not installed"]
+    assert view["banner"] == "" and view["tone"] == "engine-banner"
+    assert re.sub(LOCAL_TIME, "", view["last"]) == "update-harnesses — finished, exit 0"
+    assert view["log"] == {"open": False, "summary": "Log tail", "text": "old log"}
+    assert view["controls"] == [
+        {"label": "Update engine", "disabled": False, "cli": None},
+        {"label": "Restart engine", "disabled": False, "cli": None},
+        {"label": "Update harnesses", "disabled": False, "cli": None},
+    ]
+    # The one request to the service: no headers, no body, credentials omitted.
+    assert result["serviceRequests"] == [
+        {"path": "/status", "method": "GET", "keys": ["credentials", "method"]}]
+    assert result["apiRequests"] == ["/api/engine-ops", "/api/flavor-defaults"]
+
+
+@needs_node
+@pytest.mark.parametrize("setup,banner,service_calls", [
+    ("server.serviceUp = false;",
+     "The engine-ops service is not running. Start it with ./sc launch.", 1),
+    ("server.discovery = {...server.discovery, port: null, url: null, up: false,"
+     " up_source: 'unallocated'};",
+     "The engine-ops service is not running. Start it with ./sc launch.", 0),
+    ("server.route = false;",
+     "Engine controls are unavailable on this engine. Use the CLI:", 0),
+])
+def test_engine_controls_are_disabled_with_their_cli_when_the_service_is_absent(
+    setup, banner, service_calls,
+):
+    script = ENGINE_HARNESS + setup + r"""
+(async () => {
+  const mount = await open();
+  await press(mount, "Restart engine");   // a disabled button's handler never fires in a browser
+  finish({view: snap(mount), posts: serviceRequests.filter((r) => r.method === "POST").length});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    view = result["view"]
+    assert view["banner"] == banner
+    assert view["last"] is None and view["log"] is None
+    assert view["controls"] == [
+        {"label": "Update engine", "disabled": True, "cli": "./sc update"},
+        {"label": "Restart engine", "disabled": True, "cli": "./sc restart"},
+        {"label": "Update harnesses", "disabled": True, "cli": "./sc update-harnesses"},
+    ]
+    assert view["facts"] == ["Engine ref", "unavailable", "Runtime",
+                             "unavailable" if "route" in setup else "host"]
+    # Even if the handler ran, a service that is gone is re-read, never posted to.
+    assert result["posts"] == 0
+
+
+@needs_node
+@pytest.mark.parametrize("lost_response", [False, True])
+def test_restart_reconnects_after_the_engine_returns(lost_response):
+    script = ENGINE_HARNESS + r"""
+const LOST = __LOST__;
+server.post = (path) => {
+  server.status = {...server.status, running: true, operation: running("restart", "2026-02-02T00:00:00Z")};
+  if (LOST) throw new TypeError("Failed to fetch");
+  return json(202, {started: true, operation: server.status.operation});
+};
+const seen = [];
+(async () => {
+  const mount = await open();
+  onTick = (tick) => {
+    seen.push(snap(mount).banner);
+    if (tick === 1) { server.health = false; server.serviceUp = false; }   // engine and service go down
+    if (tick === 4) {                                                      // both return, operation done
+      server.health = true; server.serviceUp = true;
+      server.status = {...server.status, running: false, log_tail: "restart log",
+        operation: finished("restart", 0, "2026-02-02T00:00:00Z")};
+    }
+  };
+  press(mount, "Restart engine");
+  await settle();
+  finish({view: snap(mount), seen: [...new Set(seen)], ticks, confirms, notices,
+    posts: serviceRequests.filter((r) => r.method === "POST")});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("__LOST__", json.dumps(lost_response)))
+    assert result["confirms"] == ["restart"]
+    assert result["posts"] == [
+        {"path": "/ops/restart", "method": "POST", "keys": ["credentials", "method"]}]
+    assert result["seen"] == ["Engine restarting…"]
+    assert result["ticks"] == 4
+    assert result["notices"] == []
+    view = result["view"]
+    assert view["banner"] == "restart finished." and view["tone"] == "engine-banner ok"
+    assert re.sub(LOCAL_TIME, "", view["last"]) == "restart — finished, exit 0"
+    assert view["log"] == {"open": False, "summary": "Log tail", "text": "restart log"}
+    assert [control["disabled"] for control in view["controls"]] == [False, False, False]
+
+
+@needs_node
+def test_failed_update_reports_the_stopped_engine_recovery_and_log():
+    script = ENGINE_HARNESS + r"""
+server.post = () => {
+  server.status = {...server.status, running: true, operation: running("update", "2026-02-02T00:00:00Z")};
+  return json(202, {started: true, operation: server.status.operation});
+};
+(async () => {
+  const mount = await open();
+  onTick = (tick) => {
+    if (tick === 1) server.health = false;            // the review server stops and stays down
+    if (tick === 3) server.status = {...server.status, running: false, log_tail: "boom\nline 2",
+      log_truncated: true, operation: finished("update", 1, "2026-02-02T00:00:00Z")};
+  };
+  press(mount, "Update engine");
+  await settle();
+  finish({view: snap(mount), ticks, notices});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    view = result["view"]
+    assert result["ticks"] == 3 and result["notices"] == []
+    assert view["banner"] == ("update did not complete (failed, exit 1). "
+                              "The engine is stopped; recover with ./sc launch.")
+    assert view["tone"] == "engine-banner warn"
+    assert view["log"] == {"open": True, "summary": "Log tail (truncated)", "text": "boom\nline 2"}
+    assert re.sub(LOCAL_TIME, "", view["last"]) == "update — failed, exit 1"
+
+
+@needs_node
+def test_a_409_shows_the_running_operation_instead_of_an_error():
+    script = ENGINE_HARNESS + r"""
+const other = running("update", "2026-03-03T00:00:00Z");
+server.post = () => json(409, {operation: other,
+  error: {code: "engine_op_running", message: "engine operation update is running", details: {op: "update"}}});
+const seen = [];
+(async () => {
+  const mount = await open();
+  onTick = (tick) => {
+    seen.push(snap(mount));
+    if (tick === 2) server.status = {...server.status, running: false,
+      operation: finished("update", 0, "2026-03-03T00:00:00Z")};
+  };
+  press(mount, "Update harnesses");
+  await settle();
+  finish({during: seen[0], view: snap(mount), notices});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    assert result["notices"] == []
+    during = result["during"]
+    assert during["banner"] == "Engine restarting…" and during["tone"] == "engine-banner busy"
+    assert during["last"].startswith("update — running")
+    assert [control["disabled"] for control in during["controls"]] == [True, True, True]
+    assert result["view"]["banner"] == "update finished."
+
+
+@needs_node
+def test_refused_or_unanswered_requests_are_reported_in_place():
+    script = ENGINE_HARNESS + r"""
+(async () => {
+  const out = {};
+  const mount = await open();
+  server.post = () => json(403, {error: {code: "same_origin_required", message: "origin refused", details: {}}});
+  await press(mount, "Restart engine"); await settle();
+  out.refused = snap(mount).banner;
+  server.post = () => json(500, {error: {code: "engine_op_start_failed", message: "no runner", details: {}}});
+  await press(mount, "Update engine"); await settle();
+  out.startFailed = snap(mount).banner;
+  // No answer for an operation that does not stop the engine is a real failure.
+  server.post = () => { throw new TypeError("Failed to fetch"); };
+  await press(mount, "Update harnesses"); await settle();
+  out.unanswered = snap(mount).banner;
+  out.enabled = snap(mount).controls.map((control) => control.disabled);
+  confirmAnswer = false;
+  const before = serviceRequests.length;
+  await press(mount, "Restart engine"); await settle();
+  out.cancelledRequests = serviceRequests.length - before;
+  finish({out, ticks, notices});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    assert result["out"] == {
+        "refused": "restart was not started: same_origin_required: origin refused",
+        "startFailed": "update was not started: engine_op_start_failed: no runner",
+        "unanswered": "update-harnesses was not started: the engine-ops service did not answer.",
+        "enabled": [False, False, False],
+        "cancelledRequests": 0,
+    }
+    assert result["ticks"] == 0 and result["notices"] == []
+
+
+@needs_node
+def test_a_lost_request_that_never_started_and_a_stuck_engine_both_stop_waiting():
+    script = ENGINE_HARNESS + r"""
+(async () => {
+  const mount = await open();
+  server.post = () => { throw new TypeError("Failed to fetch"); };   // dropped before it arrived
+  press(mount, "Restart engine"); await settle();
+  const neverStarted = {banner: snap(mount).banner, ticks};
+  ticks = 0;
+  server.post = () => {
+    server.status = {...server.status, running: true, operation: running("restart", "2026-04-04T00:00:00Z")};
+    return json(202, {started: true, operation: server.status.operation});
+  };
+  press(mount, "Restart engine"); await settle();
+  finish({neverStarted, stuck: {banner: snap(mount).banner, tone: snap(mount).tone, ticks},
+    limit: ENGINE_FOLLOW_LIMIT});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    assert result["neverStarted"] == {"banner": "restart did not start. Try again.", "ticks": 5}
+    assert result["stuck"] == {"banner": "Still waiting on the engine. Check it from the CLI.",
+                               "tone": "engine-banner warn", "ticks": result["limit"]}
+    assert result["limit"] == 150

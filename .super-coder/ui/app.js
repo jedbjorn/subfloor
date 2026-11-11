@@ -3142,10 +3142,300 @@ function renderDrawerModels(mount) {
   return () => { closed = true; modelCatalogueListeners.delete(adopted); };
 }
 
-// Engine: the controls arrive with the host-side engine-ops service.
+// Engine: version facts and the three engine controls. The verbs run in the
+// host-side engine-ops service, never in the review API: this page finds the
+// service through GET /api/engine-ops and then talks to it directly. The
+// service's own GET /status is the authority on whether it is up, and its
+// `ops` facts word every confirmation, so nothing here is keyed on runtime.
+const ENGINE_OPS = [
+  ["update", "Update engine"],
+  ["restart", "Restart engine"],
+  ["update-harnesses", "Update harnesses"],
+];
+// Shown when the engine cannot describe its own operations (an engine
+// without the discovery route, or an unreachable review API).
+const ENGINE_CLI_FALLBACK = {
+  update: "./sc update", restart: "./sc restart", "update-harnesses": "./sc update-harnesses",
+};
+const ENGINE_FOLLOW_MS = 2000;
+const ENGINE_FOLLOW_LIMIT = 150;   // five minutes, then stop and say so
+const ENGINE_NOT_STARTED_AFTER = 5;
+
+// Requests to the service carry no Authorization header, no credentials, no
+// custom header and no body: it refuses a Bearer token, and reads no field.
+async function engineOpsRequest(base, path, method = "GET") {
+  const response = await fetch(base + path, { method, credentials: "omit" });
+  const data = await response.json().catch(() => ({}));
+  return { status: response.status, ok: response.ok, data };
+}
+
+async function engineOpsLoad() {
+  let discovery = null;
+  try { discovery = await api("/engine-ops"); } catch { /* no route, or the engine is down */ }
+  let status = null;
+  if (discovery?.url) {
+    try {
+      const answer = await engineOpsRequest(discovery.url, "/status");
+      if (answer.ok) status = answer.data;
+    } catch { /* the service is not running */ }
+  }
+  return { discovery, status };
+}
+
+function engineView({ discovery, status }) {
+  const described = status?.ops || discovery?.ops;
+  const ops = {};
+  for (const [op] of ENGINE_OPS)
+    ops[op] = described?.[op] || { cli: ENGINE_CLI_FALLBACK[op] };
+  return {
+    known: Boolean(discovery),
+    up: Boolean(status),
+    url: discovery?.url || null,
+    runtime: status?.runtime || discovery?.runtime || null,
+    ops,
+    recoveryCli: status?.recovery_cli || discovery?.recovery_cli || null,
+    startCli: discovery?.start_cli || null,
+    engineRef: status?.engine_ref || null,
+    running: Boolean(status?.running),
+    operation: status?.operation || null,
+    logTail: status?.log_tail || "",
+    logTruncated: Boolean(status?.log_truncated),
+    liveSessions: status?.live_sessions || null,
+  };
+}
+
+// The confirmation text, from the operation's facts alone.
+function engineConfirmLines(op, facts, view) {
+  const lines = [`Runs ${facts.cli} on the host.`];
+  if (facts.stops_engine)
+    lines.push("The engine stops while this runs. This page reconnects when it returns.");
+  const live = view.liveSessions;
+  // A missing count is said, never guessed.
+  const count = (n, noun) => typeof n === "number"
+    ? `${n} ${noun}${n === 1 ? "" : "s"} live now.` : "The live count is unavailable.";
+  if (facts.ends_sessions === "all")
+    lines.push("All live sessions end. " + count(live?.count, "session"));
+  else if (facts.ends_sessions === "browser")
+    lines.push("Browser chats end; terminal sessions keep running. "
+      + count(live?.browser, "browser chat"));
+  if (live?.indeterminate && facts.ends_sessions && facts.ends_sessions !== "none")
+    lines.push(`${live.indeterminate} more harness processes could not be attributed.`);
+  if (facts.takes_effect === "next_restart")
+    lines.push("The change takes effect at the next restart; the running engine is unchanged until then.");
+  if (op === "update")
+    lines.push("A failed update leaves the engine stopped."
+      + (view.recoveryCli ? ` Recover with ${view.recoveryCli}.` : ""));
+  return lines;
+}
+
+// An operation that stops the engine needs its name typed; the rest need a
+// plain confirm. Resolves true only on the confirm button.
+function engineConfirm(op, label, facts, view) {
+  return new Promise((resolve) => {
+    const typed = Boolean(facts.stops_engine);
+    const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+    const confirm = el("button", {
+      className: "act primary" + (typed ? " danger" : ""), type: "button",
+      textContent: label, disabled: typed,
+    });
+    const body = el("div", { className: "engine-confirm" });
+    for (const line of engineConfirmLines(op, facts, view)) body.append(el("p", {}, line));
+    if (typed) {
+      const input = el("input", {
+        type: "text", className: "engine-confirm-input", autocomplete: "off",
+        ariaLabel: `Type ${op} to confirm`,
+      });
+      input.oninput = () => { confirm.disabled = input.value.trim() !== op; };
+      body.append(el("label", { className: "k" }, `Type ${op} to confirm`), input);
+    }
+    let answer = false;
+    const close = openActionModal({
+      title: label, bodyNode: body, dismissNode: cancel, actionNode: confirm,
+      width: 460, height: 380,
+    });
+    // Esc and the backdrop go through the overlay's closeModal: wrap it so
+    // every way out answers.
+    const overlay = body.closest ? body.closest(".modal-overlay") : null;
+    const finish = () => { close(); resolve(answer); };
+    if (overlay) {
+      overlay.closeModal = finish;
+      overlay.onmousedown = (event) => { if (event.target === overlay) finish(); };
+    }
+    if (typed) body.querySelector?.("input")?.focus();
+    cancel.onclick = finish;
+    confirm.onclick = () => { if (!confirm.disabled) { answer = true; finish(); } };
+  });
+}
+
+const engineOutcome = (operation) => operation.state === "finished"
+  ? (operation.ok ? "finished, exit 0" : `failed, exit ${operation.exit_code ?? "unknown"}`)
+  : operation.state;
+function engineOperationLine(operation) {
+  if (!operation) return "No operation has run yet.";
+  const outcome = engineOutcome(operation);
+  const when = operation.finished_at || operation.started_at;
+  return `${operation.op} — ${outcome}` + (when ? ` · ${new Date(when).toLocaleString()}` : "")
+    + (operation.error ? ` · ${operation.error}` : "");
+}
+
 function renderDrawerEngine(mount) {
-  mount.replaceChildren(el("div", { className: "drawer-note" },
-    "Engine controls are not available in this build."));
+  const facts = el("div", { className: "engine-facts" });
+  const harnesses = el("div", { className: "engine-harnesses" });
+  const banner = el("div", { className: "engine-banner", role: "status" });
+  const last = el("div", { className: "engine-last" });
+  const controls = el("div", { className: "engine-controls" });
+  mount.replaceChildren(facts, harnesses, banner, last, controls);
+  const alive = () => mount.isConnected !== false;
+  let following = false;
+
+  const paint = (state, note = null) => {
+    const view = engineView(state);
+    facts.replaceChildren(
+      el("span", { className: "engine-k" }, "Engine ref"),
+      el("span", { className: "engine-v" }, view.engineRef || "unavailable"),
+      el("span", { className: "engine-k" }, "Runtime"),
+      el("span", { className: "engine-v" }, view.runtime || "unavailable"));
+    banner.className = "engine-banner" + (note?.tone ? " " + note.tone : "");
+    banner.textContent = note ? note.text
+      : !view.known ? "Engine controls are unavailable on this engine. Use the CLI:"
+      : !view.up ? "The engine-ops service is not running."
+        + (view.startCli ? ` Start it with ${view.startCli}.` : "")
+      : "";
+    const tail = [];
+    if (view.up) {
+      tail.push(el("div", { className: "drawer-note" }, engineOperationLine(view.operation)));
+      if (view.logTail) tail.push(el("details", {
+        className: "engine-log", open: note?.tone === "warn" },
+        el("summary", {}, view.logTruncated ? "Log tail (truncated)" : "Log tail"),
+        el("pre", {}, view.logTail)));
+    }
+    last.replaceChildren(...tail);
+    const busy = following || view.running;
+    controls.replaceChildren(...ENGINE_OPS.map(([op, label]) => {
+      const button = el("button", {
+        className: "act", type: "button", textContent: label,
+        disabled: !view.up || busy,
+      });
+      button.onclick = () => request(op, label, view);
+      const row = el("div", { className: "engine-control" }, button);
+      if (!view.up) row.append(el("code", { className: "engine-cli" }, view.ops[op].cli));
+      return row;
+    }));
+    return view;
+  };
+
+  // Wait for an operation to end and for the engine to answer again. The
+  // review API is expected to disappear when the engine stops, and the
+  // service too on a restart, so a failed read here is a tick, not an error.
+  const follow = async (state, op, previous) => {
+    following = true;
+    const stops = Boolean(engineView(state).ops[op]?.stops_engine);
+    const waiting = { text: stops ? "Engine restarting…" : `${op} running…`, tone: "busy" };
+    paint(state, waiting);
+    let outcome = { text: "Still waiting on the engine. Check it from the CLI.", tone: "warn" };
+    for (let tick = 1; tick <= ENGINE_FOLLOW_LIMIT && alive(); tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, ENGINE_FOLLOW_MS));
+      const healthy = await api("/health").then(() => true, () => false);
+      const next = healthy ? await engineOpsLoad() : {
+        discovery: state.discovery,
+        status: state.discovery?.url
+          ? await engineOpsRequest(state.discovery.url, "/status")
+            .then((answer) => answer.ok ? answer.data : null, () => null)
+          : null,
+      };
+      state = { discovery: next.discovery || state.discovery, status: next.status };
+      const operation = next.status?.operation;
+      if (!next.status || next.status.running) continue;
+      const fresh = operation && operation.op === op
+        && operation.started_at !== previous?.started_at;
+      if (!fresh) {
+        if (healthy && tick >= ENGINE_NOT_STARTED_AFTER) {
+          outcome = { text: `${op} did not start. Try again.`, tone: "warn" };
+          break;
+        }
+        continue;
+      }
+      if (!operation.ok) {
+        const view = engineView(state);
+        outcome = {
+          text: `${op} did not complete (${engineOutcome(operation)}).`
+            + (stops && !healthy && view.recoveryCli
+              ? ` The engine is stopped; recover with ${view.recoveryCli}.` : ""),
+          tone: "warn",
+        };
+        break;
+      }
+      if (!healthy) continue;   // finished cleanly; the engine is still coming up
+      outcome = {
+        text: `${op} finished.` + (engineView(state).ops[op]?.takes_effect === "next_restart"
+          ? " It takes effect at the next restart." : ""),
+        tone: "ok",
+      };
+      break;
+    }
+    following = false;
+    if (!alive()) return;
+    paint(state.status ? state : { discovery: state.discovery, status: null }, outcome);
+  };
+
+  const request = async (op, label, view) => {
+    if (!await engineConfirm(op, label, view.ops[op], view)) return;
+    const state = await engineOpsLoad();
+    const url = state.discovery?.url;
+    if (!state.status || !url) { paint(state); return; }
+    const previous = state.status.operation;
+    following = true;
+    paint(state, { text: `Starting ${op}…`, tone: "busy" });
+    let answer = null;
+    try { answer = await engineOpsRequest(url, "/ops/" + op, "POST"); }
+    catch { /* no answer: handled below */ }
+    following = false;
+    if (answer?.status === 202) return follow(state, op, previous);
+    if (answer?.status === 409 && answer.data.operation) {
+      // Someone else's operation is in flight: show it and wait on it.
+      const running = answer.data.operation;
+      state.status = { ...state.status, running: true, operation: running };
+      return follow(state, running.op, null);
+    }
+    if (!answer && view.ops[op].stops_engine)
+      return follow(state, op, previous);   // the engine going down can cut the answer off
+    const problem = answer?.data?.error;
+    paint(await engineOpsLoad(), {
+      text: `${op} was not started: ` + (problem
+        ? [problem.code, problem.message].filter(Boolean).join(": ")
+        : "the engine-ops service did not answer."),
+      tone: "warn",
+    });
+  };
+
+  paint({ discovery: null, status: null }, { text: "Loading…" });
+  engineOpsLoad().then((state) => {
+    if (!alive()) return;
+    if (state.status?.running && state.status.operation)
+      follow(state, state.status.operation.op, null);
+    else paint(state);
+  });
+  // Harness versions: the browser-surface status the Configure form already
+  // reads, plus the version the model catalogue last verified, when it has one.
+  Promise.all([
+    api("/flavor-defaults"),
+    loadModelCatalogue().catch(() => null),
+  ]).then(([defaults, catalog]) => {
+    const verified = catalog?.verification?.harnesses || {};
+    const rows = Object.entries(defaults.harness_status || {}).flatMap(([name, status]) => {
+      const version = status.version || verified[name]?.observed_version
+        || verified[name]?.version || status.conversion?.version;
+      const health = !status.installed ? "not installed" : !status.enabled ? "disabled"
+        : status.healthy ? "ready" : status.unavailable_reason || "unavailable";
+      return [
+        el("span", { className: "engine-k" }, name),
+        el("span", { className: "engine-v" }, `${version || "version unknown"} · ${health}`),
+      ];
+    });
+    harnesses.replaceChildren(...rows);
+  }, () => {
+    harnesses.replaceChildren(el("div", { className: "drawer-note" }, "Harness status unavailable."));
+  });
 }
 
 for (const [id, render] of [

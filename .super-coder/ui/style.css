@@ -1942,3 +1942,32 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .chat-refresh-models:hover { border-color: var(--tint-4); color: var(--ink); }
 .chat-refresh-models:disabled { opacity: .5; cursor: default; }
 .chat-refresh-note { color: var(--dim); font-size: .72rem; }
+/* Engine section and its confirmation dialog. */
+.engine-facts, .engine-harnesses {
+  display: grid; grid-template-columns: auto minmax(0, 1fr);
+  column-gap: var(--space-4); row-gap: var(--space-1); font-size: var(--fs-sm);
+}
+.engine-harnesses:empty { display: none; }
+.engine-k { color: var(--text-low); }
+.engine-v { color: var(--ink); overflow-wrap: anywhere; }
+.engine-banner { color: var(--dim); font-size: var(--fs-sm); }
+.engine-banner:empty, .engine-last:empty { display: none; }
+.engine-banner.busy { color: var(--accent); }
+.engine-banner.ok { color: var(--ok); }
+.engine-banner.warn { color: var(--warn); }
+.engine-last { display: grid; gap: var(--space-2); min-width: 0; }
+.engine-log summary { cursor: pointer; color: var(--text-mid); font-size: var(--fs-sm); }
+.engine-log pre {
+  margin: var(--space-2) 0 0; padding: var(--space-2); max-height: 14rem; overflow: auto;
+  background: var(--panel2); color: var(--ink); border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm); font: 11px/1.5 ui-monospace, monospace;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.engine-controls { display: grid; gap: var(--space-2); }
+.engine-control { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.engine-control .act { margin-top: 0; }
+.engine-cli { color: var(--text-mid); font: 11px ui-monospace, monospace; }
+.engine-confirm { flex: 1; min-width: 0; overflow-y: auto; font-size: var(--fs-sm); color: var(--ink); }
+.engine-confirm p { margin: 0 0 var(--space-3); }
+.engine-confirm .k { display: block; margin-bottom: var(--space-1); color: var(--dim); }
+.engine-confirm-input { width: 100%; }
