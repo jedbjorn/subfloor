@@ -1877,6 +1877,16 @@ _MOUNT_BARE_KEYS = frozenset({
     "tmpfs-noexec",
 })
 _VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# A `--mount` value may say each thing once. Docker reads fields in order and
+# lets a later one override an earlier one, and it takes several spellings for
+# the same field; a value that uses that is refused rather than interpreted,
+# so this reader and Docker cannot come to different conclusions about it.
+_MOUNT_ALIASES = (
+    ("type",), _MOUNT_SOURCE_KEYS, _MOUNT_TARGET_KEYS, ("readonly", "ro"))
+# The only fields a bind may carry here: what the launcher writes.
+_BIND_KEYS = frozenset(key for group in _MOUNT_ALIASES for key in group)
+# The only `-v` options accepted, and each at most once.
+_VOLUME_OPTIONS = frozenset({"ro", "rw"})
 
 
 def _refuse(reason: str) -> SandboxImageError:
@@ -1921,12 +1931,20 @@ def _mount_bind(
         raise _refuse(f"{what} is not a readable mount")
     fields: dict[str, str] = {}
     bare: list[str] = []
+    repeated: list[str] = []
     for field in records[0]:
         key, separator, content = field.partition("=")
         key = key.strip().lower()
         if not separator:
             bare.append(key)
-        fields[key] = content          # a repeated key: the last one wins, as in Docker
+        if key in fields:
+            repeated.append(key)
+        fields[key] = content
+    # Said once, in one spelling. Docker would take the last of a repeated
+    # field and has its own order among aliases; nothing is decided from a
+    # value that leans on either.
+    if "type" in repeated:
+        raise _refuse(f"{what} names its type more than once")
     explicit = bool(fields.get("type", "").strip())
     kind = fields.get("type", "").strip().lower() or "volume"
     if kind not in _MOUNT_TYPES:
@@ -1940,14 +1958,27 @@ def _mount_bind(
     # target; anything else is an error there, and here.
     if any(key not in _MOUNT_BARE_KEYS for key in bare):
         raise _refuse(f"{what} has a field that is not key=value")
+    if repeated:
+        raise _refuse(f"{what} repeats the field {repeated[0]!r}")
+    for group in _MOUNT_ALIASES:
+        if sum(1 for key in group if key in fields) > 1:
+            raise _refuse(
+                f"{what} gives {' and '.join(key for key in group if key in fields)}, "
+                "two spellings of one field")
     if not any(fields.get(key) for key in _MOUNT_TARGET_KEYS):
         raise _refuse(f"{what} has no target")
     if kind != "bind":
         return None
+    unknown = sorted(key for key in fields if key not in _BIND_KEYS)
+    if unknown:
+        raise _refuse(
+            f"{what} carries the field {unknown[0]!r}, which is not one a bind "
+            "mount of the launcher's has")
     sources = [fields[key] for key in _MOUNT_SOURCE_KEYS if key in fields]
     if len(sources) != 1:
         raise _refuse(f"{what} does not name exactly one source")
     # Read-only only when it plainly says so: the bare word, or a true value.
+    # (At most one of the two spellings is present, once.)
     readonly = any(
         key in fields and (key in bare or _truthy(fields[key]))
         for key in ("readonly", "ro"))
@@ -1980,8 +2011,17 @@ def _volume_bind(
         return None
     source = parts[0]
     if source.startswith(("/", ".")):
+        # `SRC:DST` or `SRC:DST:opts`, nothing after. The options are `ro` or
+        # `rw`, one of them, once: a list that says both, or says one twice,
+        # or names anything else, is refused rather than interpreted.
+        if len(parts) > 3:
+            raise _refuse(f"{what} has more than SRC:DST:opts")
         options = parts[2].split(",") if len(parts) > 2 else []
-        return _host_path(source, cwd, what), "ro" in options, parts[1]
+        if len(options) > 1 or any(option not in _VOLUME_OPTIONS for option in options):
+            raise _refuse(f"{what} has options other than one of ro or rw")
+        if not parts[1].startswith("/"):
+            raise _refuse(f"{what} has a target that is not an absolute path")
+        return _host_path(source, cwd, what), options == ["ro"], parts[1]
     if _VOLUME_NAME.match(source):
         return None
     raise _refuse(f"{what} has a source that is neither a path nor a volume name")
@@ -2099,7 +2139,19 @@ def guard_engine_ops_state(
             f"(→ {os.path.realpath(state)}). The first is mounted into the "
             "sandbox and the second must never be."
         )
-    for source, readonly, target in bind_mounts(arguments):
+    canonical = auth_sessions_mount_value(repo_root, environ)
+    reached = 0
+    base = os.getcwd()
+    for option, value in run_options(arguments):
+        if option == "-v":
+            bind = _volume_bind(value, base)
+        elif option == "--mount":
+            bind = _mount_bind(value, base)
+        else:
+            continue
+        if bind is None:
+            continue
+        source, _readonly, _target = bind
         if paths_overlap(source, state):
             raise SandboxImageError(
                 f"refusing to launch: the mount {source} "
@@ -2113,14 +2165,19 @@ def guard_engine_ops_state(
             )
         if not paths_overlap(source, sessions):
             continue
-        exact = os.path.realpath(source) == os.path.realpath(sessions)
-        if not (exact and readonly and target == AUTH_SESSIONS_TARGET):
+        # Allowed in exactly one form, the launcher's own argument, character
+        # for character, and once. Nothing about it is left to how a mount
+        # value is read: any other spelling that reaches the directory is
+        # refused, equivalent or not.
+        reached += 1
+        if option != "--mount" or value != canonical or reached > 1:
             raise SandboxImageError(
                 f"refusing to launch: the mount {source} "
                 f"(→ {os.path.realpath(source)}) overlaps the session-hash "
                 f"directory {sessions} (→ {os.path.realpath(sessions)}). "
                 "The sandbox may see that directory only as the launcher's "
-                f"own read-only mount at {AUTH_SESSIONS_TARGET}; a sandbox "
+                f"own read-only mount, once, written exactly `--mount "
+                f"{canonical}`; a sandbox "
                 "that could write it could sign itself in to the review API. "
                 "Move the mounted path, or set XDG_STATE_HOME to a directory "
                 "outside every sandbox mount."
@@ -2170,11 +2227,21 @@ def auth_sessions_mount(
     The source is written as one CSV field, quoted whole when it holds a comma
     or a quote, which is how Docker and this module's own reader take it.
     """
-    source = f"src={ensure_auth_sessions_dir(repo_root, environ)}"
+    ensure_auth_sessions_dir(repo_root, environ)
+    return ["--mount", auth_sessions_mount_value(repo_root, environ)]
+
+
+def auth_sessions_mount_value(
+    repo_root: str | os.PathLike[str],
+    environ: dict[str, str] | None = None,
+) -> str:
+    """The `--mount` value of that one mount: the canonical form, and the
+    only one the guard lets reach the session-hash directory. A pure string;
+    nothing is created."""
+    source = f"src={auth_sessions_dir(repo_root, environ)}"
     if any(character in source for character in ',"'):
         source = '"' + source.replace('"', '""') + '"'
-    return ["--mount",
-            f"type=bind,{source},dst={AUTH_SESSIONS_TARGET},readonly"]
+    return f"type=bind,{source},dst={AUTH_SESSIONS_TARGET},readonly"
 
 
 def expand_home_mounts(arguments: Sequence[str]) -> list[str]:

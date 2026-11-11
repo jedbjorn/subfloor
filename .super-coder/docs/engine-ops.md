@@ -98,6 +98,16 @@ pin, the status, and the logs. This is enforced in two places:
     is an anonymous volume. A value that fits none of that is refused: a
     malformed record, a bind with no, an empty, or a padded source, a mount
     with no target.
+  - A mount value says each thing once. Docker lets a later field override an
+    earlier one and takes several names for one field; a `--mount` that
+    repeats a field, gives two names for one (`source`/`src`,
+    `target`/`dst`/`destination`, `readonly`/`ro`), names its type twice, or
+    carries a field a launcher bind never has is refused, and so is a `-v`
+    with more than `SRC:DST` and one of `ro` or `rw`. The guard never has to
+    decide what such a value would mean to Docker.
+  - The session-hash directory ([auth.md](auth.md#the-launchers-mount)) is
+    the one place meant to be mounted, and it may be reached only by the
+    launcher's own argument, character for character, once.
 
 - **In the service**, for what it can know without a launch: the checkout,
   the instance state collection, the interpreter mount, and the home mounts
