@@ -340,7 +340,9 @@ function openEditModal({ title, value, onSave }) {
 // ordered list of { id, label, render }: each becomes a labelled block whose
 // body element carries the id, so a caller (or a later lane) fills the mount
 // with replaceChildren without touching the label. render(mount, { close })
-// is optional — a section without one stays empty but labelled.
+// is optional — a section without one stays empty but labelled. A render may
+// return a function; it runs once when the drawer closes, so a section can
+// release listeners and stop late answers from painting.
 // onClose runs once, on every close path. Returns the close function.
 // Keyboard focus stays inside the panel while it is open: Tab from the last
 // control wraps to the first, Shift+Tab from the first wraps to the last, and
@@ -350,10 +352,12 @@ function openDrawer({ title, sections = [], width = 380, onClose }) {
   const priorFocus = document.activeElement;
   const overlay = el("div", { className: "modal-overlay drawer-overlay" });
   let closed = false;
+  const cleanups = [];
   const close = () => {
     if (closed) return;
     closed = true;
     overlay.remove();
+    for (const cleanup of cleanups) { try { cleanup(); } catch { /* one section's cleanup never blocks close */ } }
     if (onClose) onClose();
     if (priorFocus?.isConnected && typeof priorFocus.focus === "function") priorFocus.focus();
   };
@@ -389,7 +393,10 @@ function openDrawer({ title, sections = [], width = 380, onClose }) {
     body.append(el("section", { className: "drawer-section" },
       el("h3", { className: "drawer-label" }, section.label), mount));
     if (section.render) {
-      try { section.render(mount, { close }); }
+      try {
+        const cleanup = section.render(mount, { close });
+        if (typeof cleanup === "function") cleanups.push(cleanup);
+      }
       catch (e) { mount.replaceChildren(el("div", { className: "drawer-note" }, "error: " + e.message)); }
     }
   }
@@ -1078,7 +1085,7 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
 let modelCatalogue = null;
 const supersededModelCatalogueGenerations = new Set();
 // Views that display the catalogue hear every adoption, whichever request
-// caused it. A listener that returns false (its view is gone) is dropped.
+// caused it. Whoever adds a listener removes it when its view closes.
 const modelCatalogueListeners = new Set();
 // What a view should show for a response it received: a response whose
 // generation was superseded while it was in flight yields the page's catalogue.
@@ -1088,7 +1095,10 @@ function currentCatalogue(response) {
     ? modelCatalogue : response;
 }
 
-async function loadModelCatalogue(refresh = false) {
+// `announce` is asked when the answer arrives, not when the request leaves: a
+// caller whose view has gone by then still gets the catalogue adopted, but
+// the "New models available!" notice stays silent.
+async function loadModelCatalogue(refresh = false, { announce = () => true } = {}) {
   const catalog = await api(refresh ? "/models?refresh=1" : "/models");
   const generation = catalog.catalogue_generation;
   const baselineGeneration = modelCatalogue?.catalogue_generation;
@@ -1118,15 +1128,14 @@ async function loadModelCatalogue(refresh = false) {
         .filter((model) => model.availability === "available"
           && !known.has(`${harness}/${model.id}`))
         .map((model) => `${harness}: ${model.id}`));
-    if (added.length) toast(`New models available!\n${added.join("\n")}`);
+    if (added.length && announce()) toast(`New models available!\n${added.join("\n")}`);
   }
   // A failed refresh must not consume the baseline for the next successful read.
   if (!catalog.stale || !modelCatalogue) {
     if (baselineGeneration && generationChanged)
       supersededModelCatalogueGenerations.add(baselineGeneration);
     modelCatalogue = catalog;
-    for (const listener of [...modelCatalogueListeners])
-      if (listener(catalog) === false) modelCatalogueListeners.delete(listener);
+    for (const listener of [...modelCatalogueListeners]) listener(catalog);
   }
   return catalog;
 }
@@ -3035,7 +3044,9 @@ function renderDrawerTokens(mount, { close }) {
   link.onclick = () => close();  // the href navigates; the drawer just gets out of the way
   const body = el("div", { className: "drawer-note" }, "Loading…");
   mount.replaceChildren(body, link);
+  let closed = false;
   api("/analytics/sessions?days=" + DRAWER_TOKEN_DAYS).then((data) => {
+    if (closed) return;
     const { total, harnesses } = drawerTokenSummary(data.sessions);
     const table = el("div", { className: "drawer-tokens" });
     const row = (label, today, week, cls = "") => table.append(
@@ -3049,7 +3060,8 @@ function renderDrawerTokens(mount, { close }) {
     if (!harnesses.length) shown.push(el("div", { className: "drawer-note" },
       `No recorded sessions in the last ${DRAWER_TOKEN_DAYS} days.`));
     mount.replaceChildren(...shown, link);
-  }, (error) => { body.textContent = "token summary error: " + error.message; });
+  }, (error) => { if (!closed) body.textContent = "token summary error: " + error.message; });
+  return () => { closed = true; };
 }
 
 // Models: what the server says about its catalogue cache, and a manual refresh.
@@ -3101,24 +3113,22 @@ function renderDrawerModels(mount) {
   };
   // Only this section's newest read paints its own answer, so a slow opening
   // read cannot overwrite a refresh that finished first. Adoptions caused
-  // elsewhere (another drawer instance, Configure, the new-chat watch) arrive
-  // through the listener.
+  // elsewhere (Configure, the new-chat watch) arrive through the listener.
+  // Closing the drawer removes the listener and retires every pending read.
   let newest = 0;
+  let closed = false;
   const read = (refreshing) => {
     const mine = ++newest;
     return loadModelCatalogue(refreshing).then((catalog) => {
-      if (mine === newest) paint(currentCatalogue(catalog), refreshing);
+      if (!closed && mine === newest) paint(currentCatalogue(catalog), refreshing);
     }, (error) => {
-      if (mine !== newest) return;
+      if (closed || mine !== newest) return;
       age.textContent = "catalogue error: " + error.message;
       state.textContent = attempt.textContent = "";
     });
   };
-  modelCatalogueListeners.add((catalog) => {
-    if (mount.isConnected === false) return false;
-    paint(catalog);
-    return true;
-  });
+  const adopted = (catalog) => paint(catalog);
+  modelCatalogueListeners.add(adopted);
   refresh.onclick = async () => {
     refresh.disabled = true;
     refresh.textContent = "Refreshing…";
@@ -3129,6 +3139,7 @@ function renderDrawerModels(mount) {
   mount.replaceChildren(age, state, attempt,
     el("div", { className: "drawer-actions" }, refresh));
   read(false);
+  return () => { closed = true; modelCatalogueListeners.delete(adopted); };
 }
 
 // Engine: the controls arrive with the host-side engine-ops service.
@@ -3150,39 +3161,36 @@ for (const [id, render] of [
 // past the cap it gives up quietly and the next read picks the result up.
 const CATALOGUE_WATCH_MS = 3000;
 const CATALOGUE_WATCH_LIMIT = 20;
-// The watch belongs to the Chats view. `activeTab` is the router's own record
-// of the view, checked before the notice and around every read; the
-// hashchange listener cancels the pending timer as soon as the operator
-// navigates away, so nothing is left scheduled on another view.
+// The watch belongs to the Chats view. Once the operator has left it, the
+// new-chat path issues no catalogue request and raises no catalogue notice:
+// the router's show() calls stopCatalogueWatch() on every other view, and
+// each step below re-checks before it reads or speaks. An answer that was
+// already in flight may still update the in-memory catalogue, silently.
 let catalogueWatch = null;   // { timer } while one watch is armed, else null
 const catalogueWatchInView = () => activeTab === "interface";
-function catalogueWatchOnHashChange() {
-  if (!location.hash.replace(/^#/, "").startsWith("interface")) stopCatalogueWatch();
-}
 function stopCatalogueWatch() {
   if (!catalogueWatch) return;
   clearTimeout(catalogueWatch.timer);
   catalogueWatch = null;
-  window.removeEventListener("hashchange", catalogueWatchOnHashChange);
 }
 function watchCatalogueOnNewChat() {
-  loadModelCatalogue().then((catalog) => {
+  if (!catalogueWatchInView()) return;
+  loadModelCatalogue(false, { announce: catalogueWatchInView }).then((catalog) => {
     if (!catalog.stale || catalogueWatch || !catalogueWatchInView()) return;
     const watch = catalogueWatch = { timer: null };
-    window.addEventListener("hashchange", catalogueWatchOnHashChange);
+    const armed = () => catalogueWatch === watch;
     toast("Model catalogue is stale — refreshing in the background.");
     let polls = 0;
     const poll = async () => {
-      if (catalogueWatch !== watch) return;
-      if (!catalogueWatchInView()) { stopCatalogueWatch(); return; }
+      if (!armed()) return;
       polls += 1;
       let done = polls >= CATALOGUE_WATCH_LIMIT;
       // loadModelCatalogue adopts a fresh answer as the page's catalogue and
       // announces new models itself, so the successful poll is the reload.
-      try { if (!(await loadModelCatalogue()).stale) done = true; }
+      try { if (!(await loadModelCatalogue(false, { announce: armed })).stale) done = true; }
       catch { /* a transient read failure spends one poll */ }
-      if (catalogueWatch !== watch) return;   // cancelled while the read was out
-      if (done || !catalogueWatchInView()) stopCatalogueWatch();
+      if (!armed()) return;   // cancelled while the read was out
+      if (done) stopCatalogueWatch();
       else watch.timer = setTimeout(poll, CATALOGUE_WATCH_MS);
     };
     watch.timer = setTimeout(poll, CATALOGUE_WATCH_MS);
@@ -8332,6 +8340,7 @@ function show(tab) {
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "interface") {
+    stopCatalogueWatch();
     chatStopReads();
     chatStopStream();
     chatStopHistoryPoll();

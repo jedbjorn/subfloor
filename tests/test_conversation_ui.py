@@ -69,6 +69,7 @@ const $ = () => ({});
 const chatStopReads = () => {}, chatStopStream = () => {};
 const chatStopHistoryPoll = () => {}, chatStopReview = () => {};
 const sprintStopPolling = () => {}, setDocumentTitle = () => {};
+const stopCatalogueWatch = () => {};
 let activeTab, shellTab, chatRouteShell, chatRouteConversation, chatRouteMode;
 let chatModeController = null, renders = 0;
 const renderInterface = () => { renders++; };
@@ -1953,6 +1954,7 @@ def test_new_chat_request_log_skips_configuration_and_closes_before_create(state
 const state = STATE;
 const requests = [], notices = [];
 const shell = {shell_id: "sh_dev", shortname: "DEV1"};
+let activeTab = "interface";
 const selectedConversation = state === null ? null : {
   conversation_id: "cv_old", state: state === "sprint" ? "running" : state,
   scope: state === "sprint" ? "sprint" : "interactive", version: 1,

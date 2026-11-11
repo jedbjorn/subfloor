@@ -48,8 +48,14 @@ class FakeElement {
   constructor(tag) {
     this.tagName = tag.toUpperCase(); this.nodeType = 1; this.children = [];
     this.className = ""; this.attributes = {}; this.parentElement = null;
-    this._text = ""; this.disabled = false;
+    this._text = ""; this.disabled = false; this.style = {};
   }
+  remove() {
+    if (this.parentElement)
+      this.parentElement.children = this.parentElement.children.filter((node) => node !== this);
+    this.parentElement = null;
+  }
+  focus() {}
   // Like the DOM, assigning textContent replaces the children.
   get textContent() { return this._text; }
   set textContent(value) { this.children = []; this._text = String(value); }
@@ -94,12 +100,10 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 # The router state and browser globals the new-chat watch reads.
 WATCH_ENV = r"""
 let activeTab = "interface";
-const hashListeners = new Set(), cleared = [];
-globalThis.window = {
-  addEventListener: (type, fn) => { if (type === "hashchange") hashListeners.add(fn); },
-  removeEventListener: (type, fn) => { hashListeners.delete(fn); },
-};
+const cleared = [];
 globalThis.clearTimeout = (id) => { cleared.push(id); };
+// What the router's show() does on the way to any other view.
+const leaveChats = () => { activeTab = "shells"; stopCatalogueWatch(); };
 """
 
 
@@ -158,6 +162,9 @@ def test_configure_refresh_and_new_chat_use_only_the_server_stale_flag():
     assert NEW_CHAT.index("watchCatalogueOnNewChat();") < NEW_CHAT.index("chatCreateConversation(shell)")
     # No client-side staleness rule: no clock, TTL or timestamp comparison.
     assert "if (!catalog.stale || catalogueWatch || !catalogueWatchInView()) return;" in WATCH
+    # Leaving Chats cancels the watch from the router itself.
+    show = between("function show(tab)", "// Hash routing:")
+    assert 'if (tab !== "interface") {\n    stopCatalogueWatch();' in show
     for clock in ("Date.", "fetched_at", "refresh_completed_at", "ttl"):
         assert clock not in WATCH
 
@@ -560,63 +567,167 @@ const chatBusyToast = (error) => { throw error; };
 
 # ── Review findings on PR 1774 ────────────────────────────────────────────────
 
+STALE_NOTICE = "Model catalogue is stale — refreshing in the background."
+
+
 @needs_node
 @pytest.mark.parametrize("scenario,expected", [
-    # the operator left before the stale answer arrived: no notice, nothing armed
-    ("before_answer", {"notices": 0, "reads": 1, "scheduled": 0, "listeners": 0, "watching": False}),
-    # navigation cancels the pending timer at once; a stray firing does nothing
-    ("hashchange", {"notices": 1, "reads": 1, "scheduled": 1, "listeners": 0, "watching": False,
-                    "cleared": [1]}),
-    # the view changed without a hash event: the next tick stops without a read
-    ("show_only", {"notices": 1, "reads": 1, "scheduled": 1, "listeners": 0, "watching": False}),
-    # the operator left while a poll's read was out: no further timer
-    ("during_read", {"notices": 1, "reads": 2, "scheduled": 1, "listeners": 0, "watching": False}),
-    # back on Chats, a new click starts exactly one new watch; the old timer is dead
-    ("again", {"notices": 2, "reads": 2, "scheduled": 2, "listeners": 1, "watching": True,
-               "cleared": [1]}),
+    # already off Chats when the new-chat path reaches the catalogue: no request at all
+    ("before_request", {"notices": [], "reads": 0, "scheduled": 0, "cleared": [], "generation": None}),
+    # left while the first read was out; it comes back stale: no notice, nothing armed
+    ("before_answer", {"notices": [], "reads": 1, "scheduled": 0, "cleared": [], "generation": "g1"}),
+    # left while the first read was out; it comes back fresh with a new model:
+    # adopted silently, with no "New models available!" off-view
+    ("first_read_brings_models", {"notices": [], "reads": 2, "scheduled": 0, "cleared": [],
+                                  "generation": "g2"}),
+    # armed, then left: the timer is cancelled at once and a stray firing reads nothing
+    ("leave_armed", {"notices": [STALE_NOTICE], "reads": 1, "scheduled": 1, "cleared": [1],
+                     "generation": "g1"}),
+    # left while a poll's read was out; it comes back fresh with a new model:
+    # adopted silently, no notice, no further timer
+    ("poll_brings_models", {"notices": [STALE_NOTICE], "reads": 2, "scheduled": 1, "cleared": [1],
+                            "generation": "g2"}),
+    # back on Chats, a new click starts exactly one new watch; the old timer stays dead
+    ("again", {"notices": [STALE_NOTICE, STALE_NOTICE], "reads": 2, "scheduled": 2,
+               "cleared": [1], "generation": "g1"}),
+    # control: the same fresh answer on Chats does announce the new model
+    ("stays", {"notices": [STALE_NOTICE, "New models available!\ncodex: b"], "reads": 2,
+               "scheduled": 1, "cleared": [1], "generation": "g2"}),
 ])
-def test_new_chat_watch_stops_when_the_operator_leaves_the_chats_view(scenario, expected):
-    script = WATCH_ENV + WATCH + r"""
+def test_new_chat_watch_is_silent_and_idle_once_the_operator_leaves_chats(scenario, expected):
+    script = API + CATALOGUE + WATCH_ENV + WATCH + r"""
 const SCENARIO = "__SCENARIO__";
-const notices = [], timers = [], pending = [];
-let reads = 0, scheduled = 0;
-const location = {hash: "#interface/DEV1"};
+const notices = [], timers = [], answers = [];
+let scheduled = 0;
 function toast(message) { notices.push(message); }
 globalThis.setTimeout = (fn, ms) => { scheduled += 1; timers.push(fn); return scheduled; };
-function loadModelCatalogue() {
-  reads += 1;
-  return new Promise((resolve) => pending.push(() => resolve({stale: true})));
-}
-const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
-const answer = async () => { pending.shift()(); await settle(); };
-const leave = (viaHash) => {
-  activeTab = "shells";
-  if (viaHash) { location.hash = "#shells"; for (const fn of [...hashListeners]) fn(); }
-};
+globalThis.fetch = () => new Promise((resolve) =>
+  answers.push((catalog) => resolve({ok: true, json: async () => catalog})));
+const settle = async () => { for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r)); };
+const models = (...ids) => ({codex: {models: ids.map((id) => ({id, availability: "available"}))}});
+const stale = {catalogue_generation: "g1", stale: true, stale_reason: "ttl",
+  fetched_at: "2026-01-01T00:00:00.000000+00:00", harnesses: models("a")};
+const fresh = {catalogue_generation: "g2", stale: false,
+  fetched_at: "2026-01-02T00:00:00.000000+00:00", harnesses: models("a", "b")};
+let reads = 0;
+const answer = async (catalog) => { reads += 1; answers.shift()(catalog); await settle(); };
 (async () => {
-  watchCatalogueOnNewChat();
-  if (SCENARIO === "before_answer") { leave(true); await answer(); }
-  else {
-    await answer();                                  // stale: the watch is armed
-    if (SCENARIO === "hashchange" || SCENARIO === "again") {
-      leave(true);
-      timers[0](); await settle();                   // a cancelled timer firing anyway
+  if (SCENARIO === "before_request") { leaveChats(); watchCatalogueOnNewChat(); await settle(); }
+  else if (SCENARIO === "before_answer") { watchCatalogueOnNewChat(); leaveChats(); await answer(stale); }
+  else if (SCENARIO === "first_read_brings_models") {
+    const known = loadModelCatalogue(); await answer({...stale, stale: false}); await known;
+    watchCatalogueOnNewChat(); leaveChats(); await answer(fresh);
+  } else {
+    watchCatalogueOnNewChat(); await answer(stale);          // armed
+    if (SCENARIO === "leave_armed" || SCENARIO === "again") {
+      leaveChats(); timers[0](); await settle();             // a cancelled timer firing anyway
     }
-    if (SCENARIO === "show_only") { leave(false); timers[0](); await settle(); }
-    if (SCENARIO === "during_read") { timers[0](); await settle(); leave(false); await answer(); }
+    if (SCENARIO === "poll_brings_models") { timers[0](); await settle(); leaveChats(); await answer(fresh); }
+    if (SCENARIO === "stays") { timers[0](); await settle(); await answer(fresh); }
     if (SCENARIO === "again") {
-      activeTab = "interface"; location.hash = "#interface/DEV1";
-      watchCatalogueOnNewChat(); await answer();
-      timers[0](); await settle();                   // the first watch's timer stays dead
+      activeTab = "interface";
+      watchCatalogueOnNewChat(); await answer(stale);
+      timers[0](); await settle();                           // the first watch's timer stays dead
     }
   }
-  console.log(JSON.stringify({notices: notices.length, reads, scheduled, cleared,
-    listeners: hashListeners.size,
-    watching: typeof catalogueWatch === "undefined" ? catalogueWatching : catalogueWatch !== null}));
+  console.log(JSON.stringify({notices, reads, pendingRequests: answers.length, scheduled, cleared,
+    generation: modelCatalogue ? modelCatalogue.catalogue_generation : null}));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
     result = run_js(script.replace("__SCENARIO__", scenario))
     assert {key: result[key] for key in expected} == expected
+    assert result["pendingRequests"] == 0, "no catalogue request is issued beyond those answered"
+
+
+@needs_node
+def test_new_chat_issues_no_catalogue_request_after_leaving_during_the_close_step():
+    script = FAKE_DOM + API + CATALOGUE + WATCH_ENV + WATCH + r"""
+const calls = [], notices = [];
+function toast(message) { notices.push(message); }
+globalThis.fetch = (url) => { calls.push(url); return new Promise(() => {}); };
+const location = {};
+const shell = {shortname: "DEV1"};
+const selectedConversation = {conversation_id: "cv_old"};
+const newChat = {disabled: false, textContent: "＋ Chat"};
+const configure = {disabled: false};
+let closed;
+const chatCloseForSwitch = () => new Promise((resolve) => { closed = () => resolve(true); });
+const chatWithShellRelease = (run) => run();
+const chatCreateConversation = async () => { calls.push("create"); return {conversation_id: "cv_1"}; };
+const chatHash = (shortname, id) => `interface/${shortname}/${id}`;
+const chatBusyToast = (error) => { throw error; };
+""" + NEW_CHAT + r"""
+(async () => {
+  const clicked = newChat.onclick();     // waits on closing the previous chat
+  leaveChats();                          // the operator goes to Shells meanwhile
+  closed();
+  await clicked;
+  console.log(JSON.stringify({calls, notices}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    assert run_js(script) == {"calls": ["create"], "notices": []}
+
+
+DRAWER_HELPER = between("const DRAWER_FOCUSABLE", "// The operator's settings drawer")
+
+
+@needs_node
+def test_closing_the_drawer_releases_catalogue_listeners_and_pending_paints():
+    script = FAKE_DOM + API + TOKEN_HELPERS + CATALOGUE + TOKENS + MODELS + DRAWER_HELPER + r"""
+globalThis.document = {body: el("body"), activeElement: null};
+function toast() {}
+let hold = false;
+const held = [];
+const payload = (url) => url.startsWith("/api/models")
+  ? {catalogue_generation: "g1", stale: false, fetched_at: new Date().toISOString(), harnesses: {}}
+  : {sessions: [{harness: "claude", started_at: new Date().toISOString(), input_tokens: 5}]};
+globalThis.fetch = (url) => new Promise((resolve) => {
+  const deliver = () => resolve({ok: true, json: async () => payload(url)});
+  if (hold) held.push(deliver); else deliver();
+});
+const settle = async () => { for (let i = 0; i < 6; i++) await tick(); };
+const sections = [
+  {id: "drawer-tokens", label: "Tokens", render: renderDrawerTokens},
+  {id: "drawer-models", label: "Models", render: renderDrawerModels},
+];
+const open = () => openDrawer({title: "Settings", sections});
+const texts = (overlay) => all(overlay, (n) => n.className === "drawer-mount")
+  .map((mount) => text(mount.children[0]).split(" · ")[0]);
+(async () => {
+  // 100 open/close cycles against one unchanged cached generation.
+  let peak = 0;
+  for (let i = 0; i < 100; i++) {
+    const close = open();
+    await settle();
+    peak = Math.max(peak, modelCatalogueListeners.size);
+    close();
+  }
+  const afterCycles = modelCatalogueListeners.size;
+
+  // Close while both opening reads are still out, then let them answer.
+  hold = true;
+  const close = open();
+  const overlay = document.body.children[0];
+  const whileOpen = {texts: texts(overlay), listeners: modelCatalogueListeners.size};
+  close();
+  for (const deliver of held) deliver();
+  await settle();
+  // A later adoption elsewhere must not reach the closed section either.
+  hold = false;
+  globalThis.fetch = async () => ({ok: true, json: async () => ({catalogue_generation: "g2",
+    stale: true, stale_reason: "ttl", fetched_at: "2020-01-01T00:00:00.000Z", harnesses: {}})});
+  modelCatalogue = null;
+  await loadModelCatalogue();
+  console.log(JSON.stringify({peak, afterCycles, whileOpen, afterClose: texts(overlay),
+    listeners: modelCatalogueListeners.size, detached: document.body.children.length}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    assert run_js(script) == {
+        "peak": 1, "afterCycles": 0,
+        "whileOpen": {"texts": ["Loading…", "Loading…"], "listeners": 1},
+        "afterClose": ["Loading…", "Loading…"],
+        "listeners": 0, "detached": 0,
+    }
 
 
 @needs_node
