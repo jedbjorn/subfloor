@@ -32,7 +32,8 @@ needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node is re
 
 PRIMARY = ["interface", "sprints", "shells", "roadmap", "docs", "flags"]
 MORE = ["worktrees", "map", "analytics", "scripts"]
-DRAWER_MOUNTS = ["drawer-appearance", "drawer-tokens", "drawer-models", "drawer-engine"]
+DRAWER_MOUNTS = ["drawer-appearance", "drawer-tokens", "drawer-models", "drawer-engine",
+                 "drawer-account"]
 LITERAL = re.compile(r"#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?)\(")
 DARK_OPEN = ":root {"
 LIGHT_OPEN = ':root[data-theme="light"] {'
@@ -104,12 +105,12 @@ def test_header_keeps_status_and_snapshot_and_gains_one_drawer_button():
 
 # ── Drawer ────────────────────────────────────────────────────────────────────
 
-def test_settings_drawer_declares_the_four_mounts_in_order():
+def test_settings_drawer_declares_the_five_mounts_in_order():
     block = APP[APP.index("const DRAWER_SECTIONS = ["):APP.index("let closeSettingsDrawer")]
     assert re.findall(r'id: "([^"]+)"', block) == DRAWER_MOUNTS
-    assert re.findall(r'label: "([^"]+)"', block) == ["Appearance", "Tokens", "Models", "Engine"]
+    assert re.findall(r'label: "([^"]+)"', block) == ["Appearance", "Tokens", "Models", "Engine", "Account"]
     assert 'id: "drawer-appearance", label: "Appearance", render: renderDrawerAppearance' in block
-    assert block.count("render: null") == 3
+    assert block.count("render: null") == 4
 
 
 @needs_node

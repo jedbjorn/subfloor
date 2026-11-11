@@ -1971,3 +1971,17 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .engine-confirm p { margin: 0 0 var(--space-3); }
 .engine-confirm .k { display: block; margin-bottom: var(--space-1); color: var(--dim); }
 .engine-confirm-input { width: 100%; }
+/* Account section (spec 271). */
+.drawer-note.warn { color: var(--warn); }
+.account-heading {
+  margin-top: var(--space-2); font-size: var(--fs-micro); font-weight: 600;
+  text-transform: uppercase; letter-spacing: .15em; color: var(--text-low);
+}
+.account-devices { display: grid; gap: var(--space-2); }
+.account-device {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: var(--space-3);
+  align-items: center; padding: var(--space-2) 0; border-top: 1px solid var(--line-soft);
+}
+.account-device-name { color: var(--ink); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+.account-device .drawer-note { grid-column: 1; }
+.account-device .act { grid-column: 2; grid-row: 1 / span 2; margin-top: 0; }

@@ -383,7 +383,7 @@ const chatApi = async (url) => {
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
 @pytest.mark.parametrize("phase", ["headers", "body"])
 def test_chat_reads_timeout_cancel_and_retry_without_timing_out_mutations(phase):
-    helpers = APP[APP.index("async function chatApi("):
+    helpers = APP[APP.index("// ── Session loss (spec #271)"):
                   APP.index("// The API refuses request bodies")]
     script = helpers + r"""
 const phase = PHASE;
@@ -1425,7 +1425,7 @@ def test_connection_status_is_attached_to_transcript_without_visible_copy():
                     APP.index("// ── Tabs + boot")]
     assert 'let streamStatus = "connecting"' in interface
     assert 'source.onopen = () => onState("connected")' in interface
-    assert 'source.onerror = () => onState("reconnecting")' in interface
+    assert 'onState("reconnecting");\n    probeSessionAfterStreamError();' in interface
     assert "transcriptHost.title = `Connection: ${connectionLabel}`" in interface
     assert "`Conversation transcript; connection ${connectionLabel.toLowerCase()}`" in interface
     assert '"stream-disconnected"' in interface
@@ -2727,7 +2727,7 @@ const holders = [{pid: 4242, start_ticks: 990, orphaned: "client-gone", claimed:
 
 def test_dropped_images_upload_raw_and_enter_the_message_as_paths():
     helpers = APP[
-        APP.index("async function chatApi("):
+        APP.index("// ── Session loss (spec #271)"):
         APP.index("function toast(msg)")
     ]
     script = helpers + r"""

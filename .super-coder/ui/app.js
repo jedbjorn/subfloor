@@ -74,7 +74,7 @@ function addCopyButton(pre) {
 }
 
 async function api(path, method = "GET", body, extraHeaders = {}) {
-  const r = await fetch("/api" + path, {
+  const r = await sessionFetch("/api" + path, {
     method, headers: {
       ...(body ? { "Content-Type": "application/json" } : {}),
       ...extraHeaders,
@@ -95,6 +95,61 @@ async function api(path, method = "GET", body, extraHeaders = {}) {
   return data;
 }
 
+// ── Session loss (spec #271) ────────────────────────────────────────────────
+// The review server answers a request without a valid session with
+// `401 {"error":"sign_in_required"}`; the host authority answers
+// `401 {"error":{"code":"sign_in_required"}}`. Either means the session was
+// revoked or has gone: the operator is sent to the sign-in screen with the
+// place they were at as `next`, instead of seeing "offline" or an error toast.
+const SIGN_IN_PATH = "/signin.html";
+let leavingForSignIn = false;
+function signInUrl() {
+  return SIGN_IN_PATH + "?next="
+    + encodeURIComponent(location.pathname + location.search + location.hash);
+}
+function goToSignIn() {
+  if (leavingForSignIn) return;   // many requests can fail at once; leave once
+  leavingForSignIn = true;
+  location.assign(signInUrl());
+}
+function isSignInRequired(status, data) {
+  const error = data?.error;
+  return status === 401
+    && (error === "sign_in_required" || error?.code === "sign_in_required");
+}
+// Every request this page makes goes through here: it is the only fetch call
+// in the file. On sign_in_required the page is leaving, so the caller is left
+// waiting rather than handed an error to report.
+async function sessionFetch(url, init) {
+  const response = await fetch(url, init);
+  if (response.status === 401) {
+    const data = await response.clone().json().catch(() => null);
+    if (isSignInRequired(401, data)) {
+      goToSignIn();
+      return new Promise(() => {});
+    }
+  }
+  return response;
+}
+// An EventSource reports an error with no status, and reconnects by itself,
+// so a revoked session and a network drop look the same from there. On a
+// stream error the open auth-status route is asked instead: only an explicit
+// `signed_in: false` leaves for sign-in; an unreachable server is a drop and
+// the stream keeps retrying. One probe at a time, and at most one per
+// SESSION_PROBE_MIN_MS however often the stream errors.
+const SESSION_PROBE_MIN_MS = 5000;
+let sessionProbe = null;
+let sessionProbedAt = -Infinity;
+function probeSessionAfterStreamError(now = Date.now()) {
+  if (sessionProbe || leavingForSignIn || now - sessionProbedAt < SESSION_PROBE_MIN_MS) return;
+  sessionProbedAt = now;
+  sessionProbe = sessionFetch("/api/auth/status")
+    .then((response) => response.ok ? response.json() : null)
+    .then((status) => { if (status && status.signed_in === false) goToSignIn(); },
+      () => { /* unreachable: a network drop, not a sign-out */ })
+    .finally(() => { sessionProbe = null; });
+}
+
 function requestKey() {
   return globalThis.crypto?.randomUUID?.()
     || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -107,7 +162,7 @@ async function chatApi(path, method = "GET", body, idempotencyKey, signal) {
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   let response;
   try {
-    response = await fetch("/api" + path, {
+    response = await sessionFetch("/api" + path, {
       method, headers, signal,
       body: body === undefined || raw ? body : JSON.stringify(body),
     });
@@ -410,7 +465,7 @@ function openDrawer({ title, sections = [], width = 380, onClose }) {
   return close;
 }
 
-// The operator's settings drawer: four mounts in a fixed order. This lane
+// The operator's settings drawer: five mounts in a fixed order. This lane
 // fills Appearance; Tokens, Models and Engine are filled by assigning a
 // render(mount, { close }) function to their entry in DRAWER_SECTIONS.
 const DRAWER_SECTIONS = [
@@ -418,6 +473,7 @@ const DRAWER_SECTIONS = [
   { id: "drawer-tokens", label: "Tokens", render: null },
   { id: "drawer-models", label: "Models", render: null },
   { id: "drawer-engine", label: "Engine", render: null },
+  { id: "drawer-account", label: "Account", render: null },
 ];
 // The header button toggles: a second press closes the open drawer.
 let closeSettingsDrawer = null;
@@ -2472,7 +2528,7 @@ async function renderScripts(view) {
       if (s.danger && !confirm(`Run "${s.name}"?\n\n${s.desc}`)) return;
       run.disabled = true; setStatus("running " + s.key + "…");
       try {
-        const r = await fetch("/api/scripts/" + s.key, { method: "POST" });
+        const r = await sessionFetch("/api/scripts/" + s.key, { method: "POST" });
         const data = await r.json();
         out.hidden = false; out.textContent = data.output || "(done)";
         setStatus(data.ok ? s.key + " ✓" : s.key + " failed (" + data.code + ")");
@@ -2544,7 +2600,7 @@ function serviceRow(s, hostLifecycle) {
     setStatus(`${s.name}: ${action}…`);
     row.classList.add("busy");
     try {
-      const r = await fetch(`/api/services/${s.key}/${action}`, {
+      const r = await sessionFetch(`/api/services/${s.key}/${action}`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
       const data = await r.json();
       out.hidden = false; out.textContent = data.output || "(done)";
@@ -2742,7 +2798,7 @@ async function openWinVmModal() {
       row.append(head, out);
       results.append(row);
       try {
-        const r = await fetch("/api/vm/validate/" + check,
+        const r = await sessionFetch("/api/vm/validate/" + check,
           { method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ vm }) });
         const data = await r.json();
@@ -2890,7 +2946,7 @@ async function renderMap(root) {
   const remap = el("button", { className: "act", textContent: "re-map ↻" });
   remap.onclick = async () => {
     remap.disabled = true; setStatus("mapping…");
-    try { await fetch("/api/scripts/map", { method: "POST" }); setStatus("mapped"); renderMap(root); }
+    try { await sessionFetch("/api/scripts/map", { method: "POST" }); setStatus("mapped"); renderMap(root); }
     finally { remap.disabled = false; }
   };
   head.append(remap);
@@ -3161,28 +3217,65 @@ const ENGINE_FOLLOW_MS = 2000;
 const ENGINE_FOLLOW_LIMIT = 150;   // five minutes, then stop and say so
 const ENGINE_NOT_STARTED_AFTER = 5;
 
-// Requests to the service carry no Authorization header, no credentials, no
-// custom header and no body: it refuses a Bearer token, and reads no field.
-async function engineOpsRequest(base, path, method = "GET") {
-  const response = await fetch(base + path, { method, credentials: "omit" });
+// The host authority (the engine-ops service) is reached directly, on the
+// hostname this page was loaded from: the session cookie is bound to that
+// exact host, and cookies ignore ports, so the authority receives it only
+// when both use the same name.
+function authorityBase(url) {
+  if (!url) return null;
+  try {
+    const target = new URL(url);
+    target.hostname = location.hostname;
+    return target.origin;
+  } catch { return null; }
+}
+// Every request to the host authority goes through here: sign-in state,
+// devices, engine status and the engine operations. It sends the session
+// cookie and never an Authorization header; a POST carries a JSON object
+// (the authority reads no field of it for /ops/). sign_in_required is
+// handled by sessionFetch.
+async function engineOpsRequest(base, path, method = "GET", body = {}) {
+  const init = { method, credentials: "include" };
+  if (method === "POST") {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  const response = await sessionFetch(base + path, init);
   const data = await response.json().catch(() => ({}));
   return { status: response.status, ok: response.ok, data };
 }
 
+const ENGINE_PIN_CLI = "./sc auth origin";
+// discovery: where the service is. auth: its /auth/status, asked first
+// because it needs no session and says whether a GUI origin is pinned.
+// status: /status, which needs the session. refusal: the error the service
+// gave instead of an answer (for example this page's origin is not the
+// pinned one).
 async function engineOpsLoad() {
   let discovery = null;
   try { discovery = await api("/engine-ops"); } catch { /* no route, or the engine is down */ }
-  let status = null;
-  if (discovery?.url) {
+  const base = authorityBase(discovery?.url);
+  let auth = null, status = null, refusal = null;
+  if (base) {
     try {
-      const answer = await engineOpsRequest(discovery.url, "/status");
-      if (answer.ok) status = answer.data;
+      const answer = await engineOpsRequest(base, "/auth/status");
+      if (answer.ok) auth = answer.data;
+      else refusal = answer.data.error || null;
+      if (auth && auth.pinned !== false) {
+        if (auth.signed_in === false) {
+          goToSignIn();
+          return new Promise(() => {});
+        }
+        const read = await engineOpsRequest(base, "/status");
+        if (read.ok && read.data.pinned !== false) status = read.data;
+        else if (!read.ok) refusal = read.data.error || null;
+      }
     } catch { /* the service is not running */ }
   }
-  return { discovery, status };
+  return { discovery, base, auth, status, refusal };
 }
 
-function engineView({ discovery, status }) {
+function engineView({ discovery, auth = null, status, refusal = null }) {
   const described = status?.ops || discovery?.ops;
   const ops = {};
   for (const [op] of ENGINE_OPS)
@@ -3190,7 +3283,11 @@ function engineView({ discovery, status }) {
   return {
     known: Boolean(discovery),
     up: Boolean(status),
-    url: discovery?.url || null,
+    unpinned: auth && auth.pinned === false ? {
+      reason: auth.reason || "No GUI origin is pinned for this install.",
+      setupCli: auth.setup_cli || null, pinCli: auth.pin_cli || ENGINE_PIN_CLI,
+    } : null,
+    refusal,
     runtime: status?.runtime || discovery?.runtime || null,
     ops,
     recoveryCli: status?.recovery_cli || discovery?.recovery_cli || null,
@@ -3303,6 +3400,10 @@ function renderDrawerEngine(mount) {
     banner.className = "engine-banner" + (note?.tone ? " " + note.tone : "");
     banner.textContent = note ? note.text
       : !view.known ? "Engine controls are unavailable on this engine. Use the CLI:"
+      : view.unpinned ? `${view.unpinned.reason} On the host, run ${view.unpinned.pinCli}`
+        + (view.unpinned.setupCli ? ` (or ${view.unpinned.setupCli} if no GUI user exists yet).` : ".")
+      : view.refusal ? "The host authority refused this page: "
+        + [view.refusal.code, view.refusal.message].filter(Boolean).join(": ")
       : !view.up ? "The engine-ops service is not running."
         + (view.startCli ? ` Start it with ${view.startCli}.` : "")
       : "";
@@ -3346,13 +3447,13 @@ function renderDrawerEngine(mount) {
       if (!alive()) break;
       const healthy = await api("/health").then(() => true, () => false);
       const next = healthy ? await engineOpsLoad() : {
-        discovery: state.discovery,
-        status: state.discovery?.url
-          ? await engineOpsRequest(state.discovery.url, "/status")
+        discovery: state.discovery, base: state.base, auth: state.auth, refusal: null,
+        status: state.base
+          ? await engineOpsRequest(state.base, "/status")
             .then((answer) => answer.ok ? answer.data : null, () => null)
           : null,
       };
-      state = { discovery: next.discovery || state.discovery, status: next.status };
+      state = { ...next, discovery: next.discovery || state.discovery, base: next.base || state.base };
       const operation = next.status?.operation;
       if (!next.status || next.status.running) continue;
       const fresh = operation && operation.op === op
@@ -3384,13 +3485,13 @@ function renderDrawerEngine(mount) {
     }
     following = false;
     if (!alive()) return;
-    paint(state.status ? state : { discovery: state.discovery, status: null }, outcome);
+    paint(state, outcome);
   };
 
   const request = async (op, label, view) => {
     if (!await engineConfirm(op, label, view.ops[op], view)) return;
     const state = await engineOpsLoad();
-    const url = state.discovery?.url;
+    const url = state.base;
     if (!state.status || !url) { paint(state); return; }
     const previous = state.status.operation;
     following = true;
@@ -3409,9 +3510,11 @@ function renderDrawerEngine(mount) {
     if (!answer && view.ops[op].stops_engine)
       return follow(state, op, previous);   // the engine going down can cut the answer off
     const problem = answer?.data?.error;
+    const fix = problem?.code === "gui_origin_unpinned"
+      ? ` On the host, run ${problem.details?.pin_cli || ENGINE_PIN_CLI}.` : "";
     paint(await engineOpsLoad(), {
       text: `${op} was not started: ` + (problem
-        ? [problem.code, problem.message].filter(Boolean).join(": ")
+        ? [problem.code, problem.message].filter(Boolean).join(": ") + fix
         : "the engine-ops service did not answer."),
       tone: "warn",
     });
@@ -3453,10 +3556,132 @@ function renderDrawerEngine(mount) {
   };
 }
 
+// Account (spec #271): who is signed in, this device, the other devices, sign
+// out and revoke. All of it is the host authority's: the review server only
+// says where the authority is. A revoked device is returned to the sign-in
+// screen by its own next request.
+const ACCOUNT_SESSIONS_CLI = "./sc auth sessions";
+const accountWhen = (iso) => iso ? new Date(iso).toLocaleString() : "unknown";
+const accountDevice = (session) => session?.device || "Unnamed device";
+
+async function accountLoad() {
+  let where = null;
+  try { where = await api("/auth/status"); } catch { /* an engine without sign-in, or down */ }
+  const base = authorityBase(where?.authority?.url);
+  if (!base) return { base: null, down: true };
+  try {
+    const status = await engineOpsRequest(base, "/auth/status");
+    if (!status.ok) return { base, refusal: status.data.error || { code: String(status.status) } };
+    if (status.data.signed_in === false) {
+      goToSignIn();
+      return new Promise(() => {});
+    }
+    const listed = await engineOpsRequest(base, "/auth/sessions");
+    return { base, user: status.data.user, current: status.data.session,
+      sessions: listed.ok ? listed.data.sessions || [] : null };
+  } catch { return { base, down: true }; }
+}
+
+// Plain confirmation for revoking one device. Resolves true only on confirm.
+function accountConfirmRevoke(session) {
+  return new Promise((resolve) => {
+    const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+    const confirm = el("button", {
+      className: "act primary danger", type: "button", textContent: "Revoke",
+    });
+    const body = el("div", { className: "engine-confirm" },
+      el("p", {}, `Revoke ${accountDevice(session)}, last seen ${accountWhen(session.last_seen_at)}?`),
+      el("p", {}, "That browser is returned to the sign-in screen on its next request."));
+    let answer = false;
+    const close = openActionModal({
+      title: "Revoke device", bodyNode: body, dismissNode: cancel, actionNode: confirm,
+      width: 440, height: 260,
+    });
+    const finish = () => { close(); resolve(answer); };
+    const overlay = body.closest ? body.closest(".modal-overlay") : null;
+    if (overlay) {
+      overlay.closeModal = finish;
+      overlay.onmousedown = (event) => { if (event.target === overlay) finish(); };
+    }
+    cancel.onclick = finish;
+    confirm.onclick = () => { answer = true; finish(); };
+  });
+}
+
+function renderDrawerAccount(mount) {
+  let closed = false;
+  const note = (text, tone = "") =>
+    el("div", { className: "drawer-note" + (tone ? " " + tone : ""), role: "status" }, text);
+  const paint = (state, message = null) => {
+    if (closed) return;
+    if (state.down) {
+      mount.replaceChildren(
+        note("The host authority is not running, so this page cannot list devices, "
+          + "revoke one, or sign out. Start it with ./sc launch."),
+        el("div", { className: "drawer-note" }, "From the host: ",
+          el("code", { className: "engine-cli" }, ACCOUNT_SESSIONS_CLI)));
+      return;
+    }
+    if (state.refusal) {
+      mount.replaceChildren(note("The host authority refused this page: "
+        + [state.refusal.code, state.refusal.message].filter(Boolean).join(": ")));
+      return;
+    }
+    const signOut = el("button", { className: "act", type: "button", textContent: "Sign out" });
+    signOut.onclick = async () => {
+      signOut.disabled = true;
+      try {
+        const answer = await engineOpsRequest(state.base, "/auth/sign-out", "POST", {});
+        if (answer.ok) { location.assign(SIGN_IN_PATH); return; }
+        paint(state, "Sign-out failed: " + (answer.data.error?.message || answer.status));
+      } catch { paint(state, "Sign-out failed: the host authority did not answer."); }
+    };
+    const others = (state.sessions || []).filter((session) => !session.current);
+    const list = el("div", { className: "account-devices" });
+    for (const session of others) {
+      const revoke = el("button", { className: "act", type: "button", textContent: "Revoke" });
+      revoke.setAttribute("aria-label", `Revoke ${accountDevice(session)}`);
+      revoke.onclick = async () => {
+        if (!await accountConfirmRevoke(session) || closed) return;
+        revoke.disabled = true;
+        try {
+          const answer = await engineOpsRequest(
+            state.base, "/auth/sessions/revoke", "POST", { id: session.id });
+          if (answer.ok && answer.data.current) { location.assign(SIGN_IN_PATH); return; }
+          const failed = answer.ok ? null
+            : "Revoke failed: " + (answer.data.error?.message || answer.status);
+          const next = await accountLoad();
+          paint(next, failed);
+        } catch { paint(state, "Revoke failed: the host authority did not answer."); }
+      };
+      list.append(el("div", { className: "account-device" },
+        el("div", { className: "account-device-name" }, accountDevice(session)),
+        el("div", { className: "drawer-note" }, `Last seen ${accountWhen(session.last_seen_at)}`),
+        revoke));
+    }
+    mount.replaceChildren(
+      el("div", { className: "engine-facts" },
+        el("span", { className: "engine-k" }, "Signed in as"),
+        el("span", { className: "engine-v" }, state.user?.username || "unknown"),
+        el("span", { className: "engine-k" }, "This device"),
+        el("span", { className: "engine-v" },
+          `${accountDevice(state.current)} · since ${accountWhen(state.current?.created_at)}`)),
+      el("div", { className: "drawer-actions" }, signOut),
+      el("div", { className: "account-heading" }, "Other devices"),
+      state.sessions === null ? note("The device list could not be read.")
+        : others.length ? list : note("No other device is signed in."),
+      ...(message ? [note(message, "warn")] : []));
+  };
+  mount.replaceChildren(note("Loading…"));
+  accountLoad().then((state) => paint(state));
+  return () => { closed = true; };
+}
+
 for (const [id, render] of [
   ["drawer-tokens", renderDrawerTokens],
   ["drawer-models", renderDrawerModels],
   ["drawer-engine", renderDrawerEngine],
+  ["drawer-account", renderDrawerAccount],
 ]) DRAWER_SECTIONS.find((section) => section.id === id).render = render;
 
 // "＋ Chat" asks the server for its catalogue without waiting on the answer:
@@ -4788,7 +5013,10 @@ function chatOpenStream(
     `/api/conversations/${conversationId}/events?after=${afterSequence}`);
   chatSource = source;
   source.onopen = () => onState("connected");
-  source.onerror = () => onState("reconnecting");
+  source.onerror = () => {
+    onState("reconnecting");
+    probeSessionAfterStreamError();
+  };
   const types = [
     "conversation.created", "conversation.updated", "conversation.renamed",
     "conversation.close.requested", "conversation.closed",
@@ -5008,7 +5236,7 @@ async function reviewObservationApi(path, { method = "GET", key = "" } = {}) {
   const headers = key ? { "Idempotency-Key": key } : {};
   let response;
   try {
-    response = await fetch("/api" + path, { method, headers });
+    response = await sessionFetch("/api" + path, { method, headers });
   } catch (cause) {
     const error = new Error("Diff observation could not be reached.");
     error.code = "REVIEW_TARGET_UNAVAILABLE";

@@ -40,7 +40,7 @@ TOKENS = DRAWER_BLOCK[DRAWER_BLOCK.index("const DRAWER_TOKEN_DAYS"):
 MODELS = DRAWER_BLOCK[DRAWER_BLOCK.index("// Models: what the server says"):
                       DRAWER_BLOCK.index("// Engine: version facts")]
 ENGINE = DRAWER_BLOCK[DRAWER_BLOCK.index("// Engine: version facts"):
-                      DRAWER_BLOCK.index("for (const [id, render] of [")]
+                      DRAWER_BLOCK.index("// Account (spec #271)")]
 WATCH = DRAWER_BLOCK[DRAWER_BLOCK.index("const CATALOGUE_WATCH_MS"):]
 NEW_CHAT = between("  newChat.onclick = async () => {", "  configure.onclick = async () => {")
 RENDER_NEW = between("async function chatRenderNew(", "function chatTranscriptPageItems")
@@ -148,12 +148,17 @@ def test_models_section_shows_server_freshness_and_refreshes_on_demand():
     assert 'refresh ? "/models?refresh=1" : "/models"' in CATALOGUE
 
 
-def test_engine_section_talks_to_the_service_without_credentials_or_headers():
+def test_engine_section_talks_to_the_authority_with_the_session_and_nothing_else():
     request = ENGINE[ENGINE.index("async function engineOpsRequest"):
-                     ENGINE.index("async function engineOpsLoad")]
-    assert 'fetch(base + path, { method, credentials: "omit" })' in request
-    assert "headers" not in request and "body" not in request
-    assert "Authorization" not in ENGINE.replace("no Authorization header", "")
+                     ENGINE.index("const ENGINE_PIN_CLI")]
+    assert 'const init = { method, credentials: "include" };' in request
+    assert 'init.headers = { "Content-Type": "application/json" };' in request
+    assert "sessionFetch(base + path, init)" in request
+    assert "Authorization" not in ENGINE.replace("never an Authorization header", "")
+    # The one call site for the authority: nothing else in the file builds a
+    # request to it.
+    assert APP.count('credentials: "include"') == 1
+    assert 'engineOpsRequest(base, "/auth/status")' in ENGINE
     # Discovery goes through the review API; the verbs never do.
     assert 'api("/engine-ops")' in ENGINE
     assert 'engineOpsRequest(url, "/ops/" + op, "POST")' in ENGINE
@@ -185,7 +190,7 @@ def test_configure_refresh_and_new_chat_use_only_the_server_stale_flag():
 
 def test_lane_css_block_closes_the_stylesheet_and_uses_tokens_only():
     block = STYLE[STYLE.index("/* ── Drawer contents and model refresh (spec 270)"):]
-    assert block.count("\n/* ") == 1, "the lane block (and its Engine part) closes style.css"
+    assert block.count("\n/* ") == 2, "the lane block, its Engine part and Account close style.css"
     assert not LITERAL.search(block)
     for selector in (".drawer-tokens", ".drawer-tok-num", ".drawer-link",
                      ".drawer-model-state.stale", ".chat-refresh-models", ".chat-refresh-note",
@@ -1001,8 +1006,14 @@ const server = {
     running: false, operation: finished("update-harnesses", 0, "2026-01-01T00:00:00Z"),
     log_tail: "old log", log_truncated: false, log_tail_limit: 16384,
     engine_ref: "abc123", live_sessions: {count: 3, browser: 1, indeterminate: 0}},
+  auth: {ok: true, pinned: true, gui_origin: "http://127.0.0.1:8837", enrolled: true,
+    signed_in: true, user: {user_id: 1, username: "operator"},
+    session: {id: "s1", device: "desk", current: true}, retry_after: 0,
+    setup_cli: "./sc auth user add <username>"},
 };
-const serviceRequests = [], apiRequests = [], notices = [];
+const serviceRequests = [], apiRequests = [], notices = [], navigations = [];
+globalThis.location = {hostname: "127.0.0.1", pathname: "/", search: "", hash: "#shells",
+  assign: (url) => { navigations.push(url); }};
 let ticks = 0, onTick = null, confirmAnswer = true, confirms = [];
 function toast(message) { notices.push(message); }
 async function loadModelCatalogue() {
@@ -1010,15 +1021,23 @@ async function loadModelCatalogue() {
 }
 engineConfirm = async (op, label, facts, view) => { confirms.push(op); return confirmAnswer; };
 globalThis.setTimeout = (fn) => { ticks += 1; if (onTick) onTick(ticks); Promise.resolve().then(fn); };
-const json = (status, data) => ({ok: status >= 200 && status < 300, status,
-  statusText: String(status), json: async () => data});
+const json = (status, data) => {
+  const response = {ok: status >= 200 && status < 300, status,
+    statusText: String(status), json: async () => data};
+  response.clone = () => response;
+  return response;
+};
+const SIGN_IN_REQUIRED = {error: {code: "sign_in_required", message: "sign in", details: {}}};
 globalThis.fetch = async (url, init = {}) => {
   if (url.startsWith(SERVICE)) {
-    serviceRequests.push({path: url.slice(SERVICE.length), method: init.method || "GET",
-      keys: Object.keys(init).sort()});
+    const path = url.slice(SERVICE.length);
+    serviceRequests.push({path, method: init.method || "GET", credentials: init.credentials,
+      headers: Object.keys(init.headers || {}), body: init.body ?? null});
     if (!server.serviceUp) throw new TypeError("Failed to fetch");
-    if (url.endsWith("/status")) return json(200, server.status);
-    return server.post(url.slice(SERVICE.length));
+    if (path === "/auth/status") return json(200, server.auth);
+    if (!server.auth.signed_in) return json(401, SIGN_IN_REQUIRED);
+    if (path === "/status") return json(200, server.status);
+    return server.post(path);
   }
   apiRequests.push(url);
   if (!server.health) throw new TypeError("Failed to fetch");
@@ -1074,8 +1093,11 @@ def test_engine_section_shows_facts_and_enables_controls_when_the_service_answer
         {"label": "Update harnesses", "disabled": False, "cli": None},
     ]
     # The one request to the service: no headers, no body, credentials omitted.
+    # Sign-in state first (no session needed), then the status that needs one.
+    # Both carry the cookie and no header.
     assert result["serviceRequests"] == [
-        {"path": "/status", "method": "GET", "keys": ["credentials", "method"]}]
+        {"path": "/auth/status", "method": "GET", "credentials": "include", "headers": [], "body": None},
+        {"path": "/status", "method": "GET", "credentials": "include", "headers": [], "body": None}]
     assert result["apiRequests"] == ["/api/engine-ops", "/api/flavor-defaults"]
 
 
@@ -1145,7 +1167,8 @@ const seen = [];
     result = run_js(script.replace("__LOST__", json.dumps(lost_response)))
     assert result["confirms"] == ["restart"]
     assert result["posts"] == [
-        {"path": "/ops/restart", "method": "POST", "keys": ["credentials", "method"]}]
+        {"path": "/ops/restart", "method": "POST", "credentials": "include",
+         "headers": ["Content-Type"], "body": "{}"}]
     assert result["seen"] == ["Engine restarting…"]
     assert result["ticks"] == 4
     assert result["notices"] == []
