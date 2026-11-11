@@ -145,7 +145,7 @@ granted automatically by Subfloor.
 
 ## More projects
 
-Other open-source projects by the same author:
+Subfloor is part of [Designs/OS](https://designs-os.com). Other open-source projects by the same author:
 
 - **[FAI Browser](https://jedbjorn.github.io/fai-browser/)** — lets a coding agent work in one browser tab you approve, with permission levels, secret redaction and compact page summaries. ([source](https://github.com/jedbjorn/fai-browser))
 - **[RST](https://jedbjorn.github.io/rst-c/)** — a native Revit add-in for curated ribbon profiles: admins build them, users load them with one click. ([source](https://github.com/jedbjorn/rst-c))
