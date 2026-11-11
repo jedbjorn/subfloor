@@ -28,13 +28,14 @@ import itertools
 import json
 import os
 import re
+import secrets
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
@@ -56,10 +57,12 @@ import review_routes  # noqa: E402
 import sandbox_devkit  # noqa: E402
 import snapshot as snapshot_cli  # noqa: E402
 import transport as transport_mod  # noqa: E402
-from signin_fixture import publish, sign_in, signed_out  # noqa: E402
+from signin_fixture import COOKIE_NAME, publish, sign_in, signed_out  # noqa: E402
 from maintainer import capture_public_docs  # noqa: E402
 from maintainer import dos_app_sprint_canary as canary  # noqa: E402
-from maintainer import signin_guard  # noqa: E402
+
+# The one module object the two tools hold (they import it by its bare name).
+tool_session = canary.tool_session
 
 HOST = "127.0.0.1:8800"
 CLI_PORT = 8800          # the port the in-process "server" of these tests holds
@@ -2055,50 +2058,327 @@ class AuditedCliCallers(GateCase):
         status, _, _ = self.http("GET", "/api/shells", browser.headers())
         self.assertEqual(status, 401)
 
-    def test_the_maintainer_tools_stop_early_and_say_why(self) -> None:
-        """Against a gated install: one message, naming flag SC-1602, instead
-        of a raw 401 or a page of sign-in HTML."""
-        self.assertTrue(signin_guard.requires_sign_in(self.base))
-        with self.assertRaises(canary.CanaryError) as raised:
-            canary.require_operator_api(self.base)
-        self.assertEqual(raised.exception.code, "CANARY_SIGN_IN_REQUIRED")
-        self.assertEqual(raised.exception.message,
-                         signin_guard.message("dos-app Sprint canary"))
-        self.assertIn("SC-1602", raised.exception.message)
-        self.assertIn("requires GUI sign-in", raised.exception.message)
-        self.assertEqual(raised.exception.details, {"flag": "SC-1602"})
-        # The same failure if an operator route is reached anyway.
-        with self.assertRaises(canary.CanaryError) as raised:
-            canary.JsonHttp(self.base, canary.Deadline(30, 30)).request(
-                "GET", "/api/shells")
-        self.assertEqual(raised.exception.code, "CANARY_SIGN_IN_REQUIRED")
-        # The check sits where the canary first has a runtime to ask, before
-        # it creates anything in it.
-        launch = next(
-            node for node in ast.walk(ast.parse(
-                (REPO / "maintainer" / "dos_app_sprint_canary.py").read_text()))
-            if isinstance(node, ast.FunctionDef) and node.name == "launch"
-            and "require_operator_api" in ast.unparse(node))
-        body = ast.unparse(launch)
-        self.assertLess(body.index("'/api/health'"), body.index("require_operator_api"))
-        self.assertLess(body.index("require_operator_api"), body.index("status = "))
+    # ── host-side maintainer tools (tool sessions) ───────────────────────────
 
-        # capture_public_docs: exit 2, the message on stderr, no page opened.
-        stderr = io.StringIO()
-        with tempfile.TemporaryDirectory() as out, \
-                mock.patch.object(server, "health_payload", return_value={
-                    "ok": True, "repo": "subfloor-docs-f73-dos-app"}), \
-                mock.patch.object(capture_public_docs, "capture_gallery") as capture, \
-                mock.patch.object(sys, "argv", [
-                    "capture_public_docs.py", "--port", str(self.port),
-                    "--output", out]), \
-                mock.patch.object(sys, "stderr", stderr):
-            code = capture_public_docs.main()
+    def install(self, **options) -> "FakeInstall":
+        return FakeInstall(self, auth_sessions.DIR, **options)
+
+    def test_a_tool_session_opens_the_gate_and_is_revoked_on_the_way_out(self) -> None:
+        install = self.install()
+        self.assertTrue(tool_session.requires_sign_in(self.base))
+        with mock.patch.dict(os.environ, {"SC_API_TOKEN": "home-engine",
+                                          "SC_API_BASE": "http://127.0.0.1:1"}):
+            with tool_session.operator_session(
+                    install.root, self.base, "a tool", enrol="canary",
+                    run=install.run) as session:
+                headers = session.headers()
+                token = install.token()
+                self.assertEqual(headers, {
+                    "Cookie": f"{COOKIE_NAME}={token}", "Origin": self.base})
+                self.assertEqual(self.http("GET", "/api/shells", headers)[0], 200)
+                # A mutation passes the origin rule with what the helper
+                # gives, and not with the cookie alone.
+                self.assertNotIn(
+                    self.http("POST", "/api/no-such-route", headers)[0], (401, 403))
+                self.assertEqual(self.http(
+                    "POST", "/api/no-such-route", {"Cookie": headers["Cookie"]})[0], 403)
+                self.assertNotIn(token, repr(session))
+        # The install's own verbs, in its checkout, labelled with the tool:
+        # a GUI user for the engine user first, because it had none.
+        self.assertEqual(install.calls, [
+            ["user", "add", "canary", "--port", str(self.port)],
+            ["sessions", "mint", "--label", "a tool", "--json", "--user", "canary"],
+            ["sessions", "revoke", session.session_id]])
+        for options in install.options:
+            self.assertEqual(options["cwd"], str(install.root))
+            self.assertNotIn("SC_API_TOKEN", options["env"])
+            self.assertNotIn("SC_API_BASE", options["env"])
+            self.assertEqual(options["stdin"], subprocess.DEVNULL)
+        # Revoked on the normal way out: the next request is signed out.
+        self.assertEqual(install.tokens, {})
+        self.assertEqual(self.http("GET", "/api/shells", headers)[0], 401)
+        self.assertEqual(session.headers(), {})
+        self.assertTrue(session.revoke())                 # once is enough
+        self.assertEqual(len(install.calls), 3)
+
+        # And on the other ways out: a failure, and Ctrl-C.
+        for leaving in (RuntimeError, KeyboardInterrupt):
+            with self.subTest(leaving.__name__):
+                with self.assertRaises(leaving):
+                    with tool_session.operator_session(
+                            install.root, self.base, "a tool", run=install.run) as held:
+                        headers = held.headers()
+                        self.assertEqual(
+                            self.http("GET", "/api/shells", headers)[0], 200)
+                        raise leaving()
+                self.assertEqual(install.calls[-1], ["sessions", "revoke", held.session_id])
+                self.assertEqual(install.tokens, {})
+                self.assertEqual(self.http("GET", "/api/shells", headers)[0], 401)
+
+    def test_a_tool_that_cannot_get_a_session_says_so(self) -> None:
+        # No GUI user, and the tool may not make one.
+        install = self.install()
+        with self.assertRaises(tool_session.SessionUnavailable) as raised:
+            tool_session.open_session(install.root, self.base, "a tool", run=install.run)
+        self.assertIn("has no GUI user", str(raised.exception))
+        self.assertIn("./sc auth user add <username>", str(raised.exception))
+        self.assertEqual(install.calls, [])
+        # The store is not reachable from here (the sandbox): the verb's own
+        # refusal is what the tool reports.
+        install = self.install(user=True, refuses="✗ ./sc auth refused: sign-in is "
+                               "managed on the HOST, and this is the sandbox.")
+        with self.assertRaises(tool_session.SessionUnavailable) as raised:
+            tool_session.open_session(install.root, self.base, "a tool", run=install.run)
+        self.assertIn("this is the sandbox", str(raised.exception))
+        # No checkout to run a verb in.
+        for missing in (None, install.root / "absent"):
+            with self.assertRaises(tool_session.SessionUnavailable) as raised:
+                tool_session.open_session(missing, self.base, "a tool", run=install.run)
+            self.assertIn("requires GUI sign-in", str(raised.exception))
+        # The verb cannot be run at all.
+        def broken(argv, **_options):
+            raise FileNotFoundError(argv[0])
+        with self.assertRaises(tool_session.SessionUnavailable):
+            tool_session.open_session(install.root, self.base, "a tool", run=broken)
+        # A checkout that is not the one this server serves: its cookie is
+        # one this gate has never heard of. Refused, and not left behind.
+        other = Path(tempfile.mkdtemp(prefix="sc-other-install-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(other, True))
+        publish(auth_sessions.DIR, [], enrolled=True)
+        elsewhere = FakeInstall(self, other, user=True)
+        with self.assertRaises(tool_session.SessionUnavailable) as raised:
+            tool_session.open_session(
+                elsewhere.root, self.base, "a tool", run=elsewhere.run)
+        self.assertIn("did not accept", str(raised.exception))
+        self.assertEqual(elsewhere.calls[-1][:2], ["sessions", "revoke"])
+        self.assertEqual(elsewhere.tokens, {})
+        # What the verb printed is never repeated, whatever it was.
+        install = self.install(user=True, garbles=True)
+        with self.assertRaises(tool_session.SessionUnavailable) as raised:
+            tool_session.open_session(install.root, self.base, "a tool", run=install.run)
+        self.assertNotIn(install.token(), str(raised.exception))
+
+    def test_the_canary_plays_the_operator_with_its_own_session(self) -> None:
+        install = self.install()
+        root = Path(tempfile.mkdtemp(prefix="sc-canary-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, True))
+        config = canary.CanaryConfig(
+            source_repo=root / "source", engine_ref="candidate",
+            dos_app_repo=root / "dos-app", dos_app_ref="origin/main",
+            repository="acme/dos-app", receipt_path=root / "receipts" / "run.json",
+            temp_parent=root, run_id="unit-test-0001")
+        deadline = canary.Deadline(30, 30)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            session = canary.open_operator_session(
+                install.root, self.base, run=install.run)
+            token = install.token()
+            # The disposable install had no GUI user: one is made for the
+            # engine user the canary installs it with, and the session is
+            # labelled with the canary's name.
+            self.assertEqual(install.calls, [
+                ["user", "add", canary.ENGINE_USER, "--port", str(self.port)],
+                ["sessions", "mint", "--label", canary.TOOL_NAME, "--json",
+                 "--user", canary.ENGINE_USER]])
+            api = canary.JsonHttp(self.base, deadline, session)
+            self.assertIsInstance(api.request("GET", "/api/shells"), dict)
+            # Cleanup revokes it, first, and says so in its actions.
+            backend = canary.HostBackend(deadline)
+            backend._operator = session
+            actions = backend.cleanup(config, None, canary.ResourceLedger())
+            self.assertEqual(actions[0], {
+                "action": "revoke_operator_session", "ok": True, "returncode": 0})
+            self.assertEqual(install.tokens, {})
+            # Signed out from the next request: the one stable failure.
+            with self.assertRaises(canary.CanaryError) as raised:
+                canary.JsonHttp(self.base, deadline, session).request(
+                    "GET", "/api/shells")
+            self.assertEqual(raised.exception.code, "CANARY_SIGN_IN_REQUIRED")
+            with self.assertRaises(canary.CanaryError) as bare:
+                canary.JsonHttp(self.base, deadline).request("GET", "/api/shells")
+            self.assertEqual(bare.exception.code, "CANARY_SIGN_IN_REQUIRED")
+            receipt = canary.Receipt(config.receipt_path, config)
+            receipt.data["cleanup"]["actions"] = canary.sanitize(actions)
+            receipt.data["failure"] = canary.sanitize(
+                {"code": raised.exception.code, "message": raised.exception.message,
+                 "details": raised.exception.details})
+            receipt.event("cleanup.completed")
+            receipt.write()
+        # The cookie is in nothing the canary prints or keeps.
+        for text in (out.getvalue(), err.getvalue(), config.receipt_path.read_text(),
+                     json.dumps(actions), repr(session), raised.exception.message):
+            self.assertNotIn(token, text)
+        self.assertIn("revoke_operator_session", config.receipt_path.read_text())
+
+        # A revocation that fails makes cleanup incomplete, and says which
+        # session to end by hand, without the cookie.
+        install = self.install(user=True)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            backend = canary.HostBackend(deadline)
+            backend._operator = canary.open_operator_session(
+                install.root, self.base, run=install.run)
+            token, install.refuses = install.token(), "✗ auth: a write failed"
+            with self.assertRaises(canary.CanaryError) as failed:
+                backend.cleanup(config, None, canary.ResourceLedger())
+        self.assertEqual(failed.exception.details["failed_actions"],
+                         ["revoke_operator_session"])
+        self.assertIn(f"./sc auth sessions revoke {backend._operator.session_id}",
+                      err.getvalue())
+        self.assertNotIn(token, err.getvalue())
+
+        # No session to be had: the canary's one failure, with the reason.
+        install = self.install(refuses="✗ auth: 'canary' is not an active engine user")
+        with self.assertRaises(canary.CanaryError) as raised:
+            canary.open_operator_session(install.root, self.base, run=install.run)
+        self.assertEqual(raised.exception.code, "CANARY_SIGN_IN_REQUIRED")
+        self.assertIn("not an active engine user", raised.exception.message)
+        # A candidate from before sign-in: nothing is minted, nothing is sent.
+        def not_found(request, timeout=None):
+            raise __import__("urllib.error").error.HTTPError(
+                request.full_url, 404, "x", {}, None)
+        plain = canary.open_operator_session(
+            install.root, "http://127.0.0.1:1", run=install.run, opener=not_found)
+        self.assertEqual((plain.gated, plain.headers(), plain.revoke()), (False, {}, True))
+        self.assertEqual(len(install.calls), 1)
+
+        # The session is obtained where the canary first has a runtime to
+        # ask, before it creates anything in it; every later call carries it.
+        source = ast.parse((REPO / "maintainer" / "dos_app_sprint_canary.py").read_text())
+        launch = next(
+            node for node in ast.walk(source)
+            if isinstance(node, ast.FunctionDef) and node.name == "launch"
+            and "open_operator_session" in ast.unparse(node))
+        body = ast.unparse(launch)
+        self.assertLess(body.index("'/api/health'"), body.index("open_operator_session"))
+        self.assertLess(body.index("open_operator_session"), body.index("status = "))
+        orchestrate = next(
+            node for node in ast.walk(source)
+            if isinstance(node, ast.FunctionDef) and node.name == "orchestrate"
+            and "JsonHttp" in ast.unparse(node))
+        self.assertIn("self._operator)", ast.unparse(orchestrate))
+
+    def test_the_canary_gives_its_session_back_on_ctrl_c(self) -> None:
+        backend = mock.Mock()
+        config = mock.Mock(whole_timeout_s=30.0, stage_timeout_s=30.0)
+        with mock.patch.object(canary, "parser") as parser, \
+                mock.patch.object(canary, "build_config", return_value=config), \
+                mock.patch.object(canary, "Receipt"), \
+                mock.patch.object(canary, "HostBackend", return_value=backend), \
+                mock.patch.object(canary, "CanaryController") as controller:
+            parser.return_value.parse_args.return_value = mock.Mock(command="run")
+            controller.return_value.run.side_effect = KeyboardInterrupt
+            with self.assertRaises(KeyboardInterrupt):
+                canary.main([])
+        backend.release_operator.assert_called_once_with()
+
+    def test_the_docs_capture_signs_its_browser_in_and_out(self) -> None:
+        install = self.install()
+        seen: dict = {}
+
+        def gallery(config, base, output, *, capture_factory):
+            session = capture_factory()._session
+            cookie = session.browser_cookies()[0]
+            seen["cookie"] = cookie
+            seen["status"] = self.http("GET", "/api/shells", {
+                "Cookie": f"{cookie['name']}={cookie['value']}"})[0]
+            if seen.get("interrupt"):
+                raise KeyboardInterrupt
+            return {"routes_total": 5, "routes_failed": 1, "routes": [
+                {"error": f"capture: the page said {cookie['value']}"}]}
+
+        def run(*extra: str):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(server, "health_payload", return_value={
+                        "ok": True, "repo": "subfloor-docs-f73-dos-app"}), \
+                    mock.patch.object(capture_public_docs, "capture_gallery",
+                                      side_effect=gallery) as capture, \
+                    mock.patch.object(capture_public_docs, "write_gallery"), \
+                    mock.patch.object(tool_session, "_sc", install.sc), \
+                    mock.patch.object(sys, "argv", [
+                        "capture_public_docs.py", "--port", str(self.port),
+                        "--output", str(output), "--install", str(install.root),
+                        *extra]), \
+                    redirect_stdout(out), redirect_stderr(err):
+                try:
+                    code = capture_public_docs.main()
+                except KeyboardInterrupt:
+                    code = "interrupted"
+            return code, out.getvalue(), err.getvalue(), capture
+
+        output = Path(tempfile.mkdtemp(prefix="sc-gallery-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(output, True))
+        # No GUI user and no leave to make one: exit 2, one message, no page.
+        code, out, err, capture = run()
         self.assertEqual(code, 2)
         capture.assert_not_called()
-        self.assertEqual(stderr.getvalue().strip(),
-                         signin_guard.message("capture_public_docs"))
-        self.assertIn("SC-1602", stderr.getvalue())
+        self.assertIn("has no GUI user", err)
+        self.assertEqual(list(output.iterdir()), [])
+
+        code, out, err, capture = run("--enrol-user", "canary")
+        self.assertEqual(code, 1)                     # one route failed
+        self.assertEqual(seen["status"], 200)         # signed in while it ran
+        self.assertEqual(seen["cookie"]["url"], self.base)
+        self.assertEqual(install.calls, [
+            ["user", "add", "canary", "--port", str(self.port)],
+            ["sessions", "mint", "--label", "capture_public_docs", "--json",
+             "--user", "canary"],
+            ["sessions", "revoke", install.calls[-1][2]]])
+        self.assertEqual(install.tokens, {})          # and signed out after
+        token = seen["cookie"]["value"]
+        written = (output / "capture.json").read_text()
+        self.assertIn(tool_session.REDACTED, written)
+        for text in (written, out, err):
+            self.assertNotIn(token, text)
+
+        # Ctrl-C in the middle of a capture still revokes.
+        seen["interrupt"] = True
+        code, out, err, capture = run()
+        self.assertEqual(code, "interrupted")
+        self.assertEqual(seen["status"], 200)
+        self.assertEqual(install.calls[-1][:2], ["sessions", "revoke"])
+        self.assertEqual(install.tokens, {})
+        self.assertNotIn(seen["cookie"]["value"], out + err)
+
+    def test_the_capture_browser_holds_the_cookie_and_never_reports_it(self) -> None:
+        install = self.install(user=True)
+        session = tool_session.open_session(
+            install.root, self.base, "capture_public_docs", run=install.run)
+        self.addCleanup(session.revoke)
+        token = install.token()
+        browser = mock.MagicMock()
+        context = browser.new_context.return_value
+        context.new_page.return_value.goto.return_value.status = 200
+        capture = capture_public_docs.DocumentationCapture(session)
+        capture._browser = browser
+        with tempfile.TemporaryDirectory() as out:
+            result = capture.capture(
+                self.base + "/#worktrees", {"width": 1440, "height": 1000},
+                Path(out) / "shot.png", settle_ms=0, timeout_ms=1000)
+            self.assertTrue(result["ok"])
+            context.add_cookies.assert_called_once_with([
+                {"name": COOKIE_NAME, "value": token, "url": self.base}])
+            context.close.assert_called_once_with()
+            # A browser error that quotes the cookie is scrubbed before the
+            # gallery, which writes the message down, ever sees it.
+            context.new_page.return_value.goto.side_effect = RuntimeError(
+                f"net::ERR with Cookie {COOKIE_NAME}={token}")
+            with self.assertRaises(RuntimeError) as raised:
+                capture.capture(
+                    self.base + "/#worktrees", {"width": 1440, "height": 1000},
+                    Path(out) / "shot.png", settle_ms=0, timeout_ms=1000)
+        self.assertNotIn(token, str(raised.exception))
+        self.assertIn(tool_session.REDACTED, str(raised.exception))
+        # Without sign-in the capture runs as it always did: no cookie.
+        plain = capture_public_docs.DocumentationCapture(
+            tool_session.ToolSession(self.base, "capture_public_docs"))
+        plain._browser = mock.MagicMock()
+        plain._browser.new_context.return_value.new_page.return_value \
+            .goto.return_value.status = 200
+        with tempfile.TemporaryDirectory() as out:
+            plain.capture(self.base + "/#worktrees", {"width": 1440, "height": 1000},
+                          Path(out) / "shot.png", settle_ms=0, timeout_ms=1000)
+        plain._browser.new_context.return_value.add_cookies.assert_not_called()
 
     def test_the_maintainer_guard_lets_other_installs_through(self) -> None:
         class Answer:
@@ -2114,8 +2394,9 @@ class AuditedCliCallers(GateCase):
             def read(self):
                 return self.body
 
-        def not_found(url, timeout=None):
-            raise __import__("urllib.error").error.HTTPError(url, 404, "x", {}, None)
+        def not_found(request, timeout=None):
+            raise __import__("urllib.error").error.HTTPError(
+                request.full_url, 404, "x", {}, None)
 
         def down(url, timeout=None):
             raise ConnectionRefusedError()
@@ -2134,10 +2415,13 @@ class AuditedCliCallers(GateCase):
         )
         for label, opener, expected in cases:
             with self.subTest(label):
-                self.assertIs(signin_guard.requires_sign_in(
+                self.assertIs(tool_session.requires_sign_in(
                     "http://127.0.0.1:1", opener=opener), expected)
                 if not expected:
-                    canary.require_operator_api("http://127.0.0.1:1", opener=opener)
+                    # Nothing to sign in to: no verb is run, nothing is sent.
+                    session = tool_session.open_session(
+                        None, "http://127.0.0.1:1", "a tool", opener=opener)
+                    self.assertEqual((session.gated, session.headers()), (False, {}))
 
     def test_no_other_sc_script_calls_the_api_over_http(self) -> None:
         """The audit, held. Every `/api/...` the `sc` entry point, a script, a
@@ -2195,6 +2479,78 @@ class AuditedCliCallers(GateCase):
                                      r"\s*f?[\"'](/[a-z_]+)", path.read_text()):
                 if match.group(1) == "/api":
                     self.assertEqual(path.name, "models.py")
+
+
+
+class FakeInstall:
+    """An install's host-side `./sc auth`, for a tool under test.
+
+    `user add`, `sessions mint` and `sessions revoke` act on a published
+    session list the way the real verbs do, so the review server under test
+    accepts and refuses what a real install's would. `run` stands in for
+    `subprocess.run`; `sc` for the helper's own runner.
+    """
+
+    def __init__(self, case, sessions_dir: Path, *, user: bool = False,
+                 refuses: str | None = None, garbles: bool = False) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="sc-install-"))
+        case.addCleanup(lambda: __import__("shutil").rmtree(self.root, True))
+        (self.root / "sc").write_text("#!/bin/sh\n")
+        self.sessions_dir = Path(sessions_dir)
+        self.user = user
+        self.refuses = refuses
+        self.garbles = garbles
+        self.tokens: dict[str, str] = {}
+        self.minted: list[str] = []
+        self.calls: list[list[str]] = []
+        self.options: list[dict] = []
+        self._publish()
+
+    def token(self) -> str:
+        return self.minted[-1]
+
+    def _publish(self) -> None:
+        publish(self.sessions_dir, [(token, 1) for token in self.tokens.values()],
+                enrolled=self.user)
+
+    def sc(self, install, argv, *, run=None, timeout=0):
+        return self.run([str(Path(install) / "sc"), "auth", *argv])
+
+    def run(self, argv, **options):
+        assert argv[:2] == [str(self.root / "sc"), "auth"], argv
+        verb = argv[2:]
+        self.calls.append(verb)
+        self.options.append(options)
+
+        def done(code, out="", err=""):
+            return subprocess.CompletedProcess(argv, code, out, err)
+
+        if self.refuses is not None:
+            return done(1, err=self.refuses + "\n")
+        if verb[:2] == ["user", "add"]:
+            self.user = True
+            self._publish()
+            return done(0, out="  one-time claim code:  ABCD-EFGH\n")
+        if verb[:2] == ["sessions", "mint"]:
+            if not self.user:
+                return done(1, err="✗ auth: no GUI user yet\n")
+            token, session_id = secrets.token_urlsafe(32), secrets.token_hex(6)
+            self.minted.append(token)
+            if self.garbles:
+                return done(0, out=f"{COOKIE_NAME}={token}\n")
+            self.tokens[session_id] = token
+            self._publish()
+            return done(0, err=f"→ tool session {session_id} minted\n", out=json.dumps({
+                "id": session_id, "kind": "tool", "label": verb[verb.index("--label") + 1],
+                "username": "canary", "user_id": 1,
+                "cookie_name": COOKIE_NAME, "cookie_value": token}) + "\n")
+        if verb[:2] == ["sessions", "revoke"]:
+            if self.tokens.pop(verb[2], None) is None:
+                return done(1, err=f"✗ no session with id {verb[2]}\n")
+            self._publish()
+            return done(0, out="→ 1 session(s) revoked\n")
+        return done(2, err="usage\n")
+
 
 if __name__ == "__main__":
     unittest.main()

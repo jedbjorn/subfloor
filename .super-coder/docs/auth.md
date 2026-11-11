@@ -57,7 +57,9 @@ path and from no file inside it (`sandbox_devkit.install_key`):
   parameters and salt, the TOTP secret, the last accepted TOTP step, and the
   scrypt hash of the one-time claim code;
 - **sessions**: an id, the user, the SHA-256 of the session token, a device
-  label, created and last-seen times. The token itself is never stored;
+  label, created and last-seen times. The token itself is never stored. A
+  [tool session](#tool-sessions) also carries `kind: "tool"` and its label; a
+  record with no `kind` is a browser's;
 - **rate**: the failed-attempt count and the time the next attempt is allowed.
 
 Nothing secret is written to the engine database, the checkout, `.sc-state/`,
@@ -107,8 +109,8 @@ put back into the list. The consequence to know about: if `sessions.json` is
 deleted or damaged, every session ends and each browser signs in again. Users,
 passwords and authenticators are not affected.
 
-This covers a single revoke, sign-out, `./sc auth sessions revoke`, and
-`./sc auth user reset`. A reset interrupted after write 1 has already ended
+This covers a single revoke, sign-out, `./sc auth sessions revoke`,
+`./sc auth sessions mint`, and `./sc auth user reset`. A reset interrupted after write 1 has already ended
 every session and has not yet cleared the password; run it again.
 
 ### The launcher's mount
@@ -289,6 +291,51 @@ username gets the normal form. A wrong claim code is refused and counted like
 a wrong password. An enrolment lasts 15 minutes and does not survive a service
 restart; the claim code still works afterwards.
 
+## Tool sessions
+
+A host-side tool that plays the operator over HTTP, or drives the GUI in a
+browser, gets its session from a host CLI verb, not from the sign-in page:
+
+    ./sc auth sessions mint --label <text> [--user <username>] [--json]
+
+- **What it makes.** An ordinary session, through the same code as a sign-in
+  (`host_auth._new_session`, then the three ordered writes above), with two
+  more fields in the store: `kind: "tool"` and the label. The published list
+  is unchanged in shape: a hash and a `user_id`. The review server's gate has
+  one decision function (`browser_gate.operator_session`) and it treats this
+  session exactly as a browser's: a published hash of an active engine user,
+  on a loopback `Host`, with a same-origin `Origin` on every mutation.
+- **No password and no code.** The verb runs as the host OS user, who can
+  already read the store and reset any user with `./sc auth user reset`. It
+  grants nothing that user lacks. It is a CLI verb only: no route of the
+  service or of the review server mints a session without the password and
+  the authenticator, and the verb refuses wherever the other `./sc auth`
+  verbs refuse (inside the sandbox, from a linked worktree).
+- **What it prints.** The cookie, once, on stdout: `sc_session_<8 hex>=<token>`
+  on one line, or with `--json` one object,
+  `{id, kind, label, username, user_id, cookie_name, cookie_value}`. A line on
+  stderr names the session id and the revoke command, never the cookie.
+- **Which user.** `--user`, or the only GUI user when there is one. With no
+  GUI user the verb refuses and names `./sc auth user add`. A user still
+  `awaiting` first sign-in may be given a tool session (a tool's own
+  disposable install has nobody to complete one). The review server accepts
+  it; the engine-ops service does not, because its own check wants a
+  completed user, so such a session cannot run an engine operation.
+- **Label.** 1 to 80 visible characters. It is what the session is listed
+  under: `./sc auth sessions` shows it in the device column with `tool` in
+  the kind column (`browser` for a signed-in device). The GUI's device list
+  shows it by its label among that user's devices.
+- **Ending it.** `./sc auth sessions revoke <id>`, `--all`, the GUI's device
+  list, or `./sc auth user reset`: the same as any session, and without
+  touching the operator's browser sessions when revoked by id. It does not
+  expire.
+
+The tool sends the cookie, and `Origin: http://<host>:<port>` of the review
+server it calls, as the GUI would. The source-maintainer tools do this through
+`maintainer/tool_session.py`, which mints in the install the tool drives,
+labels the session with the tool's name, keeps the cookie in memory only, and
+revokes on the way out: normal exit, failure, or Ctrl-C.
+
 ## The `./sc auth` verbs
 
 Host terminal, main checkout. Refused from a linked worktree (it has no
@@ -299,7 +346,8 @@ instance of its own) and inside the sandbox (the state is not there).
 | `./sc auth user add <username> [--port <port>]` | create the GUI user awaiting first sign-in; print the claim code; confirm the GUI origin |
 | `./sc auth user reset <username>` | clear the password, the TOTP secret, and every session; back to `awaiting`; print a new claim code. This is the recovery path for a lost authenticator or password |
 | `./sc auth user list` | `user_id`, username, state, session count |
-| `./sc auth sessions [list]` | every signed-in device: id, user, device, last seen, since |
+| `./sc auth sessions [list]` | every session: id, user, device or tool label, kind (`browser` or `tool`), last seen, since |
+| `./sc auth sessions mint --label <text> [--user <username>] [--json]` | give a host-side tool a labelled [tool session](#tool-sessions); print its cookie once |
 | `./sc auth sessions revoke <id>` · `--all` | sign one device, or every device, out |
 | `./sc auth unlock` | clear the failed-attempt wait |
 | `./sc auth origin [<port> \| --show]` | confirm or show the GUI origin by itself (after a review-port change). `./sc engine-ops-pin` is the same verb under its first name |
