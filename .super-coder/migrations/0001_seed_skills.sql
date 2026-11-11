@@ -741,7 +741,9 @@ sc skill list
 
 `put` succeeds only after DB, local snapshot, flat catalogue, and managed skill
 projections reconcile. Naming a standard shell changes its shared flavor pack;
-naming a Bespoke shell changes only that shell. Creation grants nothing.
+naming a Bespoke shell changes only that shell; `flavor:<name>`, the spelling
+`sc skill list` prints, changes a flavor pack directly, including one with no
+shell. Creation grants nothing.
 
 Planner owns fork-local skill operations via the API lane: on a launched seat
 every `sc skill` verb runs through the engine API, the single writer, with

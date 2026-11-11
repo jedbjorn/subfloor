@@ -8,7 +8,8 @@ lifecycle first-class and loud: unknown skill or shell names are hard
 errors, engine skills refuse `rm` (the seed would just resurrect them),
 and every supported mutation persists the local snapshot and projections.
 Naming a standard shell targets its shared flavor pack; naming a Bespoke shell
-targets only that shell.
+targets only that shell; `flavor:<name>` targets a flavor pack directly, with
+or without a member shell.
 
 The lane is chosen by identity, not by whether the DB happens to open. A
 launched shell (it carries SC_API_TOKEN) always goes through the authenticated
@@ -39,8 +40,8 @@ The list is re-applied after every seed sync/heal/rebuild, so it rides
 Usage:
     ./sc skill list                        catalogue: origin, common, grants
     ./sc skill put --file <SKILL.md>       create/update a DB-canonical LOCAL skill
-    ./sc skill grant  <name> <shell>...    grant via shell reference (flavor/Bespoke)
-    ./sc skill revoke <name> <shell>...    revoke via shell reference
+    ./sc skill grant  <name> <target>...   grant to a shell's pack or flavor:<name>
+    ./sc skill revoke <name> <target>...   revoke from a shell's pack or flavor:<name>
     ./sc skill rm     <name>               soft-delete a LOCAL skill + revoke all grants
     ./sc skill retire   <name>             retire an ENGINE skill fork-wide (durable)
     ./sc skill unretire <name>             restore a retired engine skill (+ its grants)
@@ -172,21 +173,86 @@ def resolve_shell(con, ref: str) -> tuple[int, str]:
              + ", ".join(f"{i} ({n})" for i, n in have))
 
 
+FLAVOR_REF_PREFIX = "flavor:"
+
+
+def known_flavors(con) -> list[str]:
+    """Every addressable flavor: templates, live shells, and existing packs."""
+    import shell_factory
+
+    names = {t.get("flavor") for t in shell_factory.flavors()}
+    names.update(r[0] for r in con.execute(
+        "SELECT DISTINCT flavor FROM shells WHERE flavor IS NOT NULL"))
+    names.update(r[0] for r in con.execute(
+        "SELECT DISTINCT flavor FROM flavor_skills"))
+    return sorted(name for name in names if name)
+
+
+def resolve_flavor(con, ref: str) -> str:
+    """`flavor:<name>` → the flavor name. Loud on an unknown flavor."""
+    name = ref[len(FLAVOR_REF_PREFIX):].strip()
+    have = known_flavors(con)
+    if name in have:
+        return name
+    sys.exit(f"sc skill: no flavor '{name}' — have: "
+             + ", ".join(f"{FLAVOR_REF_PREFIX}{flavor}" for flavor in have))
+
+
+def set_flavor_grant(con, flavor: str, skill_id: int,
+                     granted: bool) -> tuple[int, str]:
+    """Mutate one flavor pack and return (rowcount, scope label)."""
+    if granted:
+        cur = con.execute(
+            "INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) "
+            "VALUES (?, ?)", (flavor, skill_id))
+    else:
+        cur = con.execute(
+            "DELETE FROM flavor_skills WHERE flavor=? AND skill_id=?",
+            (flavor, skill_id))
+    return cur.rowcount, f"{flavor} flavor"
+
+
+def apply_grants(con, skill_id: int, refs: list[str], granted: bool):
+    """Apply one grant/revoke to every ref (a shell or `flavor:<name>`).
+
+    Every ref resolves before any row changes, so one bad ref refuses the
+    whole call. Returns ([(scope, changed, ref)], reconcile) where `reconcile`
+    converges the skill mirrors of every shell the change reaches.
+    """
+    targets = [
+        ("flavor", resolve_flavor(con, ref), ref)
+        if ref.lower().startswith(FLAVOR_REF_PREFIX)
+        else ("shell", resolve_shell(con, ref), ref)
+        for ref in refs
+    ]
+    rows: list[tuple[str, bool, str]] = []
+    shell_ids: list[int] = []
+    flavors: list[str] = []
+    for kind, target, ref in targets:
+        if kind == "flavor":
+            flavors.append(target)
+            changed, scope = set_flavor_grant(con, target, skill_id, granted)
+        else:
+            shell_id, label = target
+            shell_ids.append(shell_id)
+            changed, scope = set_target_grant(
+                con, shell_id, label, skill_id, granted)
+        rows.append((scope, bool(changed), ref))
+
+    def reconcile():
+        skill_projection.reconcile_assignment_targets(con, shell_ids)
+        skill_projection.reconcile_flavors(con, flavors)
+
+    return rows, reconcile
+
+
 def set_target_grant(con, shell_id: int, label: str, skill_id: int,
                      granted: bool) -> tuple[int, str]:
     """Mutate the owning pack for a shell and return (rowcount, scope label)."""
     flavor = con.execute(
         "SELECT flavor FROM shells WHERE shell_id=?", (shell_id,)).fetchone()[0]
     if flavor is not None:
-        if granted:
-            cur = con.execute(
-                "INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) "
-                "VALUES (?, ?)", (flavor, skill_id))
-        else:
-            cur = con.execute(
-                "DELETE FROM flavor_skills WHERE flavor=? AND skill_id=?",
-                (flavor, skill_id))
-        return cur.rowcount, f"{flavor} flavor"
+        return set_flavor_grant(con, flavor, skill_id, granted)
     if granted:
         cur = con.execute(
             "INSERT OR IGNORE INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
@@ -526,37 +592,23 @@ def cmd_unretire_api(name: str) -> int:
 
 def cmd_grant(con, name: str, shell_refs: list[str]) -> int:
     skill_id = resolve_skill(con, name)
-    targets: list[int] = []
-    for ref in shell_refs:
-        shell_id, label = resolve_shell(con, ref)
-        targets.append(shell_id)
-        changed, scope = set_target_grant(con, shell_id, label, skill_id, True)
+    rows, reconcile = apply_grants(con, skill_id, shell_refs, True)
+    for scope, changed, _ref in rows:
         print(f"grant: {name} → {scope}"
               + ("" if changed else "  (already granted)"))
     con.commit()
-    _persist_mutation(
-        con,
-        f"grant {name}",
-        lambda: skill_projection.reconcile_assignment_targets(con, targets),
-    )
+    _persist_mutation(con, f"grant {name}", reconcile)
     return 0
 
 
 def cmd_revoke(con, name: str, shell_refs: list[str]) -> int:
     skill_id = resolve_skill(con, name)
-    targets: list[int] = []
-    for ref in shell_refs:
-        shell_id, label = resolve_shell(con, ref)
-        targets.append(shell_id)
-        changed, scope = set_target_grant(con, shell_id, label, skill_id, False)
+    rows, reconcile = apply_grants(con, skill_id, shell_refs, False)
+    for scope, changed, _ref in rows:
         print(f"revoke: {name} ⇸ {scope}"
               + ("" if changed else "  (was not granted)"))
     con.commit()
-    _persist_mutation(
-        con,
-        f"revoke {name}",
-        lambda: skill_projection.reconcile_assignment_targets(con, targets),
-    )
+    _persist_mutation(con, f"revoke {name}", reconcile)
     return 0
 
 
@@ -618,40 +670,20 @@ def _put_spec(con, spec: dict) -> str:
 
 
 def _grant_spec(con, name: str, shell_refs: list[str]) -> list[tuple[str, bool, str]]:
-    """Grant one skill to every shell ref (flavor pack or Bespoke shell)."""
+    """Grant one skill to every ref (shell's pack or `flavor:<name>`)."""
     skill_id = resolve_skill_id(con, name)
-    rows: list[tuple[str, bool, str]] = []
-    targets: list[int] = []
-    for ref in shell_refs:
-        shell_id, label = resolve_shell(con, ref)
-        targets.append(shell_id)
-        changed, scope = set_target_grant(con, shell_id, label, skill_id, True)
-        rows.append((scope, bool(changed), ref))
+    rows, reconcile = apply_grants(con, skill_id, shell_refs, True)
     con.commit()
-    _persist_mutation(
-        con,
-        f"grant {name}",
-        lambda: skill_projection.reconcile_assignment_targets(con, targets),
-    )
+    _persist_mutation(con, f"grant {name}", reconcile)
     return rows
 
 
 def _revoke_spec(con, name: str, shell_refs: list[str]) -> list[tuple[str, bool, str]]:
-    """Revoke one skill from every shell ref (flavor pack or Bespoke shell)."""
+    """Revoke one skill from every ref (shell's pack or `flavor:<name>`)."""
     skill_id = resolve_skill_id(con, name)
-    rows: list[tuple[str, bool, str]] = []
-    targets: list[int] = []
-    for ref in shell_refs:
-        shell_id, label = resolve_shell(con, ref)
-        targets.append(shell_id)
-        changed, scope = set_target_grant(con, shell_id, label, skill_id, False)
-        rows.append((scope, bool(changed), ref))
+    rows, reconcile = apply_grants(con, skill_id, shell_refs, False)
     con.commit()
-    _persist_mutation(
-        con,
-        f"revoke {name}",
-        lambda: skill_projection.reconcile_assignment_targets(con, targets),
-    )
+    _persist_mutation(con, f"revoke {name}", reconcile)
     return rows
 
 
@@ -811,8 +843,8 @@ def cmd_unretire(con, name: str) -> int:
 
 def main(argv: list[str]) -> int:
     usage = ("usage: ./sc skill list | put --file <SKILL.md> | "
-             "grant <name> <shell>... | "
-             "revoke <name> <shell>... | rm <name> | "
+             "grant <name> <shell|flavor:<name>>... | "
+             "revoke <name> <shell|flavor:<name>>... | rm <name> | "
              "retire <name> | unretire <name>")
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(usage)
