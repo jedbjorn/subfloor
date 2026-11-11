@@ -143,14 +143,17 @@ import flat as flat_render  # noqa: E402  (document render-path ownership)
 # Normal activation contract: DB_PATH = instance_state.active_database_path(ENGINE)
 DB_PATH = instance_state.maintenance_database_path(ENGINE)
 
-# The app SHELL stays a frozen route table (spec #48): four files, a closed set
-# that has not changed in the life of the project, and index.html is where the
-# CSP header hangs. Adding one is a route change its author is already looking
-# at. Vendored assets are the opposite population — see _VENDOR_TYPES below.
+# The app SHELL stays a frozen route table (spec #48): a closed set that
+# changes only by a deliberate edit here, and index.html is where the CSP
+# header hangs. Adding one is a route change its author is already looking
+# at: theme.js joined in spec #270, because the theme has to be applied from
+# <head> before first paint and the CSP forbids doing that inline. Vendored
+# assets are the opposite population — see _VENDOR_TYPES below.
 _STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    "/theme.js": ("theme.js", "application/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
 
