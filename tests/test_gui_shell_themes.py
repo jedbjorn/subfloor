@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -276,12 +277,48 @@ def test_appearance_control_offers_system_light_dark_through_the_theme_contract(
 
 # ── Theme application ─────────────────────────────────────────────────────────
 
+class _InlineScriptAudit(HTMLParser):
+    """Collects what the CSP would refuse: scripts without a src, script
+    bodies, and on* handler attributes on any element."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.script_sources: list[str] = []
+        self.inline_scripts: list[str] = []
+        self.inline_handlers: list[str] = []
+        self._in_script = False
+
+    def handle_starttag(self, tag, attrs):
+        names = dict(attrs)
+        self.inline_handlers += [f"{tag} {name}" for name in names if name.startswith("on")]
+        if tag == "script":
+            self._in_script = True
+            if names.get("src"):
+                self.script_sources.append(names["src"])
+            else:
+                self.inline_scripts.append("<script> without src")
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self._in_script = False
+
+    def handle_data(self, data):
+        if self._in_script and data.strip():
+            self.inline_scripts.append(data.strip())
+
 def test_theme_script_loads_from_head_before_the_stylesheet_with_no_inline_script():
     head = INDEX[INDEX.index("<head>"):INDEX.index("</head>")]
     assert head.index('<script src="/theme.js"></script>') < head.index('href="/style.css"')
-    assert re.findall(r"<script(?![^>]*\bsrc=)[^>]*>", INDEX) == []
+    # Parsed, not pattern-matched: the parser lower-cases tag and attribute
+    # names, so no spelling of a script tag or handler slips past.
+    page = _InlineScriptAudit()
+    page.feed(INDEX)
+    page.close()
+    assert page.script_sources == ["/theme.js", "/vendor/marked.umd.js",
+                                   "/vendor/purify.min.js", "/app.js"]
+    assert page.inline_scripts == []
     # no inline event handlers either: the CSP would drop them silently
-    assert re.findall(r"<[^>]*\son\w+\s*=", INDEX) == []
+    assert page.inline_handlers == []
 
 
 def test_theme_script_is_a_served_static_route():
