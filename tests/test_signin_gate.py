@@ -344,7 +344,7 @@ class NoRouteAnswersWithoutASession(GateCase):
         self.assertEqual(ast.unparse(serve.args[2]), "dispatch_http")
         self.assertEqual(
             {keyword.arg: ast.unparse(keyword.value) for keyword in serve.keywords},
-            {"on_started": "_on_listening",
+            {"on_bound": "_on_bound", "on_started": "_on_listening",
              "stream_handler": "conversation_routes.stream_events"})
 
     def test_every_route_refuses_without_a_cookie(self) -> None:
@@ -1465,7 +1465,152 @@ class ShellAndCliCredentials(GateCase):
         self.assertEqual(cli_credential.read(8811, self.run_dir), "sccli_this-process")
         # Under its own port, and no other file was touched.
         self.assertEqual(cli_credential.read(CLI_PORT, self.run_dir), self.token)
-        self.assertIn("_LISTEN_PORT = port", ast.unparse(boot))
+        # The boot path does not decide the port the file is named for: the
+        # transport reports it, after the bind.
+        self.assertIn("_LISTEN_PORT = None", ast.unparse(boot))
+        self.assertNotIn("_LISTEN_PORT = port", ast.unparse(boot))
+        with mock.patch.object(server, "_LISTEN_PORT", None):
+            server._on_bound(8812)
+            self.assertEqual(server._LISTEN_PORT, 8812)
+
+    def _boot(self, port: int, publish_patch=None):
+        """Run the real `_run_server(port)` on the real transport, in a
+        thread, with everything outside the listener stubbed. Returns
+        (bound port or None, what `_run_server` raised or None, stop)."""
+        started = threading.Event()
+        state: dict = {}
+
+        def services():
+            state["loop"] = asyncio.get_running_loop()
+            state["port"] = server._LISTEN_PORT
+            started.set()
+
+        def run():
+            try:
+                server._run_server(port)
+            except BaseException as exc:  # noqa: BLE001 — reported to the test
+                state["raised"] = exc
+            finally:
+                started.set()
+
+        patches = [
+            mock.patch.object(cli_credential, "RUN_DIR", self.run_dir),
+            mock.patch.object(server, "DB_PATH", _DB_PATH),
+            mock.patch.object(server, "_CSP", server._CSP),
+            mock.patch.object(server, "_LISTEN_PORT", None),
+            mock.patch.object(server, "require_current_schema"),
+            mock.patch.object(server.backfill_shell_api_keys, "backfill"),
+            mock.patch.object(server.mem_credentials, "provision"),
+            mock.patch.object(server.ports_mod, "stored_engine_ops_port",
+                              return_value=None),
+            mock.patch.object(server, "in_container", return_value=False),
+            mock.patch.object(server, "start_runtime_services", services),
+            mock.patch.object(server.conversation_reaper, "stop_service"),
+            mock.patch.dict(os.environ, {"SC_BIND": "127.0.0.1"}),
+            mock.patch("builtins.print", lambda *a, **k: state.setdefault(
+                "printed", []).append(" ".join(str(x) for x in a))),
+        ]
+        if publish_patch is not None:
+            patches.append(publish_patch)
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.assertTrue(started.wait(20), "the server neither started nor failed")
+
+        def stop():
+            loop = state.get("loop")
+            if loop is not None and thread.is_alive():
+                loop.call_soon_threadsafe(
+                    lambda: [task.cancel() for task in asyncio.all_tasks(loop)])
+            thread.join(timeout=10)
+
+        self.addCleanup(stop)
+        return state, stop
+
+    def test_port_zero_publishes_under_the_port_the_socket_holds(self) -> None:
+        """Codex pass 3: `--port 0` binds an ephemeral port. The credential is
+        named for THAT port, the server starts, and its caller is admitted."""
+        state, stop = self._boot(0)
+        self.assertNotIn(
+            "raised", state,
+            f"startup aborted on port 0: {state.get('raised')!r}")
+        port = state["port"]
+        self.assertIsInstance(port, int)
+        self.assertNotEqual(port, 0)
+        token = browser_gate.CLI_TOKEN
+        self.assertEqual(
+            sorted(p.name for p in self.run_dir.iterdir()),
+            sorted([f"cli-token.{CLI_PORT}", f"cli-token.{port}"]))
+        self.assertEqual(cli_credential.read(port, self.run_dir), token)
+        self.assertEqual(
+            cli_credential.path_for(port, self.run_dir).stat().st_mode & 0o777, 0o600)
+        # The listener is up on that port, and the caller for it is admitted.
+        con = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            con.request("GET", "/api/health")
+            self.assertEqual(con.getresponse().status, 200)
+        finally:
+            con.close()
+        with mock.patch.object(snapshot_cli.ports, "resolve",
+                               return_value={"port": port}), \
+                mock.patch.object(snapshot_cli, "_owns_this_checkout",
+                                  return_value=True), \
+                mock.patch.object(server, "run_script", return_value={
+                    "ok": True, "output": "snapshot: wrote"}) as ran:
+            self.assertEqual(snapshot_cli._snapshot_via_runtime_api(),
+                             "snapshot: wrote")
+        ran.assert_called_once_with("snapshot")
+        stop()
+
+    def test_a_publication_that_fails_is_loud_and_the_server_runs(self) -> None:
+        """Any failure, not only OSError: the listener and the runtime
+        services start, the failure is printed, and the caller is told that
+        no credential is published for the port."""
+        for failure in (ValueError("not a TCP port"), OSError("read-only"),
+                        RuntimeError("anything")):
+            with self.subTest(failure=type(failure).__name__):
+                state, stop = self._boot(0, mock.patch.object(
+                    cli_credential, "publish", side_effect=failure))
+                self.assertNotIn("raised", state, repr(state.get("raised")))
+                port = state["port"]
+                self.assertNotEqual(port, 0)
+                self.assertIsNone(cli_credential.read(port, self.run_dir))
+                loud = [line for line in state.get("printed", [])
+                        if "could NOT publish the engine CLI credential" in line]
+                self.assertEqual(len(loud), 1, state.get("printed"))
+                self.assertIn(f"port {port}", loud[0])
+                self.assertIn(type(failure).__name__, loud[0])
+                con = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                try:
+                    con.request("GET", "/api/health")
+                    self.assertEqual(con.getresponse().status, 200)
+                finally:
+                    con.close()
+                with mock.patch.object(snapshot_cli.ports, "resolve",
+                                       return_value={"port": port}), \
+                        mock.patch.object(snapshot_cli, "_owns_this_checkout",
+                                          return_value=True), \
+                        mock.patch.object(server, "run_script") as ran, \
+                        self.assertRaises(SystemExit) as raised:
+                    snapshot_cli._snapshot_via_runtime_api()
+                ran.assert_not_called()
+                self.assertIn("none is published for that port",
+                              str(raised.exception))
+                stop()
+
+    def test_no_bound_port_reported_is_loud_not_fatal(self) -> None:
+        printed: list[str] = []
+        with mock.patch.object(cli_credential, "RUN_DIR", self.run_dir), \
+                mock.patch.object(server, "_LISTEN_PORT", None), \
+                mock.patch.object(server, "start_runtime_services") as services, \
+                mock.patch("builtins.print",
+                           lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            server._on_listening()
+        services.assert_called_once_with()
+        self.assertEqual(len(printed), 1)
+        self.assertIn("did not report the bound port", printed[0])
 
     def test_a_startup_that_loses_the_bind_leaves_the_survivors_token(self) -> None:
         """Two servers, one port. The loser never publishes, so a CLI caller

@@ -247,7 +247,8 @@ class Transport:
 
 
 async def serve(host: str, port: int, http_handler, ws_handler,
-                log=print, on_started=None, stream_handler=None) -> int:
+                log=print, on_started=None, stream_handler=None,
+                on_bound=None) -> int:
     """Start the multiplex and block forever (until cancelled). Returns the
     bound port after start for callers that passed port=0 — via `log` line and
     the Transport object; this coroutine simply runs until shutdown.
@@ -256,6 +257,11 @@ async def serve(host: str, port: int, http_handler, ws_handler,
     listening service is advertised. Background workers that can cause external
     side effects belong behind that boundary: a second process must lose the
     bind race before it can dispatch work, and failed readiness must stay quiet.
+
+    ``on_bound(port)`` runs first, right after the bind, with the port the
+    socket ACTUALLY holds. That is not always the port asked for: port 0 asks
+    the kernel to choose. Anything that names this server by its port takes
+    the number from here.
     """
     transport = Transport(
         host,
@@ -267,6 +273,8 @@ async def serve(host: str, port: int, http_handler, ws_handler,
     )
     await transport.start()
     try:
+        if on_bound is not None:
+            on_bound(transport.port)
         if on_started is not None:
             on_started()
         log(f"transport: listening on {host}:{transport.port}")

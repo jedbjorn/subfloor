@@ -6771,9 +6771,17 @@ def require_loopback_bind(bind: str) -> None:
     )
 
 
-# The port this process serves, set by `_run_server` before it binds. The
-# engine CLI credential is published under this port and no other.
+# The port this process's listening socket actually holds, reported by the
+# transport once it is bound (`_on_bound`). Not the port that was asked for:
+# `--port 0` asks the kernel to choose. None until the bind. The engine CLI
+# credential is published under this port and no other.
 _LISTEN_PORT: int | None = None
+
+
+def _on_bound(port: int) -> None:
+    """The transport's `on_bound`: the port the listening socket holds."""
+    global _LISTEN_PORT
+    _LISTEN_PORT = port
 
 
 def publish_cli_credential() -> None:
@@ -6788,16 +6796,21 @@ def publish_cli_credential() -> None:
     behind it opens nothing.
     """
     token, port = browser_gate.CLI_TOKEN, _LISTEN_PORT
-    if not token or port is None:
-        return
     try:
+        if not token:
+            raise RuntimeError("no token was minted")
+        if port is None:
+            raise RuntimeError("the transport did not report the bound port")
         cli_credential.publish(token, port)
-    except OSError as exc:
-        # Not a reason to refuse the GUI: with no token published, the CLI
-        # routes still take a shell token, and `./sc snapshot` says what it
-        # could not read.
-        print(f"server: could not publish the engine CLI credential ({exc}); "
-              "`./sc snapshot` will be refused until the next restart")
+    except Exception as exc:  # noqa: BLE001 — never a reason to stop serving
+        # Loud, and not fatal, whatever went wrong: the server keeps the port
+        # and the GUI. With no token published the CLI routes still take a
+        # shell token, and `./sc snapshot` says that no credential is
+        # published for this port.
+        print("server: could NOT publish the engine CLI credential for port "
+              f"{port} ({type(exc).__name__}: {exc}). The server is running; "
+              "`./sc snapshot` and `./sc update` will be refused by it until "
+              "the next restart publishes one.", flush=True)
 
 
 def _on_listening() -> None:
@@ -6880,7 +6893,7 @@ def _run_server(port: int) -> int:
     # (`_on_listening`): a duplicate startup that loses the bind must not
     # replace the file the surviving server's callers read.
     global _LISTEN_PORT
-    _LISTEN_PORT = port
+    _LISTEN_PORT = None          # known only once the socket is bound
     browser_gate.CLI_TOKEN = cli_credential.mint()
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can
@@ -6914,6 +6927,7 @@ def _run_server(port: int) -> int:
                 port,
                 dispatch_http,
                 _ws_unavailable,
+                on_bound=_on_bound,
                 on_started=_on_listening,
                 stream_handler=conversation_routes.stream_events,
             )
