@@ -127,7 +127,8 @@ handoffs and add only what differs.
    cleanup, or status command after it. Stop and wait for the next wake.
 
 **Integrity pause** — the one exception to stopping after a handoff. Any
-participant may pause for an integrity problem that makes continuing unsafe:
+participant may pause for an integrity problem that makes continuing unsafe.
+A Developer or Reviewer:
 
 1. Send the Planner one `--intent information` message with the evidence,
    impact, and recommendation. Do not stop on it.
@@ -137,6 +138,10 @@ participant may pause for an integrity problem that makes continuing unsafe:
 The pause notifies the Planner with the reason and interrupts every live
 participant turn, yours included, so nothing can follow it. Wakes are not
 delivered while paused; your message waits in the Planner's Sprint inbox.
+
+The Planner sends no evidence message — the relay refuses a message to
+yourself — and pauses directly: `sc sprint pause --sprint <id> --reason
+"<what and why>"`. The reason is the durable record.
 
 ## Receipt recovery
 

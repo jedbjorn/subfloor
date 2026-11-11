@@ -94,7 +94,9 @@ substitute nothing, and stop.
 ### Pause or resume
 
 Pause for a Reviewer decision or safe Planner restructuring; preserve partial
-artifacts, interrupt intent, judgment, and evidence. A Developer or Reviewer
+artifacts, interrupt intent, judgment, and evidence. For your own integrity
+pause, run the command below directly with what and why in the reason; send
+yourself no evidence message (the relay refuses it). A Developer or Reviewer
 may also pause for integrity: the pause notice carries the reason and the
 pauser's evidence message waits in the Sprint inbox — read it once, reconcile,
 then resume as below:

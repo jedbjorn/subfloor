@@ -287,7 +287,9 @@ substitute nothing, and stop.
 ### Pause or resume
 
 Pause for a Reviewer decision or safe Planner restructuring; preserve partial
-artifacts, interrupt intent, judgment, and evidence. A Developer or Reviewer
+artifacts, interrupt intent, judgment, and evidence. For your own integrity
+pause, run the command below directly with what and why in the reason; send
+yourself no evidence message (the relay refuses it). A Developer or Reviewer
 may also pause for integrity: the pause notice carries the reason and the
 pauser''s evidence message waits in the Sprint inbox — read it once, reconcile,
 then resume as below:
@@ -598,7 +600,8 @@ handoffs and add only what differs.
    cleanup, or status command after it. Stop and wait for the next wake.
 
 **Integrity pause** — the one exception to stopping after a handoff. Any
-participant may pause for an integrity problem that makes continuing unsafe:
+participant may pause for an integrity problem that makes continuing unsafe.
+A Developer or Reviewer:
 
 1. Send the Planner one `--intent information` message with the evidence,
    impact, and recommendation. Do not stop on it.
@@ -608,6 +611,10 @@ participant may pause for an integrity problem that makes continuing unsafe:
 The pause notifies the Planner with the reason and interrupts every live
 participant turn, yours included, so nothing can follow it. Wakes are not
 delivered while paused; your message waits in the Planner''s Sprint inbox.
+
+The Planner sends no evidence message — the relay refuses a message to
+yourself — and pauses directly: `sc sprint pause --sprint <id> --reason
+"<what and why>"`. The reason is the durable record.
 
 ## Receipt recovery
 

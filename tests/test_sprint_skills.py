@@ -162,6 +162,21 @@ class SprintSkillTest(unittest.TestCase):
         self.assertLess(flat.index("Do not stop on it."),
                         flat.index("as the literal last action. The pause notifies"))
         self.assertIn("interrupts every live participant turn, yours included", flat)
+        # The two-step order is the Developer's and Reviewer's. The Planner
+        # cannot relay to itself, so it pauses directly; protocol and
+        # sprint_pln agree.
+        self.assertLess(flat.index("A Developer or Reviewer: 1. Send the Planner"),
+                        flat.index("The Planner sends no evidence message"))
+        self.assertIn(
+            "The Planner sends no evidence message — the relay refuses a message "
+            "to yourself — and pauses directly", flat)
+        self.assertIn(
+            "Sprint participants cannot relay to self",
+            (ENGINE / "scripts" / "sprint_message_delivery.py").read_text())
+        pln = " ".join(skill_text("sprint_pln").split())
+        self.assertIn(
+            "For your own integrity pause, run the command below directly with "
+            "what and why in the reason; send yourself no evidence message", pln)
         for name in ("sprint_dev", "sprint_rev"):
             role = " ".join(skill_text(name).split())
             self.assertIn("in the protocol's integrity-pause order", role, name)
