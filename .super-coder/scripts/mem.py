@@ -46,6 +46,10 @@ Run from the repo root, like every engine command:
                                                    # default: every open flag; <id>: exact row incl. resolved;
                                                    # --feature: that feature's open flags; + --resolved: its history
     ./sc mem get roadmap [<id>]                    # the live board; <id> = one feature (retired included) + deps + docs
+    ./sc mem get narrative [<archive_id>|--prev|--list]
+                                                   # default: the active session's narrative; <archive_id>: one of
+                                                   # YOUR earlier sessions'; --prev: the last session before the active
+                                                   # one that recorded anything; --list: your 10 newest archives
     ./sc mem get tasks (<id> | --doc ID | --feature ID)
     ./sc mem get qaqc (<spec_document_id> | --doc ID)
 
@@ -734,7 +738,32 @@ def _render_get(surface: str, data: dict, args=None) -> int:
                 print("  " + x["summary"])
         return 0
     if surface == "narrative":
-        print(data.get("narrative") or "(no active narrative)")
+        def label(a: dict) -> str:
+            return (f"archive #{a['archive_id']} · session {a.get('session_id') or '—'}"
+                    f" · {a.get('date') or '—'}")
+        if "archives" in data:                    # --list: the index, no bodies
+            if not data["archives"]:
+                print("mem: no session archives")
+                return 0
+            for a in data["archives"]:
+                mark = " (active)" if a.get("active") else ""
+                print(f"{label(a)} · {a.get('lines', 0)} line(s){mark}")
+            print(f"mem: newest {data.get('limit')} at most — "
+                  "`get narrative <archive_id>` reads one")
+            return 0
+        if data.get("archive_id") is None:
+            print("(no active narrative)")
+        else:
+            mark = " (active)" if data.get("active") else ""
+            print(f"{label(data)}{mark}")
+            print(data.get("narrative") or "(empty narrative)")
+        prev = data.get("previous")
+        if prev and data.get("lines", 0) <= 1:
+            # A fresh session holds only its session-start line; the handoff
+            # detail a state line points at lives one archive back.
+            print(f"mem: nothing recorded this session yet — the previous "
+                  f"session's narrative is {label(prev)}: "
+                  f"`sc mem get narrative {prev['archive_id']}`")
         return 0
     if surface == "projects":
         ps = data.get("projects", [])
@@ -841,9 +870,12 @@ def cmd_get(args) -> int:
 
     A positional id always means "this one row". Where the API has an exact
     read it is used (decisions, flags, documents, roadmap, tasks); the small
-    list surfaces pick the row out of their own list; the two single-value
-    surfaces (state, narrative) refuse an id and say why."""
+    list surfaces pick the row out of their own list; narrative reads one of
+    the caller's own session archives; the single-value surface (state)
+    refuses an id and says why."""
     surface = args.surface
+    if (args.list or args.prev) and surface != "narrative":
+        die("--list and --prev are only valid with get narrative")
     if args.resolved and surface != "flags":
         die("--resolved is only valid with get flags --feature <id>")
     if getattr(args, "retired", False) and surface != "documents":
@@ -901,6 +933,15 @@ def cmd_get(args) -> int:
             die("get qaqc needs the spec: `get qaqc <spec_document_id>` "
                 "(or --doc <spec_document_id>)")
         path = f"/_sc/sprint/approvals/{doc}"
+    elif surface == "narrative":
+        if sum((args.id is not None, args.list, args.prev)) > 1:
+            die("get narrative takes one of <archive_id>, --prev or --list")
+        if args.id is not None:                   # one of the caller's own archives
+            path = f"/_sc/mem/narrative/{args.id}"
+        elif args.list:
+            path = "/_sc/mem/narrative?list=1"
+        elif args.prev:
+            path = "/_sc/mem/narrative?prev=1"
     elif args.id is not None:
         if surface not in _GET_PICK:
             die(f"get {surface} takes no <id> — {surface} is one value, not a "
@@ -1460,7 +1501,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("id", nargs="?", type=int,
                     help="one row by id — decisions: with rationale; flags: incl. "
                          "resolved; documents: with body (= --doc); roadmap: one "
-                         "feature with deps + docs; qaqc: the spec document id")
+                         "feature with deps + docs; qaqc: the spec document id; "
+                         "narrative: one of your own session archives")
+    sp.add_argument("--list", action="store_true",
+                    help="narrative: your newest session archives (id, session, "
+                         "date, line count) instead of the active narrative")
+    sp.add_argument("--prev", action="store_true",
+                    help="narrative: the last session before the active one that "
+                         "recorded anything")
     sp.add_argument("--all", action="store_true",
                     help="decisions: full log incl. superseded (default: active index)")
     sp.add_argument("--json", action="store_true", help="raw JSON instead of formatted text")

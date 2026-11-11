@@ -2132,6 +2132,171 @@ class ApiMemTest(unittest.TestCase):
                 continue
             self.assertEqual(self.run_mem("get", surface), 0, surface)
 
+    # ── narrative reads: the caller's own session archives ───────────────────
+    def _peer_archives(self, count: int = 13) -> list:
+        """Give the peer shell `count` session archives (newest = active) and
+        act as the peer; everything is undone when the test ends."""
+        ids = list(range(9001, 9001 + count))
+        con = sqlite3.connect(self.db)
+        for n, aid in enumerate(ids, start=1):
+            text = (f"# {n:04d} | 2026-02-{n:02d} | session opened\n\n"
+                    f"## Narrative\n\n[09:00] Session start.\n")
+            if aid != ids[-1]:
+                text += f"[09:05] beat of session {n}\n[09:10] handoff {n}\n"
+            con.execute(
+                "INSERT INTO shell_memory_archives "
+                "(archive_id, shell_id, session_id, date, full_narrative) "
+                "VALUES (?, 2, ?, ?, ?)",
+                (aid, f"{n:04d}", f"2026-02-{n:02d}", text))
+        con.execute("UPDATE shells SET active_archive_id=? WHERE shell_id=2",
+                    (ids[-1],))
+        con.commit()
+        con.close()
+
+        def undo():
+            con = sqlite3.connect(self.db)
+            con.execute("UPDATE shells SET active_archive_id=NULL WHERE shell_id=2")
+            con.execute("DELETE FROM shell_memory_archives WHERE shell_id=2")
+            con.commit()
+            con.close()
+        self.addCleanup(undo)
+        patch = mock.patch.object(mem, "SC_API_TOKEN", PEER_TOKEN)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return ids
+
+    def test_get_narrative_default_names_its_archive_and_the_previous_one(self):
+        ids = self._peer_archives()
+        rc, out = self.run_out("get", "narrative")
+        self.assertEqual(rc, 0)
+        lines = out.splitlines()
+        self.assertEqual(
+            lines[0], f"archive #{ids[-1]} · session 0013 · 2026-02-13 (active)")
+        self.assertIn("[09:00] Session start.", out)
+        # only the session-start line so far → one hint naming the read
+        self.assertIn(f"`sc mem get narrative {ids[-2]}`", lines[-1])
+        self.assertIn(f"archive #{ids[-2]} · session 0012", lines[-1])
+        rc, out = self.run_out("get", "narrative", "--json")
+        data = json.loads(out)
+        self.assertEqual(data["archive_id"], ids[-1])
+        self.assertTrue(data["active"])
+        self.assertEqual(data["lines"], 1)
+        self.assertIn("Session start.", data["narrative"])
+        self.assertEqual(data["previous"], {
+            "archive_id": ids[-2], "session_id": "0012",
+            "date": "2026-02-12", "lines": 3})
+        # once the session has its own lines the hint is gone
+        self.run_mem("narrative", "first real beat")
+        rc, out = self.run_out("get", "narrative")
+        self.assertIn("first real beat", out)
+        self.assertNotIn("previous session", out)
+
+    def test_get_narrative_reads_an_own_archive_by_id_and_prev(self):
+        ids = self._peer_archives()
+        rc, out = self.run_out("get", "narrative", str(ids[3]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.splitlines()[0],
+                         f"archive #{ids[3]} · session 0004 · 2026-02-04")
+        self.assertIn("handoff 4", out)
+        self.assertNotIn("previous session", out)
+        rc, out = self.run_out("get", "narrative", str(ids[3]), "--json")
+        data = json.loads(out)
+        self.assertEqual(
+            (data["archive_id"], data["session_id"], data["date"],
+             data["lines"], data["active"]),
+            (ids[3], "0004", "2026-02-04", 3, False))
+        self.assertIn("handoff 4", data["narrative"])
+        rc, out = self.run_out("get", "narrative", "--prev")
+        self.assertEqual(out.splitlines()[0],
+                         f"archive #{ids[-2]} · session 0012 · 2026-02-12")
+        self.assertIn("handoff 12", out)
+        rc, out = self.run_out("get", "narrative", "--prev", "--json")
+        self.assertEqual(json.loads(out)["archive_id"], ids[-2])
+
+    def test_get_narrative_prev_skips_sessions_that_recorded_nothing(self):
+        ids = self._peer_archives()
+        stub = "## Narrative\n\n[09:00] Session start.\n"
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE shell_memory_archives SET full_narrative=? "
+                    "WHERE archive_id IN (?, ?)", (stub, ids[-2], ids[-3]))
+        con.commit()
+        con.close()
+        # sessions 12 and 11 hold only their start line → 10 is "previous"
+        rc, out = self.run_out("get", "narrative", "--prev", "--json")
+        self.assertEqual(json.loads(out)["archive_id"], ids[-4])
+        rc, out = self.run_out("get", "narrative", "--json")
+        self.assertEqual(json.loads(out)["previous"]["archive_id"], ids[-4])
+        rc, out = self.run_out("get", "narrative")
+        self.assertIn(f"`sc mem get narrative {ids[-4]}`", out.splitlines()[-1])
+        # a stub archive is still readable by id and still listed
+        rc, out = self.run_out("get", "narrative", str(ids[-2]), "--json")
+        self.assertEqual(json.loads(out)["lines"], 1)
+        rc, out = self.run_out("get", "narrative", "--list", "--json")
+        self.assertEqual(json.loads(out)["archives"][1]["archive_id"], ids[-2])
+
+    def test_get_narrative_refuses_another_shells_archive(self):
+        ids = self._peer_archives()
+        # archive 1 is shell 1's: to the peer it reads like a missing row
+        foreign = self.refusal("get", "narrative", "1")
+        self.assertIn("HTTP 404", foreign)
+        self.assertIn("no such archive among your sessions", foreign)
+        missing = self.refusal("get", "narrative", "424242")
+        self.assertIn("no such archive among your sessions", missing)
+        rc, out, err = self.fails("get", "narrative", "1", "--json")
+        self.assertEqual(rc, 1)
+        error = json.loads(out)
+        self.assertFalse(error["ok"])
+        self.assertEqual(error["error"]["code"], "api_error")
+        self.assertEqual(error["error"]["http_status"], 404)
+        self.assertNotIn("beat", out)
+        # …and the peer's archives are just as closed to shell 1
+        with mock.patch.object(mem, "SC_API_TOKEN", TOKEN):
+            self.assertIn("no such archive among your sessions",
+                          self.refusal("get", "narrative", str(ids[3])))
+            rc, out = self.run_out("get", "narrative", "--list", "--json")
+            self.assertEqual(
+                [a["archive_id"] for a in json.loads(out)["archives"]], [1])
+            self.assertIn("no session archive before the active one",
+                          self.refusal("get", "narrative", "--prev"))
+
+    def test_get_narrative_list_is_bounded_and_newest_first(self):
+        ids = self._peer_archives()
+        rc, out = self.run_out("get", "narrative", "--list", "--json")
+        data = json.loads(out)
+        self.assertEqual(data["limit"], 10)
+        self.assertEqual([a["archive_id"] for a in data["archives"]],
+                         ids[:2:-1])               # the 10 newest of 13
+        self.assertEqual(data["archives"][0], {
+            "archive_id": ids[-1], "session_id": "0013", "date": "2026-02-13",
+            "lines": 1, "active": True})
+        self.assertEqual(data["archives"][1]["lines"], 3)
+        self.assertFalse(data["archives"][1]["active"])
+        rc, out = self.run_out("get", "narrative", "--list")
+        rows = out.splitlines()
+        self.assertEqual(
+            rows[0],
+            f"archive #{ids[-1]} · session 0013 · 2026-02-13 · 1 line(s) (active)")
+        self.assertEqual(
+            rows[1], f"archive #{ids[-2]} · session 0012 · 2026-02-12 · 3 line(s)")
+        self.assertEqual(len(rows), 11)             # 10 rows + the footer
+        self.assertNotIn("handoff", out)
+
+    def test_get_narrative_argument_refusals(self):
+        self.assertIn("one of <archive_id>, --prev or --list",
+                      self.refusal("get", "narrative", "1", "--list"))
+        self.assertIn("one of <archive_id>, --prev or --list",
+                      self.refusal("get", "narrative", "--prev", "--list"))
+        self.assertIn("only valid with get narrative",
+                      self.refusal("get", "state", "--list"))
+        self.assertIn("only valid with get narrative",
+                      self.refusal("get", "flags", "--prev"))
+        # a shell with no session archive still gets the plain answer
+        with mock.patch.object(mem, "SC_API_TOKEN", REVIEW_TOKEN):
+            rc, out = self.run_out("get", "narrative")
+            self.assertEqual((rc, out.strip()), (0, "(no active narrative)"))
+            rc, out = self.run_out("get", "narrative", "--list")
+            self.assertEqual(out.strip(), "mem: no session archives")
+
     def test_get_tasks_requires_scope(self):
         with self.assertRaises(SystemExit):  # no --doc/--feature → fail loud
             self.run_mem("get", "tasks")

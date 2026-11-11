@@ -56,6 +56,16 @@ LOG_MAX_EVENTS = 20
 # A size backstop behind the semantic filter (superseded rows excluded); the
 # client footer names what was hidden, so the cap is never silent.
 DECISIONS_INDEX_CAP = 30
+# mem get narrative --list: the caller's most recent session archives.
+NARRATIVE_INDEX_CAP = 10
+
+
+def _narrative_line_count(narrative: "str | None") -> int:
+    """The `[HH:MM]` lines of one archive — 1 is the bare session-start stub."""
+    return sum(1 for line in (narrative or "").splitlines()
+               if line.startswith("["))
+
+
 _LOG_LOCK = threading.Lock()
 
 sys.path.insert(0, str(ENGINE / "scripts"))
@@ -4656,12 +4666,65 @@ class Handler(BaseHTTPRequestHandler):
                     (fid,)))
                 return self._send(200, {"feature": feature})
 
-            if path == "/_sc/mem/narrative":
+            if path == "/_sc/mem/narrative" or (
+                    len(parts) == 4 and parts[2] == "narrative"):
+                # The caller's OWN session archives only: every query here is
+                # scoped to the token's shell, so another shell's archive id
+                # answers exactly like one that does not exist.
+                q = parse_qs(urlparse(self.path).query)
                 r = con.execute(
-                    "SELECT a.full_narrative FROM shells s "
-                    "JOIN shell_memory_archives a ON a.archive_id = s.active_archive_id "
-                    "WHERE s.shell_id=?", (sid,)).fetchone()
-                return self._send(200, {"narrative": (r[0] if r else None)})
+                    "SELECT active_archive_id FROM shells WHERE shell_id=?",
+                    (sid,)).fetchone()
+                active_id = r[0] if r else None
+
+                def archives(where: str, params: tuple, limit: int = 1) -> list:
+                    return [{
+                        "archive_id": a[0], "session_id": a[1], "date": a[2],
+                        "lines": _narrative_line_count(a[3]),
+                        "active": a[0] == active_id, "narrative": a[3],
+                    } for a in con.execute(
+                        "SELECT archive_id, session_id, date, full_narrative "
+                        "FROM shell_memory_archives "
+                        f"WHERE shell_id=? AND {where} "
+                        "ORDER BY archive_id DESC LIMIT ?",
+                        (sid, *params, limit))]
+
+                def previous() -> list:
+                    # The newest earlier session that recorded something: an
+                    # archive still holding only its session-start line has
+                    # no handoff to read, so it is skipped.
+                    return [a for a in archives(
+                        "(? IS NULL OR archive_id < ?)",
+                        (active_id, active_id), -1) if a["lines"] > 1][:1]
+
+                if len(parts) == 4:
+                    found = (archives("archive_id=?", (int(parts[3]),))
+                             if parts[3].isdigit() else [])
+                    if not found:
+                        return self._send(404, {
+                            "error": "no such archive among your sessions"})
+                    return self._send(200, found[0])
+                if q.get("list", ["0"])[0] == "1":
+                    found = archives("1=1", (), NARRATIVE_INDEX_CAP)
+                    for a in found:
+                        del a["narrative"]
+                    return self._send(200, {"archives": found,
+                                            "limit": NARRATIVE_INDEX_CAP})
+                if q.get("prev", ["0"])[0] == "1":
+                    found = previous()
+                    if not found:
+                        return self._send(404, {
+                            "error": "no session archive before the active one"})
+                    return self._send(200, found[0])
+                found = archives("archive_id=?", (active_id,))
+                out = found[0] if found else {
+                    "archive_id": None, "session_id": None, "date": None,
+                    "lines": 0, "active": False, "narrative": None}
+                prev = previous()
+                out["previous"] = ({k: prev[0][k] for k in
+                                    ("archive_id", "session_id", "date", "lines")}
+                                   if prev else None)
+                return self._send(200, out)
 
             if path == "/_sc/mem/messages":
                 # ?direction=sent — the caller's OUTBOUND view (#333): after an
