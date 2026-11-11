@@ -47,8 +47,13 @@ in a host-private directory outside the bind mount:
 
 mode `0700`, owned by the host user, named from the checkout's path and from
 no file inside it. Its real path (links resolved) must lie outside the
-checkout and outside every directory `./sc launch` mounts into the sandbox —
-the instance state collection and the harness state homes included. If
+checkout and outside everything `./sc launch` mounts into the sandbox: the
+instance state collection, and every home bind mount (the harness state homes
+and the `~/.claude.json` profile, whatever those paths resolve to). The home
+mounts are one list, `sandbox_devkit.HOME_BIND_MOUNTS`: the launcher's
+`docker run` is built from it and this check reads it, so a mount added there
+is excluded here by the same edit. If the list cannot be read, nothing is
+trusted. If
 `XDG_STATE_HOME` points inside one of those, or is a link that resolves there,
 the service refuses to start and no `engine-ops*` verb proceeds; the error
 names the offending path. It holds:
@@ -127,6 +132,14 @@ that introduces this service — the service runs but starts nothing:
 - every `POST /ops/*` answers `409 gui_origin_unpinned` with the same reason.
 - those two answers carry no state, so any loopback page may read them; that
   is what lets the GUI show the reason and the command.
+
+Being answered is not being authorised. Whether an operation starts, and
+whether the full status is returned, is decided in one place
+(`engine_ops.start`, `engine_ops.status`, both through
+`engine_ops.origin_allowed`) against the pin as it is at that moment. A request
+that arrived before the pin and reaches that point after it is judged against
+the pin like any other: a foreign origin gets `403 same_origin_required` and
+starts nothing.
 
 Once pinned, `GET /status` carries `pinned: true` and `gui_origin`.
 
@@ -246,13 +259,22 @@ still doing its work, whatever the status file says:
 Three things in that session or scope are not the operation's work and do not
 hold the gate: zombies; the runner itself once it has recorded the result; and
 the long-lived services a restart's `launch` step starts on purpose — the vm,
-ts, pm2, and db brokers and this service — recognised by their exact identity
-(a Python interpreter running that script of this install). A record from
-before a reboot never blocks, and neither does a session id that has since
-been reused by another process.
+ts, pm2, and db brokers and this service — together with everything those
+services run. A service is recognised by its exact identity (a Python
+interpreter running that script of this install); its work is any process
+with such a service among its ancestors. A broker serves requests for as long
+as the engine is up, some of them from the sandbox, so a worker it spawns must
+not be able to hold the gate. A record from before a reboot never blocks, and
+neither does a session id that has since been reused by another process.
 
-Known limit: without a systemd scope, a process that deliberately leaves the
-session (a daemon that calls `setsid`) is no longer seen. With a scope it is.
+Known limits:
+
+- Without a systemd scope, a process that deliberately leaves the session (a
+  daemon that calls `setsid`) is no longer seen. With a scope it is.
+- A broker's worker that outlives its broker (the broker is killed mid-request)
+  is re-parented and no longer has a service ancestor, so it holds the gate
+  until it exits. A sandbox cannot kill a host broker; the next operation after
+  that worker ends is unaffected.
 
 `restart` brings the service back itself (its `launch` step starts it), so
 after a restart the GUI is talking to a new service process reading the same

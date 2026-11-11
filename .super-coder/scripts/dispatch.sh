@@ -1735,13 +1735,7 @@ case "$cmd" in
         $state_namespace_mounts \
         $state_mount \
         $py_mount \
-        -v "$HOME/.claude:$HOME/.claude" \
-        -v "$HOME/.claude.json:$HOME/.claude.json" \
-        -v "$HOME/.config/opencode:$HOME/.config/opencode" \
-        -v "$HOME/.local/share/opencode:$HOME/.local/share/opencode" \
-        -v "$HOME/.codex:$HOME/.codex" \
-        -v "$HOME/.vibe:$HOME/.vibe" \
-        -v "$HOME/.kimi-code:$HOME/.kimi-code" \
+        SC_HOME_MOUNTS \
         -p "127.0.0.1:$p:$p" \
         -p "127.0.0.1:$dp:$dp" \
         SC_DEVKIT_MOUNTS \

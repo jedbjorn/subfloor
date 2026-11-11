@@ -139,6 +139,10 @@ class Unpinned(Exception):
     """No operator has pinned the GUI origin yet; nothing may be started."""
 
 
+class ForeignOrigin(Exception):
+    """The request's origin is not the pinned GUI origin."""
+
+
 class StateError(Exception):
     """The host-private state directory cannot be trusted or used."""
 
@@ -186,23 +190,24 @@ def _own_directory(path: Path) -> None:
         raise StateError(f"{path} is not owned by this user")
 
 
-# Host directories `./sc launch` bind-mounts into the sandbox, besides the
-# checkout and the instance state directory (dispatch.sh, the `docker run`
-# argument list). Relative to the user's home.
-_SANDBOX_HOME_MOUNTS = (
-    ".claude", ".config/opencode", ".local/share/opencode", ".codex", ".vibe",
-    ".kimi-code",
-)
-
-
 def sandbox_visible_roots() -> list[Path]:
-    """Real paths of every host directory a sandbox of this install can write.
+    """Real paths of every host location a sandbox of this install can write.
 
     The checkout; the owner-local instance state collection (this install's
     directory in it is mounted, and which one is named by a file in the
     checkout, so the whole collection is excluded); the engine DB's directory
-    when it resolves; and the harness state homes.
+    when it resolves; and every home bind mount the launcher makes, taken from
+    the launcher's own list (`sandbox_devkit.HOME_BIND_MOUNTS`, the one the
+    `docker run` arguments are built from), so a mount added there is excluded
+    here without anyone remembering to.
     """
+    try:
+        import sandbox_devkit  # noqa: PLC0415  (scripts/, on sys.path)
+
+        home_mounts = list(sandbox_devkit.home_bind_paths(Path.home()))
+    except Exception as exc:  # noqa: BLE001 — unknown mounts: fail closed
+        raise StateError(
+            f"cannot read the launcher's sandbox mount list: {exc}") from exc
     roots = [REPO_ROOT]
     try:
         roots.append(_state_home() / "subfloor" / "instances")
@@ -214,15 +219,8 @@ def sandbox_visible_roots() -> list[Path]:
         roots.append(Path(instance_state.active_database_path(ENGINE)).parent)
     except Exception:  # noqa: BLE001 — advisory: it can only add a root
         pass
-    home = Path.home()
-    roots.extend(home / part for part in _SANDBOX_HOME_MOUNTS)
-    resolved = []
-    for root in roots:
-        try:
-            resolved.append(Path(os.path.realpath(root)))
-        except OSError:
-            continue
-    return resolved
+    roots.extend(home_mounts)
+    return [Path(os.path.realpath(root)) for root in roots]
 
 
 _host_private_checked: set[tuple[str, str]] = set()
@@ -579,7 +577,10 @@ def operation_pids(record: dict | None) -> list[int]:
     not the operation's work and are left out: zombies; the runner itself once
     it has recorded the result; and the known long-lived services a restart's
     `launch` step starts on purpose (the brokers and this service), told apart
-    by their exact interpreter-plus-script identity.
+    by their exact interpreter-plus-script identity — together with everything
+    those services run. A broker serves requests for as long as the engine is
+    up, some of them from the sandbox, and a worker it spawns for one is the
+    broker's work, not the finished operation's.
     """
     if not record:
         return []
@@ -619,6 +620,27 @@ def operation_pids(record: dict | None) -> list[int]:
         except (OSError, ValueError):
             pass
     services = known_service_scripts()
+    is_service: dict[int, bool] = {}
+
+    def service(pid: int) -> bool:
+        if pid not in is_service:
+            is_service[pid] = any(runs_script(pid, script) for script in services)
+        return is_service[pid]
+
+    def under_a_service(pid: int) -> bool:
+        """`pid` is a known service, or has one among its ancestors."""
+        seen = set()
+        while pid > 1 and pid not in seen:
+            seen.add(pid)
+            if service(pid):
+                return True
+            fields = _proc_stat(pid)
+            try:
+                pid = int(fields[1]) if fields else 0
+            except (IndexError, ValueError):
+                return False
+        return False
+
     live = []
     for pid in sorted(candidates):
         fields = _proc_stat(pid)
@@ -626,7 +648,7 @@ def operation_pids(record: dict | None) -> list[int]:
             continue
         if pid == session and record.get("state") == "finished":
             continue
-        if any(runs_script(pid, script) for script in services):
+        if under_a_service(pid):
             continue
         live.append(pid)
     return live
@@ -773,10 +795,18 @@ def unpinned_status() -> dict:
     }
 
 
-def status() -> dict:
+def status(origin: str | None = None) -> dict:
+    """The service's status, decided against the pin read once, here.
+
+    Unpinned: the stateless refusal, whoever asks. Pinned: the full status,
+    and a request that names an origin must name the pinned one — a request
+    admitted while no pin existed gets nothing once one does.
+    """
     gui_port = pinned_gui_port()
     if gui_port is None:
         return unpinned_status()
+    if origin is not None and not origin_allowed(origin, gui_port):
+        raise ForeignOrigin(origin)
     runtime = detect_runtime()
     record = read_status()
     tail, truncated = log_tail(record)
@@ -893,6 +923,15 @@ def pin_gui_port(port: int) -> dict:
     config.update({"gui_port": port, "pinned_at": _now()})
     write_private(private_dir() / CONFIG_NAME, config)
     return config
+
+
+def origin_allowed(origin, gui_port) -> bool:
+    """THE origin check: is `origin` the GUI origin for pinned port `gui_port`?
+
+    One place, so that whatever records the pin later (spec #271's host-run
+    enrolment) and whatever else needs the decision reuse exactly this.
+    """
+    return isinstance(origin, str) and origin in gui_origins(gui_port)
 
 
 def gui_origins(gui_port) -> frozenset[str]:
@@ -1014,16 +1053,25 @@ def _wait_recorded(proc: subprocess.Popen, path: Path, started_at: str,
         time.sleep(0.05)
 
 
-def start(op: str) -> dict:
-    """Start one operation. Returns its public record.
+def start(op: str, origin: str | None) -> dict:
+    """Start one operation for a request from `origin`. Returns its public record.
 
-    Raises UnknownOp, Unpinned, Busy, or StartFailed. `op` only selects a row
-    of the verb table.
+    Raises UnknownOp, Unpinned, ForeignOrigin, Busy, or StartFailed. `op` only
+    selects a row of the verb table.
+
+    The origin decision is made here, once, against the pin as it is at the
+    moment of starting — not earlier in the request. Whatever let the request
+    reach this point (including the rule that lets any loopback page read the
+    unpinned refusal) authorises nothing: no pin, or an origin that is not the
+    pinned one, starts nothing.
     """
     argv = command(op)
     state_dir = private_dir()
-    if pinned_gui_port() is None:
+    gui_port = pinned_gui_port()
+    if gui_port is None:
         raise Unpinned(unpinned_status()["reason"])
+    if not origin_allowed(origin, gui_port):
+        raise ForeignOrigin(origin)
     path = state_dir / STATUS_NAME
     with _start_lock:
         current = read_status(path)
@@ -1228,9 +1276,24 @@ def service_down() -> tuple[int, str]:
         return 0, "→ engine-ops not running"
     pid, ticks = record["pid"], record["pid_start_ticks"]
     try:
-        os.kill(pid, signal.SIGTERM)
+        # Hold the process itself, prove identity again on that handle, and
+        # signal through it: the pid cannot be reused between the proof and
+        # the signal.
+        handle = os.pidfd_open(pid)
+    except (AttributeError, OSError):
+        handle = None
+    try:
+        if not pid_alive(pid, ticks) or not runs_script(pid, SERVICE_SCRIPT):
+            return 0, "→ engine-ops not running"
+        if handle is not None:
+            signal.pidfd_send_signal(handle, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
     except OSError as exc:
         return 1, f"✗ engine-ops (pid {pid}) could not be signalled: {exc}"
+    finally:
+        if handle is not None:
+            os.close(handle)
     deadline = time.monotonic() + SERVICE_WAIT_SECONDS
     while time.monotonic() < deadline:
         if not pid_alive(pid, ticks):

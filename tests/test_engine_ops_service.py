@@ -107,6 +107,22 @@ STUB_SC = textwrap.dedent('''\
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
         (here / "child.pid").write_text(str(child.pid))
         time.sleep(600)
+    if verb == "leave-busy-broker":
+        # A broker a restart leaves behind, already serving a long request:
+        # it has spawned a worker, the way a broker does per request.
+        broker = here / ".super-coder" / "api" / "ts_broker.py"
+        broker.parent.mkdir(parents=True, exist_ok=True)
+        broker.write_text(
+            "import pathlib, subprocess, sys, time; "
+            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)']); "
+            "pathlib.Path(sys.argv[1]).write_text(str(c.pid)); time.sleep(600)")
+        child = subprocess.Popen([sys.executable, str(broker), str(here / "worker.pid")])
+        (here / "broker.pid").write_text(str(child.pid))
+        for _ in range(200):
+            if (here / "worker.pid").exists():
+                break
+            time.sleep(0.05)
+        sys.exit(0)
     if verb == "leave-broker":
         # What a restart's launch step does: leave a known service running.
         broker = here / ".super-coder" / "api" / "pm2_broker.py"
@@ -553,6 +569,34 @@ class GateTest(ServiceFixture):
         status, _headers, out = self.post("update-harnesses")
         self.assertEqual(status, 202, out)
 
+    def test_work_done_by_a_service_launch_left_behind_does_not_hold_the_gate(self):
+        """A broker started by a restart inherits its session, and so does the
+        worker it spawns for a request (from the sandbox, on docker). That is
+        the broker's work: it must not turn a finished restart back into a
+        running one."""
+        self.kill_later("worker.pid")
+        self.kill_later("broker.pid")
+        with mock.patch.dict(engine_ops.VERBS, {"restart": ("leave-busy-broker",)}):
+            status, _headers, out = self.post("restart")
+            self.assertEqual(status, 202, out)
+            stored = self.finished()
+        self.assertEqual(stored["exit_code"], 0)
+        broker = int((self.root / "broker.pid").read_text())
+        worker = int((self.root / "worker.pid").read_text())
+        self.assertTrue(wait_for(
+            lambda: not engine_ops.pid_alive(stored["pid"], stored["pid_start_ticks"])))
+        # Both are alive and both are in the finished operation's session.
+        for pid in (broker, worker):
+            self.assertTrue(engine_ops.pid_alive(pid))
+            self.assertEqual(os.getsid(pid), stored["pid"])
+
+        _status, _headers, out = self.status()
+        self.assertFalse(out["running"])
+        self.assertEqual(out["operation"]["state"], "finished")
+        self.assertIs(out["operation"]["ok"], True)
+        status, _headers, out = self.post("update-harnesses")
+        self.assertEqual(status, 202, out)
+
     def test_a_reused_session_id_is_not_the_operation(self):
         ticks = engine_ops.pid_start_ticks(os.getpid())
         if ticks is None:
@@ -670,6 +714,67 @@ class UnpinnedTest(ServiceFixture):
         self.assertEqual(out["error"]["code"], "same_origin_required")
         status, _headers, out = self.post("update-harnesses")
         self.assertEqual(status, 202, out)
+
+
+class PinTransitionTest(ServiceFixture):
+    """The origin decision is made once, against the pin, at the point of
+    acting. A request admitted while no pin existed gets nothing once one does."""
+
+    pinned = False
+    DEV = "http://127.0.0.1:8813"      # the sandbox's published dev server
+
+    def pin_lands_before(self, name: str):
+        """Make the operator's pin land after the request was admitted and
+        just before `engine_ops.<name>` runs — the transition's worst moment."""
+        real = getattr(engine_ops, name)
+
+        def then(*args, **kwargs):
+            operator_pins(self.private)
+            return real(*args, **kwargs)
+
+        return mock.patch.object(engine_ops, name, side_effect=then)
+
+    def test_post_admitted_before_the_pin_starts_nothing_once_pinned(self):
+        with mock.patch.dict(engine_ops.VERBS, {"update": ("noop",)}), \
+                self.pin_lands_before("start"):
+            status, _headers, out = self.post("update", origin=self.DEV)
+        self.assertEqual(status, 403, out)
+        self.assertEqual(out["error"]["code"], "same_origin_required")
+        time.sleep(0.5)
+        self.assert_nothing_ran()
+        self.assertEqual(engine_ops.pinned_gui_port(), GUI_PORT)
+
+    def test_status_admitted_before_the_pin_returns_nothing_once_pinned(self):
+        with self.pin_lands_before("status"):
+            status, _headers, out = self.call("GET", "/status", origin=self.DEV)
+        self.assertEqual(status, 403, out)
+        self.assertEqual(out["error"]["code"], "same_origin_required")
+        self.assertNotIn("runtime", out)
+
+    def test_the_gui_origin_crossing_the_same_transition_is_served(self):
+        with mock.patch.dict(engine_ops.VERBS, {"update": ("noop",)}), \
+                self.pin_lands_before("start"):
+            status, _headers, out = self.post("update")
+        self.assertEqual(status, 202, out)
+        self.finished()
+        self.assertEqual(self.stub_argv(), ["noop"])
+
+    def test_start_decides_the_origin_itself(self):
+        with mock.patch.dict(engine_ops.VERBS, {"update": ("noop",)}):
+            with self.assertRaises(engine_ops.Unpinned):
+                engine_ops.start("update", GUI)
+            operator_pins(self.private)
+            for origin in (self.DEV, None, "", "null", f"https://127.0.0.1:{GUI_PORT}",
+                           GUI + "/", GUI_PORT):
+                with self.assertRaises(engine_ops.ForeignOrigin, msg=repr(origin)):
+                    engine_ops.start("update", origin)
+            with self.assertRaises(engine_ops.ForeignOrigin):
+                engine_ops.status(self.DEV)
+            self.assert_nothing_ran()
+            self.assertEqual(engine_ops.status(GUI)["pinned"], True)
+            self.assertEqual(engine_ops.status(None)["pinned"], True)
+            self.assertEqual(engine_ops.start("update", GUI)["op"], "update")
+            self.finished()
 
 
 class CorsTest(ServiceFixture):
@@ -999,7 +1104,7 @@ class ForgedStateTest(ServiceFixture):
                     engine_ops.private_dir()
                 self.assertIn("mounted into the sandbox", str(raised.exception))
                 for call in (engine_ops.ensure_config, engine_ops.status_path,
-                             lambda: engine_ops.start("update"),
+                             lambda: engine_ops.start("update", GUI),
                              lambda: engine_ops.pin_gui_port(GUI_PORT)):
                     with self.assertRaises(engine_ops.StateError, msg=label):
                         call()
@@ -1022,6 +1127,36 @@ class ForgedStateTest(ServiceFixture):
         # Nothing was created under the checkout by any refused attempt.
         self.assertEqual(sorted(str(p) for p in self.root.rglob("*")), before)
         self.assertFalse((instance_state_dir / "engine-ops").exists())
+
+    def home_with_profile_link(self):
+        """A home whose `.claude.json` is a link to a directory elsewhere —
+        the launcher mounts that path writable, whatever it resolves to."""
+        home = self.base / "home"
+        home.mkdir()
+        target = self.base / "profile-target"
+        target.mkdir()
+        (home / ".claude.json").symlink_to(target, target_is_directory=True)
+        return home, target
+
+    def test_state_reached_through_the_mounted_claude_profile_is_refused(self):
+        home, target = self.home_with_profile_link()
+        with mock.patch.object(Path, "home", return_value=home), \
+                mock.patch.dict(os.environ, {
+                    "HOME": str(home),
+                    "XDG_STATE_HOME": str(self.base / "state-home")}):
+            for bad in (target / "state", target):
+                engine_ops._host_private_checked.clear()
+                with self.assertRaises(engine_ops.StateError, msg=str(bad)):
+                    engine_ops.private_dir(bad)
+            # An XDG state home that resolves there is refused the same way.
+            link = self.base / "state-link"
+            link.symlink_to(target, target_is_directory=True)
+            engine_ops._host_private_checked.clear()
+            with mock.patch.object(engine_ops, "PRIVATE_DIR", None), \
+                    mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(link)}):
+                with self.assertRaises(engine_ops.StateError):
+                    engine_ops.private_dir()
+        self.assertEqual(list(target.iterdir()), [])
 
     def test_service_refuses_to_start_with_its_state_inside_the_checkout(self):
         state_home = ENGINE.parent / ".sc-state" / f"engine-ops-test-{os.getpid()}"
@@ -1055,6 +1190,95 @@ class ForgedStateTest(ServiceFixture):
         self.assertTrue(first.name.startswith("root-"))
         self.assertNotIn(self.root, first.parents)
         self.assertEqual(stat.S_IMODE(first.stat().st_mode), 0o700)
+
+
+class LauncherMountParityTest(ServiceFixture):
+    """The launcher's mounts and the state-directory exclusion are one list."""
+
+    def launch_block(self) -> list[str]:
+        """The `docker run` argument lines of the dispatcher's sandbox launch."""
+        text = (ENGINE / "scripts" / "dispatch.sh").read_text()
+        start = text.index('"$PY" "$S/sandbox_devkit.py" launch-container')
+        end = text.index('"$IMG" ./sc serve', start)
+        return [line.strip().rstrip("\\").strip()
+                for line in text[start:end].splitlines()[1:]]
+
+    def test_dispatcher_names_no_mount_outside_the_shared_list(self):
+        lines = self.launch_block()
+        self.assertEqual(lines.count("SC_HOME_MOUNTS"), 1)
+        # Every way the block can mount something is accounted for: the
+        # checkout, three computed variables, and the shared marker.
+        literal = [line for line in lines
+                   if line.startswith(("-v", "--volume", "--mount", "--tmpfs"))]
+        self.assertEqual(literal, ['-v "$here:$here"'], (
+            "a bind mount was added to the launcher's docker run. Add it to "
+            "sandbox_devkit.HOME_BIND_MOUNTS (or teach "
+            "engine_ops.sandbox_visible_roots about it) instead."))
+        variables = sorted(line for line in lines if line.startswith("$") and "mount" in line)
+        self.assertEqual(
+            variables, ["$py_mount", "$state_mount", "$state_namespace_mounts"])
+        for line in lines:
+            self.assertNotIn("$HOME/.", line.replace('HOME="$HOME"', ""), line)
+        # The interpreter mount is read-only, and the state mount is this
+        # install's directory in the instance collection.
+        text = (ENGINE / "scripts" / "dispatch.sh").read_text()
+        py = [line.strip() for line in text.splitlines()
+              if line.strip().startswith("py_mount=") and "-v" in line]
+        self.assertTrue(py)
+        for line in py:
+            self.assertTrue(line.endswith(':ro"'), line)
+        self.assertIn(
+            'state_target="$HOME/.local/state/subfloor/instances/$(basename "$state_dir")"',
+            text)
+
+    def test_the_marker_expands_to_exactly_the_shared_list(self):
+        import sandbox_devkit
+
+        home = self.base / "home"
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            expanded = sandbox_devkit.expand_home_mounts(
+                ["-d", "SC_HOME_MOUNTS", "SC_DEVKIT_MOUNTS", "image"])
+        mounts = []
+        for relative in sandbox_devkit.HOME_BIND_MOUNTS:
+            mounts += ["-v", f"{home / relative}:{home / relative}"]
+        self.assertEqual(expanded, ["-d", *mounts, "SC_DEVKIT_MOUNTS", "image"])
+        self.assertIn(".claude.json", sandbox_devkit.HOME_BIND_MOUNTS)
+        self.assertEqual(sandbox_devkit.expand_home_mounts(["a", "b"]), ["a", "b"])
+
+    def test_every_launcher_mount_is_excluded_and_a_new_one_follows(self):
+        import sandbox_devkit
+
+        home = self.base / "home"
+        home.mkdir()
+        env = {"HOME": str(home), "XDG_STATE_HOME": str(self.base / "state-home")}
+        with mock.patch.object(Path, "home", return_value=home), \
+                mock.patch.dict(os.environ, env):
+            roots = engine_ops.sandbox_visible_roots()
+            for relative in sandbox_devkit.HOME_BIND_MOUNTS:
+                self.assertIn(Path(os.path.realpath(home / relative)), roots)
+                engine_ops._host_private_checked.clear()
+                with self.assertRaises(engine_ops.StateError, msg=relative):
+                    engine_ops.private_dir(home / relative / "state")
+            # A harness added to the launcher tomorrow: mounted and excluded
+            # by the same edit.
+            fresh = home / ".newharness" / "state"
+            engine_ops._host_private_checked.clear()
+            engine_ops.private_dir(home / ".unmounted")
+            with mock.patch.object(
+                    sandbox_devkit, "HOME_BIND_MOUNTS",
+                    (*sandbox_devkit.HOME_BIND_MOUNTS, ".newharness")):
+                self.assertIn(
+                    f"{home / '.newharness'}:{home / '.newharness'}",
+                    sandbox_devkit.expand_home_mounts(["SC_HOME_MOUNTS"]))
+                engine_ops._host_private_checked.clear()
+                with self.assertRaises(engine_ops.StateError):
+                    engine_ops.private_dir(fresh)
+            # If the launcher's list cannot be read, nothing is trusted.
+            engine_ops._host_private_checked.clear()
+            with mock.patch.object(sandbox_devkit, "home_bind_paths",
+                                   side_effect=RuntimeError("unreadable")):
+                with self.assertRaises(engine_ops.StateError):
+                    engine_ops.private_dir(self.base / "anywhere")
 
 
 class StopIdentityTest(ServiceFixture):

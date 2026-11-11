@@ -87,13 +87,25 @@ class Handler(BaseHTTPRequestHandler):
     # ── responses ────────────────────────────────────────────────────────────
 
     def _allowed_origin(self, origin: str | None) -> bool:
-        """The pinned GUI origin; or, while unpinned, any loopback page."""
+        """May this origin be ANSWERED: the pinned GUI origin; or, while
+        unpinned, any loopback page.
+
+        This admits a request and addresses its CORS headers. It authorises
+        nothing: whether an operation starts, and whether status is returned,
+        is decided inside `engine_ops.start` and `engine_ops.status`, against
+        the pin as it is at that moment.
+        """
         if not origin:
             return False
         pinned = engine_ops.pinned_gui_port()
         if pinned is None:
             return bool(_LOOPBACK_ORIGIN.match(origin))
-        return origin in engine_ops.gui_origins(pinned)
+        return engine_ops.origin_allowed(origin, pinned)
+
+    def _foreign(self) -> None:
+        self._send(403, _error(
+            "same_origin_required",
+            "engine operations require the review GUI's origin"))
 
     def _cors(self) -> list[tuple[str, str]]:
         """CORS headers, only when the request's Origin is an allowed one."""
@@ -176,7 +188,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/health":
                 return self._send(200, {"ok": True, "service": "engine-ops"})
             if path == "/status":
-                return self._send(200, engine_ops.status())
+                try:
+                    payload = engine_ops.status(self.headers.get("Origin"))
+                except engine_ops.ForeignOrigin:
+                    return self._foreign()
+                return self._send(200, payload)
             return self._send(404, _error("not_found", "not found"))
         except Exception as exc:  # noqa: BLE001 — one request must not end the service
             return self._send(500, _error("internal_error", str(exc)))
@@ -189,7 +205,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, _error("not_found", "not found"))
         op = path[len(OPS_PREFIX):]
         try:
-            operation = engine_ops.start(op)
+            operation = engine_ops.start(op, self.headers.get("Origin"))
+        except engine_ops.ForeignOrigin:
+            return self._foreign()
         except engine_ops.UnknownOp:
             return self._send(404, _error(
                 "unknown_engine_op", "no such engine operation",

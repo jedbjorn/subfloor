@@ -61,6 +61,22 @@ EXTENSION_LABELS = (
     "sc.package_layer_id",
 )
 MOUNT_MARKER = "SC_DEVKIT_MOUNTS"
+# The host paths under the operator's home that `./sc launch` bind-mounts,
+# writable, into the sandbox: harness state homes and the Claude profile file.
+# This is the ONLY list. The dispatcher's `docker run` names them through
+# HOME_MOUNT_MARKER, expanded in `docker_run` below, and host-side code that
+# must stay out of the sandbox's reach (api/engine_ops.py) excludes exactly
+# these. Add a mount here and both follow.
+HOME_BIND_MOUNTS = (
+    ".claude",
+    ".claude.json",
+    ".config/opencode",
+    ".local/share/opencode",
+    ".codex",
+    ".vibe",
+    ".kimi-code",
+)
+HOME_MOUNT_MARKER = "SC_HOME_MOUNTS"
 GITHUB_HOST_TRUST = Path("assets/github_known_hosts")
 
 
@@ -1754,6 +1770,24 @@ def _mount_value(value: str) -> str:
     return f'"{escaped}"'
 
 
+def home_bind_paths(home: str | os.PathLike[str] | None = None) -> tuple[Path, ...]:
+    """Absolute host paths of every home bind mount the launcher makes."""
+    base = Path(home if home is not None else os.environ.get("HOME") or Path.home())
+    return tuple(base / relative for relative in HOME_BIND_MOUNTS)
+
+
+def expand_home_mounts(arguments: Sequence[str]) -> list[str]:
+    """Replace HOME_MOUNT_MARKER with one `-v path:path` per home bind mount."""
+    expanded: list[str] = []
+    for argument in arguments:
+        if argument != HOME_MOUNT_MARKER:
+            expanded.append(argument)
+            continue
+        for path in home_bind_paths():
+            expanded.extend(("-v", f"{path}:{path}"))
+    return expanded
+
+
 def docker_run(
     plan: ImagePlan,
     arguments: Sequence[str],
@@ -1765,6 +1799,7 @@ def docker_run(
         raise SandboxImageError(
             f"docker-run arguments must contain one {MOUNT_MARKER} marker"
         )
+    arguments = expand_home_mounts(arguments)
     volumes = ensure_volumes(plan, runner=runner)
     marker = arguments.index(MOUNT_MARKER)
     mount_arguments = []

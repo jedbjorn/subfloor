@@ -806,6 +806,14 @@ class RestrictedLaunchTests(unittest.TestCase):
                         and "serve --port" in line)
         self.assertLess(port_call, run_call)
         self.assertNotIn("18802", calls[run_call])
+        # The harness homes and the Claude profile are still mounted, now from
+        # the one shared list (sandbox_devkit.HOME_BIND_MOUNTS).
+        self.assertNotIn("SC_HOME_MOUNTS", calls[run_call])
+        home = self.fx.home
+        for relative in (".claude", ".claude.json", ".config/opencode",
+                         ".local/share/opencode", ".codex", ".vibe", ".kimi-code"):
+            self.assertIn(f" -v {home}/{relative}:{home}/{relative} ",
+                          calls[run_call], relative)
         self.assertGreater(calls.index("engine_ops up"), run_call)
         self.assertIn("→ engine-ops up (fixture)", launched.stdout)
 
