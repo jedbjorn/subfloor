@@ -46,16 +46,27 @@ in a host-private directory outside the bind mount:
     <XDG state home>/subfloor/engine-ops/<repo name>-<hash of the checkout path>/
 
 mode `0700`, owned by the host user, named from the checkout's path and from
-no file inside it. Its real path (links resolved) must lie outside the
-checkout and outside everything `./sc launch` mounts into the sandbox: the
-instance state collection, and every home bind mount (the harness state homes
-and the `~/.claude.json` profile, whatever those paths resolve to). The home
-mounts are one list, `sandbox_devkit.HOME_BIND_MOUNTS`: the launcher's
-`docker run` is built from it and this check reads it, so a mount added there
-is excluded here by the same edit. If the list cannot be read, nothing is
-trusted. If
-`XDG_STATE_HOME` points inside one of those, or is a link that resolves there,
-the service refuses to start and no `engine-ops*` verb proceeds; the error
+no file inside it.
+
+It must not **overlap** anything mounted into the sandbox, with links resolved
+and in both directions: the directory inside a mount, a mount inside the
+directory, or a mounted file that is one of its files (a `~/.claude.json` that
+is a link to its `config.json`). Read-only mounts count; a read still leaks the
+pin, the status, and the logs. This is enforced in two places:
+
+- **At the launch**, in `sandbox_devkit.docker_run`, the one place that sees
+  the final `docker run` argument list. Every bind source in it (`-v`,
+  `--volume`, `--mount type=bind`, however it was built: the checkout, the
+  instance state, an interpreter mount, the home mounts, anything added later)
+  is resolved and compared with the directory. An overlap stops the launch
+  with a message naming both paths. It needs no list of mounts to be kept in
+  step, and it does not need the directory to exist yet.
+- **In the service**, for what it can know without a launch: the checkout,
+  the instance state collection, the interpreter mount, and the home mounts
+  (`sandbox_devkit.HOME_BIND_MOUNTS`, the list the launcher's arguments are
+  built from). On an overlap the service refuses to start and no `engine-ops*`
+  verb proceeds; a clear result is re-checked every few seconds, and if the
+  list cannot be read nothing is trusted. The error
 names the offending path. It holds:
 
 | File | What |
@@ -304,6 +315,11 @@ start time, and be a Python interpreter whose script argument resolves to this
 install's `api/engine_ops_service.py`. A process that merely has that name
 somewhere on its command line, or runs a same-named file elsewhere, is not it.
 A pid written anywhere in the checkout is never read.
+
+The proof and the signal use one process handle (a pidfd), so the pid cannot
+be reused between them. If no handle can be had, nothing is signalled: the
+verb reports that the service could not be stopped safely and names the
+manual step. There is no signal-by-number fallback.
 
 It refuses to start when `SC_SANDBOX` is set or a container marker is present,
 and every `engine-ops*` verb refuses from a linked worktree, which has no

@@ -823,6 +823,32 @@ class RestrictedLaunchTests(unittest.TestCase):
         # Nothing of the service's is kept in the bind-mounted run directory.
         self.assertFalse(list((self.fx.engine / "run").glob("engine-ops*")))
 
+    def test_launch_refuses_a_mount_that_overlaps_the_engine_ops_state(self):
+        sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
+        import sandbox_devkit
+
+        state = sandbox_devkit.engine_ops_state_dir(
+            self.fx.root, {"HOME": str(self.fx.home)})
+        state.mkdir(parents=True)
+        (state / "config.json").write_text("{}")
+        profile = self.fx.home / ".claude.json"
+        profile.unlink(missing_ok=True)
+        profile.symlink_to(state / "config.json")
+
+        result = self.fx.run("launch", "--no-build")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("refusing to launch", result.stdout + result.stderr)
+        self.assertIn(str(state), result.stdout + result.stderr)
+        self.assertFalse(any(
+            line.startswith("docker run ") and "serve --port" in line
+            for line in self.fx.calls()))
+
+        # Without the overlap the same launch goes through, state or no state.
+        profile.unlink()
+        ok = self.fx.run("launch", "--no-build")
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+
     def test_restart_aggregates_health_failure_and_returns_nonzero(self):
         self.fx.env["SC_TEST_CONFIGURED"] = "vm"
         unit = f"sc-vm-broker-{self.fx.root.name}.service"

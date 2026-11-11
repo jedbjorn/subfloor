@@ -18,8 +18,10 @@ DECIDES from lives there:
   (`<XDG state home>/subfloor/engine-ops/<repo>-<path hash>/`, mode 0700,
   owned by the host user). The path is derived from the checkout's path, never
   from a file in it.
-* The directory itself must resolve outside the checkout and outside every
-  directory the launcher mounts into the sandbox; otherwise nothing starts.
+* The directory must not overlap, in either direction and with links
+  resolved, anything the launcher mounts into the sandbox. That is enforced
+  where the mounts are made (`sandbox_devkit.docker_run` refuses the launch)
+  and again here for what this side can know; otherwise nothing starts.
 * The GUI origin the service accepts is never taken from the checkout. It is
   pinned by an explicit operator act in a host terminal (`./sc engine-ops-pin`)
   and until then the service refuses every operation and says why. The port
@@ -51,7 +53,6 @@ variable can.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -190,16 +191,45 @@ def _own_directory(path: Path) -> None:
         raise StateError(f"{path} is not owned by this user")
 
 
+def _interpreter_mount() -> Path | None:
+    """The interpreter directory the launcher mounts read-only, if any.
+
+    Mirrors the dispatcher's `py_mount`: a checkout venv whose interpreter
+    lives under the operator's home gets that interpreter's registry (or its
+    root) mounted. The launcher's own guard is the authority; this lets the
+    service refuse the same overlap without waiting for a launch.
+    """
+    try:
+        python = REPO_ROOT / ".venv" / "bin" / "python"
+        if not python.exists():
+            return None
+        real = Path(os.path.realpath(python))
+        home = Path.home()
+        if REPO_ROOT in real.parents or home not in real.parents:
+            return None
+        version_dir = real.parent.parent
+        registry = version_dir.parent
+        if registry.is_dir() and registry != home:
+            return registry
+        return version_dir if version_dir.is_dir() else None
+    except OSError:
+        return None
+
+
 def sandbox_visible_roots() -> list[Path]:
-    """Real paths of every host location a sandbox of this install can write.
+    """Real paths of every host location a sandbox of this install can reach.
 
     The checkout; the owner-local instance state collection (this install's
     directory in it is mounted, and which one is named by a file in the
     checkout, so the whole collection is excluded); the engine DB's directory
-    when it resolves; and every home bind mount the launcher makes, taken from
-    the launcher's own list (`sandbox_devkit.HOME_BIND_MOUNTS`, the one the
-    `docker run` arguments are built from), so a mount added there is excluded
-    here without anyone remembering to.
+    when it resolves; the interpreter mount; and every home bind mount the
+    launcher makes, taken from the launcher's own list
+    (`sandbox_devkit.HOME_BIND_MOUNTS`, the one the `docker run` arguments are
+    built from).
+
+    This is what the service can know without a launch. The complete answer is
+    the launcher's final argument list, which `sandbox_devkit.docker_run`
+    checks against the same directory with the same overlap rule.
     """
     try:
         import sandbox_devkit  # noqa: PLC0415  (scripts/, on sys.path)
@@ -219,32 +249,42 @@ def sandbox_visible_roots() -> list[Path]:
         roots.append(Path(instance_state.active_database_path(ENGINE)).parent)
     except Exception:  # noqa: BLE001 — advisory: it can only add a root
         pass
+    interpreter = _interpreter_mount()
+    if interpreter is not None:
+        roots.append(interpreter)
     roots.extend(home_mounts)
     return [Path(os.path.realpath(root)) for root in roots]
 
 
-_host_private_checked: set[tuple[str, str]] = set()
+# (path, real path) -> when it was last found clear of every mount.
+_host_private_checked: dict[tuple[str, str], float] = {}
+HOST_PRIVATE_RECHECK_SECONDS = 5.0
 
 
 def _require_host_private(path: Path) -> None:
-    """Refuse a state directory that a sandbox can reach.
+    """Refuse a state directory that overlaps anything a sandbox can reach.
 
-    Checked once per process for each (path, real path) pair: the mounts are
-    fixed for a process's lifetime, and a path that starts resolving somewhere
-    else is checked again.
+    Overlap is judged on resolved paths and in both directions: the directory
+    inside a mount, a mount inside the directory, or a mounted file that is
+    one of its files (a `~/.claude.json` that is a link to `config.json`).
+    A clear result is reused for a few seconds only, because what a mounted
+    path resolves to can change while the service runs.
     """
     real = Path(os.path.realpath(path))
     key = (str(path), str(real))
-    if key in _host_private_checked:
+    checked = _host_private_checked.get(key)
+    if checked is not None and time.monotonic() - checked < HOST_PRIVATE_RECHECK_SECONDS:
         return
     for root in sandbox_visible_roots():
-        if real == root or root in real.parents:
+        if real == root or root in real.parents or real in root.parents:
+            _host_private_checked.pop(key, None)
             raise StateError(
-                f"the engine-ops state directory {path} resolves to {real}, "
-                f"inside {root}, which is mounted into the sandbox. It must be "
+                f"the engine-ops state directory {path} (→ {real}) overlaps "
+                f"{root}, which is mounted into the sandbox. It must be "
                 "host-private: unset XDG_STATE_HOME or point it outside the "
-                "checkout and the sandbox mounts.")
-    _host_private_checked.add(key)
+                "checkout and the sandbox mounts, and keep mounted paths from "
+                "resolving into it.")
+    _host_private_checked[key] = time.monotonic()
 
 
 def private_dir(path: Path | None = None) -> Path:
@@ -259,17 +299,25 @@ def private_dir(path: Path | None = None) -> Path:
     if path is None:
         path = PRIVATE_DIR
     if path is None:
-        root = str(REPO_ROOT.resolve())
-        key = hashlib.sha256(root.encode()).hexdigest()[:16]
-        name = re.sub(r"[^A-Za-z0-9_.-]", "_", REPO_ROOT.name) or "repo"
         home = _state_home()
-        _require_host_private(home / "subfloor" / "engine-ops" / f"{name}-{key}")
+        try:
+            import sandbox_devkit  # noqa: PLC0415  (scripts/, on sys.path)
+
+            # One derivation, shared with the launcher's mount guard.
+            target = sandbox_devkit.engine_ops_state_dir(
+                REPO_ROOT, {"XDG_STATE_HOME": str(home)})
+        except StateError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — unknown location: fail closed
+            raise StateError(
+                f"cannot derive the engine-ops state directory: {exc}") from exc
+        _require_host_private(target)
         try:
             home.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise StateError(f"cannot create {home}: {exc}") from exc
         path = home
-        for part in ("subfloor", "engine-ops", f"{name}-{key}"):
+        for part in target.relative_to(home).parts:
             path = path / part
             _own_directory(path)
     else:
@@ -1275,25 +1323,27 @@ def service_down() -> tuple[int, str]:
                        "match a running service — leaving it")
         return 0, "→ engine-ops not running"
     pid, ticks = record["pid"], record["pid_start_ticks"]
+    # Hold the process itself, prove its identity again on that handle, and
+    # signal through the handle: the pid cannot be reused between the proof
+    # and the signal. There is no numeric-pid fallback — without a handle the
+    # race is back, so the service is left running and the operator is told.
     try:
-        # Hold the process itself, prove identity again on that handle, and
-        # signal through it: the pid cannot be reused between the proof and
-        # the signal.
         handle = os.pidfd_open(pid)
-    except (AttributeError, OSError):
-        handle = None
+    except ProcessLookupError:
+        return 0, "→ engine-ops not running"
+    except (AttributeError, OSError) as exc:
+        return 1, (
+            f"✗ engine-ops (pid {pid}) could not be stopped safely: no process "
+            f"handle ({exc}). Nothing was signalled. To stop it by hand, check "
+            f"`ps -p {pid} -o args=` shows engine_ops_service.py, then `kill {pid}`.")
     try:
         if not pid_alive(pid, ticks) or not runs_script(pid, SERVICE_SCRIPT):
             return 0, "→ engine-ops not running"
-        if handle is not None:
-            signal.pidfd_send_signal(handle, signal.SIGTERM)
-        else:
-            os.kill(pid, signal.SIGTERM)
+        signal.pidfd_send_signal(handle, signal.SIGTERM)
     except OSError as exc:
         return 1, f"✗ engine-ops (pid {pid}) could not be signalled: {exc}"
     finally:
-        if handle is not None:
-            os.close(handle)
+        os.close(handle)
     deadline = time.monotonic() + SERVICE_WAIT_SECONDS
     while time.monotonic() < deadline:
         if not pid_alive(pid, ticks):

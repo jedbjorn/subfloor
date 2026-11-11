@@ -1158,6 +1158,85 @@ class ForgedStateTest(ServiceFixture):
                     engine_ops.private_dir()
         self.assertEqual(list(target.iterdir()), [])
 
+    def test_mount_source_inside_the_state_directory_is_refused(self):
+        """The other direction: the state directory is not inside a mount, a
+        mount is inside it. `~/.claude.json`, mounted writable, is a link to
+        the service's own `config.json`."""
+        home = self.base / "home"
+        home.mkdir()
+        (home / ".claude.json").symlink_to(self.private / "config.json")
+        env = {"HOME": str(home), "XDG_STATE_HOME": str(self.base / "state-home")}
+        with mock.patch.object(Path, "home", return_value=home), \
+                mock.patch.dict(os.environ, env):
+            engine_ops._host_private_checked.clear()
+            with self.assertRaises(engine_ops.StateError) as raised:
+                engine_ops.private_dir()
+            self.assertIn("mounted into the sandbox", str(raised.exception))
+            # Nothing that trusts the directory proceeds: the pin a sandbox
+            # could rewrite through that mount is not read.
+            self.assertIsNone(engine_ops.pinned_gui_port())
+            for call in (engine_ops.ensure_config, engine_ops.status_path,
+                         lambda: engine_ops.pin_gui_port(GUI_PORT)):
+                with self.assertRaises(engine_ops.StateError):
+                    call()
+            # A mounted directory inside the state directory, likewise.
+            (home / ".claude.json").unlink()
+            inner = self.private / "harness-home"
+            inner.mkdir()
+            (home / ".codex").symlink_to(inner, target_is_directory=True)
+            engine_ops._host_private_checked.clear()
+            with self.assertRaises(engine_ops.StateError):
+                engine_ops.private_dir()
+            # And the state directory itself as the mount.
+            (home / ".codex").unlink()
+            (home / ".vibe").symlink_to(self.private, target_is_directory=True)
+            engine_ops._host_private_checked.clear()
+            with self.assertRaises(engine_ops.StateError):
+                engine_ops.private_dir()
+            (home / ".vibe").unlink()
+            engine_ops._host_private_checked.clear()
+            self.assertEqual(engine_ops.private_dir(), self.private)
+
+    def test_a_mount_that_starts_resolving_into_the_state_is_noticed(self):
+        home = self.base / "home"
+        home.mkdir()
+        env = {"HOME": str(home), "XDG_STATE_HOME": str(self.base / "state-home")}
+        with mock.patch.object(Path, "home", return_value=home), \
+                mock.patch.dict(os.environ, env):
+            engine_ops._host_private_checked.clear()
+            self.assertEqual(engine_ops.private_dir(), self.private)
+            (home / ".claude.json").symlink_to(self.private / "config.json")
+            with mock.patch.object(engine_ops, "HOST_PRIVATE_RECHECK_SECONDS", 0.0):
+                with self.assertRaises(engine_ops.StateError):
+                    engine_ops.private_dir()
+
+    def test_interpreter_mount_over_the_state_directory_is_refused(self):
+        """A checkout venv whose interpreter is `~/.local/bin/python` makes the
+        launcher mount `~/.local` read-only — and the default state directory
+        is under `~/.local/state`. Read-only still leaks."""
+        home = self.base / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        (home / ".local" / "bin" / "python").write_text("")
+        venv = self.root / ".venv" / "bin"
+        venv.mkdir(parents=True)
+        (venv / "python").symlink_to(home / ".local" / "bin" / "python")
+        env = {"HOME": str(home)}
+        with mock.patch.object(Path, "home", return_value=home), \
+                mock.patch.object(engine_ops, "PRIVATE_DIR", None), \
+                mock.patch.dict(os.environ, env):
+            os.environ.pop("XDG_STATE_HOME", None)
+            engine_ops._host_private_checked.clear()
+            with self.assertRaises(engine_ops.StateError) as raised:
+                engine_ops.private_dir()
+            self.assertIn(str(home / ".local"), str(raised.exception))
+            self.assertFalse((home / ".local" / "state").exists())
+            # A state home outside that mount is accepted.
+            os.environ["XDG_STATE_HOME"] = str(self.base / "state-home")
+            engine_ops._host_private_checked.clear()
+            good = engine_ops.private_dir()
+            self.assertEqual(good.parent,
+                             self.base / "state-home" / "subfloor" / "engine-ops")
+
     def test_service_refuses_to_start_with_its_state_inside_the_checkout(self):
         state_home = ENGINE.parent / ".sc-state" / f"engine-ops-test-{os.getpid()}"
         self.assertFalse(state_home.exists())
@@ -1281,6 +1360,113 @@ class LauncherMountParityTest(ServiceFixture):
                     engine_ops.private_dir(self.base / "anywhere")
 
 
+class LauncherGuardTest(ServiceFixture):
+    """The launcher refuses, at the one place that sees every mount, a
+    `docker run` whose binds overlap the engine-ops state in either direction."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        import sandbox_devkit
+
+        self.devkit = sandbox_devkit
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.env = {"HOME": str(self.home)}
+        self.state = sandbox_devkit.engine_ops_state_dir(self.root, self.env)
+
+    def guard(self, *arguments: str) -> None:
+        self.devkit.guard_engine_ops_state(
+            ["docker", "run", "-d", *arguments, "image", "./sc", "serve"],
+            self.root, self.env)
+
+    def test_state_directory_is_the_one_the_service_uses(self):
+        self.assertEqual(
+            self.state.parent, self.home / ".local" / "state" / "subfloor" / "engine-ops")
+        self.assertFalse(self.state.exists())
+        with mock.patch.object(engine_ops, "PRIVATE_DIR", None), \
+                mock.patch.object(Path, "home", return_value=self.home), \
+                mock.patch.dict(os.environ, self.env):
+            os.environ.pop("XDG_STATE_HOME", None)
+            engine_ops._host_private_checked.clear()
+            self.assertEqual(engine_ops.private_dir(), self.state)
+        custom = self.devkit.engine_ops_state_dir(
+            self.root, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.base / "x")})
+        self.assertEqual(custom.parent, self.base / "x" / "subfloor" / "engine-ops")
+
+    def test_bind_sources_reads_every_form(self):
+        arguments = [
+            "docker", "run", "-d", "--name", "c",
+            "-v", "/a:/a", "-v", "/b:/b:ro", "--volume", "/c:/c",
+            "--volume=/d:/d", "-v=/e:/e", "-v/f:/f",
+            "--mount", "type=bind,src=/g,dst=/g",
+            "--mount", "type=bind,source=/h,target=/h,readonly",
+            "--mount=type=bind,src=/i,dst=/i",
+            # Not binds: named volumes and tmpfs.
+            "-v", "named-volume:/data",
+            "--mount", "type=volume,src=named,dst=/sc-devkit-volume",
+            "--mount", "type=tmpfs,dst=/t", "--tmpfs", "/u:uid=0",
+            "-p", "127.0.0.1:1:1", "-e", "HOME=/home/x", "-w", "/a",
+            "image", "./sc", "serve",
+        ]
+        self.assertEqual(self.devkit.bind_sources(arguments),
+                         ["/a", "/b", "/c", "/d", "/e", "/f", "/g", "/h", "/i"])
+
+    def test_a_normal_install_launches_with_or_without_state(self):
+        normal = []
+        for relative in self.devkit.HOME_BIND_MOUNTS:
+            normal += ["-v", f"{self.home / relative}:{self.home / relative}"]
+        normal += ["-v", f"{self.root}:{self.root}",
+                   "-v", f"{self.home}/.local/state/subfloor/instances/abc:/state",
+                   "-v", f"{self.home}/.local/share/uv/python:/py:ro",
+                   "--mount", "type=volume,src=devkit,dst=/sc-devkit-volume"]
+        self.guard(*normal)                       # no engine-ops state yet
+        self.state.mkdir(parents=True)
+        (self.state / "config.json").write_text("{}")
+        self.guard(*normal)                       # and with it
+
+    def test_overlap_is_refused_in_both_directions(self):
+        self.state.mkdir(parents=True)
+        (self.state / "config.json").write_text("{}")
+        profile = self.home / ".claude.json"
+        profile.symlink_to(self.state / "config.json")
+        link_home = self.home / "harness"
+        link_home.symlink_to(self.state, target_is_directory=True)
+        cases = {
+            "a mounted file that is one of its files":
+                ["-v", f"{profile}:{profile}"],
+            "the directory itself, through a link":
+                ["-v", f"{link_home}:/h"],
+            "a directory containing it (read-only interpreter mount)":
+                ["-v", f"{self.home}/.local:{self.home}/.local:ro"],
+            "the state home": ["--volume", f"{self.home}/.local/state:/s"],
+            "the whole home, as a bind mount":
+                ["--mount", f"type=bind,src={self.home},dst=/home"],
+            "a directory inside it": ["-v", f"{self.state}/sub:/sub"],
+        }
+        for label, arguments in cases.items():
+            with self.assertRaises(self.devkit.SandboxImageError, msg=label) as raised:
+                self.guard(*arguments)
+            message = str(raised.exception)
+            self.assertIn("refusing to launch", message)
+            self.assertIn(str(self.state), message)
+            self.assertIn("XDG_STATE_HOME", message)
+
+    def test_a_checkout_inside_reach_of_the_state_home_is_refused(self):
+        inside = {"HOME": str(self.home),
+                  "XDG_STATE_HOME": str(self.root / ".super-coder" / "state")}
+        with self.assertRaises(self.devkit.SandboxImageError):
+            self.devkit.guard_engine_ops_state(
+                ["docker", "run", "-v", f"{self.root}:{self.root}", "image"],
+                self.root, inside)
+
+    def test_docker_run_applies_the_guard_to_its_final_arguments(self):
+        text = (ENGINE / "scripts" / "sandbox_devkit.py").read_text()
+        body = text[text.index("def docker_run("):text.index("def ", text.index("def docker_run(") + 10)]
+        self.assertIn("guard_engine_ops_state(command, plan.engine.parent)", body)
+        self.assertLess(body.index("guard_engine_ops_state(command"),
+                        body.index("_run(command"))
+
+
 class StopIdentityTest(ServiceFixture):
     """`down` signals only a process proven to be this service."""
 
@@ -1324,6 +1510,37 @@ class StopIdentityTest(ServiceFixture):
             self.assertEqual(code, 0, message)
             self.assertNotIn("stopped", message)
             self.assert_canary_alive()
+
+    def test_no_process_handle_means_no_signal(self):
+        """If the service cannot be held by a handle, it is not signalled by
+        number either: that is where a reused pid would get the signal."""
+        real = self.base / "install" / "engine_ops_service.py"
+        real.parent.mkdir()
+        real.write_text("import time; time.sleep(600)\n")
+        proc = subprocess.Popen([sys.executable, str(real)], start_new_session=True)
+        self.addCleanup(reap, proc)
+        with mock.patch.object(engine_ops, "SERVICE_SCRIPT", real):
+            self.assertTrue(wait_for(lambda: engine_ops.runs_script(proc.pid, real)))
+            engine_ops.write_private(self.private / engine_ops.SERVICE_NAME, {
+                "pid": proc.pid,
+                "pid_start_ticks": engine_ops.pid_start_ticks(proc.pid),
+                "port": self.port})
+            for failure in (OSError(24, "Too many open files"),
+                            AttributeError("pidfd_open")):
+                with mock.patch.object(os, "pidfd_open", side_effect=failure), \
+                        mock.patch.object(os, "kill", wraps=os.kill) as kill:
+                    code, message = engine_ops.service_down()
+                self.assertEqual(code, 1, message)
+                self.assertIn("could not be stopped safely", message)
+                self.assertIn(f"kill {proc.pid}", message)
+                # No real signal was sent by number (signal 0 is only a probe).
+                self.assertEqual(
+                    [call for call in kill.call_args_list if call.args[1] != 0], [])
+                time.sleep(0.2)
+                self.assertIsNone(proc.poll())
+            # With a handle, the same service is stopped.
+            code, message = engine_ops.service_down()
+            self.assertEqual((code, message), (0, "→ engine-ops stopped"))
 
     def test_a_process_that_only_mentions_the_service_script_is_not_the_service(self):
         """Right pid, right start time, and the script's name on its command

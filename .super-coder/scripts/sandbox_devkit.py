@@ -1776,6 +1776,108 @@ def home_bind_paths(home: str | os.PathLike[str] | None = None) -> tuple[Path, .
     return tuple(base / relative for relative in HOME_BIND_MOUNTS)
 
 
+def engine_ops_state_dir(
+    repo_root: str | os.PathLike[str],
+    environ: dict[str, str] | None = None,
+) -> Path:
+    """Where the engine-ops service of the install at `repo_root` keeps its
+    host-private state (api/engine_ops.py). A pure path: nothing is created.
+
+    Named from the checkout's own path under the owner's state home, so no
+    file in the checkout takes part in choosing it.
+    """
+    env = os.environ if environ is None else environ
+    configured = (env.get("XDG_STATE_HOME") or "").strip()
+    if configured:
+        home = Path(configured).expanduser()
+    else:
+        base = (env.get("HOME") or "").strip()
+        home = (Path(base) if base else Path.home()) / ".local" / "state"
+    root = Path(repo_root)
+    key = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", root.name) or "repo"
+    return home / "subfloor" / "engine-ops" / f"{name}-{key}"
+
+
+def paths_overlap(first: str | os.PathLike[str], second: str | os.PathLike[str]) -> bool:
+    """Whether two paths, links resolved, are the same or one contains the other."""
+    a = Path(os.path.realpath(first))
+    b = Path(os.path.realpath(second))
+    return a == b or a in b.parents or b in a.parents
+
+
+def bind_sources(arguments: Sequence[str]) -> list[str]:
+    """Every host path a `docker run` argument list bind-mounts.
+
+    `-v`/`--volume SRC:DST[:opts]` (a source that is not an absolute path is a
+    named volume, not a bind) and `--mount type=bind,src=…`, in both the
+    two-argument and the `=` forms. Read-only binds count: a read still leaks.
+    """
+    sources: list[str] = []
+    index = 0
+    arguments = list(arguments)
+    while index < len(arguments):
+        argument = arguments[index]
+        value = None
+        kind = None
+        for flag in ("-v", "--volume", "--mount"):
+            if argument == flag and index + 1 < len(arguments):
+                value, kind = arguments[index + 1], flag
+                index += 1
+                break
+            if argument.startswith(flag + "="):
+                value, kind = argument[len(flag) + 1:], flag
+                break
+        if kind is None and argument.startswith("-v") and len(argument) > 2 \
+                and not argument.startswith("--"):
+            value, kind = argument[2:], "-v"
+        index += 1
+        if value is None:
+            continue
+        if kind == "--mount":
+            fields = dict(
+                part.split("=", 1) if "=" in part else (part, "")
+                for part in value.split(","))
+            if fields.get("type", "volume") != "bind":
+                continue
+            source = fields.get("src") or fields.get("source") or ""
+        else:
+            source = value.split(":", 1)[0]
+        if source.startswith("/"):
+            sources.append(source)
+    return sources
+
+
+def guard_engine_ops_state(
+    arguments: Sequence[str],
+    repo_root: str | os.PathLike[str],
+    environ: dict[str, str] | None = None,
+) -> None:
+    """Refuse a `docker run` that would put the engine-ops state in a sandbox.
+
+    The engine-ops service (api/engine_ops.py) decides which GUI origin may
+    start `./sc update` / `restart` from files in its private directory, so a
+    sandbox must be able to neither write nor read them. This is checked here
+    because this is the one place that sees the final argument list: every
+    bind, however it was built (the checkout, the instance state, interpreter
+    mounts, the home mounts, anything added later), is resolved and compared
+    with that directory in both directions. A mount that contains it, lies
+    inside it, or is one of its files stops the launch.
+    """
+    state = engine_ops_state_dir(repo_root, environ)
+    for source in bind_sources(arguments):
+        if paths_overlap(source, state):
+            raise SandboxImageError(
+                f"refusing to launch: the mount {source} "
+                f"(→ {os.path.realpath(source)}) overlaps the engine-ops "
+                f"service's private state directory {state} "
+                f"(→ {os.path.realpath(state)}). That directory holds the GUI "
+                "origin allowed to start engine update/restart and must stay "
+                "out of the sandbox. Move the mounted path, or set "
+                "XDG_STATE_HOME to a directory outside every sandbox mount."
+            )
+
+
 def expand_home_mounts(arguments: Sequence[str]) -> list[str]:
     """Replace HOME_MOUNT_MARKER with one `-v path:path` per home bind mount."""
     expanded: list[str] = []
@@ -1829,6 +1931,9 @@ def docker_run(
         *mount_arguments,
         *arguments[marker + 1 :],
     )
+    # The final argument list, every mount in it: nothing reaches a sandbox
+    # that overlaps the engine-ops service's private state.
+    guard_engine_ops_state(command, plan.engine.parent)
     # `docker run -d` prints only the container ID.  Suppress that transport
     # detail here so callers can leave provisioning output visible.
     _run(command, runner=runner, capture=True)
