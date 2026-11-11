@@ -16,6 +16,7 @@ Run:
 """
 from __future__ import annotations
 
+import random
 import sqlite3
 import sys
 import tempfile
@@ -63,6 +64,13 @@ QUOTED = {
     "null": '"null"',
     "116": '"116"',
     "2026-11-11": '"2026-11-11"',
+    "2001-12-14 21:59:43": '"2001-12-14 21:59:43"',
+    "2001-12-14 21:59:43.10 -5": '"2001-12-14 21:59:43.10 -5"',
+    "2001-12-14t21:59:43Z": '"2001-12-14t21:59:43Z"',
+    "190:20:30": '"190:20:30"',
+    "1_000": '"1_000"',
+    ".inf": '".inf"',
+    "0x1F": '"0x1F"',
     "": '""',
 }
 
@@ -79,6 +87,9 @@ BARE = [
     "em dash — arrow → and accents é",
     "-leading dash without a space",
     "Version 2 of the thing",
+    "2001-12-14 was the day",
+    "12 seats and 3 shells",
+    "true enough",
 ]
 
 
@@ -112,6 +123,24 @@ class EmitParseTest(unittest.TestCase):
                 rendered = skill_frontmatter.emit_scalar(value)
                 self.assertEqual(yaml_value(rendered), value)
 
+    @unittest.skipIf(yaml is None, "PyYAML is not installed")
+    def test_seeded_fuzz_with_internal_spaces(self) -> None:
+        """Values assembled from typed-looking tokens joined by spaces."""
+        tokens = [
+            "2001-12-14", "21:59:43", "21:59:43.10", "-5", "+05:30", "Z", "t",
+            "12", "1e3", "0x1f", "0o17", ".5", "1_000", "190:20", "true",
+            "null", "~", "yes", "<<", "=", ".inf", ".NaN", "word", "#", ":",
+            "-", "?", "a:", "#b", "'", '"', "\\", "[x]", "{y}", "é", "",
+        ]
+        rng = random.Random(1767)
+        for _ in range(20000):
+            value = " ".join(
+                rng.choice(tokens) for _ in range(rng.randint(1, 4))).strip()
+            rendered = skill_frontmatter.emit_scalar(value)
+            if (yaml_value(rendered) != value
+                    or skill_frontmatter.parse_scalar(rendered) != value):
+                self.fail(f"{value!r} rendered as {rendered!r}")
+
     def test_reader_accepts_legacy_bare_and_quoted_forms(self) -> None:
         cases = {
             # Legacy bare values are taken whole: that is how they were stored.
@@ -130,6 +159,38 @@ class EmitParseTest(unittest.TestCase):
         for raw, expected in cases.items():
             with self.subTest(raw=raw):
                 self.assertEqual(skill_frontmatter.parse_scalar(raw), expected)
+
+    def test_new_reader_stores_every_shipped_asset_as_the_old_one_did(self) -> None:
+        """No shipped skill changes a stored value on reseed or update.
+
+        The pre-quoting reader, restated here, against the current one, over
+        every asset the seed reads. Seed and reseed migrations carry skills
+        as SQL literals and are never read through a frontmatter parser.
+        """
+        def old_reader(path: Path) -> dict:
+            _, front, body = path.read_text().split("---", 2)
+            meta = {}
+            for line in front.strip().splitlines():
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    meta[key.strip()] = value.strip()
+            common = meta.get("common", "true").lower() not in (
+                "false", "0", "no")
+            return {
+                "name": meta["name"],
+                "description": meta.get("description"),
+                "category": meta.get("category"),
+                "command": meta.get("command"),
+                "common": 1 if common else 0,
+                "content": body.strip(),
+            }
+
+        paths = sorted(seed_skills.SKILLS_DIR.glob("*/SKILL.md"))
+        paths.append(seed_skills.DEV_KIT_STARTER)
+        self.assertGreater(len(paths), 20)
+        for path in paths:
+            with self.subTest(asset=str(path.relative_to(ENGINE))):
+                self.assertEqual(seed_skills.parse_skill(path), old_reader(path))
 
     def test_engine_asset_descriptions_render_safely(self) -> None:
         """Shipped engine skills: bare where bare is already valid YAML (no
@@ -243,16 +304,55 @@ class RenderedSkillTest(unittest.TestCase):
                     front = yaml.safe_load(rendered.split("---\n")[1])
                     self.assertEqual(front["description"], description)
 
-    def test_asset_reader_accepts_both_forms(self) -> None:
-        description = "Seeded: for Spec #116"
+    def test_asset_values_are_read_literally(self) -> None:
+        """An asset value is stored as written, quote characters included, and
+        the render quotes it so a YAML reader gets that same stored string."""
+        cases = {
+            '"quoted"': '"\\"quoted\\""',
+            '"line\\nbreak"': '"\\"line\\\\nbreak\\""',
+            "'single'": "\"'single'\"",
+            "Seeded: for Spec #116": '"Seeded: for Spec #116"',
+        }
         with tempfile.TemporaryDirectory() as tmp:
-            for index, line in enumerate(
-                (description, skill_frontmatter.emit_scalar(description))
-            ):
-                path = Path(tmp) / f"asset_{index}.md"
-                path.write_text(draft(f"asset_{index}", line))
-                self.assertEqual(
-                    seed_skills.parse_skill(path)["description"], description)
+            for index, (line, expected) in enumerate(cases.items()):
+                with self.subTest(line=line):
+                    path = Path(tmp) / f"asset_{index}.md"
+                    path.write_text(draft(f"asset_{index}", line))
+                    stored = seed_skills.parse_skill(path)["description"]
+                    self.assertEqual(stored, line)
+                    rendered = skill_frontmatter.emit_scalar(stored)
+                    self.assertEqual(rendered, expected)
+                    self.assertEqual(
+                        skill_frontmatter.parse_scalar(rendered), stored)
+                    if yaml is not None:
+                        self.assertEqual(yaml_value(rendered), stored)
+
+    def test_put_stores_exactly_what_every_mirror_renders(self) -> None:
+        """`put` stores one stripped line; render then parse returns it."""
+        lines = {
+            "plain prose": "plain prose",
+            "   padded on both sides   ": "padded on both sides",
+            '"  padded inside quotes  "': "padded inside quotes",
+            '"tab\\tand # hash: colon"': "tab\tand # hash: colon",
+            '"\\"kept quotes\\""': '"kept quotes"',
+            "2001-12-14 21:59:43": "2001-12-14 21:59:43",
+            "'it''s'": "it's",
+        }
+        for index, (line, stored) in enumerate(lines.items()):
+            with self.subTest(line=line):
+                name = f"exact_{index}"
+                spec = skill_mod.parse_local_skill_spec(draft(name, line))
+                self.assertEqual(spec["description"], stored)
+                for rendered in self.render(name, spec["description"]):
+                    again = skill_mod.parse_local_skill_spec(rendered)
+                    self.assertEqual(again["description"], stored)
+                    if yaml is not None:
+                        front = yaml.safe_load(rendered.split("---\n")[1])
+                        self.assertEqual(front["description"], stored)
+        for line in ('"first\\nsecond"', '"first\\rsecond"', '"   "', ""):
+            with self.subTest(refused=line):
+                with self.assertRaises(skill_mod.DraftValidationError):
+                    skill_mod.parse_local_skill_spec(draft("refused", line))
 
     def test_multi_line_description_is_refused(self) -> None:
         with self.assertRaises(skill_mod.DraftValidationError):

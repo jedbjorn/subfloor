@@ -7,10 +7,12 @@ indicator, `true`/`12` are not strings. `emit_scalar` writes a value bare
 only when a YAML parser reads the bare form back as that exact string, and
 double-quotes it otherwise, so renders of ordinary prose stay byte-stable.
 
-`parse_scalar` is the engine's reader for the same position. It accepts the
-quoted forms and the legacy bare form: a bare value is taken whole, comment
-characters included, because that is how every value was stored before
-quoting existed.
+`parse_scalar` is the reader for a fork-local draft (`sc skill put`). It
+accepts the quoted forms and the legacy bare form: a bare value is taken
+whole, comment characters included, because that is how every value was
+stored before quoting existed. Engine assets are not read through it: an
+asset value is taken literally (`seed_skills.parse_skill`), so a reseed never
+changes a stored value.
 """
 
 from __future__ import annotations
@@ -22,9 +24,29 @@ _BLOCK_INDICATORS = ("- ", "? ", ": ")
 _RESERVED_WORDS = frozenset(
     {"null", "~", "true", "false", "yes", "no", "on", "off", "y", "n", "<<", "="}
 )
-# A single token that opens like a number, date, or special float may resolve
-# to a non-string type; prose never matches because it contains whitespace.
+# A single token that opens like a number or special float may resolve to a
+# non-string type under some YAML 1.1 or 1.2 schema; quoting every such token
+# is cheap because prose is never a lone numeric token.
 _NUMERIC_TOKEN = re.compile(r"[-+.]?[0-9]|[-+]?\.(inf|nan)$", re.IGNORECASE)
+# The YAML 1.1 implicit resolvers that match a whole value and may contain
+# spaces, so the single-token rule above cannot see them: timestamps
+# (`2001-12-14 21:59:43`) and sexagesimal numbers are the live cases; the
+# rest are listed so the rule reads as the resolver table it mirrors.
+_IMPLICIT_TYPES = re.compile(
+    r"""^(?:
+      yes|no|true|false|on|off|y|n                                  # bool
+    | ~|null|                                                       # null
+    | <<|=                                                          # merge, value
+    | [-+]?(?:0b[0-1_]+|0x[0-9a-f_]+|0o?[0-7_]+|[0-9][0-9_]*)       # int
+    | [-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+(?:\.[0-9_]*)?              # sexagesimal
+    | [-+]?(?:[0-9][0-9_]*)?\.?[0-9_]*(?:e[-+]?[0-9]+)?             # float
+    | [-+]?\.(?:inf|nan)                                            # special float
+    | [0-9]{4}-[0-9]{1,2}-[0-9]{1,2}                                # date
+      (?:(?:t|[ \t]+)[0-9]{1,2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]*)?
+         (?:[ \t]*(?:z|[-+][0-9]{1,2}(?::[0-9]{2})?))?)?            # timestamp
+    )$""",
+    re.IGNORECASE | re.VERBOSE,
+)
 _UNSAFE_CHARS = re.compile(
     "[\x00-\x1f\x7f-\x9f  ﻿\ud800-\udfff￾￿]"
 )
@@ -50,6 +72,8 @@ def needs_quoting(value: str) -> bool:
     if ": " in value or " #" in value or value.endswith(":"):
         return True
     if _UNSAFE_CHARS.search(value):
+        return True
+    if _IMPLICIT_TYPES.match(value):
         return True
     if not any(ch.isspace() for ch in value):
         if value.lower() in _RESERVED_WORDS or _NUMERIC_TOKEN.match(value):

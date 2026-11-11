@@ -46,7 +46,6 @@ from pathlib import Path
 
 import artifact_policy
 import instance_state
-import skill_frontmatter
 
 ENGINE = Path(__file__).resolve().parents[1]
 SKILLS_DIR = ENGINE / "assets" / "skills"
@@ -296,7 +295,10 @@ def parse_skill(path: Path) -> dict:
     for line in fm.strip().splitlines():
         if ":" in line:
             k, v = line.split(":", 1)
-            meta[k.strip()] = skill_frontmatter.parse_scalar(v)
+            # Taken whole, quote characters included: an asset is read only
+            # by the engine, and unquoting here would change stored values
+            # on the next reseed. The render quotes for YAML readers.
+            meta[k.strip()] = v.strip()
     if "name" not in meta:
         sys.exit(f"seed_skills: {path} frontmatter missing `name`")
     common = meta.get("common", "true").lower() not in ("false", "0", "no")
