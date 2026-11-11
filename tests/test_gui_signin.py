@@ -256,6 +256,12 @@ globalThis.EventSource = class {
     if (this.onerror) this.onerror();
   }
 };
+const handlers = {};
+const listen = (type, fn) => { (handlers[type] = handlers[type] || []).push(fn); };
+globalThis.document = {hidden: false, addEventListener: listen};
+globalThis.window = {addEventListener: listen};
+const fire = (type) => { for (const fn of handlers[type] || []) fn(); };
+const wakeIfDefined = () => { if (typeof wakeSessionWatch === "function") wakeSessionWatch(); };
 // The watch a stream owns: null, or how much it is holding.
 const watching = () => typeof sessionWatch === "undefined" ? "n/a" : sessionWatch === null ? null
   : {timer: Boolean(sessionWatch.timer), probing: sessionWatch.probing};
@@ -268,6 +274,10 @@ const report = (extra = {}) => console.log(JSON.stringify({
   last: states[states.length - 1], pendingTimers: timers.length, ...extra}));
 """
 STREAM_SOURCE = SESSION + function_source("chatStopStream") + function_source("chatOpenStream")
+# The page's wake-up listeners for the stream watch, run against a fake
+# document and window that record them (STREAM_ENV's `fire`).
+WAKE_MARK = "// A tab coming back, or the network returning"
+WAKE = APP[APP.index(WAKE_MARK):APP.index("// Close any open popover menu")] if WAKE_MARK in APP else ""
 
 
 @needs_node
@@ -436,37 +446,135 @@ const UNKNOWN = "__UNKNOWN__";
 
 
 @needs_node
-def test_reopening_a_refused_stream_is_bounded_and_backs_off():
-    script = STREAM_ENV + STREAM_SOURCE + r"""
+def test_a_refused_stream_recovers_within_one_slow_interval_once_the_server_is_healthy():
+    # The reviewed sequence: the stream answers with errors while auth-status
+    # says signed in, long enough to pass the fast attempts; then the server
+    # recovers. No reload, no chat switch.
+    script = STREAM_ENV + STREAM_SOURCE + WAKE + r"""
 (async () => {
   openStream();
   await advance(100);
-  // Signed in, but the server refuses the stream every time.
   server.stream = "refuse";
   opened[0].drop();
-  await advance(3600000);
-  const refused = {streams: opened.length, probes: probes.length, navigations: [...navigations],
-    state: states[states.length - 1], watch: watching(), pendingTimers: timers.length,
-    gaps: connections.slice(2).map((at, i) => at - connections.slice(1)[i])};
-  // A stream that opens resets the count: a later refusal gets its reopens again.
-  server.stream = "ok";
-  openStream();
-  await advance(100);
-  const fresh = opened.length;
-  server.stream = "refuse";
-  opened[opened.length - 1].drop();
-  await advance(3600000);
-  report({refused, reopenedAgain: opened.length - fresh});
+  await advance(240000);
+  const refused = {streams: opened.length, watch: watching(), closed: opened[opened.length - 1].readyState === 2,
+    state: states[states.length - 1], navigations: [...navigations]};
+  server.stream = "ok";                                   // healthy again
+  const healthyAt = clock;
+  let recoveredAfter = null;
+  for (let i = 0; i < 3600 && recoveredAfter === null; i++) {
+    await advance(1000);
+    if (states[states.length - 1] === "connected") recoveredAfter = clock - healthyAt;
+  }
+  await advance(600000);                                  // and it stays quiet afterwards
+  report({refused, recoveredAfter, streamsAfter: opened.length, watch: watching(), events});
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
     result = run_js(script)
     refused = result["refused"]
-    assert refused["streams"] == 6, "the first stream and five reopens, then no more"
-    assert refused["navigations"] == [] and refused["state"] == "reconnecting"
-    assert refused["watch"] is None and refused["pendingTimers"] == 0
-    assert refused["gaps"] == sorted(refused["gaps"]) and refused["gaps"][-1] > refused["gaps"][0], \
-        "each reopen waits longer than the one before"
-    assert result["reopenedAgain"] == 5
+    assert refused["closed"] is True and refused["state"] == "reconnecting"
+    assert refused["watch"] == {"timer": True, "probing": False}, "an attempt is always scheduled"
+    assert refused["navigations"] == []
+    assert result["recoveredAfter"] is not None and result["recoveredAfter"] <= 61000
+    assert result["last"] == "connected" and result["navigations"] == []
+    assert result["streamsAfter"] == refused["streams"] + 1, "one reopen was enough"
+    assert result["watch"] == {"timer": False, "probing": False} and result["pendingTimers"] == 0
+
+
+@needs_node
+def test_a_long_refusal_costs_one_attempt_per_interval_and_the_label_stays_true():
+    script = STREAM_ENV + STREAM_SOURCE + WAKE + r"""
+(async () => {
+  openStream();
+  await advance(100);
+  server.stream = "refuse";
+  opened[0].drop();
+  let peakTimers = 0, unbacked = 0;
+  for (let i = 0; i < 3600; i++) {
+    await advance(1000);
+    peakTimers = Math.max(peakTimers, timers.length);
+    // "Reconnecting" must mean it: a closed stream has an attempt pending.
+    const source = opened[opened.length - 1], watch = watching();
+    if (states[states.length - 1] === "reconnecting" && source.readyState === 2
+        && !(watch && (watch.timer || watch.probing))) unbacked += 1;
+  }
+  const gaps = connections.slice(1).map((at, i) => at - connections[i]);
+  report({attempts: connections.length, gaps: gaps.slice(0, 7), steady: [...new Set(gaps.slice(7))],
+    peakTimers, unbacked, probeCount: probes.length});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    # Fast attempts first, each further apart, then one a minute for the rest of the hour.
+    assert result["gaps"] == [3100, 2000, 10000, 20000, 40000, 60000, 60000]
+    assert result["steady"] == [60000]
+    assert 60 <= result["attempts"] <= 66 and result["probeCount"] <= 66
+    assert result["peakTimers"] <= 2, "one probe timer, plus a connection in progress"
+    assert result["unbacked"] == 0
+    assert result["navigations"] == []
+
+
+@needs_node
+def test_visibility_online_and_sending_each_bring_one_attempt_forward():
+    script = STREAM_ENV + STREAM_SOURCE + WAKE + r"""
+(async () => {
+  const out = {};
+  openStream();
+  await advance(100);
+  // An open stream: a wake-up does nothing.
+  fire("visibilitychange"); fire("online"); wakeIfDefined();
+  await advance(1000);
+  out.whileOpen = probes.length;
+  server.stream = "refuse";
+  opened[0].drop();
+  await advance(400000);                                   // well into the slow lane
+  const attempt = async (trigger) => {
+    await advance(10000);                                  // clear of the minimum gap
+    const before = connections.length, at = clock;
+    trigger();
+    await advance(1000);
+    return {attempts: connections.length - before, timers: timers.length};
+  };
+  out.visible = await attempt(() => fire("visibilitychange"));
+  out.online = await attempt(() => fire("online"));
+  out.sent = await attempt(() => wakeIfDefined());          // what a sent message does
+  out.together = await attempt(() => { fire("visibilitychange"); fire("online"); wakeIfDefined(); fire("online"); });
+  // A tab going to the background is not a wake-up.
+  document.hidden = true;
+  out.hidden = await attempt(() => fire("visibilitychange"));
+  document.hidden = false;
+  // Wake-ups in quick succession are held to the minimum gap, not a storm.
+  const before = connections.length;
+  for (let i = 0; i < 40; i++) { fire("online"); await advance(250); }
+  out.burst = connections.length - before;
+  // After the stream is stopped, nothing is left to wake.
+  chatStopStream();
+  fire("online"); fire("visibilitychange"); wakeIfDefined();
+  await advance(600000);
+  report({out, registered: Object.keys(handlers).sort()});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    out = result["out"]
+    assert result["registered"] == ["online", "visibilitychange"]
+    assert out["whileOpen"] == 0
+    for name in ("visible", "online", "sent", "together"):
+        assert out[name] == {"attempts": 1, "timers": 1}, name
+    assert out["hidden"]["attempts"] == 0
+    assert out["burst"] <= 2, "ten seconds of wake-ups, five seconds apart at the fastest"
+    assert result["pendingTimers"] == 0 and result["navigations"] == []
+
+
+def test_the_wake_ups_are_wired_to_the_watch():
+    assert 'document.addEventListener("visibilitychange", () => { if (!document.hidden) wakeSessionWatch(); });' in APP
+    assert 'window.addEventListener("online", () => wakeSessionWatch());' in APP
+    submit = APP[APP.index("  async function submit() {"):APP.index("  send.onclick = submit;")]
+    sent = submit[submit.index('"POST", { text }, chatPendingSend.key'):submit.index("} catch (error) {")]
+    assert "wakeSessionWatch();" in sent, "a sent message retries a closed stream"
+    watch = function_source("startSessionWatch")
+    assert "STREAM_REOPEN_LIMIT" not in APP and "stopSessionWatch(); return; }" not in watch
+    assert watch.count("stopSessionWatch();") == 3, "replacing a watch, signing out, and the stream's event"
+    # The label follows the stream state the watch keeps honest.
+    assert 'streamStatus === "reconnecting" ? "Reconnecting" : "Connecting"' in APP
 
 
 @needs_node

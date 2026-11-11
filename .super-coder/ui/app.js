@@ -167,9 +167,17 @@ async function sessionFetch(url, init) {
 // stream that is gone. Probes are spaced by the watch's wait: five seconds,
 // doubling to a minute while the answer stays unknown or the server keeps
 // refusing the stream.
+//
+// The watch never gives up while its stream is the live one. A stream the
+// server refuses while the session holds is reopened at that growing wait,
+// which settles at one attempt a minute, so a server that recovers is picked
+// up within a minute with no reload. A closed stream therefore always has an
+// attempt scheduled, which is what the "Reconnecting" label claims. Three
+// wake-ups bring the next attempt forward instead of adding a timer: the tab
+// becoming visible, the browser coming back online, and the operator sending
+// a message.
 const SESSION_PROBE_MIN_MS = 5000;
 const SESSION_PROBE_MAX_MS = 60000;
-const STREAM_REOPEN_LIMIT = 5;
 let sessionWatch = null;
 let sessionProbedAt = -Infinity;
 function stopSessionWatch() {
@@ -185,12 +193,15 @@ async function probeSession() {
     return status?.signed_in === true ? "in" : status?.signed_in === false ? "out" : "unknown";
   } catch { return "unknown"; }
 }
+function wakeSessionWatch() {
+  if (sessionWatch) sessionWatch.wake();
+}
 // `closed()` says whether the browser has given up on the stream (the server
-// refused it); `reopen()` opens a fresh one. `reopens` and `wait` carry over
-// from the stream this one replaced, and reset when a stream opens.
-function startSessionWatch({ closed, reopen, reopens = 0, wait = SESSION_PROBE_MIN_MS }) {
+// refused it); `reopen()` opens a fresh one. `wait` carries over from the
+// stream this one replaced, and resets when a stream opens.
+function startSessionWatch({ closed, reopen, wait = SESSION_PROBE_MIN_MS }) {
   stopSessionWatch();
-  const watch = { timer: null, probing: false, reopens, wait };
+  const watch = { timer: null, probing: false, wait };
   sessionWatch = watch;
   const live = () => sessionWatch === watch && !leavingForSignIn;
   const schedule = (delay) => {
@@ -219,15 +230,23 @@ function startSessionWatch({ closed, reopen, reopens = 0, wait = SESSION_PROBE_M
       return;
     }
     if (!closed()) { watch.wait = SESSION_PROBE_MIN_MS; return; }
-    // Signed in, yet the server refused the stream: reopen it, a bounded
-    // number of times and further apart each time.
-    if (watch.reopens >= STREAM_REOPEN_LIMIT) { stopSessionWatch(); return; }
-    reopen({ reopens: watch.reopens + 1, wait: Math.min(watch.wait * 2, SESSION_PROBE_MAX_MS) });
+    // Signed in, yet the server refused the stream: reopen it, further apart
+    // each time up to the ceiling, for as long as this stream is the live one.
+    reopen({ wait: Math.min(watch.wait * 2, SESSION_PROBE_MAX_MS) });
+  };
+  // Bring the pending attempt forward (never sooner than the minimum gap
+  // since the last probe). Nothing to do for a stream that is open, or that
+  // the browser is retrying with no probe pending.
+  watch.wake = () => {
+    if (!live() || watch.probing || (!closed() && !watch.timer)) return;
+    clearTimeout(watch.timer);
+    watch.timer = null;
+    schedule(sessionProbedAt + SESSION_PROBE_MIN_MS - Date.now());
   };
   return {
     // Every stream error lands here; it asks at most once per wait.
     errored: () => schedule(sessionProbedAt + watch.wait - Date.now()),
-    opened: () => { watch.reopens = 0; watch.wait = SESSION_PROBE_MIN_MS; },
+    opened: () => { watch.wait = SESSION_PROBE_MIN_MS; },
     signedOut: () => { if (live()) { stopSessionWatch(); goToSignIn(); } },
   };
 }
@@ -6973,6 +6992,7 @@ async function chatRenderOpen(
       conversation.close_requested_at = null;
       paint();
       refresh();
+      wakeSessionWatch();   // a closed event stream is retried now, not at its next slot
     } catch (error) {
       pending.hidden = false;
       pending.textContent = `${error.code} — retry keeps this exact send`;
@@ -9063,6 +9083,10 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) sprintStopPolling();
   else if (activeTab === "sprints") load("sprints");
 });
+// A tab coming back, or the network returning, is a good moment to retry a
+// closed event stream: both bring the stream watch's next attempt forward.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) wakeSessionWatch(); });
+window.addEventListener("online", () => wakeSessionWatch());
 // Close any open popover menu on an outside click (one handler for all .gmenu).
 document.addEventListener("mousedown", (e) => {
   for (const m of document.querySelectorAll(".gmenu:not([hidden])"))
