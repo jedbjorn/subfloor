@@ -61,6 +61,7 @@ MANAGED_KEYS = frozenset({
     "browser",
     "browser_port",
     "browser_proxy_port",
+    "engine_ops_port",
 })
 PORT_KEYS = frozenset({"repo", "port", "dev_port"})
 
@@ -121,7 +122,8 @@ def _sibling_ports() -> set[int]:
             sibling = json.loads(candidate.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        for key in ("port", "dev_port", "browser_port", "browser_proxy_port"):
+        for key in ("port", "dev_port", "browser_port", "browser_proxy_port",
+                    "engine_ops_port"):
             value = sibling.get(key)
             if isinstance(value, int):
                 occupied.add(value)
@@ -185,7 +187,8 @@ def resolve(persist: bool = False) -> dict:
     cfg = None
     occupied = _sibling_ports()
     loaded = _load_config()
-    occupied.update(loaded[key] for key in ("browser_port", "browser_proxy_port")
+    occupied.update(loaded[key] for key in ("browser_port", "browser_proxy_port",
+                                            "engine_ops_port")
                     if type(loaded.get(key)) is int)
     if "port" in loaded:
         cfg = _runtime_view(loaded)
@@ -219,6 +222,8 @@ def ensure_browser_ports() -> dict:
     """Allocate the opt-in server and gate without moving existing assignments."""
     cfg = resolve()
     occupied = _sibling_ports() | {cfg['port'], cfg['dev_port']}
+    if type(cfg.get('engine_ops_port')) is int:
+        occupied.add(cfg['engine_ops_port'])
     changes = {}
     for key, suffix in (('browser_port', ':browser'), ('browser_proxy_port', ':browser-proxy')):
         value = cfg.get(key)
@@ -228,6 +233,38 @@ def ensure_browser_ports() -> dict:
         changes[key] = value
     update(changes)
     return {**cfg, **changes}
+
+
+def stored_engine_ops_port() -> int | None:
+    """The engine-ops service port this install has allocated, if any.
+
+    A pure read: it never derives. The review API and its CSP name the port
+    only once `ensure_engine_ops_port` has persisted one, so they can never
+    point the browser at a port the service does not hold.
+    """
+    value = _load_config().get("engine_ops_port")
+    return value if type(value) is int else None
+
+
+def ensure_engine_ops_port() -> int:
+    """Allocate the engine-ops service's host loopback port once, and keep it.
+
+    Derived like the review port (repo path hash, 8800 band, bumped past
+    occupied ports) from its own seed. An existing assignment is never moved
+    while it stays clear of this fork's other ports: the service is commonly
+    listening on it when this runs.
+    """
+    cfg = resolve()
+    occupied = _sibling_ports() | {cfg["port"], cfg["dev_port"]}
+    occupied.update(cfg[key] for key in ("browser_port", "browser_proxy_port")
+                    if type(cfg.get(key)) is int)
+    value = cfg.get("engine_ops_port")
+    if (type(value) is int and PORT_BASE <= value < PORT_BASE + SPAN
+            and value not in occupied):
+        return value
+    value = _resolve_offset(_offset(str(REPO_ROOT) + ":engine-ops"), occupied)
+    update({"engine_ops_port": value})
+    return value
 
 
 def main(argv: list[str]) -> int:
@@ -240,12 +277,14 @@ def main(argv: list[str]) -> int:
         print(resolve(persist=False)["port"])
     elif mode == "devport":       # bare dev-server port, for shell/sc use
         print(resolve(persist=False)["dev_port"])
+    elif mode == "engine-ops-port":   # allocate-once host port of the ops service
+        print(ensure_engine_ops_port())
     elif mode == "name":          # pm2 process name — unique per fork
         print("sc-" + resolve(persist=False).get("repo", "fork"))
     else:
         sys.exit(
             "usage: ports.py "
-            "[show|ensure|port|devport|name]"
+            "[show|ensure|port|devport|engine-ops-port|name]"
         )
     return 0
 
