@@ -77,9 +77,39 @@ decision, so a `./sc auth user reset` reaches a running service at once.
 
 It holds no username and no secret. A hash lets a reader recognise a token and
 gives it nothing to sign in with: presenting a hash matches nothing, because
-what is compared is the hash of what was presented. The file is replaced
-atomically, **before** the store on every change, so a revoked session stops
-being recognised even if the second write fails.
+what is compared is the hash of what was presented.
+
+### Two files, one rule
+
+**A session exists only while its hash is in both files.** The review server
+reads the published list; the service reads the store and, on every read,
+drops any session the published list does not carry. A change is two or three
+atomic writes, always in this order:
+
+1. sessions being removed leave the published list;
+2. the store is saved;
+3. sessions being added enter the published list.
+
+Stopped anywhere, by a failed write or a crash, it fails closed:
+
+| Stopped | Removed session | New session |
+|---|---|---|
+| before write 1 lands | nothing changed; the command or request reports the failure | nothing changed |
+| after 1, before 2 | gone for both servers (the list no longer carries it) | not saved |
+| after 2, before 3 | gone for both | in the store only: accepted by neither, and never handed out |
+
+Each write is flushed to disk, file and directory entry, before the next
+begins, so the table holds across a power loss as well as a crash.
+
+A service start settles the two files by the same rule and so cannot bring a
+session back: a hash missing from the list is dropped from the store, never
+put back into the list. The consequence to know about: if `sessions.json` is
+deleted or damaged, every session ends and each browser signs in again. Users,
+passwords and authenticators are not affected.
+
+This covers a single revoke, sign-out, `./sc auth sessions revoke`, and
+`./sc auth user reset`. A reset interrupted after write 1 has already ended
+every session and has not yet cleared the password; run it again.
 
 ### The launcher's mount
 
@@ -92,11 +122,21 @@ The launch guard (`sandbox_devkit.guard_engine_ops_state`) holds both
 directories to their rules on the final argument list:
 
 - no mount may overlap the private directory, in either direction;
-- the `auth-sessions` directory may be reached by exactly one mount: the
-  directory itself, read-only, at that target. A writable mount of it, a mount
-  of a parent (the state home, the whole home), of a file in it, or at another
-  target stops the launch. A sandbox that could write the list could sign
-  itself in to the review API;
+- the `auth-sessions` directory may be reached by exactly one argument: the
+  launcher's own, character for character, once. Any other mount that reaches
+  it stops the launch: a writable one, a parent (the state home, the whole
+  home), a file in it, another target, a second copy, and also another
+  spelling that Docker would read as the same read-only mount (`-v …:ro`,
+  `source=`/`target=`, a different field order). Nothing rests on reading a
+  mount value the way Docker does. A sandbox that could write the list could
+  sign itself in to the review API;
+- a mount value says each thing once. Docker reads `--mount` fields in order,
+  lets a later field override an earlier one, and takes several names for one
+  field (`source`/`src`; `target`/`dst`/`destination`; `readonly`/`ro`). A
+  value that repeats a field, gives two names for one, or names its type
+  twice is refused, wherever it points, and a bind may carry only the fields
+  the launcher writes (type, source, target, read-only). `-v` is `SRC:DST`
+  with at most one of `ro` or `rw`;
 - the two directories may not resolve into each other.
 
 ### The verifier's call

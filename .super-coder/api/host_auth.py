@@ -17,9 +17,14 @@ is its core and the `./sc auth` verbs. It owns three things:
   `run/`.
 * **The published session-hash list** (`auth_sessions.py`): the hashes, the
   cookie name, and whether a user exists, in a directory of its own that is
-  mounted read-only into the docker sandbox. Written here, atomically, before
-  the store on every change, so a revocation reaches the review server even if
-  the second write fails.
+  mounted read-only into the docker sandbox. Written here, atomically.
+* **The rule that joins the two files.** A session exists only while its hash
+  is in BOTH the store and the published list. Every read of the store drops
+  a session the list does not carry. A change is two or three atomic writes
+  in a fixed order (`_commit`): removals leave the list first, then the store
+  is saved, then additions enter the list. Stopped anywhere, by a failed
+  write or a crash, a removed session is already gone for both servers and
+  stays gone after a restart, and a new one is not yet accepted by either.
 * **The checks**: scrypt (`hashlib.scrypt`) and RFC 6238 TOTP (SHA-1, 30 s,
   six digits, one step either side, a step accepted once), both evaluated
   before answering, one generic failure, the same work for an unknown user as
@@ -326,8 +331,23 @@ def load() -> dict:
     if not isinstance(record.get("rate"), dict):
         record["rate"] = _empty_store()["rate"]
     record["users"] = [user for user in record["users"] if isinstance(user, dict)]
-    record["sessions"] = [s for s in record["sessions"] if isinstance(s, dict)]
+    # A session exists only while the published list carries its hash too.
+    # One that the list lacks is a revocation whose second write did not
+    # land, or a sign-in whose last write did not: gone, either way, for
+    # every reader of the store, and dropped from the file at the next save.
+    published = published_hashes()
+    record["sessions"] = [
+        s for s in record["sessions"]
+        if isinstance(s, dict) and s.get("token_sha256") in published]
     return record
+
+
+def published_hashes() -> frozenset[str]:
+    """The hashes in the published list as it is on disk now; none when the
+    file is absent or is not the authority's format. A link is not followed."""
+    record = engine_ops.read_private(public_dir() / auth_sessions.FILE_NAME)
+    return frozenset(
+        entry["hash"] for entry in auth_sessions._normalise(record)["sessions"])
 
 
 def cookie_name() -> str:
@@ -366,11 +386,12 @@ def public_dir() -> Path:
     return path
 
 
-def publish(store: dict) -> None:
+def publish(store: dict, only=None) -> None:
     """Write the session-hash list the review server verifies against.
 
     Hashes, the cookie name, and whether a user exists. No username, no
-    secret. Replaced atomically.
+    secret. Replaced atomically. With `only`, just the sessions of `store`
+    whose hash is in that set.
     """
     directory = public_dir()
     record = {
@@ -380,24 +401,49 @@ def publish(store: dict) -> None:
         "sessions": [{"hash": session["token_sha256"],
                       "user_id": session.get("user_id")}
                      for session in store["sessions"]
-                     if isinstance(session.get("token_sha256"), str)],
+                     if isinstance(session.get("token_sha256"), str)
+                     and (only is None or session["token_sha256"] in only)],
         "updated_at": _stamp(_clock()),
     }
     engine_ops.write_private(directory / auth_sessions.FILE_NAME, record)
 
 
 def _commit(store: dict) -> None:
-    """Publish, then save. In that order a removed session stops being
-    recognised by the review server even if the save then fails, and a new
-    one whose save fails was never handed to anybody."""
-    publish(store)
-    engine_ops.write_private(store_path(), store)
+    """Make `store` the state of both files, so that stopping at any point
+    fails closed.
+
+    A session exists only while its hash is in both files (`load`). So:
+
+    1. Sessions that `store` no longer has leave the published list. From
+       this write on they are gone for the review server and for this
+       authority, whatever happens next. If this write fails nothing has
+       changed and the caller is told.
+    2. The store is saved. A session it adds is still in no list, so it is
+       accepted nowhere yet.
+    3. The published list gains the additions. Only after this does the
+       caller hand a new token to anybody.
+
+    A failure or a crash between two of these leaves the removals done and
+    the additions not done. A restart reads the same two files by the same
+    rule, so it cannot bring a removed session back.
+    """
+    wanted = {session.get("token_sha256") for session in store["sessions"]}
+    published = published_hashes()
+    if published - wanted:
+        publish(store, only=published)                       # 1
+    engine_ops.write_private(store_path(), store)            # 2
+    publish(store)                                           # 3
 
 
 def republish() -> None:
-    """Bring the published list back in step with the store (service start)."""
+    """Settle the two files on what both of them hold (service start).
+
+    Never restores anything: the store is read by the both-files rule, so a
+    session missing from the published list is dropped from the store here,
+    not put back into the list.
+    """
     with _locked():
-        publish(load())
+        _commit(load())
 
 
 # ── users and sessions inside a loaded store ─────────────────────────────────
@@ -1092,6 +1138,14 @@ def main(argv: list[str]) -> int:
         return 1
     except engine_ops.StateError as exc:
         print(f"✗ auth: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        # A write did not land. What was written before it stands, and in
+        # the order that fails closed: a session being removed is already
+        # signed out everywhere; anything being added is not in effect.
+        print(f"✗ auth: a write failed and the command did not finish: {exc}. "
+              "Any session it was removing is already signed out; nothing it "
+              "was adding is in effect. Run it again.", file=sys.stderr)
         return 1
 
 

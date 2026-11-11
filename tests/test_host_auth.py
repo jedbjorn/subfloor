@@ -176,6 +176,52 @@ class AuthFixture(base.ServiceFixture):
         return {str(path): path.read_bytes()
                 for path in self.base.rglob("*") if path.is_file()}
 
+    def restart_as_a_new_process(self) -> int:
+        """End this process's service and start the real service in a NEW
+        process over the same private and published directories. Returns its
+        port. That process runs on the real clock."""
+        self.service.shutdown()
+        self.service.server_close()
+        launcher = self.base / "launcher"
+        launcher.mkdir()
+        script = launcher / "engine_ops_service.py"
+        script.write_text(base.SERVICE_LAUNCHER)
+        proc = subprocess.Popen(
+            [sys.executable, str(script), str(ENGINE), str(self.root),
+             str(self.private), "session", json.dumps(["noop"])],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(base.reap, proc)
+        port_file = self.root / "service.port"
+        self.assertTrue(base.wait_for(port_file.exists, timeout=30))
+        return int(port_file.read_text())
+
+    def accepted_by(self, cookie: str) -> tuple[bool, bool]:
+        """Whether the host authority, and the review server's check, accept
+        a session cookie right now."""
+        host = self.get("/status", cookie=cookie)[0] == 200
+        review = auth_sessions.session_from_cookie_header(cookie) is not None
+        return host, review
+
+    @contextlib.contextmanager
+    def write_fails(self, index: int):
+        """Make the `index`-th atomic write from now fail, as a full disk or a
+        crash at that point would leave things. Yields a list that holds the
+        paths written before it, and whether the failure was reached."""
+        real = engine_ops.write_private
+        seen: list[str] = []
+        state = {"hit": False}
+
+        def write(path, record):
+            if len(seen) == index and not state["hit"]:
+                state["hit"] = True
+                raise OSError(28, "No space left on device (injected)")
+            seen.append(Path(path).name)
+            return real(path, record)
+
+        with mock.patch.object(engine_ops, "write_private", side_effect=write):
+            yield seen, state
+
     def assert_nowhere_on_disk(self, secret: str, allow: tuple[str, ...] = ()) -> None:
         for name, data in self.every_file().items():
             if name.endswith(allow) and allow:
@@ -767,22 +813,7 @@ class RateLimitTest(AuthFixture):
         self.assertTrue(60 < remaining <= host_auth.RATE_MAX_SECONDS, remaining)
 
         # This process's service goes away entirely.
-        self.service.shutdown()
-        self.service.server_close()
-
-        launcher = self.base / "launcher"
-        launcher.mkdir()
-        script = launcher / "engine_ops_service.py"
-        script.write_text(base.SERVICE_LAUNCHER)
-        proc = subprocess.Popen(
-            [sys.executable, str(script), str(ENGINE), str(self.root),
-             str(self.private), "session", json.dumps(["noop"])],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True)
-        self.addCleanup(base.reap, proc)
-        port_file = self.root / "service.port"
-        self.assertTrue(base.wait_for(port_file.exists, timeout=30))
-        port = int(port_file.read_text())
+        port = self.restart_as_a_new_process()
 
         def attempt():
             # That process runs on the real clock.
@@ -1230,6 +1261,432 @@ class EngineOpsNeedASessionTest(AuthFixture):
         self.assertEqual(self.sign_in(self.secret)[0], 200)
 
 
+# ── two files, one rule: stopped anywhere, it fails closed ───────────────────
+
+class InterruptedCommitTest(AuthFixture):
+    """A change is two or three atomic writes. A session exists only while
+    its hash is in both the store and the published list, so a write that
+    fails (or a crash) between them leaves a removed session removed for both
+    servers, after a restart too, and a new session accepted by neither."""
+
+    def fresh(self):
+        """An active user with two sessions. Returns (victim, keeper, secret)."""
+        host_auth.unlock()
+        if self.store_users():
+            _user, claim = host_auth.reset_user("Operator")
+        else:
+            claim = self.add_user()
+        _status, _headers, begun = self.begin("Operator", claim)
+        status, headers, out = self.post("/auth/first/confirm", {
+            "enrolment": begun["enrolment"], "password": PASSWORD,
+            "code": self.code(begun["secret"]), "device": "victim"})
+        self.assertEqual(status, 200, out)
+        victim = headers["Set-Cookie"].split(";")[0]
+        self.tick()
+        status, headers, out = self.sign_in(begun["secret"], device="keeper")
+        self.assertEqual(status, 200, out)
+        self.tick()
+        return victim, headers["Set-Cookie"].split(";")[0], begun["secret"]
+
+    def store_users(self) -> list:
+        path = self.private / host_auth.STORE_NAME
+        return json.loads(path.read_text())["users"] if path.exists() else []
+
+    def session_id(self, device: str) -> str:
+        return next(s["id"] for s in host_auth.all_sessions() if s["device"] == device)
+
+    def operations(self):
+        """name -> (run, cookies it must end). `run` returns True on success."""
+        def http(path, body, cookie):
+            return lambda: self.post(path, body(), cookie=cookie())[0] == 200
+
+        def cli(*argv):
+            return lambda: self.cli(*(a() if callable(a) else a for a in argv))[0] == 0
+
+        victim_id = lambda: self.session_id("victim")       # noqa: E731
+        return {
+            "revoke from another device": (
+                http("/auth/sessions/revoke", lambda: {"id": victim_id()},
+                     lambda: self.keeper), ("victim",)),
+            "sign-out": (
+                http("/auth/sign-out", dict, lambda: self.victim), ("victim",)),
+            "./sc auth sessions revoke <id>": (
+                cli("sessions", "revoke", victim_id), ("victim",)),
+            "./sc auth sessions revoke --all": (
+                cli("sessions", "revoke", "--all"), ("victim", "keeper")),
+            "./sc auth user reset": (
+                cli("user", "reset", "Operator"), ("victim", "keeper")),
+        }
+
+    def test_an_interrupted_revocation_stays_revoked(self):
+        for name, (run, ended) in self.operations().items():
+            interrupted_after_a_write = 0
+            for index in range(8):
+                self.victim, self.keeper, _secret = self.fresh()
+                cookies = {"victim": self.victim, "keeper": self.keeper}
+                for cookie in cookies.values():
+                    self.assertEqual(self.accepted_by(cookie), (True, True))
+                with self.write_fails(index) as (seen, state):
+                    succeeded = run()
+                label = f"{name}, write {index} fails after {seen}"
+                if not state["hit"]:
+                    # Every write point has been tried; this run was whole.
+                    self.assertTrue(succeeded, label)
+                    for who in ended:
+                        self.assertEqual(self.accepted_by(cookies[who]),
+                                         (False, False), label)
+                    break
+                # It did not finish, and said so.
+                self.assertFalse(succeeded, label)
+                # If nothing was written, nothing changed. Otherwise the
+                # sessions it was ending are ended, for BOTH servers.
+                expected = (False, False) if seen else (True, True)
+                for who in ended:
+                    self.assertEqual(self.accepted_by(cookies[who]), expected, label)
+                # A restart reads the same two files by the same rule. It does
+                # not bring a session back.
+                host_auth.republish()
+                for who in ended:
+                    self.assertEqual(self.accepted_by(cookies[who]), expected,
+                                     label + ", after a restart")
+                if seen:
+                    interrupted_after_a_write += 1
+                    digests = {auth_sessions.token_hash(cookies[who].split("=")[1])
+                               for who in ended}
+                    self.assertFalse(digests & {
+                        s["hash"] for s in self.published()["sessions"]}, label)
+                    self.assertFalse(digests & {
+                        s["token_sha256"] for s in self.store()["sessions"]}, label)
+                # A session it was not ending is untouched throughout.
+                for who in set(cookies) - set(ended):
+                    self.assertEqual(self.accepted_by(cookies[who]), (True, True), label)
+                # And the operation, run again, completes (unless it names a
+                # session by id, and that session is already gone).
+                by_id = name in ("revoke from another device",
+                                 "./sc auth sessions revoke <id>")
+                if not (seen and by_id):
+                    self.assertTrue(run(), label + ", run again")
+                    for who in ended:
+                        self.assertEqual(self.accepted_by(cookies[who]),
+                                         (False, False), label + ", run again")
+            else:
+                self.fail(f"{name} never completed")
+            # The interesting case was really exercised: a failure after the
+            # list changed and before the store did, and after both.
+            self.assertGreaterEqual(interrupted_after_a_write, 2, name)
+
+    def test_each_write_is_on_disk_before_the_next_begins(self):
+        """The order only fails closed across a power loss if the first write
+        is durable before the second starts: the file's data, the rename, and
+        then the directory entry, for each of the three writes of a revoke."""
+        victim, keeper, _secret = self.fresh()
+        victim_id = self.session_id("victim")
+        events: list[tuple] = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(fd):
+            kind = "directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+            events.append(("fsync", kind))
+            return real_fsync(fd)
+
+        def replace(source, target, **kwargs):
+            events.append(("rename", Path(target).name))
+            return real_replace(source, target, **kwargs)
+
+        with mock.patch.object(os, "fsync", side_effect=fsync), \
+                mock.patch.object(os, "replace", side_effect=replace):
+            status, _headers, out = self.post(
+                "/auth/sessions/revoke", {"id": victim_id}, cookie=keeper)
+        self.assertEqual(status, 200, out)
+        one = lambda name: [("fsync", "file"), ("rename", name),       # noqa: E731
+                            ("fsync", "directory")]
+        self.assertEqual(
+            events, one("sessions.json") + one("auth.json") + one("sessions.json"))
+
+    def test_the_cli_says_what_an_interrupted_command_left(self):
+        self.victim, self.keeper, _secret = self.fresh()
+        with self.write_fails(1):
+            code, out, err = self.cli("user", "reset", "Operator")
+        self.assertEqual(code, 1)
+        self.assertIn("a write failed", err)
+        self.assertIn("already signed out", err)
+        self.assertNotIn("claim code", out)
+        self.assertEqual(self.accepted_by(self.victim), (False, False))
+
+    def test_a_new_session_is_accepted_nowhere_until_both_writes_land(self):
+        _first, secret = self.enrol()
+        hits = 0
+        for index in range(6):
+            host_auth.unlock()
+            self.tick()
+            with self.write_fails(index) as (seen, state):
+                status, headers, out = self.sign_in(secret, device="new")
+            label = f"sign-in, write {index} fails after {seen}"
+            if not state["hit"]:
+                self.assertEqual(status, 200, label)
+                self.assertEqual(self.accepted_by(headers["Set-Cookie"].split(";")[0]),
+                                 (True, True))
+                break
+            hits += 1
+            self.assertEqual(status, 500, label)
+            # No token was handed out, and no session exists for either
+            # server: not now, and not after a restart.
+            self.assertNotIn("Set-Cookie", headers)
+            self.assertNotIn("session", out)
+            for moment in ("now", "after a restart"):
+                self.assertEqual(len(self.published()["sessions"]), 1, label + moment)
+                self.assertEqual([s["device"] for s in host_auth.all_sessions()],
+                                 ["first browser"], label + moment)
+                host_auth.republish()
+            self.assertEqual(len(self.store()["sessions"]), 1, label)
+        else:
+            self.fail("sign-in never completed")
+        self.assertEqual(hits, 2)          # the store, then the list
+
+    def test_an_interrupted_first_sign_in_issues_nothing(self):
+        claim = self.add_user()
+        _status, _headers, begun = self.begin("Operator", claim)
+        confirm = {"enrolment": begun["enrolment"], "password": PASSWORD,
+                   "code": self.code(begun["secret"])}
+        # The store write fails: nothing was saved, and it can be tried again.
+        with self.write_fails(0):
+            status, headers, out = self.post("/auth/first/confirm", confirm)
+        self.assertEqual(status, 500, out)
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertEqual(self.store()["users"][0]["state"], "awaiting")
+        self.assertIsNone(self.store()["users"][0]["password"])
+        # The list write fails: the password and authenticator are saved, but
+        # no session exists and no token was handed out. The operator signs
+        # in with the next code.
+        with self.write_fails(1):
+            status, headers, out = self.post("/auth/first/confirm", confirm)
+        self.assertEqual(status, 500, out)
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertEqual(self.published()["sessions"], [])
+        self.assertEqual(host_auth.all_sessions(), [])
+        host_auth.republish()
+        self.assertEqual(self.store()["sessions"], [])
+        self.assertEqual(self.store()["users"][0]["state"], "active")
+        self.tick()
+        self.assertEqual(self.sign_in(begun["secret"])[0], 200)
+
+    def test_a_restart_never_restores_a_session_the_list_lacks(self):
+        """The reviewer's probe, directly: the list lost a hash, the store
+        still has it. Neither accepts it, and starting the service again does
+        not publish it back."""
+        victim, keeper, _secret = self.fresh()
+        digest = auth_sessions.token_hash(victim.split("=")[1])
+        published = self.published()
+        published["sessions"] = [s for s in published["sessions"]
+                                 if s["hash"] != digest]
+        engine_ops.write_private(self.public / "sessions.json", published)
+        self.assertIn(digest, [s["token_sha256"] for s in self.store()["sessions"]])
+        self.assertEqual(self.accepted_by(victim), (False, False))
+        self.assertEqual(self.get("/auth/status", cookie=victim)[2]["signed_in"], False)
+        self.assertEqual(self.post("/auth/sessions/revoke", {"id": "x"},
+                                   cookie=victim)[0], 401)
+        host_auth.republish()                       # what service start does
+        self.assertEqual(self.accepted_by(victim), (False, False))
+        self.assertNotIn(digest, [s["hash"] for s in self.published()["sessions"]])
+        self.assertNotIn(digest, [s["token_sha256"] for s in self.store()["sessions"]])
+        self.assertEqual(self.accepted_by(keeper), (True, True))
+        # With no list at all, nobody is signed in to either server.
+        (self.public / "sessions.json").unlink()
+        self.assertEqual(self.accepted_by(keeper), (False, False))
+        host_auth.republish()
+        self.assertEqual(self.accepted_by(keeper), (False, False))
+        self.assertEqual(self.store()["users"][0]["state"], "active")
+
+
+class RestartAndRaceTest(AuthFixture):
+    """What must hold across a service restart and under simultaneous requests."""
+
+    def test_a_spent_step_stays_spent_across_a_service_restart(self):
+        # Enrol a little in the past, then sign in on the real clock, which
+        # is the one the new process runs on.
+        self.now = time.time() - 90
+        _cookie, secret = self.enrol()
+        self.now = time.time()
+        used = self.code(secret)
+        self.assertEqual(self.sign_in(secret, code=used)[0], 200)
+        step = host_auth.totp_step(self.now)
+        self.assertEqual(self.store()["users"][0]["totp_last_step"], step)
+
+        port = self.restart_as_a_new_process()
+
+        def attempt(code):
+            return base.http_call(
+                port, "POST", "/auth/sign-in", origin=GUI,
+                body={"username": "Operator", "password": PASSWORD, "code": code})
+
+        # The code that signed in before the restart is still inside its
+        # window, and is still refused: the step is remembered on disk.
+        self.assertLess(time.time() - self.now, 25)
+        status, headers, out = attempt(used)
+        self.assertEqual(status, 401, out)
+        self.assertEqual(out["error"]["code"], "invalid_credentials")
+        self.assertNotIn("Set-Cookie", headers)
+        # So is the step before it.
+        self.assertEqual(attempt(host_auth.totp_at(secret, (step - 1) * 30))[0], 401)
+        # It was the replay and nothing else: the next step's code signs in.
+        status, headers, out = attempt(host_auth.totp_at(secret, (step + 1) * 30))
+        self.assertEqual(status, 200, out)
+        self.assertIn("HttpOnly", headers["Set-Cookie"])
+        self.assertEqual(self.store()["users"][0]["totp_last_step"], step + 1)
+
+    def simultaneously(self, count: int, request):
+        barrier = threading.Barrier(count)
+        results: list = [None] * count
+
+        def run(slot: int) -> None:
+            barrier.wait(30)
+            results[slot] = request(slot)
+
+        threads = [threading.Thread(target=run, args=(slot,)) for slot in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(120)
+        self.assertNotIn(None, results)
+        return results
+
+    def test_simultaneous_attempts_cannot_exceed_the_rate_limit(self):
+        _cookie, secret = self.enrol()
+        code = self.code(secret)
+        allowed = host_auth.RATE_FREE + 1        # the free ones, and the one
+        count = 16                               # that starts the wait
+        with mock.patch.object(host_auth, "_scrypt", wraps=host_auth._scrypt) as scrypt, \
+                mock.patch.object(host_auth, "totp_accept",
+                                  wraps=host_auth.totp_accept) as totp:
+            results = self.simultaneously(count, lambda _slot: self.sign_in(
+                secret, password="wrong", code=code))
+        statuses = sorted(status for status, _headers, _out in results)
+        self.assertEqual(statuses, [401] * allowed + [429] * (count - allowed))
+        # Only that many were ever evaluated, however they arrived.
+        self.assertEqual((scrypt.call_count, totp.call_count), (allowed, allowed))
+        self.assertEqual(self.store()["rate"]["failures"], allowed)
+        self.assertEqual(self.store()["rate"]["blocked_until"], self.now + 1)
+        self.assertEqual(len(self.store()["sessions"]), 1)
+
+        # The same with a claim code being guessed.
+        host_auth.unlock()
+        claim = self.add_user("Second")
+        results = self.simultaneously(count, lambda slot: self.begin(
+            "Second", f"AAAA-BBB{slot % 8 + 2}"))
+        statuses = sorted(status for status, _headers, _out in results)
+        self.assertEqual(statuses, [401] * allowed + [429] * (count - allowed))
+        host_auth.unlock()
+        self.assertEqual(self.begin("Second", claim)[0], 200)
+
+    def test_one_code_signs_in_once_however_many_present_it_together(self):
+        _cookie, secret = self.enrol()
+        code = self.code(secret)
+        results = self.simultaneously(8, lambda _slot: self.sign_in(secret, code=code))
+        statuses = sorted(status for status, _headers, _out in results)
+        self.assertEqual(statuses.count(200), 1, statuses)
+        self.assertTrue(set(statuses) <= {200, 401, 429}, statuses)
+        self.assertEqual(
+            sum(1 for _status, headers, _out in results if "Set-Cookie" in headers), 1)
+        self.assertEqual(len(self.store()["sessions"]), 2)
+        self.assertEqual(len(self.published()["sessions"]), 2)
+
+    def test_two_simultaneous_confirms_complete_once(self):
+        claim = self.add_user()
+        _status, _headers, begun = self.begin("Operator", claim)
+        passwords = [PASSWORD, "another password entirely"]
+        results = self.simultaneously(2, lambda slot: self.post("/auth/first/confirm", {
+            "enrolment": begun["enrolment"], "password": passwords[slot],
+            "code": self.code(begun["secret"]), "device": f"browser {slot}"}))
+        statuses = sorted(status for status, _headers, _out in results)
+        self.assertEqual(statuses, [200, 409])
+        winner = next(slot for slot, result in enumerate(results) if result[0] == 200)
+        loser = results[1 - winner]
+        self.assertEqual(loser[2]["error"]["code"], "enrolment_expired")
+        self.assertNotIn("Set-Cookie", loser[1])
+        # One user, one session, and the winner's password.
+        store = self.store()
+        self.assertEqual([u["state"] for u in store["users"]], ["active"])
+        self.assertEqual([s["device"] for s in store["sessions"]], [f"browser {winner}"])
+        self.assertEqual(len(self.published()["sessions"]), 1)
+        cookie = results[winner][1]["Set-Cookie"].split(";")[0]
+        self.assertEqual(self.accepted_by(cookie), (True, True))
+        self.tick()
+        self.assertEqual(
+            self.sign_in(begun["secret"], password=passwords[1 - winner])[0], 401)
+        self.assertEqual(
+            self.sign_in(begun["secret"], password=passwords[winner])[0], 200)
+
+    def test_confirm_and_reset_at_once_never_leave_a_claimed_user_or_a_session(self):
+        """Both orders, each forced: one is held inside the lock while the
+        other arrives, and the other must wait for it."""
+        real = host_auth.hash_secret
+        for leader in ("confirm", "reset"):
+            host_auth.unlock()
+            if self.store()["users"]:
+                _user, claim = host_auth.reset_user("Operator")
+            else:
+                claim = self.add_user()
+            _status, _headers, begun = self.begin("Operator", claim)
+            inside, release = threading.Event(), threading.Event()
+            outcome: dict = {}
+
+            def slow(secret):
+                inside.set()
+                release.wait(30)
+                return real(secret)
+
+            def confirm():
+                outcome["confirm"] = self.post("/auth/first/confirm", {
+                    "enrolment": begun["enrolment"], "password": PASSWORD,
+                    "code": self.code(begun["secret"])})
+
+            def reset():
+                outcome["reset"] = host_auth.reset_user("Operator")
+
+            jobs = {"confirm": confirm, "reset": reset}
+            follower = "reset" if leader == "confirm" else "confirm"
+            with mock.patch.object(host_auth, "hash_secret", side_effect=slow):
+                first = threading.Thread(target=jobs[leader])
+                first.start()
+                self.assertTrue(inside.wait(30), leader)
+                second = threading.Thread(target=jobs[follower])
+                second.start()
+                time.sleep(0.4)
+                # The second is waiting for the first: nothing interleaves.
+                self.assertTrue(second.is_alive(), leader)
+                self.assertNotIn(follower, outcome)
+                release.set()
+                first.join(60)
+                second.join(60)
+            self.assertEqual(set(outcome), {"confirm", "reset"}, leader)
+            status, headers, out = outcome["confirm"]
+            _user, new_claim = outcome["reset"]
+            if leader == "confirm":
+                # It completed, and the reset that followed undid all of it.
+                self.assertEqual(status, 200, out)
+                cookie = headers["Set-Cookie"].split(";")[0]
+                self.assertEqual(self.accepted_by(cookie), (False, False))
+            else:
+                # The reset ended the enrolment before it could complete.
+                self.assertEqual(status, 409, out)
+                self.assertEqual(out["error"]["code"], "enrolment_expired")
+                self.assertNotIn("Set-Cookie", headers)
+            # Either way: awaiting, nothing saved, no session anywhere, the
+            # old claim dead, and the reset's claim code the only way in.
+            user = self.store()["users"][0]
+            self.assertEqual((user["state"], user["password"], user["totp_secret"]),
+                             ("awaiting", None, None), leader)
+            self.assertEqual(self.store()["sessions"], [], leader)
+            self.assertEqual(self.published()["sessions"], [], leader)
+            self.assertEqual(self.begin("Operator", claim)[0], 401, leader)
+            host_auth.unlock()
+            self.tick()
+            self.assertEqual(self.sign_in(begun["secret"])[0], 401, leader)
+            host_auth.unlock()
+            self.assertEqual(
+                self.begin("Operator", host_auth.show_claim_code(new_claim))[0], 200)
+
+
 # ── the review server's side ─────────────────────────────────────────────────
 
 class VerifyTest(AuthFixture):
@@ -1375,8 +1832,9 @@ class SessionsMountGuardTest(unittest.TestCase):
             "--mount", f"type=bind,src={self.sessions},dst={self.target},readonly"])
         self.assertEqual(stat.S_IMODE(self.sessions.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(self.sessions.parent.stat().st_mode), 0o700)
+        self.assertEqual(
+            mount[1], sandbox_devkit.auth_sessions_mount_value(self.root, self.env))
         self.guard(*mount)
-        self.guard("-v", f"{self.sessions}:{self.target}:ro")
         self.assertEqual(
             sandbox_devkit.bind_mounts(["-d", *mount, "image"]),
             [(str(self.sessions), True, self.target)])
@@ -1404,8 +1862,91 @@ class SessionsMountGuardTest(unittest.TestCase):
             self.assertIn("overlaps", message, label)
         # The launcher's mount beside a second, writable one: still refused.
         self.refused(*mount, "-v", f"{self.sessions}:/rw")
-        # Read-only through a link to exactly that directory resolves to it.
-        self.guard("--mount", f"type=bind,src={link},dst={self.target},ro")
+
+    def test_only_the_launchers_exact_spelling_reaches_the_list(self):
+        """The directory is allowed as one argument, character for character.
+        Another spelling that Docker would read as the same read-only mount is
+        refused too: nothing rests on reading a mount the way Docker does."""
+        with mock.patch.dict(os.environ, self.env):
+            os.environ.pop("XDG_STATE_HOME", None)
+            mount = sandbox_devkit.auth_sessions_mount(self.root)
+        link = self.home / "harness"
+        link.symlink_to(self.sessions, target_is_directory=True)
+        s, t = self.sessions, self.target
+        equivalent = {
+            "the short form": ["-v", f"{s}:{t}:ro"],
+            "the other read-only word": ["--mount", f"type=bind,src={s},dst={t},ro"],
+            "the long field names":
+                ["--mount", f"type=bind,source={s},target={t},readonly"],
+            "another field order": ["--mount", f"type=bind,dst={t},src={s},readonly"],
+            "read-only by value": ["--mount", f"type=bind,src={s},dst={t},readonly=true"],
+            "through a link": ["--mount", f"type=bind,src={link},dst={t},readonly"],
+            "a trailing slash": ["--mount", f"type=bind,src={s}/,dst={t},readonly"],
+            "padding": ["--mount", f" type=bind,src={s},dst={t},readonly"],
+        }
+        for label, arguments in equivalent.items():
+            self.assertIn("overlaps", self.refused(*arguments), label)
+        # Twice is not once.
+        self.assertIn("overlaps", self.refused(*mount, *mount))
+        self.guard(*mount)
+
+    def test_a_mount_value_says_each_thing_once(self):
+        """Docker reads `--mount` fields in order, a later one overriding an
+        earlier one, and takes several names for one field. A value that uses
+        either is refused, so the guard and Docker cannot read it differently.
+        The first case is the one from the review of PR #1775: read with
+        "the first target, and read-only if any field says so", it looked like
+        the launcher's mount, while Docker mounts the list WRITABLE at
+        /tmp/writable-sessions."""
+        with mock.patch.dict(os.environ, self.env):
+            os.environ.pop("XDG_STATE_HOME", None)
+            mount = sandbox_devkit.auth_sessions_mount(self.root)
+        s, t = self.sessions, self.target
+        other = self.base / "elsewhere"
+        ambiguous = {
+            "two targets and read-only taken back": (
+                f"type=bind,src={s},target={t},dst=/tmp/writable-sessions,"
+                "readonly,readonly=false"),
+            "two targets": f"type=bind,src={s},target={t},dst=/tmp/writable-sessions,readonly",
+            "the same target key twice": f"type=bind,src={s},dst={t},dst=/tmp/w,readonly",
+            "three names for the target":
+                f"type=bind,src={s},dst={t},destination=/tmp/w,readonly",
+            "read-only taken back": f"type=bind,src={s},dst={t},readonly,readonly=false",
+            "read-only taken back, other word": f"type=bind,src={s},dst={t},readonly,ro=false",
+            "read-only said twice": f"type=bind,src={s},dst={t},readonly,readonly",
+            "two sources, the list last": f"type=bind,src={other},src={s},dst={t},readonly",
+            "two sources, the list first": f"type=bind,src={s},source={other},dst={t},readonly",
+            "type said twice": f"type=volume,src={s},dst={t},readonly,type=bind",
+            "type said twice, bind first": f"type=bind,src={s},dst={t},type=volume",
+            "a field a launcher bind never has":
+                f"type=bind,src={s},dst={t},readonly,bind-propagation=rshared",
+            "an unknown field": f"type=bind,src={s},dst={t},readonly,volume-opt=o=bind",
+        }
+        for label, value in ambiguous.items():
+            for arguments in (["--mount", value], [*mount, "--mount", value]):
+                message = self.refused(*arguments)
+                self.assertIn("cannot be checked", message, label)
+            with self.assertRaises(sandbox_devkit.SandboxImageError, msg=label):
+                sandbox_devkit.bind_mounts(["-d", "--mount", value, "image"])
+        # The same rule wherever the mount points: the guard never has to
+        # know what such a value would mean.
+        for value in (f"type=bind,src={other},dst=/a,dst=/b",
+                      f"type=bind,src={other},dst=/a,readonly,ro",
+                      f"type=bind,src={other},dst=/a,consistency=cached"):
+            self.assertIn("cannot be checked", self.refused("--mount", value), value)
+        # `-v`: SRC:DST and at most one of ro or rw, nothing more.
+        for value in (f"{s}:{t}:ro,rw", f"{s}:{t}:rw,ro", f"{s}:{t}:ro,ro",
+                      f"{s}:{t}:ro:rw", f"{s}:{t}:ro,z", f"{s}:{t}:",
+                      f"{other}:/a:ro,rw", f"{other}:/a:rw:ro", f"{other}:/a:Z",
+                      f"{other}:relative:ro"):
+            self.assertIn("cannot be checked", self.refused("-v", value), value)
+        # What the launcher writes is untouched.
+        for arguments in (["-v", f"{other}:{other}"], ["-v", f"{other}:/py:ro"],
+                          ["-v", f"{other}:/data:rw"],
+                          ["--mount", f"type=bind,src={other},dst=/run/agent,readonly"],
+                          ["--mount", "type=volume,src=sc-devkit-abc,dst=/opt/devkit"],
+                          ["--mount", 'type=volume,src=sc-devkit-def,dst="/opt/with,comma"']):
+            self.guard(*mount, *arguments)
 
     def test_a_list_directory_that_resolves_into_the_private_state_is_refused(self):
         self.state.mkdir(parents=True)
