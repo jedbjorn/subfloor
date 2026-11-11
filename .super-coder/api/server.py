@@ -61,9 +61,24 @@ NARRATIVE_INDEX_CAP = 10
 
 
 def _narrative_line_count(narrative: "str | None") -> int:
-    """The `[HH:MM]` lines of one archive — 1 is the bare session-start stub."""
+    """The `[HH:MM]` lines of one archive."""
     return sum(1 for line in (narrative or "").splitlines()
                if line.startswith("["))
+
+
+def _narrative_is_stub(narrative: "str | None") -> bool:
+    """Nothing recorded: the narrative is empty, or exactly what a session
+    opens with — the `# …` title, `## Narrative`, one `[HH:MM] Session start.`
+    line. ANY other text counts as recorded, timestamped or not: the POST
+    endpoint appends its `text` verbatim."""
+    lines = [ln.strip() for ln in (narrative or "").splitlines() if ln.strip()]
+    if lines and lines[0].startswith("# "):
+        lines.pop(0)
+    if lines and lines[0] == "## Narrative":
+        lines.pop(0)
+    return not lines or (
+        len(lines) == 1 and lines[0].startswith("[")
+        and lines[0].endswith("] Session start."))
 
 
 _LOG_LOCK = threading.Lock()
@@ -4677,29 +4692,49 @@ class Handler(BaseHTTPRequestHandler):
                     (sid,)).fetchone()
                 active_id = r[0] if r else None
 
-                def archives(where: str, params: tuple, limit: int = 1) -> list:
-                    return [{
+                def shaped(a) -> dict:
+                    return {
                         "archive_id": a[0], "session_id": a[1], "date": a[2],
                         "lines": _narrative_line_count(a[3]),
-                        "active": a[0] == active_id, "narrative": a[3],
-                    } for a in con.execute(
+                        "stub": _narrative_is_stub(a[3]),
+                        "active": a[0] == active_id, "narrative": a[3]}
+
+                def scan(where: str, params: tuple, limit: int = -1):
+                    # A lazy cursor, newest first: a caller that stops early
+                    # never loads the bodies it did not reach.
+                    return con.execute(
                         "SELECT archive_id, session_id, date, full_narrative "
                         "FROM shell_memory_archives "
                         f"WHERE shell_id=? AND {where} "
                         "ORDER BY archive_id DESC LIMIT ?",
-                        (sid, *params, limit))]
+                        (sid, *params, limit))
+
+                def archives(where: str, params: tuple, limit: int = 1) -> list:
+                    return [shaped(a) for a in scan(where, params, limit)]
 
                 def previous() -> list:
                     # The newest earlier session that recorded something: an
-                    # archive still holding only its session-start line has
-                    # no handoff to read, so it is skipped.
-                    return [a for a in archives(
-                        "(? IS NULL OR archive_id < ?)",
-                        (active_id, active_id), -1) if a["lines"] > 1][:1]
+                    # archive holding nothing past its session-start line has
+                    # no handoff to read, so it is skipped. Stops at the
+                    # first hit — only a run of stubs is ever read past.
+                    cur = scan("(? IS NULL OR archive_id < ?)",
+                               (active_id, active_id))
+                    try:
+                        for a in cur:
+                            if not _narrative_is_stub(a[3]):
+                                return [shaped(a)]
+                        return []
+                    finally:
+                        cur.close()
 
                 if len(parts) == 4:
-                    found = (archives("archive_id=?", (int(parts[3]),))
-                             if parts[3].isdigit() else [])
+                    # Digits only (so no sign), and inside SQLite's signed
+                    # 64-bit rowid range: anything else cannot name a row.
+                    raw = parts[3]
+                    wanted = int(raw) if raw.isascii() and raw.isdigit() \
+                        and len(raw) <= 19 else 0
+                    found = (archives("archive_id=?", (wanted,))
+                             if 1 <= wanted <= 2**63 - 1 else [])
                     if not found:
                         return self._send(404, {
                             "error": "no such archive among your sessions"})
@@ -4719,7 +4754,8 @@ class Handler(BaseHTTPRequestHandler):
                 found = archives("archive_id=?", (active_id,))
                 out = found[0] if found else {
                     "archive_id": None, "session_id": None, "date": None,
-                    "lines": 0, "active": False, "narrative": None}
+                    "lines": 0, "stub": True, "active": False,
+                    "narrative": None}
                 prev = previous()
                 out["previous"] = ({k: prev[0][k] for k in
                                     ("archive_id", "session_id", "date", "lines")}

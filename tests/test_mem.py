@@ -2234,6 +2234,75 @@ class ApiMemTest(unittest.TestCase):
         rc, out = self.run_out("get", "narrative", "--list", "--json")
         self.assertEqual(json.loads(out)["archives"][1]["archive_id"], ids[-2])
 
+    def test_get_narrative_prev_keeps_untimestamped_recorded_text(self):
+        ids = self._peer_archives()
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "UPDATE shell_memory_archives SET full_narrative=? WHERE archive_id=?",
+            ("# 0012 | 2026-02-12 | session opened\n\n## Narrative\n\n"
+             "[09:00] Session start.\nHandoff: deployment completed\n",
+             ids[-2]))
+        con.commit()
+        con.close()
+        # one timestamped line, but text was recorded after it → not a stub
+        rc, out = self.run_out("get", "narrative", "--prev", "--json")
+        data = json.loads(out)
+        self.assertEqual(data["archive_id"], ids[-2])
+        self.assertEqual((data["lines"], data["stub"]), (1, False))
+        self.assertIn("Handoff: deployment completed", data["narrative"])
+        rc, out = self.run_out("get", "narrative", "--json")
+        data = json.loads(out)
+        self.assertTrue(data["stub"])               # the active one IS a stub
+        self.assertEqual(data["previous"]["archive_id"], ids[-2])
+        # the same text appended to the active session ends the hint
+        urllib.request.urlopen(urllib.request.Request(
+            f"{mem.SC_API_BASE}/_sc/mem/narrative", method="POST",
+            data=json.dumps({"text": "untimestamped note"}).encode(),
+            headers={"Authorization": f"Bearer {PEER_TOKEN}",
+                     "Content-Type": "application/json"})).read()
+        rc, out = self.run_out("get", "narrative")
+        self.assertIn("untimestamped note", out)
+        self.assertNotIn("previous session", out)
+
+    def test_get_narrative_prev_stops_at_the_first_recorded_archive(self):
+        ids = self._peer_archives()
+        real = server._narrative_is_stub
+        seen = []
+
+        def counting(narrative):
+            seen.append(narrative)
+            return real(narrative)
+        with mock.patch.object(server, "_narrative_is_stub", counting):
+            rc, out = self.run_out("get", "narrative", "--prev", "--json")
+        self.assertEqual(json.loads(out)["archive_id"], ids[-2])
+        # the scan's own check plus the one shaping the row it returns —
+        # never the eleven older bodies
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all("session 12" in n for n in seen))
+
+    def test_get_narrative_out_of_range_ids_read_as_missing(self):
+        self._peer_archives(2)
+        for raw in ("0", "9223372036854775807", "9223372036854775808",
+                    "99999999999999999999999999"):
+            with self.subTest(archive_id=raw):
+                rc, out, err = self.fails("get", "narrative", raw, "--json")
+                self.assertEqual(rc, 1)
+                error = json.loads(out)["error"]
+                self.assertEqual(error["http_status"], 404)
+                self.assertIn("no such archive among your sessions",
+                              error["message"])
+        # the raw route too: a sign or a non-number is a 404, never a 500
+        for raw in ("-1", "-9223372036854775809", "abc", "1.5", "%31"):
+            with self.subTest(path=raw):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(urllib.request.Request(
+                        f"{mem.SC_API_BASE}/_sc/mem/narrative/{raw}",
+                        headers={"Authorization": f"Bearer {PEER_TOKEN}"}))
+                self.assertEqual(caught.exception.code, 404)
+        # argparse reads `-1` as a number, so it reaches the server the same way
+        self.assertIn("no such archive among your sessions",
+                      self.refusal("get", "narrative", "-1"))
+
     def test_get_narrative_refuses_another_shells_archive(self):
         ids = self._peer_archives()
         # archive 1 is shell 1's: to the peer it reads like a missing row
@@ -2268,7 +2337,7 @@ class ApiMemTest(unittest.TestCase):
                          ids[:2:-1])               # the 10 newest of 13
         self.assertEqual(data["archives"][0], {
             "archive_id": ids[-1], "session_id": "0013", "date": "2026-02-13",
-            "lines": 1, "active": True})
+            "lines": 1, "stub": True, "active": True})
         self.assertEqual(data["archives"][1]["lines"], 3)
         self.assertFalse(data["archives"][1]["active"])
         rc, out = self.run_out("get", "narrative", "--list")
@@ -2282,14 +2351,23 @@ class ApiMemTest(unittest.TestCase):
         self.assertNotIn("handoff", out)
 
     def test_get_narrative_argument_refusals(self):
-        self.assertIn("one of <archive_id>, --prev or --list",
-                      self.refusal("get", "narrative", "1", "--list"))
-        self.assertIn("one of <archive_id>, --prev or --list",
-                      self.refusal("get", "narrative", "--prev", "--list"))
-        self.assertIn("only valid with get narrative",
-                      self.refusal("get", "state", "--list"))
-        self.assertIn("only valid with get narrative",
-                      self.refusal("get", "flags", "--prev"))
+        # a conflicting argument is a usage error: status 2, code `usage`
+        for argv, said in (
+                (("get", "narrative", "1", "--list"),
+                 "one of <archive_id>, --prev or --list"),
+                (("get", "narrative", "1", "--prev"),
+                 "one of <archive_id>, --prev or --list"),
+                (("get", "narrative", "--prev", "--list"),
+                 "one of <archive_id>, --prev or --list"),
+                (("get", "state", "--list"), "only valid with get narrative"),
+                (("get", "flags", "--prev"), "only valid with get narrative")):
+            with self.subTest(argv=argv):
+                rc, out, err = self.fails(*argv)
+                self.assertEqual(rc, 2)
+                self.assertIn(said, err)
+                rc, out, err = self.fails(*argv, "--json")
+                self.assertEqual(rc, 2)
+                self.assertEqual(json.loads(out)["error"]["code"], "usage")
         # a shell with no session archive still gets the plain answer
         with mock.patch.object(mem, "SC_API_TOKEN", REVIEW_TOKEN):
             rc, out = self.run_out("get", "narrative")

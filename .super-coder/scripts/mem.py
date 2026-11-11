@@ -758,7 +758,7 @@ def _render_get(surface: str, data: dict, args=None) -> int:
             print(f"{label(data)}{mark}")
             print(data.get("narrative") or "(empty narrative)")
         prev = data.get("previous")
-        if prev and data.get("lines", 0) <= 1:
+        if prev and data.get("stub"):
             # A fresh session holds only its session-start line; the handoff
             # detail a state line points at lives one archive back.
             print(f"mem: nothing recorded this session yet — the previous "
@@ -875,7 +875,7 @@ def cmd_get(args) -> int:
     refuses an id and says why."""
     surface = args.surface
     if (args.list or args.prev) and surface != "narrative":
-        die("--list and --prev are only valid with get narrative")
+        _usage("--list and --prev are only valid with get narrative")
     if args.resolved and surface != "flags":
         die("--resolved is only valid with get flags --feature <id>")
     if getattr(args, "retired", False) and surface != "documents":
@@ -935,7 +935,7 @@ def cmd_get(args) -> int:
         path = f"/_sc/sprint/approvals/{doc}"
     elif surface == "narrative":
         if sum((args.id is not None, args.list, args.prev)) > 1:
-            die("get narrative takes one of <archive_id>, --prev or --list")
+            _usage("get narrative takes one of <archive_id>, --prev or --list")
         if args.id is not None:                   # one of the caller's own archives
             path = f"/_sc/mem/narrative/{args.id}"
         elif args.list:
