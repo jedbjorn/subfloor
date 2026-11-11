@@ -1538,5 +1538,207 @@ class SandboxImagePlanTest(unittest.TestCase):
         self.assertEqual(list(outside.iterdir()), [])
 
 
+class LauncherGrammarParityTest(unittest.TestCase):
+    """The mount guard reads `docker run` arguments with a fixed option table
+    (sandbox_devkit.RUN_OPTIONS). These tests keep that table and the launcher
+    in step: the real argument list goes through untouched, and an option any
+    `docker_run` caller passes that is missing from the table fails here, not
+    at a launch."""
+
+    DISPATCH = SCRIPTS / "dispatch.sh"
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+
+    # The launch block of the dispatcher, as text: the `docker run` arguments
+    # between `"$CNAME" -- ` and the provisioning status check.
+    def launch_block(self) -> str:
+        text = self.DISPATCH.read_text()
+        start = text.index('"$PY" "$S/sandbox_devkit.py" launch-container')
+        start = text.index('"$CNAME" -- \\\n', start) + len('"$CNAME" -- \\\n')
+        end = text.index("|| provision_rc=$?", start)
+        return text[start:end].replace("\\\n", " ")
+
+    def shell_words(self, block: str, values: dict[str, str]) -> list[str]:
+        """What the shell passes for that block, given its variables.
+
+        Variables are substituted as text and the result split the way sh
+        splits it, so an unquoted variable becomes several arguments and a
+        quoted one stays whole — exactly the launcher's behaviour.
+        """
+        import re
+        import shlex
+
+        def value(match):
+            name = match.group(1) or match.group(2)
+            self.assertIn(name, values, f"the launch block uses ${name}")
+            return values[name]
+
+        return shlex.split(re.sub(r"\$\{(\w+)\}|\$(\w+)", value, block))
+
+    def auth_arguments(self) -> list[str]:
+        """What sandbox_github_auth puts at SC_GITHUB_AUTH_ARGS, at its fullest."""
+        import sandbox_github_auth
+
+        target = sandbox_github_auth.AGENT_TARGET
+        return ["--user", "1000:1000", "-e", "GH_TOKEN",
+                "--mount", f"type=bind,src=/run/user/1000/ssh agent.sock,dst={target},readonly",
+                "-e", f"SSH_AUTH_SOCK={target}"]
+
+    def real_arguments(self, fixture, home: Path, *, optional: bool) -> list[str]:
+        plan = fixture.plan()
+        state_dir = "/var/lib/sc-state/instances/abc"
+        registry = "/opt/python-registry"
+        values = {
+            "CNAME": "sc-fork", "SC_NET": "sc-net", "HOME": str(home),
+            "dp": "8801", "p": "8800", "here": str(fixture.root),
+            "IMG": plan.runtime_tag,
+            "mistral_env": "-e MISTRAL_API_KEY=key" if optional else "",
+            "disabled_harnesses_env": "-e SC_DISABLED_HARNESSES" if optional else "",
+            "pg_env": ("-e DATABASE_URL=postgresql://sc:sc@sc-pg-fork:5432/sc"
+                       if optional else ""),
+            # Built the way the dispatcher builds them (asserted below).
+            "state_namespace_mounts": (
+                f"--tmpfs {home}/.local/state:uid=0,gid=0,mode=0700 "
+                f"--tmpfs {home}/.local/state/subfloor:uid=0,gid=0,mode=0700 "
+                f"--tmpfs {home}/.local/state/subfloor/instances:uid=0,gid=0,mode=0700"
+                if optional else ""),
+            "state_mount": (
+                f"-v {state_dir}:{home}/.local/state/subfloor/instances/abc"
+                if optional else ""),
+            "py_mount": f"-v {registry}:{registry}:ro" if optional else "",
+        }
+        words = self.shell_words(self.launch_block(), values)
+        marker = words.index("SC_GITHUB_AUTH_ARGS")
+        return words[:marker] + self.auth_arguments() + words[marker + 1:]
+
+    def run_through_docker_run(self, fixture, home: Path, arguments: list[str]):
+        plan = fixture.plan()
+        docker = FakeDocker()
+        SandboxImagePlanTest._seed_runtime_image(plan, docker)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            os.environ.pop("XDG_STATE_HOME", None)
+            docker_run(plan, arguments, runner=docker)
+            expanded = sandbox_devkit.expand_home_mounts(arguments)
+        run = next(command for command in docker.commands
+                   if command[:2] == ("docker", "run") and "-d" in command)
+        return plan, run, expanded
+
+    def test_dispatcher_builds_its_variable_mounts_the_way_this_test_does(self):
+        text = self.DISPATCH.read_text()
+        for formula in (
+            'state_mount="-v $state_dir:$state_target"',
+            'py_mount="-v $pyreg:$pyreg:ro"',
+            'py_mount="-v $pyver_dir:$pyver_dir:ro"',
+            'state_namespace_mounts="--tmpfs $HOME/.local/state:uid=0,gid=0,mode=0700 '
+            '--tmpfs $HOME/.local/state/subfloor:uid=0,gid=0,mode=0700 '
+            '--tmpfs $HOME/.local/state/subfloor/instances:uid=0,gid=0,mode=0700"',
+            'mistral_env="-e MISTRAL_API_KEY=${MISTRAL_API_KEY}"',
+            'disabled_harnesses_env="-e SC_DISABLED_HARNESSES"',
+            'pg_env="-e DATABASE_URL=',
+        ):
+            self.assertIn(formula, text)
+
+    def test_real_launch_arguments_pass_the_guard_and_reach_docker_unchanged(self):
+        cases = {
+            # A spaced home and a checkout with a space and a comma: the
+            # quoted arguments, and a dev-kit volume target with a comma.
+            "spaced home, comma in the checkout": (
+                "fork, with comma", "home dir/of operator", False),
+            # Every optional piece: namespace tmpfs, instance state, the
+            # interpreter mount, and the optional environment.
+            "every optional mount": ("fork", "home", True),
+        }
+        for label, (name, home_name, optional) in cases.items():
+            with self.subTest(label):
+                fixture = ImageFixture(self.base / label.split()[0], name, mounts=True)
+                home = self.base / label.split()[0] / home_name
+                arguments = self.real_arguments(fixture, home, optional=optional)
+                self.assertIn("SC_HOME_MOUNTS", arguments)
+                self.assertIn(MOUNT_MARKER, arguments)
+                plan, run, expanded = self.run_through_docker_run(
+                    fixture, home, arguments)
+
+                # Byte-identical: the launcher's arguments with the two markers
+                # expanded and the resource arguments added, nothing else.
+                marker = expanded.index(MOUNT_MARKER)
+                memory = run[run.index("--memory") + 1]
+                volumes = []
+                for volume in volume_plans(plan):
+                    target = str(volume.target)
+                    if "," in target:
+                        target = '"' + target + '"'
+                    volumes += ["--mount",
+                                f"type=volume,src={volume.volume_name},dst={target}"]
+                self.assertTrue(volumes)
+                self.assertEqual(list(run), [
+                    "docker", "run", *expanded[:marker],
+                    "--memory", memory, "--memory-swap", memory,
+                    *volumes, *expanded[marker + 1:]])
+                if "," in name:
+                    self.assertIn(',dst="', " ".join(volumes))
+                for relative in sandbox_devkit.HOME_BIND_MOUNTS:
+                    self.assertIn(f"{home / relative}:{home / relative}", run)
+                self.assertEqual(run[-5:], (plan.runtime_tag, "./sc", "serve", "--port", "8800"))
+
+                # Every option in the final list is in the table, and the
+                # option region ends exactly at the image.
+                options = sandbox_devkit.run_options(run)
+                self.assertEqual({option for option, _value in options}
+                                 - set(sandbox_devkit.RUN_OPTIONS), set())
+                consumed = 2 + sum(1 if value is None else 2 for _o, value in options)
+                self.assertEqual(run[consumed], plan.runtime_tag)
+
+    def test_an_option_a_caller_adds_without_the_table_fails_here(self):
+        """Every option any `docker_run` caller can pass is in RUN_OPTIONS."""
+        import re
+
+        table = set(sandbox_devkit.RUN_OPTIONS)
+        # 1. The dispatcher: the launch block and every variable it expands.
+        text = self.DISPATCH.read_text()
+        block = self.launch_block()
+        block = block[:block.index('"$IMG"')]      # the rest is the container command
+        used = set(re.findall(r"(?<![\w$\"=:/.-])(--?[A-Za-z][\w-]*)", block))
+        for name in re.findall(r"\$(\w+)", block):
+            for assignment in re.findall(rf'^\s*{name}="([^"\n]*)', text, re.M):
+                used |= set(re.findall(r"(?:^|\s)(--?[A-Za-z][\w-]*)", assignment))
+        self.assertTrue({"-d", "--init", "-v", "-p", "--tmpfs", "-e", "-w"} <= used, used)
+        self.assertEqual(used - table, set(), "dispatch.sh passes an option that "
+                         "sandbox_devkit.RUN_OPTIONS does not list")
+        # 2. The GitHub-auth expansion and the resource arguments.
+        for module, begin, finish in (
+            ("sandbox_github_auth.py", "docker_args: list[str] = [",
+             "return RuntimeArguments("),
+            ("sandbox_resources.py", "def docker_arguments", "\ndef "),
+        ):
+            source = (SCRIPTS / module).read_text()
+            start = source.index(begin)
+            region = source[start:source.index(finish, start + len(begin))]
+            passed = set(re.findall(r'"(--?[a-z][a-z-]*)"', region))
+            self.assertTrue(passed, module)
+            self.assertEqual(passed - table, set(), f"{module} passes an option "
+                             "that sandbox_devkit.RUN_OPTIONS does not list")
+        # 3. What docker_run itself adds.
+        for option in ("--mount", "-v", "--memory", "--memory-swap"):
+            self.assertIn(option, table)
+        # And the failure mode, end to end: a launcher that grows an option
+        # the table does not have is refused by name before docker runs.
+        fixture = ImageFixture(self.base, "fork", mounts=True)
+        home = self.base / "home"
+        arguments = self.real_arguments(fixture, home, optional=True)
+        arguments[1:1] = ["--cap-add", "SYS_PTRACE"]
+        plan = fixture.plan()
+        docker = FakeDocker()
+        SandboxImagePlanTest._seed_runtime_image(plan, docker)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            with self.assertRaisesRegex(
+                    SandboxImageError, r"'--cap-add' is not in the launcher's option table"):
+                docker_run(plan, arguments, runner=docker)
+        self.assertFalse([command for command in docker.commands
+                          if command[:2] == ("docker", "run") and "-d" in command])
+
+
 if __name__ == "__main__":
     unittest.main()

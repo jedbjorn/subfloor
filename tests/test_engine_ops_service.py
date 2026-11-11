@@ -1362,7 +1362,10 @@ class LauncherMountParityTest(ServiceFixture):
 
 class LauncherGuardTest(ServiceFixture):
     """The launcher refuses, at the one place that sees every mount, a
-    `docker run` whose binds overlap the engine-ops state in either direction."""
+    `docker run` whose binds overlap the engine-ops state in either direction.
+    It reads the option region with the launcher's own grammar, not Docker's
+    whole command line: an option it does not know is refused, and nothing
+    after the image is looked at."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -1374,10 +1377,24 @@ class LauncherGuardTest(ServiceFixture):
         self.env = {"HOME": str(self.home)}
         self.state = sandbox_devkit.engine_ops_state_dir(self.root, self.env)
 
+    def check(self, arguments) -> None:
+        with mock.patch.object(os, "getcwd", return_value=str(self.base)):
+            self.devkit.guard_engine_ops_state(list(arguments), self.root, self.env)
+
     def guard(self, *arguments: str) -> None:
-        self.devkit.guard_engine_ops_state(
-            ["docker", "run", "-d", *arguments, "image", "./sc", "serve"],
-            self.root, self.env)
+        self.check(["docker", "run", "-d", *arguments, "image", "./sc", "serve"])
+
+    def refused(self, *arguments: str) -> str:
+        with self.assertRaises(self.devkit.SandboxImageError, msg=arguments) as raised:
+            self.guard(*arguments)
+        self.assertIn("refusing to launch", str(raised.exception))
+        return str(raised.exception)
+
+    def allowed(self, arguments) -> None:
+        try:
+            self.check(arguments)
+        except self.devkit.SandboxImageError as exc:
+            self.fail(f"{arguments} was refused: {exc}")
 
     def test_state_directory_is_the_one_the_service_uses(self):
         self.assertEqual(
@@ -1393,26 +1410,67 @@ class LauncherGuardTest(ServiceFixture):
             self.root, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.base / "x")})
         self.assertEqual(custom.parent, self.base / "x" / "subfloor" / "engine-ops")
 
-    def test_bind_sources_reads_every_form(self):
-        arguments = [
-            "docker", "run", "-d", "--name", "c",
-            "-v", "/a:/a", "-v", "/b:/b:ro", "--volume", "/c:/c",
-            "--volume=/d:/d", "-v=/e:/e", "-v/f:/f",
-            "--mount", "type=bind,src=/g,dst=/g",
-            "--mount", "type=bind,source=/h,target=/h,readonly",
-            "--mount=type=bind,src=/i,dst=/i",
-            # Not binds: named volumes and tmpfs.
-            "-v", "named-volume:/data",
-            "--mount", "type=volume,src=named,dst=/sc-devkit-volume",
-            "--mount", "type=tmpfs,dst=/t", "--tmpfs", "/u:uid=0",
-            "-p", "127.0.0.1:1:1", "-e", "HOME=/home/x", "-w", "/a",
-            "image", "./sc", "serve",
-        ]
-        self.assertEqual(self.devkit.bind_sources(arguments),
-                         ["/a", "/b", "/c", "/d", "/e", "/f", "/g", "/h", "/i"])
+    # ── the three bypasses of the looser parser, each by name ────────────────
+
+    def test_trailing_whitespace_in_a_mount_value_is_a_bind_of_the_state(self):
+        """Docker trims the whole `--mount` value before reading it."""
+        self.state.mkdir(parents=True)
+        for value in (f"type=bind,target=/leak,source={self.state} ",
+                      f"type=bind,target=/leak,source={self.state}\t",
+                      f"  type=bind,source={self.state},target=/leak\n"):
+            self.assertIn("overlaps", self.refused("--mount", value))
+
+    def test_short_flag_cluster_with_an_attached_value_is_refused(self):
+        """pflag reads `-dvSRC:DST` as `-d -v SRC:DST`. The launcher never
+        writes that, so the guard does not try to: it is not in the table."""
+        self.state.mkdir(parents=True)
+        for argument in (f"-dv{self.state}:/leak", f"-dv={self.state}:/leak",
+                         f"-itv{self.state}:/leak", f"-v{self.state}:/leak",
+                         f"-v={self.state}:/leak"):
+            message = self.refused(argument)
+            self.assertIn(repr(argument), message)
+            self.assertIn("RUN_OPTIONS", message)
+
+    def test_container_command_arguments_are_never_inspected(self):
+        """Everything from the image on is the container's command."""
+        self.state.mkdir(parents=True)
+        for arguments in (
+            ["docker", "run", "image", "tool", "-v"],
+            ["docker", "run", "image", "tool", "--", "-v"],
+            ["docker", "run", "-d", "--name", "c", "image", "tool", "--mount",
+             "garbage", "-dv", f"{self.state}:/x", "--volumes-from", "y",
+             "--no-such-option", f"--mount=type=bind,src={self.state},dst=/z"],
+            ["image", "./sc", "serve", "--port", "8800"],
+        ):
+            self.allowed(arguments)
+            self.assertEqual(self.devkit.bind_sources(arguments), [])
+        # A mount before the image is still a mount, whatever follows.
+        with self.assertRaises(self.devkit.SandboxImageError):
+            self.check(["docker", "run", "-v", f"{self.state}:/leak", "image",
+                        "tool", "-v"])
+        self.assertEqual(
+            self.devkit.run_options(["docker", "run", "-d", "-e", "A=1", "img", "-v", "x"]),
+            [("-d", None), ("-e", "A=1")])
+
+    # ── values, read the way Docker reads them ───────────────────────────────
+
+    def test_quoted_csv_source_field_is_a_bind_of_the_state(self):
+        self.state.mkdir(parents=True)
+        self.assertIn("overlaps", self.refused(
+            "--mount", f'type=bind,"source={self.state}",target=/leak'))
+
+    def test_capitalised_keys_and_type_are_a_bind_of_the_state(self):
+        self.state.mkdir(parents=True)
+        self.assertIn("overlaps", self.refused(
+            "--mount", f"Type=bind,Source={self.state},target=/leak"))
+
+    def test_dot_relative_source_is_a_bind_of_the_state(self):
+        self.state.mkdir(parents=True)
+        relative = os.path.relpath(self.state, self.base)
+        self.assertIn("overlaps", self.refused(
+            "--mount", f"type=bind,source=./{relative},target=/leak"))
 
     def test_mount_values_are_read_the_way_docker_reads_them(self):
-        """Each of these is a bind of the state directory to Docker."""
         self.state.mkdir(parents=True)
         cwd = self.base
         relative = os.path.relpath(self.state, cwd)
@@ -1424,45 +1482,55 @@ class LauncherGuardTest(ServiceFixture):
             "a bare relative source": f"type=bind,source={relative},target=/leak",
             "a parent-relative source":
                 f"type=bind,source=./x/../{relative},target=/leak,readonly",
-            "a quoted value with a comma after it":
+            "every field quoted":
                 f'"type=bind","src={self.state}","dst=/leak",ro',
+            "padded with whitespace": f" type=bind,src={self.state},dst=/leak \t",
         }
         for label, value in forms.items():
-            for arguments in (["--mount", value], [f"--mount={value}"]):
-                with mock.patch.object(os, "getcwd", return_value=str(cwd)):
-                    with self.assertRaises(self.devkit.SandboxImageError, msg=label) as raised:
-                        self.guard(*arguments)
-                self.assertIn("refusing to launch", str(raised.exception))
-                self.assertIn("overlaps", str(raised.exception))
-                self.assertEqual(
-                    self.devkit.bind_sources(["docker", "run", *arguments, "img"], cwd),
-                    [str(self.state)], label)
+            self.assertIn("overlaps", self.refused("--mount", value), label)
+            self.assertEqual(
+                self.devkit.bind_sources(["docker", "run", "--mount", value, "img"], cwd),
+                [str(self.state)], label)
         # -v: a source starting with `.` is a path against the working directory.
         for value in (f"./{relative}:/leak", f"./{relative}/../{self.state.name}:/leak:ro"):
-            for arguments in (["-v", value], [f"--volume={value}"], [f"-v{value}"]):
-                with mock.patch.object(os, "getcwd", return_value=str(cwd)):
-                    with self.assertRaises(self.devkit.SandboxImageError, msg=value):
-                        self.guard(*arguments)
-                self.assertEqual(
-                    self.devkit.bind_sources(["docker", "run", *arguments, "img"], cwd),
-                    [str(self.state)], value)
+            self.assertIn("overlaps", self.refused("-v", value), value)
+            self.assertEqual(
+                self.devkit.bind_sources(["docker", "run", "-v", value, "img"], cwd),
+                [str(self.state)], value)
 
-    def refused(self, value: str) -> None:
-        self.state.mkdir(parents=True, exist_ok=True)
-        with mock.patch.object(os, "getcwd", return_value=str(self.base)):
+    def test_bind_sources_reads_the_launchers_spellings(self):
+        arguments = [
+            "docker", "run", "-d", "--name", "c",
+            "-v", "/a:/a", "-v", "/b:/b:ro",
+            "--mount", "type=bind,src=/g,dst=/g",
+            "--mount", "type=bind,source=/h,target=/h,readonly",
+            # Not binds: named and anonymous volumes, tmpfs.
+            "-v", "named-volume:/data", "-v", "/anonymous",
+            "--mount", "type=volume,src=named,dst=/sc-devkit-volume",
+            "--mount", "type=tmpfs,dst=/t", "--mount", "src=named,dst=/n",
+            "--tmpfs", "/u:uid=0",
+            "-p", "127.0.0.1:1:1", "-e", "HOME=/home/x", "-w", "/a",
+            "image", "./sc", "serve",
+        ]
+        self.assertEqual(self.devkit.bind_sources(arguments), ["/a", "/b", "/g", "/h"])
+
+    # ── fail closed ──────────────────────────────────────────────────────────
+
+    def test_an_option_outside_the_table_is_refused_and_named(self):
+        for arguments in (
+            ["--cap-add", "SYS_ADMIN"], ["--privileged"], ["--volumes-from", "other"],
+            ["--volume", "/a:/b"], ["--mount=type=bind,src=/a,dst=/b"],
+            ["--volume=/a:/b"], ["-v=/a:/b"], ["-v/a:/b"], ["-dv", "/a:/b"],
+            ["-it"], ["--name=c"], ["-eA=1"], ["--"], ["-"],
+        ):
+            message = self.refused(*arguments)
+            self.assertIn(repr(arguments[0]), message)
+            self.assertIn("sandbox_devkit.RUN_OPTIONS", message)
+        # A table option with its value missing.
+        for option in ("-v", "--mount", "-e", "--name"):
             with self.assertRaises(self.devkit.SandboxImageError) as raised:
-                self.guard("--mount", value)
-        self.assertIn("overlaps", str(raised.exception))
-
-    def test_quoted_csv_source_field_is_a_bind_of_the_state(self):
-        self.refused(f'type=bind,"source={self.state}",target=/leak')
-
-    def test_capitalised_keys_and_type_are_a_bind_of_the_state(self):
-        self.refused(f"Type=bind,Source={self.state},target=/leak")
-
-    def test_dot_relative_source_is_a_bind_of_the_state(self):
-        relative = os.path.relpath(self.state, self.base)
-        self.refused(f"type=bind,source=./{relative},target=/leak")
+                self.devkit.bind_sources(["docker", "run", "-d", option])
+            self.assertIn("has no value", str(raised.exception))
 
     def test_what_cannot_be_classified_is_refused(self):
         unclassifiable = [
@@ -1470,27 +1538,24 @@ class LauncherGuardTest(ServiceFixture):
             ["--mount", "type=bind,target=/b"],                # a bind with no source
             ["--mount", "type=bind,source=,target=/b"],        # an empty source
             ["--mount", "type=bind,source=/a,src=/b,target=/c"],
+            ["--mount", "type=bind,source=/a ,target=/c"],     # a padded source
             ["--mount", "type=overlay,source=/a,target=/b"],   # no such type
             ["--mount", ""],
+            ["--mount", "   "],
             ["--mount", "type=bind,source=/a"],                # no target
             ["--mount", "type=bind,source=/a,target=/b,whatever"],
-            ["-v", "relative-without-a-colon"],
-            ["--mount"],                                       # no value at all
-            ["-v"],
+            ["--mount", "source=/a,whatever,target=/b"],
             ["-v", ""],
             ["-v", ":/b"],                                     # an empty source
             ["-v", "~/state:/b"],                              # unexpanded home
-            ["--volumes-from", "other"],
-            ["--volumes-from=other"],
-            ["-dv", "/a:/b"],                                  # -v inside a cluster
+            ["-v", " /a:/b"],                                  # padded
+            ["-v", "/a :/b"],
+            ["-v", "na me:/b"],                                # not a volume name
+            ["-v", "relative-without-a-colon"],
         ]
         for arguments in unclassifiable:
-            with self.assertRaises(self.devkit.SandboxImageError, msg=arguments) as raised:
-                self.devkit.bind_sources(["docker", "run", "-d", *arguments])
-            self.assertIn("refusing to launch", str(raised.exception))
-            self.assertIn("cannot tell what", str(raised.exception))
-            with self.assertRaises(self.devkit.SandboxImageError, msg=arguments):
-                self.guard(*arguments)
+            message = self.refused(*arguments)
+            self.assertIn("cannot be checked", message)
 
     def test_what_the_launcher_really_produces_is_classified(self):
         """Fail-closed must not refuse the launcher's own arguments."""
@@ -1499,7 +1564,9 @@ class LauncherGuardTest(ServiceFixture):
             expanded = self.devkit.expand_home_mounts(["SC_HOME_MOUNTS"])
         arguments = [
             "docker", "run", "-d", "--name", "sc-x", "--restart", "unless-stopped",
-            "--init", "--network", "sc-net", "-e", f"HOME={home}", "-e", "SC_SANDBOX=1",
+            "--init", "--network", "sc-net", "--user", "1000:1000", "-e", "GH_TOKEN",
+            "--mount", "type=bind,src=/run/user/1000/agent.sock,dst=/run/super-coder/ssh-agent,readonly",
+            "-e", f"HOME={home}", "-e", "SC_SANDBOX=1",
             "-w", str(self.root), "-v", f"{self.root}:{self.root}",
             "--tmpfs", f"{home}/.local/state:uid=0,gid=0,mode=0700",
             "-v", f"{home}/.local/state/subfloor/instances/abc:{home}/.local/state/subfloor/instances/abc",
@@ -1510,17 +1577,14 @@ class LauncherGuardTest(ServiceFixture):
             # The dev-kit volumes, exactly as docker_run spells them.
             "--mount", "type=volume,src=sc-devkit-abc,dst=/opt/devkit",
             "--mount", 'type=volume,src=sc-devkit-def,dst="/opt/with,comma"',
-            "-v", "named-volume:/data", "-v", "/anonymous",
-            "--mount", "type=tmpfs,dst=/t", "--mount", "src=named,dst=/n",
-            "--mount", "type=volume,src=named,dst=/ro,readonly",
             "image", "./sc", "serve", "--port", "8800",
         ]
         sources = self.devkit.bind_sources(arguments)
-        self.assertEqual(sources[0], str(self.root))
-        self.assertEqual(len(sources), 3 + len(self.devkit.HOME_BIND_MOUNTS))
+        self.assertEqual(sources[:2], ["/run/user/1000/agent.sock", str(self.root)])
+        self.assertEqual(len(sources), 4 + len(self.devkit.HOME_BIND_MOUNTS))
         # None of those paths exists; that is not a reason to refuse.
         self.assertFalse((home / ".claude").exists())
-        self.devkit.guard_engine_ops_state(arguments, self.root, self.env)
+        self.allowed(arguments)
 
     def test_a_normal_install_launches_with_or_without_state(self):
         normal = []
@@ -1549,16 +1613,14 @@ class LauncherGuardTest(ServiceFixture):
                 ["-v", f"{link_home}:/h"],
             "a directory containing it (read-only interpreter mount)":
                 ["-v", f"{self.home}/.local:{self.home}/.local:ro"],
-            "the state home": ["--volume", f"{self.home}/.local/state:/s"],
+            "the state home": ["-v", f"{self.home}/.local/state:/s"],
             "the whole home, as a bind mount":
                 ["--mount", f"type=bind,src={self.home},dst=/home"],
             "a directory inside it": ["-v", f"{self.state}/sub:/sub"],
         }
         for label, arguments in cases.items():
-            with self.assertRaises(self.devkit.SandboxImageError, msg=label) as raised:
-                self.guard(*arguments)
-            message = str(raised.exception)
-            self.assertIn("refusing to launch", message)
+            message = self.refused(*arguments)
+            self.assertIn("overlaps", message, label)
             self.assertIn(str(self.state), message)
             self.assertIn("XDG_STATE_HOME", message)
 

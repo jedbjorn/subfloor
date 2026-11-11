@@ -61,14 +61,29 @@ pin, the status, and the logs. This is enforced in two places:
   is resolved and compared with the directory. An overlap stops the launch
   with a message naming both paths. It needs no list of mounts to be kept in
   step, and it does not need the directory to exist yet.
-  Values are read the way Docker reads them: a `--mount` value is one CSV
-  record with case-insensitive keys and type, `src` for `source`, and
-  `volume` when no type is given; a `-v` source starting with `/` or `.` is a
-  path, relative ones against the launch directory. What the guard cannot
-  classify it refuses rather than passes through: a malformed `--mount`, a
-  bind with no or an empty source, a flag with no value, `--volumes-from`, or
-  `-v` inside a cluster of short flags. Named volumes, `--tmpfs`, and
-  `type=volume` mounts name no host path and are left alone.
+  The guard is a strict grammar for one caller, the launcher, not an
+  emulation of Docker's command line:
+  - It walks the **option region only**, up to the image. Everything from the
+    image on is the container's command and is never looked at.
+  - It knows where the image is from a fixed table of the options the launcher
+    passes and whether each takes a value (`sandbox_devkit.RUN_OPTIONS`:
+    `-d`, `--init`, `--name`, `--restart`, `--network`, `--user`, `-e`, `-w`,
+    `-p`, `--tmpfs`, `--memory`, `--memory-swap`, `-v`, `--mount`).
+  - An option that is not in the table, in exactly that spelling, stops the
+    launch with a message naming it. Joined `--opt=value`, attached values
+    (`-vSRC:DST`), short-flag clusters (`-dv`), `--volume`, `--volumes-from`
+    and `--` are all outside the table, and so is any option Docker gains
+    later. A launcher change that needs a new option adds it to the table; a
+    test fails until it does.
+  - Mount values are read the way Docker reads them. `--mount`: the whole
+    value is trimmed, then read as one CSV record with case-insensitive keys
+    and type, `src` for `source`, and `volume` when no type is given. `-v`: a
+    source starting with `/` or `.` is a path (relative ones against the
+    launch directory), a volume name is a named volume, a lone absolute path
+    is an anonymous volume. A value that fits none of that is refused: a
+    malformed record, a bind with no, an empty, or a padded source, a mount
+    with no target.
+
 - **In the service**, for what it can know without a launch: the checkout,
   the instance state collection, the interpreter mount, and the home mounts
   (`sandbox_devkit.HOME_BIND_MOUNTS`, the list the launcher's arguments are
