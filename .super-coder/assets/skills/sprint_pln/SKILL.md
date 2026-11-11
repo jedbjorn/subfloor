@@ -261,9 +261,9 @@ dispatch trigger. On that handoff wake:
 2. Handle informational items and `accept` each, including the handoff.
 3. Finish reconciliation and Planner bookkeeping, then stop.
 
-Run `sc sprint dispatch --sprint <id>` yourself only after a restructure or
-resume, or when `sc sprint show` has a ready lane undispatched. Then it is the
-literal final action: require durable assignments + wakes and run no trailing
+Run `sc sprint dispatch --sprint <id>` yourself only after a restructure, or
+when `sc sprint show` has a ready lane undispatched. Then it is the literal
+final action: require durable assignments + wakes and run no trailing
 command. An empty dispatch remains final.
 
 On a clean completion receipt, verify the named Sprint is terminal and record

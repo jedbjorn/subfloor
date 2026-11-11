@@ -29,7 +29,7 @@ MIGRATIONS = (
     ENGINE / "migrations" / "0262_reseed_sprint_resume_reentry.sql",
     ENGINE / "migrations" / "0280_remove_sprint_followups.sql",
     ENGINE / "migrations" / "0282_skills_dedupe_posture.sql",
-    ENGINE / "migrations" / "0283_reseed_sprint_consistency.sql",
+    ENGINE / "migrations" / "0284_reseed_sprint_consistency.sql",
 )
 sys.path.insert(0, str(ENGINE / "scripts"))
 
