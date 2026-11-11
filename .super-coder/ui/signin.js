@@ -413,6 +413,15 @@ function createSignIn(env) {
         el("div", { className: "signin-actions" }, retry)).focus();
       return;
     }
+    // Before a GUI user exists no origin is pinned, and the authority's
+    // answers are then unreadable from any page (its CORS allows only the
+    // pinned origin). The review server reads the authority's published list
+    // and says there is no user: that is the state, and nothing is asked of
+    // the authority.
+    if (review.data.enrolled === false && !review.data.signed_in) {
+      viewNoUser(review.data.setup_cli);
+      return;
+    }
     base = signInAuthorityBase(review.data.authority?.url, location);
     let auth = null;
     if (base) {

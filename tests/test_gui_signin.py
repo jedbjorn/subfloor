@@ -836,6 +836,17 @@ const finish = (value) => realLog(JSON.stringify(value));
     ("server.auth.enrolled = false; server.auth.setup_cli = './sc auth user add NAME';",
      {"heading": "No GUI user exists yet", "form": False, "has": ["./sc auth user add NAME"],
       "navigations": []}),
+    # The real unpinned install: the authority's answer cannot be read from the
+    # page at all (its CORS allows only a pinned origin), and the review server
+    # reports that no user exists.
+    ("server.authorityUp = false; server.review.enrolled = false;"
+     " server.review.setup_cli = './sc auth user add <username>';",
+     {"heading": "No GUI user exists yet", "form": False, "has": ["./sc auth user add <username>"],
+      "navigations": []}),
+    # ...and then the authority is not asked at all, so no cross-origin failure is logged.
+    ("server.review.enrolled = false; server.review.setup_cli = './sc auth user add <username>';",
+     {"heading": "No GUI user exists yet", "form": False, "has": ["./sc auth user add <username>"],
+      "navigations": [], "authority_requests": 0}),
     # signed in everywhere: straight to next
     ("server.auth.signed_in = true; server.review.signed_in = true;",
      {"heading": "Sign in", "form": False, "has": [], "navigations": [HOME]}),
@@ -857,7 +868,8 @@ def test_sign_in_page_states(setup, expected):
 (async () => {
   await page.start(); await settle();
   finish({heading: heading(), form: Boolean(formNode()), text: view().text + " | " + buttons().join(" | "),
-    fields: view().fields, navigations, posts: posts().length, leaks});
+    fields: view().fields, navigations, posts: posts().length, leaks,
+    authorityRequests: requests.filter((r) => r.url.startsWith(AUTHORITY)).length});
 })().catch((error) => { realLog(String(error.stack)); process.exitCode = 1; });
 """
     result = run_js(script)
@@ -868,6 +880,8 @@ def test_sign_in_page_states(setup, expected):
     assert result["navigations"] == expected["navigations"]
     assert result["fields"] == (["username"] if expected["form"] else [])
     assert result["posts"] == 0 and result["leaks"] == []
+    if "authority_requests" in expected:
+        assert result["authorityRequests"] == expected["authority_requests"]
 
 
 @needs_node
