@@ -258,12 +258,34 @@ session.
 Work that runs inside the server process needs no HTTP authority and is
 unchanged: Sprint participant chats, the conversation broker, and the reaper.
 
+**Host-side tools get a session from the host, not from this server.** The
+boundary: only a host-side CLI caller can obtain an operator session without
+the password and the authenticator, by running
+`./sc auth sessions mint --label <text>` in the install's main checkout
+([auth.md](auth.md#tool-sessions)). That caller is the host OS user, who can
+already read the credential store and reset any user, so the verb grants
+nothing new. It refuses inside the sandbox, where the store is absent. No
+route here or on the engine-ops service mints one, and the gate has no second
+path for it: a tool session is an ordinary published hash, decided by the
+same `browser_gate.operator_session` as a browser's, held to the same origin
+rule, listed in `./sc auth sessions` with its label and the kind `tool`, and
+revoked like any other without touching the operator's browser sessions.
+
 The source-maintainer tools under `maintainer/` (`dos_app_sprint_canary.py`,
-`capture_public_docs.py`) play the operator with no session, and an install
-that requires sign-in refuses them. They stop early with one message that
-names flag SC-1602, where it is being decided whether a host-side tool may be
-given an operator session without the password and the authenticator. Nothing
-in this server mints one.
+`capture_public_docs.py`) play the operator this way, through
+`maintainer/tool_session.py`. The gate each one faces is that of the
+disposable install it drives, not this checkout's, so the session is minted
+by that install's own `./sc`. Such an install has no GUI user; the tool runs
+its `./sc auth user add <engine user>` first (the canary always, the capture
+with `--enrol-user`). The session is labelled with the tool's name and revoked
+when the tool ends, including on failure, on Ctrl-C, and when acquiring it is
+interrupted after the mint. A kill while the mint verb itself runs, or one
+that runs no cleanup, can leave the session listed under that label for
+manual revoke ([auth.md](auth.md#tool-sessions)). The cookie is held in
+memory only: never printed, logged, or written to a receipt or gallery. When
+no session can be had (no user and no leave to create one, the store not
+reachable, a checkout that is not the one serving the port) the tool stops
+with one message before it creates anything.
 
 The Sprint Board distinguishes browser-operator actions from
 shell-authenticated Sprint commands. Shell commands use scoped Bearer identity
