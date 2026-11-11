@@ -1012,7 +1012,8 @@ const server = {
     setup_cli: "./sc auth user add <username>"},
 };
 const serviceRequests = [], apiRequests = [], notices = [], navigations = [];
-globalThis.location = {hostname: "127.0.0.1", pathname: "/", search: "", hash: "#shells",
+globalThis.location = {origin: "http://127.0.0.1:8837", hostname: "127.0.0.1",
+  pathname: "/", search: "", hash: "#shells",
   assign: (url) => { navigations.push(url); }};
 let ticks = 0, onTick = null, confirmAnswer = true, confirms = [];
 function toast(message) { notices.push(message); }

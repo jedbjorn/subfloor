@@ -1425,7 +1425,7 @@ def test_connection_status_is_attached_to_transcript_without_visible_copy():
                     APP.index("// ── Tabs + boot")]
     assert 'let streamStatus = "connecting"' in interface
     assert 'source.onopen = () => onState("connected")' in interface
-    assert 'onState("reconnecting");\n    probeSessionAfterStreamError();' in interface
+    assert 'onState("reconnecting");\n    probeSessionAfterStreamError(() => {' in interface
     assert "transcriptHost.title = `Connection: ${connectionLabel}`" in interface
     assert "`Conversation transcript; connection ${connectionLabel.toLowerCase()}`" in interface
     assert '"stream-disconnected"' in interface

@@ -103,9 +103,29 @@ async function api(path, method = "GET", body, extraHeaders = {}) {
 // place they were at as `next`, instead of seeing "offline" or an error toast.
 const SIGN_IN_PATH = "/signin.html";
 let leavingForSignIn = false;
+// `next` is honoured only as a path on this origin, and what is validated is
+// the value that will be navigated to, after the URL parser has normalised
+// it: "/a/..//host" and "/%2e//host" both normalise to "//host", which a
+// browser reads as another origin. The result must start with exactly one
+// "/", hold no backslash or control character, and parse back to itself on
+// this origin. Anything else falls back to "/".
+const NEXT_UNSAFE = /[\\\u0000-\u001f\u007f]/;
+const NEXT_LOCAL = /^\/(?![\/\\])/;
+function safeNext(raw, origin) {
+  if (typeof raw !== "string" || NEXT_UNSAFE.test(raw) || !NEXT_LOCAL.test(raw)) return "/";
+  let url;
+  try { url = new URL(raw, origin); } catch { return "/"; }
+  if (url.origin !== origin) return "/";
+  const path = url.pathname + url.search + url.hash;
+  if (NEXT_UNSAFE.test(path) || !NEXT_LOCAL.test(path)) return "/";
+  let again;
+  try { again = new URL(path, origin); } catch { return "/"; }
+  if (again.origin !== origin || again.pathname + again.search + again.hash !== path) return "/";
+  return again.pathname === "/signin.html" ? "/" : path;
+}
 function signInUrl() {
-  return SIGN_IN_PATH + "?next="
-    + encodeURIComponent(location.pathname + location.search + location.hash);
+  return SIGN_IN_PATH + "?next=" + encodeURIComponent(
+    safeNext(location.pathname + location.search + location.hash, location.origin));
 }
 function goToSignIn() {
   if (leavingForSignIn) return;   // many requests can fail at once; leave once
@@ -137,17 +157,50 @@ async function sessionFetch(url, init) {
 // `signed_in: false` leaves for sign-in; an unreachable server is a drop and
 // the stream keeps retrying. One probe at a time, and at most one per
 // SESSION_PROBE_MIN_MS however often the stream errors.
+//
+// An error inside that window is never dropped: it schedules one deferred
+// probe for when the window ends. That matters because a browser gives up on
+// a stream the server refuses (the EventSource closes for good), so the
+// refusal can be the last error the page ever gets. `onStillSignedIn` is
+// called once a probe has reached the server and the session still holds;
+// the stream uses it to reopen a closed connection. An unreachable server
+// keeps the waiters and probes again after the window.
 const SESSION_PROBE_MIN_MS = 5000;
 let sessionProbe = null;
 let sessionProbedAt = -Infinity;
-function probeSessionAfterStreamError(now = Date.now()) {
-  if (sessionProbe || leavingForSignIn || now - sessionProbedAt < SESSION_PROBE_MIN_MS) return;
-  sessionProbedAt = now;
+let sessionProbeTimer = null;
+const sessionProbeWaiters = new Set();
+function probeSessionAfterStreamError(onStillSignedIn = null) {
+  if (leavingForSignIn) return;
+  if (onStillSignedIn) sessionProbeWaiters.add(onStillSignedIn);
+  const wait = sessionProbedAt + SESSION_PROBE_MIN_MS - Date.now();
+  if (sessionProbe || wait > 0) {
+    if (!sessionProbeTimer) sessionProbeTimer = setTimeout(() => {
+      sessionProbeTimer = null;
+      probeSessionAfterStreamError();
+    }, wait > 0 ? wait : SESSION_PROBE_MIN_MS);
+    return;
+  }
+  sessionProbedAt = Date.now();
   sessionProbe = sessionFetch("/api/auth/status")
-    .then((response) => response.ok ? response.json() : null)
-    .then((status) => { if (status && status.signed_in === false) goToSignIn(); },
-      () => { /* unreachable: a network drop, not a sign-out */ })
-    .finally(() => { sessionProbe = null; });
+    // An engine without the route answers 404: no sign-in there, so the
+    // session "holds". null means the server could not be reached at all.
+    .then((response) => response.ok ? response.json().catch(() => ({})) : {}, () => null)
+    .then((status) => {
+      sessionProbe = null;
+      if (status === null) {
+        if (sessionProbeWaiters.size) probeSessionAfterStreamError();
+        return;
+      }
+      if (status.signed_in === false) {
+        sessionProbeWaiters.clear();
+        goToSignIn();
+        return;
+      }
+      const waiters = [...sessionProbeWaiters];
+      sessionProbeWaiters.clear();
+      for (const waiter of waiters) waiter();
+    });
 }
 
 function requestKey() {
@@ -3488,9 +3541,13 @@ function renderDrawerEngine(mount) {
     paint(state, outcome);
   };
 
+  // Closing the drawer withdraws a confirmation that has not been sent yet:
+  // after every wait between the confirm button and the POST, a closed
+  // section stops, so nothing is posted from a drawer the operator has left.
   const request = async (op, label, view) => {
-    if (!await engineConfirm(op, label, view.ops[op], view)) return;
+    if (!await engineConfirm(op, label, view.ops[op], view) || closed) return;
     const state = await engineOpsLoad();
+    if (closed) return;
     const url = state.base;
     if (!state.status || !url) { paint(state); return; }
     const previous = state.status.operation;
@@ -5013,9 +5070,19 @@ function chatOpenStream(
     `/api/conversations/${conversationId}/events?after=${afterSequence}`);
   chatSource = source;
   source.onopen = () => onState("connected");
+  // Events carry their sequence; a reopened stream resumes after the last
+  // one seen here rather than replaying from where this one started.
+  let resumeAfter = afterSequence;
   source.onerror = () => {
     onState("reconnecting");
-    probeSessionAfterStreamError();
+    probeSessionAfterStreamError(() => {
+      // The browser retries a dropped connection by itself, but closes the
+      // stream for good when the server refuses it. With the session
+      // confirmed, a closed stream that is still the current one is reopened.
+      if (chatSource === source && generation === chatRenderGeneration
+          && source.readyState === 2)
+        chatOpenStream(conversationId, generation, resumeAfter, onEvent, onState);
+    });
   };
   const types = [
     "conversation.created", "conversation.updated", "conversation.renamed",
@@ -5030,7 +5097,12 @@ function chatOpenStream(
   for (const type of types) {
     source.addEventListener(type, (raw) => {
       if (generation !== chatRenderGeneration) return;
-      try { onEvent(JSON.parse(raw.data)); } catch { /* malformed frames reconnect */ }
+      try {
+        const event = JSON.parse(raw.data);
+        const sequence = Number(event.sequence);
+        if (Number.isFinite(sequence) && sequence > resumeAfter) resumeAfter = sequence;
+        onEvent(event);
+      } catch { /* malformed frames reconnect */ }
     });
   }
   return source;

@@ -15,16 +15,25 @@ const SIGNIN_SETUP_CLI = "./sc auth user add <username>";
 const SIGNIN_START_CLI = "./sc launch";
 const SIGNIN_PASSWORD_MIN = 8;
 
-// `next` is honoured only as a path on this origin. Anything else (another
-// host, a scheme, a protocol-relative or backslash form, a control character,
-// this page itself) falls back to "/".
+// `next` is honoured only as a path on this origin, and what is validated is
+// the value that will be navigated to, after the URL parser has normalised
+// it: "/a/..//host" and "/%2e//host" both normalise to "//host", which a
+// browser reads as another origin. The result must start with exactly one
+// "/", hold no backslash or control character, and parse back to itself on
+// this origin. Anything else falls back to "/".
+const NEXT_UNSAFE = /[\\\u0000-\u001f\u007f]/;
+const NEXT_LOCAL = /^\/(?![\/\\])/;
 function safeNext(raw, origin) {
-  if (typeof raw !== "string" || raw[0] !== "/" || raw[1] === "/") return "/";
-  if (/[\\\u0000-\u001f\u007f]/.test(raw)) return "/";
+  if (typeof raw !== "string" || NEXT_UNSAFE.test(raw) || !NEXT_LOCAL.test(raw)) return "/";
   let url;
   try { url = new URL(raw, origin); } catch { return "/"; }
-  if (url.origin !== origin || url.pathname === "/signin.html") return "/";
-  return url.pathname + url.search + url.hash;
+  if (url.origin !== origin) return "/";
+  const path = url.pathname + url.search + url.hash;
+  if (NEXT_UNSAFE.test(path) || !NEXT_LOCAL.test(path)) return "/";
+  let again;
+  try { again = new URL(path, origin); } catch { return "/"; }
+  if (again.origin !== origin || again.pathname + again.search + again.hash !== path) return "/";
+  return again.pathname === "/signin.html" ? "/" : path;
 }
 // A redirect from the review server cannot carry the fragment (it never
 // reaches a server), but the browser keeps it on this page's URL, so a
@@ -32,7 +41,8 @@ function safeNext(raw, origin) {
 function nextTarget(location) {
   const raw = new URLSearchParams(location.search).get("next");
   const next = safeNext(raw === null ? "/" : raw, location.origin);
-  return next.includes("#") || !location.hash ? next : next + location.hash;
+  if (next.includes("#") || !location.hash) return next;
+  return safeNext(next + location.hash, location.origin);
 }
 // The authority is reached on this page's hostname: the session cookie is
 // bound to that exact host, and cookies ignore ports.
@@ -78,7 +88,10 @@ function createSignIn(env) {
     for (const kid of kids) node.append(kid);
     return node;
   };
+  // Navigation is always to an absolute URL on this origin, built from the
+  // validated path, so nothing about the value can be read as another host.
   const next = nextTarget(location);
+  const leave = () => env.navigate(location.origin + next);
   let base = null;          // the authority, once known
   let limitedUntil = 0;     // ms timestamp; attempts are refused until then
   let unlockCli = SIGNIN_UNLOCK_CLI;
@@ -225,7 +238,7 @@ function createSignIn(env) {
     for (let attempt = 0; attempt < 8; attempt += 1) {
       try {
         const review = await call("", "/api/auth/status");
-        if (review.ok && review.data.signed_in) { env.navigate(next); return; }
+        if (review.ok && review.data.signed_in) { leave(); return; }
       } catch { /* try again */ }
       await env.sleep(250);
     }
@@ -408,14 +421,14 @@ function createSignIn(env) {
     if (!auth) {
       // Without the authority nobody can sign in, but a session that the
       // review server already accepts still works.
-      if (review.data.signed_in) env.navigate(next);
+      if (review.data.signed_in) leave();
       else viewDown();
       return;
     }
     if (!auth.ok) { viewRefused(auth.data.error); return; }
     const status = auth.data;
     if (status.pinned === false || !status.enrolled) { viewNoUser(status.setup_cli); return; }
-    if (status.signed_in && review.data.signed_in) { env.navigate(next); return; }
+    if (status.signed_in && review.data.signed_in) { leave(); return; }
     if (status.signed_in) { await finish(); return; }
     if (Number(status.retry_after) > 0) limitedUntil = env.now() + Number(status.retry_after) * 1000;
     viewUsername();

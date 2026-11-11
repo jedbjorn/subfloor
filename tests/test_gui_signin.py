@@ -39,6 +39,7 @@ OPEN_STATIC = {"/signin.js", "/signin.css", "/theme.js", "/style.css", "/vendor/
 SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 OTPAUTH = ("otpauth://totp/Subfloor:operator?secret=" + SECRET
            + "&issuer=Subfloor&algorithm=SHA1&digits=6&period=30")
+HOME = "http://localhost:8837/?a=1#interface/DEV1"   # the harness page's validated next
 FAILED = ("Sign-in failed. Check the username, password and code, "
           "and that this device's clock is right.")
 
@@ -116,13 +117,13 @@ def test_every_request_in_the_app_goes_through_the_session_aware_fetch():
     # The one event stream asks about the session when it errors.
     assert APP.count("new EventSource(") == 1
     stream = function_source("chatOpenStream")
-    assert 'onState("reconnecting");\n    probeSessionAfterStreamError();' in stream
+    assert 'onState("reconnecting");\n    probeSessionAfterStreamError(() => {' in stream
 
 
 SESSION_ENV = r"""
 const navigations = [];
-globalThis.location = {pathname: "/", search: "?q=1", hash: "#interface/DEV1/cv_1",
-  hostname: "127.0.0.1", assign: (url) => { navigations.push(url); }};
+globalThis.location = {origin: "http://127.0.0.1:8837", pathname: "/", search: "?q=1",
+  hash: "#interface/DEV1/cv_1", hostname: "127.0.0.1", assign: (url) => { navigations.push(url); }};
 const answer = (status, data) => {
   const response = {ok: status >= 200 && status < 300, status, statusText: "x",
     json: async () => data};
@@ -192,97 +193,292 @@ globalThis.fetch = async () => queue.shift();
     }
 
 
-@needs_node
-def test_stream_errors_probe_the_session_without_loops_or_storms():
-    script = SESSION_ENV + SESSION + function_source("chatOpenStream") + r"""
-let chatSource = null;
-const chatStopStream = () => {};
-const sources = [];
-globalThis.EventSource = class { constructor(url) { this.url = url; sources.push(this); }
-  addEventListener() {} close() {} };
-const probes = [];
-let reply = () => answer(200, {signed_in: true});
-globalThis.fetch = (url) => { probes.push(url); return Promise.resolve().then(() => reply()); };
+# A browser-like stream and clock for the session probe: timers fire only as
+# the clock advances, and the fake EventSource behaves as a browser's does. A
+# dropped connection raises an error and is retried by the stream itself after
+# three seconds; a refused one (any HTTP error) raises one error and closes
+# the stream for good. Nothing in these tests emits an error by hand.
+STREAM_ENV = SESSION_ENV + r"""
 let clock = 1000000;
 Date.now = () => clock;
-const states = [];
-(async () => {
-  chatOpenStream("cv_1", 1, 0, () => {}, (state) => states.push(state));
-  const source = sources[0];
-  const out = {};
-  // A reconnect storm: the browser fires error after error.
-  for (let i = 0; i < 25; i++) source.onerror();
+const timers = [];
+globalThis.setTimeout = (fn, ms = 0) => { const timer = {at: clock + ms, fn}; timers.push(timer); return timer; };
+globalThis.clearTimeout = (timer) => { const i = timers.indexOf(timer); if (i >= 0) timers.splice(i, 1); };
+// Run every timer that falls due while the clock moves forward by `ms`.
+const advance = async (ms) => {
+  const end = clock + ms;
+  for (;;) {
+    await settle();
+    const due = timers.filter((t) => t.at <= end).sort((x, y) => x.at - y.at)[0];
+    if (!due) break;
+    timers.splice(timers.indexOf(due), 1);
+    clock = due.at;
+    due.fn();
+  }
+  clock = end;
   await settle();
-  out.storm = {probes: probes.length, states: new Set(states).size, navigations: [...navigations]};
-  // Still signed in: nothing more for the rest of the window, one more after it.
-  clock += 4999; source.onerror(); await settle();
-  out.insideWindow = probes.length;
-  clock += 1; source.onerror(); await settle();
-  out.afterWindow = probes.length;
-  // The server cannot be reached: a network drop, not a sign-out.
-  reply = () => { throw new TypeError("Failed to fetch"); };
-  clock += 5000; source.onerror(); await settle();
-  // An engine without the route.
-  reply = () => answer(404, {error: "not found"});
-  clock += 5000; source.onerror(); await settle();
-  out.dropAndOldEngine = {probes: probes.length, navigations: [...navigations]};
-  // The session is gone: leave once, and stop asking.
-  reply = () => answer(200, {enrolled: true, signed_in: false});
-  clock += 5000; source.onerror(); await settle();
-  clock += 5000; source.onerror(); await settle();
-  clock += 5000; source.onerror(); await settle();
-  out.revoked = {probes: probes.length, navigations: [...navigations]};
-  out.urls = [...new Set(probes)];
+};
+const server = {stream: "ok", session: true, reachable: true, authRoute: true};
+const probes = [], opened = [];
+globalThis.fetch = (url) => {
+  probes.push(clock);
+  if (!server.reachable) return Promise.reject(new TypeError("Failed to fetch"));
+  return Promise.resolve(server.authRoute
+    ? answer(200, {enrolled: true, signed_in: server.session}) : answer(404, {error: "not found"}));
+};
+globalThis.EventSource = class {
+  constructor(url) { this.url = url; this.readyState = 0; this.listeners = {}; opened.push(this); this.connect(); }
+  addEventListener(type, fn) { this.listeners[type] = fn; }
+  close() { this.readyState = 2; }
+  connect() {
+    setTimeout(() => {
+      if (this.readyState === 2) return;
+      const outcome = !server.reachable ? "drop" : !server.session ? "refuse" : server.stream;
+      if (outcome === "ok") { this.readyState = 1; if (this.onopen) this.onopen(); return; }
+      if (outcome === "refuse") { this.readyState = 2; if (this.onerror) this.onerror(); return; }
+      this.readyState = 0; if (this.onerror) this.onerror(); setTimeout(() => this.connect(), 3000);
+    }, 10);
+  }
+  // The connection breaks under an open stream: error now, retry in three seconds.
+  drop() { this.readyState = 0; if (this.onerror) this.onerror(); setTimeout(() => this.connect(), 3000); }
+  emit(type, event) { this.listeners[type]({data: JSON.stringify(event)}); }
+};
+let chatSource = null, chatRenderGeneration = 1;
+const chatStopStream = () => { if (chatSource) chatSource.close(); chatSource = null; };
+const states = [], events = [];
+const openStream = () => chatOpenStream("cv_1", 1, 7, (event) => events.push(event.sequence),
+  (state) => states.push(state));
+const report = (extra = {}) => console.log(JSON.stringify({
+  probes: probes.map((at) => at - 1000000), navigations, urls: opened.map((s) => s.url),
+  last: states[states.length - 1], pendingTimers: timers.length, ...extra}));
+"""
+STREAM_SOURCE = SESSION + function_source("chatOpenStream")
+
+
+@needs_node
+def test_a_session_revoked_inside_the_probe_window_still_reaches_sign_in():
+    # The reviewed sequence: a transient error probes fine; the session is then
+    # revoked; the stream's own retry is refused inside the five-second window
+    # and the browser closes the stream. That last error must not be lost.
+    script = STREAM_ENV + STREAM_SOURCE + r"""
+(async () => {
+  openStream();
+  await advance(100);                       // connected
+  opened[0].drop();                         // t=100: transient error, first probe: signed in
+  await advance(1000);
+  const afterDrop = {probes: probes.length, navigations: [...navigations]};
+  server.session = false;                   // t=1100: revoked
+  await advance(2500);                      // t=3100: the retry is refused, the stream closes
+  const afterRefusal = {closed: opened[0].readyState === 2, probes: probes.length,
+    navigations: [...navigations], deferred: timers.length};
+  await advance(3000);                      // past the window: the deferred probe runs
+  report({afterDrop, afterRefusal});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    assert result["afterDrop"] == {"probes": 1, "navigations": []}
+    assert result["afterRefusal"] == {"closed": True, "probes": 1, "navigations": [], "deferred": 1}
+    assert result["probes"] == [100, 5100], "one probe, then one deferred to the end of the window"
+    assert result["navigations"] == [NEXT]
+    assert result["pendingTimers"] == 0
+
+
+@needs_node
+def test_a_refused_stream_is_reopened_once_the_session_is_confirmed():
+    script = STREAM_ENV + STREAM_SOURCE + r"""
+(async () => {
+  openStream();
+  await advance(100);
+  opened[0].emit("message.accepted", {sequence: 8});
+  opened[0].emit("usage", {sequence: 9});
+  // The server refuses the stream (an error status) while the session holds.
+  server.stream = "refuse";
+  opened[0].drop();
+  await advance(3100);                       // probe at t=100 (ok); the retry at t=3100 is refused
+  const closed = {readyState: opened[0].readyState, streams: opened.length};
+  server.stream = "ok";
+  await advance(2500);                       // deferred probe at t=5100 confirms; the stream reopens
+  const reopened = {streams: opened.length, state: states[states.length - 1]};
+  // A stream that was replaced or stopped meanwhile is not reopened.
+  server.stream = "refuse";
+  opened[1].drop();
+  await advance(3100);
+  chatStopStream();
+  await advance(20000);
+  report({closed, reopened, events});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    assert result["closed"] == {"readyState": 2, "streams": 1}
+    assert result["reopened"] == {"streams": 2, "state": "connected"}
+    assert result["urls"] == ["/api/conversations/cv_1/events?after=7",
+                              "/api/conversations/cv_1/events?after=9"], "resumes after the last event seen"
+    assert result["events"] == [8, 9]
+    assert result["navigations"] == [] and result["pendingTimers"] == 0
+
+
+@needs_node
+def test_stream_probes_stay_bounded_and_stop_after_leaving():
+    script = STREAM_ENV + STREAM_SOURCE + r"""
+(async () => {
+  const out = {};
+  openStream();
+  await advance(100);
+  // The server goes away: the stream errors every three seconds for a minute.
+  server.reachable = false;
+  opened[0].drop();
+  await advance(60000);
+  out.outage = {probes: probes.length, maxTimers: timers.length, navigations: [...navigations],
+    spacing: Math.min(...probes.slice(1).map((at, i) => at - probes[i]))};
+  // It comes back with the session intact: the stream reconnects by itself.
+  server.reachable = true;
+  await advance(10000);
+  out.recovered = {state: states[states.length - 1], streams: opened.length, navigations: [...navigations]};
+  // An engine without the auth route never sends anyone to sign-in.
+  server.authRoute = false;
+  opened[0].drop();
+  await advance(10000);
+  out.oldEngine = [...navigations];
+  // Revoked: leave once; nothing probes or reconnects afterwards.
+  server.authRoute = true; server.session = false;
+  opened[0].drop();
+  await advance(10000);
+  const before = probes.length;
+  await advance(60000);
+  out.afterLeaving = {extraProbes: probes.length - before, navigations: [...navigations],
+    pendingTimers: timers.length};
   console.log(JSON.stringify(out));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
-    assert run_js(script) == {
-        "storm": {"probes": 1, "states": 1, "navigations": []},
-        "insideWindow": 1, "afterWindow": 2,
-        "dropAndOldEngine": {"probes": 4, "navigations": []},
-        "revoked": {"probes": 5, "navigations": [NEXT]},
-        "urls": ["/api/auth/status"],
-    }
+    out = run_js(script)
+    assert out["outage"]["navigations"] == [], "an unreachable server is a drop, not a sign-out"
+    assert out["outage"]["probes"] <= 13 and out["outage"]["spacing"] >= 5000
+    assert out["outage"]["maxTimers"] <= 2, "one stream retry and at most one deferred probe"
+    assert out["recovered"] == {"state": "connected", "streams": 1, "navigations": []}
+    assert out["oldEngine"] == []
+    assert out["afterLeaving"] == {"extraProbes": 0, "navigations": [NEXT], "pendingTimers": 0}
 
 
 # ── next ──────────────────────────────────────────────────────────────────────
 
+NEXT_CASES = {
+    # honoured
+    "/": "/", "/?a=1#interface/DEV1": "/?a=1#interface/DEV1", "/index.html#docs": "/index.html#docs",
+    "/a/../b": "/b", "/./x": "/x",
+    # another host, a scheme, a backslash form, a control character, this page
+    "//evil.example/": "/", "https://evil.example/": "/", "http://127.0.0.1:8837/": "/",
+    "/\\evil.example": "/", "\\\\evil.example": "/", "/a\\b": "/",
+    "javascript:alert(1)": "/", "data:text/html,x": "/", "": "/", "evil": "/",
+    "/\tjavascript:x": "/", "/a\nb": "/", "/signin.html?next=/": "/", "/signin.html": "/",
+    "/x/../signin.html": "/",
+    # normalisation that would turn a local-looking path into another origin
+    "/a/..//evil.example": "/", "/.//evil.example": "/", "/%2e//evil.example": "/",
+    "/%2E//evil.example": "/", "/a/%2e%2e//evil.example": "/", "/a/%2E%2e//evil.example": "/",
+    "/..//evil.example": "/", "/a/b/../..//evil.example/path?x#y": "/", "/././/evil.example": "/",
+    "/a/..///evil.example": "/", "/a/../%2e//evil.example": "/",
+    # encoded separators stay encoded, so they stay a path on this origin
+    "/%2F%2Fevil.example": "/%2F%2Fevil.example", "/%5Cevil.example": "/%5Cevil.example",
+    "/a/..%2F%2Fevil.example": "/a/..%2F%2Fevil.example",
+    # double-encoded forms are not decoded a second time
+    "/%252e//evil.example": "/%252e//evil.example", "/%252F%252Fevil.example": "/%252F%252Fevil.example",
+    "/a/%252e%252e//evil.example": "/a/%252e%252e//evil.example",
+}
+NEXT_QUERIES = {
+    # as they arrive in ?next=, once- and twice-encoded
+    "?next=%2Fa%2F..%2F%2Fevil.example": "/", "?next=%2F.%2F%2Fevil.example": "/",
+    "?next=%2F%252e%2F%2Fevil.example": "/", "?next=%2F%25252e%2F%2Fevil.example": "/%252e//evil.example", "?next=/%2e//evil.example": "/",
+    "?next=%252Fa%252F..%252F%252Fevil.example": "/", "?next=%2F%2Fevil.example": "/",
+    "?next=%255C%255Cevil.example": "/", "?next=https%3A%2F%2Fevil.example": "/",
+    "?next=%2F%3Fa%3D1": "/?a=1", "": "/",
+}
+
+
 @needs_node
-def test_next_is_honoured_only_as_a_path_on_this_origin():
-    cases = {
-        "/": "/", "/?a=1#interface/DEV1": "/?a=1#interface/DEV1", "/index.html#docs": "/index.html#docs",
-        "//evil.example/": "/", "https://evil.example/": "/", "http://127.0.0.1:8837/": "/",
-        "/\\evil.example": "/", "\\\\evil.example": "/", "/a\\b": "/",
-        "javascript:alert(1)": "/", "data:text/html,x": "/", "": "/", "evil": "/",
-        "/\tjavascript:x": "/", "/a\nb": "/", "/signin.html?next=/": "/", "/signin.html": "/",
-        "/%2F%2Fevil.example": "/%2F%2Fevil.example",
-    }
-    script = SIGNIN_JS + r"""
+@pytest.mark.parametrize("source", ["signin.js", "app.js"])
+def test_next_is_validated_after_normalisation_on_both_pages(source):
+    code = SIGNIN_JS if source == "signin.js" else between("const NEXT_UNSAFE", "function signInUrl()")
+    script = code + r"""
 const cases = __CASES__;
 const origin = "http://127.0.0.1:8837";
-const out = {};
-for (const raw of Object.keys(cases)) out[raw] = safeNext(raw, origin);
+const out = {}, escapes = [];
+for (const raw of Object.keys(cases)) {
+  const result = safeNext(raw, origin);
+  out[raw] = result;
+  // Whatever comes back, navigating to it stays on this origin, by any reading.
+  if (new URL(origin + result).origin !== origin) escapes.push(raw);
+  if (new URL(result, origin).origin !== origin) escapes.push(raw);
+  if (!/^\/(?![\/\\])/.test(result)) escapes.push(raw);
+}
+console.log(JSON.stringify({out, escapes,
+  notString: [safeNext(null, origin), safeNext(undefined, origin), safeNext(7, origin)]}));
+"""
+    result = run_js(script.replace("__CASES__", json.dumps(NEXT_CASES)))
+    assert result["out"] == NEXT_CASES
+    assert result["escapes"] == []
+    assert result["notString"] == ["/", "/", "/"]
+
+
+def test_both_pages_carry_the_same_next_rule():
+    in_app = between("const NEXT_UNSAFE", "function signInUrl()")
+    in_page = SIGNIN_JS[SIGNIN_JS.index("const NEXT_UNSAFE"):SIGNIN_JS.index("// A redirect from the review")]
+    assert in_app.strip() == in_page.strip()
+    assert "safeNext(location.pathname + location.search + location.hash, location.origin)" in APP
+    assert "env.navigate(location.origin + next)" in SIGNIN_JS
+    assert SIGNIN_JS.count("env.navigate(") == 1, "one way out of the sign-in page"
+
+
+@needs_node
+def test_sign_in_page_reads_next_from_its_own_url():
+    script = SIGNIN_JS + r"""
+const queries = __QUERIES__;
+const origin = "http://127.0.0.1:8837";
 const loc = (search, hash) => ({origin, search, hash});
+const out = {};
+for (const search of Object.keys(queries)) out[search] = nextTarget(loc(search, ""));
 console.log(JSON.stringify({out,
-  notString: [safeNext(null, origin), safeNext(undefined, origin), safeNext(7, origin)],
-  missing: nextTarget(loc("", "")),
   fragmentKept: nextTarget(loc("?next=%2F", "#interface/DEV1")),
   ownFragmentWins: nextTarget(loc("?next=%2F%23docs", "#interface/DEV1")),
-  hostile: nextTarget(loc("?next=%2F%2Fevil.example", "#x")),
+  hostileWithFragment: nextTarget(loc("?next=%2Fa%2F..%2F%2Fevil.example", "#x")),
   base: [signInAuthorityBase("http://127.0.0.1:8857", {hostname: "localhost"}),
          signInAuthorityBase("http://127.0.0.1:8857/x?y", {hostname: "127.0.0.1"}),
          signInAuthorityBase(null, {hostname: "localhost"}),
          signInAuthorityBase("not a url", {hostname: "localhost"})],
 }));
 """
-    result = run_js(script.replace("__CASES__", json.dumps(cases)))
-    assert result["out"] == cases
-    assert result["notString"] == ["/", "/", "/"]
-    assert result["missing"] == "/"
+    result = run_js(script.replace("__QUERIES__", json.dumps(NEXT_QUERIES)))
+    assert result["out"] == NEXT_QUERIES
     assert result["fragmentKept"] == "/#interface/DEV1"
     assert result["ownFragmentWins"] == "/#docs"
-    assert result["hostile"] == "/#x"
+    assert result["hostileWithFragment"] == "/#x"
     assert result["base"] == ["http://localhost:8857", "http://127.0.0.1:8857", None, None]
+
+
+@needs_node
+def test_a_hostile_next_ends_on_this_origin_after_sign_in():
+    script = SIGNIN_HARNESS.replace('search: "?next=%2F%3Fa%3D1", hash: "#interface/DEV1"',
+                                    'search: "?next=%2Fa%2F..%2F%2Fevil.example", hash: ""') + r"""
+server.auth.signed_in = true; server.review.signed_in = true;
+(async () => {
+  await page.start(); await settle();
+  finish({navigations, next: page.next});
+})().catch((error) => { realLog(String(error.stack)); process.exitCode = 1; });
+"""
+    assert run_js(script) == {"navigations": ["http://localhost:8837/"], "next": "/"}
+
+
+@needs_node
+@pytest.mark.parametrize("pathname,expected", [
+    ("//evil.example/x", "/signin.html?next=%2F"),
+    ("/\\evil.example", "/signin.html?next=%2F"),
+    ("/index.html", "/signin.html?next=%2Findex.html%3Fq%3D1%23interface%2FDEV1%2Fcv_1"),
+])
+def test_the_app_only_hands_the_sign_in_page_a_local_next(pathname, expected):
+    script = SESSION_ENV + SESSION + r"""
+location.pathname = __PATH__;
+goToSignIn();
+console.log(JSON.stringify({navigations}));
+"""
+    assert run_js(script.replace("__PATH__", json.dumps(pathname))) == {"navigations": [expected]}
 
 
 # ── The sign-in page ──────────────────────────────────────────────────────────
@@ -386,10 +582,10 @@ const finish = (value) => realLog(JSON.stringify(value));
       "navigations": []}),
     # signed in everywhere: straight to next
     ("server.auth.signed_in = true; server.review.signed_in = true;",
-     {"heading": "Sign in", "form": False, "has": [], "navigations": ["/?a=1#interface/DEV1"]}),
+     {"heading": "Sign in", "form": False, "has": [], "navigations": [HOME]}),
     # the review server accepts the session and the authority is down: the GUI still works
     ("server.review.signed_in = true; server.authorityUp = false;",
-     {"heading": "Sign in", "form": False, "has": [], "navigations": ["/?a=1#interface/DEV1"]}),
+     {"heading": "Sign in", "form": False, "has": [], "navigations": [HOME]}),
     # the review server accepts a session the authority does not: sign in again, no bounce
     ("server.review.signed_in = true;",
      {"heading": "Sign in", "form": True, "has": [], "navigations": []}),
@@ -509,7 +705,7 @@ server.routes["/auth/identify"] = () => [200, {first_sign_in: false}];
         "notice": "Enter the six-digit code from your authenticator app.", "posts": 1}
     assert out["refused"] == {"notice": FAILED, "password": "", "code": "", "focus": "password"}
     assert out["refusedAgain"] == FAILED
-    assert out["done"] == {"navigations": ["/?a=1#interface/DEV1"], "sleeps": 2, "heading": "Signed in"}
+    assert out["done"] == {"navigations": [HOME], "sleeps": 2, "heading": "Signed in"}
     json_post = {"method": "POST", "credentials": "include", "type": "application/json"}
     assert out["posts"] == [
         {"url": "http://localhost:8857/auth/identify", **json_post, "body": {"username": "operator"}},
@@ -620,7 +816,7 @@ const confirms = () => posts().filter((r) => r.url.endsWith("/auth/first/confirm
     assert out["expired"] == {"heading": "First sign-in",
                               "notice": "First sign-in timed out. Enter the claim code again.",
                               "text": False}
-    assert out["done"]["navigations"] == ["/?a=1#interface/DEV1"]
+    assert out["done"]["navigations"] == [HOME]
     assert out["begins"] == [{"username": "operator", "claim_code": "AAAA-BBBB"},
                              {"username": "operator", "claim_code": "ABCD-EFGH"},
                              {"username": "operator", "claim_code": "ABCD-EFGH"}]
@@ -1082,3 +1278,71 @@ def test_engine_operations_ask_for_no_authenticator_code():
     assert "one-time-code" not in ENGINE and "totp" not in ENGINE.lower()
     assert "authenticator" not in ENGINE.lower()
     assert "const typed = Boolean(facts.stops_engine);" in confirm
+
+
+# ── Closing the drawer withdraws an unsent confirmation ───────────────────────
+
+@needs_node
+@pytest.mark.parametrize("op,label", [("update", "Update engine"), ("restart", "Restart engine"),
+                                      ("update-harnesses", "Update harnesses")])
+@pytest.mark.parametrize("phase", ["confirmation", "revalidation"])
+def test_closing_the_drawer_before_an_operation_is_sent_posts_nothing(op, label, phase):
+    script = ENGINE_HARNESS + r"""
+const PHASE = "__PHASE__";
+server.post = () => json(202, {started: true, operation: running("__OP__", "2026-06-06T00:00:00Z")});
+(async () => {
+  const mount = el("div");
+  const cleanup = renderDrawerEngine(mount);
+  await settle();
+  const before = snap(mount);
+  let armed = false;
+  // The operator confirms, then closes the drawer: either while the dialog's
+  // answer is being delivered, or while the status is re-read before the POST.
+  engineConfirm = async (name) => { confirms.push(name); if (PHASE === "confirmation") cleanup(); else armed = true; return true; };
+  const inner = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (armed && url === "/api/engine-ops") { armed = false; cleanup(); }
+    return inner(url, init);
+  };
+  press(mount, "__LABEL__");
+  await settle();
+  finish({confirms, posts: serviceRequests.filter((r) => r.method === "POST").map((r) => r.path),
+    unchanged: JSON.stringify(snap(mount)) === JSON.stringify(before), ticks, navigations});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("__PHASE__", phase).replace("__OP__", op).replace("__LABEL__", label))
+    assert result == {"confirms": [op], "posts": [], "unchanged": True, "ticks": 0, "navigations": []}
+
+
+@needs_node
+def test_closing_the_drawer_before_a_revoke_is_sent_posts_nothing():
+    script = ACCOUNT_HARNESS + r"""
+(async () => {
+  const [mount, close] = await open();
+  accountConfirmRevoke = async (session) => { confirmed.push(session.id); close(); return true; };
+  server.revoke = () => answer(200, {revoked: true, current: false});
+  await button(mount, "Revoke").onclick(); await settle();
+  console.log(JSON.stringify({confirmed, posts: requests.filter((r) => r.method === "POST").length,
+    devices: all(mount, (n) => n.className === "account-device").length}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    assert run_js(script) == {"confirmed": ["s2"], "posts": 0, "devices": 2}
+
+
+def test_no_wait_separates_a_confirmation_from_its_post_without_a_closed_check():
+    # Sign-out has no wait before its POST; revoke and the engine operations
+    # re-check `closed` after each one.
+    request = ENGINE[ENGINE.index("  const request = async (op, label, view) => {"):
+                     ENGINE.index("  paint({ discovery: null, status: null }")]
+    before_post = request[:request.index("    try { answer = await engineOpsRequest(url")]
+    waits = [line for line in before_post.splitlines() if "await " in line]
+    assert waits == [
+        "    if (!await engineConfirm(op, label, view.ops[op], view) || closed) return;",
+        "    const state = await engineOpsLoad();",
+    ]
+    assert "    const state = await engineOpsLoad();\n    if (closed) return;" in before_post
+    account = function_source("renderDrawerAccount")
+    assert "if (!await accountConfirmRevoke(session) || closed) return;" in account
+    sign_out = account[account.index("signOut.onclick = async () => {"):account.index("const others =")]
+    assert sign_out.index("await engineOpsRequest(state.base, \"/auth/sign-out\"") \
+        == sign_out.index("await "), "nothing is awaited before the sign-out request"
