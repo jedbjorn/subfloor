@@ -211,7 +211,7 @@ class RenderedSkillTest(unittest.TestCase):
 
     def test_hash_reference_survives_every_adapter_mirror(self) -> None:
         description = (
-            "Run the exact-ref, disposable dos-app Sprint promotion canary "
+            "Run the exact-ref, disposable promotion canary "
             "for Spec #116."
         )
         rendered = self.render("canary_probe", description)
