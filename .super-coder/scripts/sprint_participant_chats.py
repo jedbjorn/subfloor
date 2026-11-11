@@ -93,7 +93,8 @@ def wake_prompt(sprint_id: int, role: str) -> str:
             f"unsupported Sprint participant role: {role}"
         ) from exc
     return (
-        f"Sprint {sprint_id} handoff for your {label} role. Load `{skill}`. "
+        f"Sprint {sprint_id} handoff for your {label} role. Load `sprint_protocol`, "
+        f"then `{skill}`. "
         f"Run `sc sprint inbox --sprint {sprint_id}` now and act on the Sprint "
         f"message(s) using `{skill}`. Confirm every Sprint write succeeds before "
         "stopping. If a Sprint command failed or did not confirm its durable write, "

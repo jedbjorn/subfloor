@@ -1807,8 +1807,11 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
             f"All planned delivery work for Sprint {self.sprint_id} is terminal "
             f"({terminal_count} units: {completed} completed, {cancelled} "
             "cancelled). Begin whole-Sprint conformance per sprint_rev — compile "
-            "the evidence packet, judge integrated main, then send the Planner "
-            "either a re-enter decision or your conclude decision."
+            "the evidence packet and judge integrated main. Clean or "
+            "post-Sprint-only findings -> close with `sc sprint "
+            "record-conformance` and send no conclude message; in-Sprint "
+            "patching needed -> send the Planner a Sprint-level re-enter "
+            "decision instead."
         )
         self.assertEqual(
             [("notification", expected_body, "new", 0, None)],
@@ -2485,7 +2488,7 @@ class ProductionPulseTest(SprintWorkDispatchCase):
         ).fetchone()
         expected_prompt = (
             f"Sprint {self.sprint_id} handoff for your Developer role. Load "
-            "`sprint_dev`. Run `sc sprint inbox --sprint "
+            "`sprint_protocol`, then `sprint_dev`. Run `sc sprint inbox --sprint "
             f"{self.sprint_id}` now and act on the Sprint message(s) using "
             "`sprint_dev`. Confirm every Sprint write succeeds before stopping. "
             "If a Sprint command failed or did not confirm its durable write, retry "
