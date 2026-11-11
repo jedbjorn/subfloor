@@ -29,6 +29,7 @@ import conversation_events
 import conversation_launch
 import conversation_routes
 import sprint_participant_chats
+from signin_fixture import sign_in
 from conversation_adapters import NativeTurn, NormalizedEvent
 from conversation_adapters import opencode as opencode_adapter
 from segmented_response_traces import (
@@ -191,6 +192,7 @@ class ConversationApiCase(unittest.TestCase):
         con.close()
         (self.root / ".sc-worktrees" / "dev").mkdir(parents=True)
         (self.root / ".sc-worktrees" / "review").mkdir(parents=True)
+        self.browser = sign_in(self, host="localhost:8800")
 
         patches = (
             mock.patch.object(conversation_routes, "DB_PATH", self.db_path),
@@ -231,9 +233,11 @@ class ConversationApiCase(unittest.TestCase):
         con.execute("PRAGMA foreign_keys=ON")
         return con
 
-    @staticmethod
-    def headers(*, key: str | None = None, extra: dict | None = None) -> str:
-        values = {"Host": "localhost:8800", **(extra or {})}
+    def headers(self, *, key: str | None = None, extra: dict | None = None) -> str:
+        # The operator is a signed-in browser (Feature #94): every request
+        # carries the session cookie the fixture published.
+        values = {"Host": "localhost:8800", "Cookie": self.browser.cookie,
+                  **(extra or {})}
         if key is not None:
             values["Idempotency-Key"] = key
         return "\r\n".join(f"{name}: {value}" for name, value in values.items())

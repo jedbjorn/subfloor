@@ -125,6 +125,8 @@ import sprint_pr_watcher  # noqa: E402  (engine-wide PR subscription observation
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import route_bindings  # noqa: E402  (shared durable model-route freshness gate)
 import engine_ops  # noqa: E402  (where the host-side engine-ops service is)
+import browser_gate  # noqa: E402  (the sign-in gate: default deny, Feature #94)
+import cli_credential  # noqa: E402  (the engine CLI credential for sc verbs)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
 from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quota probes — doc #49)
@@ -152,7 +154,16 @@ _STATIC = {
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
+    # The sign-in page and the files it loads (Feature #94). These, and
+    # `/vendor/qrcode.js`, are the only static files `browser_gate.OPEN_ROUTES`
+    # serves to a visitor who has not signed in; `/style.css` is shared.
+    "/signin.html": ("signin.html", "text/html; charset=utf-8"),
+    "/signin.js": ("signin.js", "application/javascript; charset=utf-8"),
+    "/signin.css": ("signin.css", "text/css; charset=utf-8"),
+    "/theme.js": ("theme.js", "application/javascript; charset=utf-8"),
 }
+# The pages: each carries the CSP, and the app shell renews the session cookie.
+_PAGES = frozenset(("index.html", "signin.html"))
 
 # Vendored assets resolve PER REQUEST against `ui/vendor/` (spec #48). The
 # frozen table above ages at a different rate than the file bodies it points
@@ -3107,15 +3118,18 @@ class Handler(BaseHTTPRequestHandler):
                     "details": {},
                 }})
             return False
-        operator = con.execute(
-            "SELECT 1 FROM users WHERE is_active=1 ORDER BY user_id LIMIT 1"
+        # No Authorization header proves nothing (Feature #94): the operator
+        # is the user a verified session cookie belongs to. `dispatch_http`
+        # has already refused a request without one; this is the same check,
+        # held where the route is, for a caller that did not come that way.
+        session = browser_gate.session(self.headers)
+        operator = None if session is None else con.execute(
+            "SELECT 1 FROM users WHERE user_id=? AND is_active=1",
+            (session["user_id"],),
         ).fetchone()
         if operator is None:
-            self._send(401, {"error": {
-                "code": "unauthorized",
-                "message": "no active browser operator exists",
-                "details": {},
-            }})
+            self._send(401, browser_gate.sign_in_required_payload(),
+                       headers={"Cache-Control": "no-store"})
             return False
         return True
 
@@ -5683,8 +5697,13 @@ class Handler(BaseHTTPRequestHandler):
             }
             # Restrictive CSP on the app shell (spec #20 Security): vendored
             # scripts/styles + same-origin connections only, no inline script.
-            if fname == "index.html":
+            if fname in _PAGES:
                 headers["Content-Security-Policy"] = _CSP
+            if fname == "index.html":
+                # Loading the app is "use": re-issue the session cookie with a
+                # fresh lifetime (the engine never expires a session; a
+                # browser drops a cookie after about 400 days).
+                headers.update(browser_gate.renewal_headers(self.headers))
             if self._if_none_match(headers["ETag"]):
                 return self._not_modified(headers)
             return self._send(200, text, ctype, headers=headers)
@@ -5717,6 +5736,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/logs":
             return self._send(200, {"events": list(reversed(read_log())),
                                     "max": LOG_MAX_EVENTS})
+        if path == "/api/auth/status":
+            # Open (browser_gate.OPEN_ROUTES): what the sign-in page needs
+            # before anyone is signed in. No secret. The authority is
+            # the host engine-ops service; a signed-in caller also has its
+            # cookie renewed.
+            try:
+                payload = browser_gate.auth_status(
+                    self.path, self.headers, engine_ops.discovery(
+                        in_container() or bool(os.environ.get("SC_SANDBOX"))),
+                    _active_user)
+            except Exception as e:
+                return self._fail(e)
+            headers = {"Cache-Control": "no-store"}
+            if payload["signed_in"]:
+                headers.update(browser_gate.renewal_headers(self.headers))
+            return self._send(200, payload, headers=headers)
         if path == "/api/models":
             q = parse_qs(urlparse(self.path).query)
             try:
@@ -6547,11 +6582,59 @@ class _ShimHandler(Handler):
     # log_request/log_message already quiet via Handler.log_message.
 
 
+def _live_shell_token(token: str) -> bool:
+    """Whether a Bearer token is a live shell's API key (for the gate)."""
+    con = db()
+    try:
+        return con.execute(
+            "SELECT 1 FROM shells WHERE api_key=? AND COALESCE(is_deleted,0)=0",
+            (token,)).fetchone() is not None
+    finally:
+        con.close()
+
+
+def _active_user(user_id: int) -> bool:
+    """Whether a session's user is an active engine user (for the gate)."""
+    con = db()
+    try:
+        return con.execute(
+            "SELECT 1 FROM users WHERE user_id=? AND is_active=1",
+            (user_id,)).fetchone() is not None
+    finally:
+        con.close()
+
+
+def _gate(method: str, path: str, headers_raw: str) -> tuple | None:
+    """The sign-in gate's refusal for this request, or None to let it through.
+
+    Fails closed: if the check itself cannot run (the engine DB is busy while
+    a session's user or a Bearer's shell is looked up), the request is
+    refused with a retryable 503. It is never let through undecided.
+    """
+    try:
+        verdict = browser_gate.authorize(
+            method, path, conversation_routes._parse_headers(headers_raw),
+            _live_shell_token, _active_user)
+    except Exception:  # noqa: BLE001 — undecided is refused
+        traceback.print_exc()
+        body = b"" if method == "HEAD" else json.dumps(browser_gate.error_payload(
+            "gate_unavailable",
+            "the sign-in check could not run — retry")).encode()
+        return 503, [("Content-Type", "application/json"),
+                     ("Cache-Control", "no-store"), ("Retry-After", "2")], body
+    return None if verdict.allowed else verdict.response
+
+
 def dispatch_http(method: str, path: str, headers_raw: str,
                   body: bytes) -> tuple:
     """The transport's HTTP entry: route one request, return
     (status, [(header, value)], body bytes). Focused retained routes go to
     their own modules; everything else runs through the shimmed Handler."""
+    # THE gate (Feature #94, spec #271): default deny, decided before any
+    # route below is chosen. Nothing above this line answers a request.
+    refusal = _gate(method, path, headers_raw)
+    if refusal is not None:
+        return refusal
     parsed = urlparse(path)
     if parsed.path == "/api/diagnostics/request-timing":
         return request_timing.handle(method, headers_raw)
@@ -6751,6 +6834,19 @@ def _run_server(port: int) -> int:
     # api_key rotation is picked up here. Lives under the gitignored,
     # never-snapshotted .super-coder/run/.
     mem_credentials.provision(str(DB_PATH), f"http://127.0.0.1:{port}")
+    # The engine CLI credential (Feature #94): a fresh token every boot, held
+    # in memory and published owner-only under the same gitignored run/. The
+    # `sc` verbs that call `/api/*` present it; the gate accepts it on
+    # `browser_gate.CLI_ROUTES` only.
+    try:
+        browser_gate.CLI_TOKEN = cli_credential.provision()
+    except OSError as exc:
+        # Not a reason to refuse the GUI: with no token published, the CLI
+        # routes still take a shell token, and `./sc snapshot` says what it
+        # could not read.
+        browser_gate.CLI_TOKEN = None
+        print(f"server: could not publish the engine CLI credential ({exc}); "
+              "`./sc snapshot` will be refused until the next restart")
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can
     # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which

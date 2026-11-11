@@ -96,6 +96,8 @@ import snapshot  # noqa: E402
 sys.path.insert(0, str(ENGINE / "api"))
 import review_routes  # noqa: E402
 import server  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from signin_fixture import sign_in  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "render"))
 import compose  # noqa: E402
@@ -526,8 +528,9 @@ class GrantApiTest(unittest.TestCase):
             status, _headers, body = server.dispatch_http(
                 "PUT",
                 f"/api/flavors/dev/skills/{self.kid}",
-                "Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
-                "Content-Length: 17\r\n",
+                sign_in(self, host="127.0.0.1").add_to(
+                    "Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                    "Content-Length: 17\r\n"),
                 b'{"granted": true}',
             )
         self.assertEqual(status, 200, body)
@@ -546,8 +549,9 @@ class GrantApiTest(unittest.TestCase):
             status, _headers, body = server.dispatch_http(
                 "PUT",
                 f"/api/shells/{self.custom1}/skills/{self.kid}",
-                "Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
-                "Content-Length: 18\r\n",
+                sign_in(self, host="127.0.0.1").add_to(
+                    "Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                    "Content-Length: 18\r\n"),
                 b'{"granted": false}',
             )
         self.assertEqual(status, 200, body)
