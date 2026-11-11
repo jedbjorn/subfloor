@@ -224,11 +224,20 @@ Either request accepts either credential:
 - **a shell token** (`shells.api_key`), the one the shell already holds;
 - **the engine CLI credential.** The review server mints a random token at
   every boot and keeps it in memory. Once it holds its port, and not before,
-  it writes the token to `.super-coder/run/api/cli-token` (directory `0700`,
-  file `0600`), under the gitignored `run/`. A second server that starts and
-  fails to bind therefore never replaces the file, and it always names the
-  token of the server that is listening. Nothing deletes it at shutdown. A
-  host verb that has no shell identity reads it from there. The server
+  it writes the token to `.super-coder/run/api/cli-token.<port>` (directory
+  `0700`, file `0600`), under the gitignored `run/`, keyed by the port it
+  bound. A second server of the same checkout on another port publishes its
+  own file and leaves this one alone, and one that fails to bind publishes
+  nothing, so the file for a port names the token of the server listening on
+  that port. Nothing deletes a file, at startup or at shutdown: another
+  port's may belong to a live server, and a token with no server behind it
+  opens nothing. A host verb that has no shell identity reads the file for
+  the port it is about to call; if the server there asks for a credential and
+  none is published for that port, the verb says so (no server of this
+  checkout on that port, or not this checkout's server). On docker the server
+  runs in the container on the same port number the host publishes and
+  resolves, and `run/` is in the bind-mounted checkout, so the host verb
+  finds the file where the container wrote it. The server
   compares against the value in memory, so writing the file grants nothing,
   and a restart retires the old token. It is worth exactly what a shell token
   is worth on those two requests; it exists so that `./sc snapshot` does not

@@ -684,13 +684,14 @@ def _snapshot_via_runtime_api() -> str | None:
         return None
     # The review API answers `/api/*` only to a signed-in browser or to a
     # credential it accepts (Feature #94). This verb presents the engine CLI
-    # credential THIS checkout's runtime published at boot, never an ambient
-    # `SC_API_TOKEN`, which may belong to another installation (see above).
+    # credential THIS checkout's runtime published for the port being called,
+    # never another port's and never an ambient `SC_API_TOKEN`, which may
+    # belong to another installation (see above).
     # No credential on disk means a runtime from before sign-in, which asks
     # for none.
     request = urllib.request.Request(
         base + "/api/scripts/snapshot", data=b"", method="POST",
-        headers=cli_credential.authorization(),
+        headers=cli_credential.authorization(port),
     )
     try:
         with urllib.request.urlopen(request, timeout=185) as response:
@@ -698,11 +699,7 @@ def _snapshot_via_runtime_api() -> str | None:
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             raise SystemExit(
-                "snapshot: the runtime refused this verb's credential "
-                f"(HTTP {exc.code}). It is read from "
-                f"{cli_credential.RUN_DIR / cli_credential.FILE_NAME}, which "
-                "the runtime rewrites at every boot, owner-only: restart the "
-                "runtime (`./sc restart`) and retry."
+                "snapshot: " + cli_credential.refused(port, exc.code)
             ) from exc
         try:
             payload = json.loads(exc.read())

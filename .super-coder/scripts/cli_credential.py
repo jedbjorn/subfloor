@@ -9,11 +9,18 @@ the credential they present.
 
 * The review server mints a fresh random token at every boot and keeps it in
   memory. Once it holds its port, and not before, it writes the token to
-  `.super-coder/run/api/cli-token` (directory `0700`, file `0600`), replacing
-  the file by rename. A second server that fails to bind never publishes, so
-  the file names the token of the server that is listening. Nothing deletes
-  the file at shutdown.
-* A caller reads the file and sends `Authorization: Bearer <token>`.
+  `.super-coder/run/api/cli-token.<port>` (directory `0700`, file `0600`),
+  replacing the file by rename. The file is keyed by the port the server
+  bound: a second server for the same checkout on another port publishes its
+  own file and leaves this one alone, and a second server that fails to bind
+  never publishes. So the file for a port names the token of the server
+  listening on that port.
+* A caller reads the file for the port it is about to call and sends
+  `Authorization: Bearer <token>`.
+* Nothing deletes a file: not at shutdown, and not at startup for another
+  port, whose server may be alive. A file left by a server that has stopped
+  opens nothing, because no server holds that token any more; the next server
+  on that port replaces it.
 * The server accepts it on the routes in `browser_gate.CLI_ROUTES` and nowhere
   else. It is never a browser session and never the operator.
 
@@ -46,28 +53,37 @@ def mint() -> str:
     return PREFIX + secrets.token_urlsafe(32)
 
 
-def provision(run_dir: Path | None = None) -> str:
-    """Mint a token, publish it owner-only, and return it."""
+def path_for(port: int, run_dir: Path | None = None) -> Path:
+    """Where the server listening on `port` publishes its token."""
+    if type(port) is not int or not 0 < port < 65536:
+        raise ValueError(f"not a TCP port: {port!r}")
+    return (run_dir or RUN_DIR) / f"{FILE_NAME}.{port}"
+
+
+def provision(port: int, run_dir: Path | None = None) -> str:
+    """Mint a token, publish it for `port` owner-only, and return it."""
     token = mint()
-    publish(token, run_dir)
+    publish(token, port, run_dir)
     return token
 
 
-def publish(token: str, run_dir: Path | None = None) -> None:
-    """Publish `token` owner-only.
+def publish(token: str, port: int, run_dir: Path | None = None) -> None:
+    """Publish `token`, owner-only, as the credential of the server on `port`.
 
     The file is written as a new inode and renamed over the name, so a link
-    planted at the path is replaced and never followed.
+    planted at the path is replaced and never followed. Only this port's file
+    is touched.
     """
-    run_dir = run_dir or RUN_DIR
+    path = path_for(port, run_dir)
+    run_dir = path.parent
     run_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(run_dir, 0o700)
-    fd, tmp = tempfile.mkstemp(dir=run_dir, prefix=f".{FILE_NAME}.", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=run_dir, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as handle:
             os.fchmod(handle.fileno(), 0o600)
             handle.write(token.encode("ascii"))
-        os.replace(tmp, run_dir / FILE_NAME)
+        os.replace(tmp, path)
     except OSError:
         try:
             os.unlink(tmp)
@@ -76,16 +92,17 @@ def publish(token: str, run_dir: Path | None = None) -> None:
         raise
 
 
-def read(run_dir: Path | None = None) -> str | None:
-    """The published token, or None when there is none that can be trusted.
+def read(port: int, run_dir: Path | None = None) -> str | None:
+    """The token published for `port`, or None when there is none to trust.
 
-    None for a missing file (no server has booted here, or an engine older
-    than this credential is running), a link, a file that is not a regular
-    file owned by this user, or one readable by group or others.
+    None for a missing file (no server of this checkout has bound that port,
+    or an engine older than this credential is running), a link, a file that
+    is not a regular file owned by this user, or one readable by group or
+    others.
     """
-    path = (run_dir or RUN_DIR) / FILE_NAME
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path_for(port, run_dir),
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
@@ -107,12 +124,33 @@ def read(run_dir: Path | None = None) -> str | None:
     return token
 
 
-def authorization(run_dir: Path | None = None) -> dict[str, str]:
-    """Request headers that present the credential; empty when there is none.
+def authorization(port: int, run_dir: Path | None = None) -> dict[str, str]:
+    """Request headers that present the credential of the server on `port`;
+    empty when none is published for it.
 
     Empty is deliberate, not an error: an engine from before sign-in publishes
     no token and asks for none, and `./sc update` talks to exactly that engine
-    while replacing it.
+    while replacing it. A server that does ask refuses the request, and the
+    caller then says `refused(port)`.
     """
-    token = read(run_dir)
+    token = read(port, run_dir)
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def refused(port: int, status: int, run_dir: Path | None = None) -> str:
+    """The one message for a caller the server on `port` turned away."""
+    path = path_for(port, run_dir)
+    if read(port, run_dir) is None:
+        return (
+            f"the server on port {port} asked for the engine CLI credential "
+            f"(HTTP {status}) and none is published for that port at {path}. "
+            "Either no server of this checkout is running on that port, or "
+            "the server answering there is not this checkout's. Start or "
+            "restart this checkout's runtime (`./sc restart`) and retry."
+        )
+    return (
+        f"the server on port {port} refused the engine CLI credential "
+        f"published at {path} (HTTP {status}). The file is from a server that "
+        "is no longer the one listening there. Restart this checkout's "
+        "runtime (`./sc restart`), which publishes its own, and retry."
+    )

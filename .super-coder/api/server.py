@@ -6771,19 +6771,27 @@ def require_loopback_bind(bind: str) -> None:
     )
 
 
-def publish_cli_credential() -> None:
-    """Publish this process's engine CLI token, owner-only, under run/.
+# The port this process serves, set by `_run_server` before it binds. The
+# engine CLI credential is published under this port and no other.
+_LISTEN_PORT: int | None = None
 
-    Called only after the listener is bound, so the file always names the
-    token of the server that holds the port. Nothing removes the file at
-    shutdown: by then another server may have published its own, and a stale
-    token with no server behind it opens nothing.
+
+def publish_cli_credential() -> None:
+    """Publish this process's engine CLI token, owner-only, under run/, as
+    the credential of the port it bound.
+
+    Called only after the listener is bound, and keyed by that port, so the
+    file for a port always names the token of the server holding it. A second
+    server of this checkout on another port publishes its own file and does
+    not touch this one. Nothing removes a file, at startup or at shutdown:
+    another port's may belong to a live server, and a token with no server
+    behind it opens nothing.
     """
-    token = browser_gate.CLI_TOKEN
-    if not token:
+    token, port = browser_gate.CLI_TOKEN, _LISTEN_PORT
+    if not token or port is None:
         return
     try:
-        cli_credential.publish(token)
+        cli_credential.publish(token, port)
     except OSError as exc:
         # Not a reason to refuse the GUI: with no token published, the CLI
         # routes still take a shell token, and `./sc snapshot` says what it
@@ -6871,6 +6879,8 @@ def _run_server(port: int) -> int:
     # request. It is PUBLISHED only once this process holds the port
     # (`_on_listening`): a duplicate startup that loses the bind must not
     # replace the file the surviving server's callers read.
+    global _LISTEN_PORT
+    _LISTEN_PORT = port
     browser_gate.CLI_TOKEN = cli_credential.mint()
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can

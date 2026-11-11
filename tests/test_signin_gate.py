@@ -62,6 +62,7 @@ from maintainer import dos_app_sprint_canary as canary  # noqa: E402
 from maintainer import signin_guard  # noqa: E402
 
 HOST = "127.0.0.1:8800"
+CLI_PORT = 8800          # the port the in-process "server" of these tests holds
 ROUTE_MODULES = ("server.py", "conversation_routes.py", "review_routes.py")
 # Every module under api/ that names a `/api` or `/_sc` path at all, pinned.
 # The walk reads ALL of api/*.py, so a path named in a new module is walked
@@ -1286,7 +1287,7 @@ class ShellAndCliCredentials(GateCase):
         signed_out(self)
         self.run_dir = Path(tempfile.mkdtemp(prefix="sc-cli-token-"))
         self.addCleanup(lambda: __import__("shutil").rmtree(self.run_dir, True))
-        self.token = cli_credential.provision(self.run_dir)
+        self.token = cli_credential.provision(CLI_PORT, self.run_dir)
         patcher = mock.patch.object(browser_gate, "CLI_TOKEN", self.token)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -1403,9 +1404,9 @@ class ShellAndCliCredentials(GateCase):
 
     def test_the_token_is_this_boots_and_the_file_grants_nothing(self) -> None:
         old = self.token
-        new = cli_credential.provision(self.run_dir)
+        new = cli_credential.provision(CLI_PORT, self.run_dir)
         self.assertNotEqual(old, new)
-        self.assertEqual(cli_credential.read(self.run_dir), new)
+        self.assertEqual(cli_credential.read(CLI_PORT, self.run_dir), new)
         # The server still holds `old` in memory: what is on disk is not believed.
         with mock.patch.object(server, "run_script") as ran:
             status, _, _ = self.json("POST", "/api/scripts/snapshot", self.bearer(new))
@@ -1418,27 +1419,27 @@ class ShellAndCliCredentials(GateCase):
         ran.assert_not_called()
 
     def test_the_published_token_is_owner_only_and_checked_on_read(self) -> None:
-        path = self.run_dir / cli_credential.FILE_NAME
+        path = cli_credential.path_for(CLI_PORT, self.run_dir)
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.run_dir.stat().st_mode & 0o777, 0o700)
-        self.assertEqual(cli_credential.read(self.run_dir), self.token)
-        self.assertEqual(cli_credential.authorization(self.run_dir),
+        self.assertEqual(cli_credential.read(CLI_PORT, self.run_dir), self.token)
+        self.assertEqual(cli_credential.authorization(CLI_PORT, self.run_dir),
                          {"Authorization": f"Bearer {self.token}"})
         path.chmod(0o640)
-        self.assertIsNone(cli_credential.read(self.run_dir))
+        self.assertIsNone(cli_credential.read(CLI_PORT, self.run_dir))
         path.chmod(0o600)
         real = path.with_name("real")
         path.rename(real)
         path.symlink_to(real)
-        self.assertIsNone(cli_credential.read(self.run_dir))
-        self.assertEqual(cli_credential.authorization(self.run_dir), {})
+        self.assertIsNone(cli_credential.read(CLI_PORT, self.run_dir))
+        self.assertEqual(cli_credential.authorization(CLI_PORT, self.run_dir), {})
         # A boot replaces a planted link; it does not write through it.
-        again = cli_credential.provision(self.run_dir)
+        again = cli_credential.provision(CLI_PORT, self.run_dir)
         self.assertFalse(path.is_symlink())
         self.assertEqual(real.read_text(), self.token)
-        self.assertEqual(cli_credential.read(self.run_dir), again)
+        self.assertEqual(cli_credential.read(CLI_PORT, self.run_dir), again)
         path.unlink()
-        self.assertEqual(cli_credential.authorization(self.run_dir), {})
+        self.assertEqual(cli_credential.authorization(CLI_PORT, self.run_dir), {})
 
     def test_the_token_is_minted_before_the_bind_and_published_after(self) -> None:
         tree = ast.parse((ENGINE / "api" / "server.py").read_text())
@@ -1457,26 +1458,31 @@ class ShellAndCliCredentials(GateCase):
         # starts the runtime services.
         with mock.patch.object(cli_credential, "RUN_DIR", self.run_dir), \
                 mock.patch.object(browser_gate, "CLI_TOKEN", "sccli_this-process"), \
+                mock.patch.object(server, "_LISTEN_PORT", 8811), \
                 mock.patch.object(server, "start_runtime_services") as services:
             server._on_listening()
         services.assert_called_once_with()
-        self.assertEqual(cli_credential.read(self.run_dir), "sccli_this-process")
+        self.assertEqual(cli_credential.read(8811, self.run_dir), "sccli_this-process")
+        # Under its own port, and no other file was touched.
+        self.assertEqual(cli_credential.read(CLI_PORT, self.run_dir), self.token)
+        self.assertIn("_LISTEN_PORT = port", ast.unparse(boot))
 
     def test_a_startup_that_loses_the_bind_leaves_the_survivors_token(self) -> None:
         """Two servers, one port. The loser never publishes, so a CLI caller
         still reads the token the listening server accepts."""
-        survivor = self.token                       # published in setUp
         holder = __import__("socket").socket()
         self.addCleanup(holder.close)
         holder.bind(("127.0.0.1", 0))
         holder.listen(1)
         port = holder.getsockname()[1]
+        survivor = cli_credential.provision(port, self.run_dir)
 
         async def no_ws(reader, writer, head_raw):  # pragma: no cover
             writer.close()
 
         with mock.patch.object(cli_credential, "RUN_DIR", self.run_dir), \
                 mock.patch.object(browser_gate, "CLI_TOKEN", cli_credential.mint()), \
+                mock.patch.object(server, "_LISTEN_PORT", port), \
                 mock.patch.object(server, "start_runtime_services") as services:
             loser = browser_gate.CLI_TOKEN
             with self.assertRaises(OSError):
@@ -1486,13 +1492,16 @@ class ShellAndCliCredentials(GateCase):
                     stream_handler=conversation_routes.stream_events))
         services.assert_not_called()
         self.assertNotEqual(loser, survivor)
-        self.assertEqual(cli_credential.read(self.run_dir), survivor)
-        with mock.patch.object(server, "run_script", return_value={
-                "ok": True, "output": "done"}):
-            status, _, _ = self.json(
-                "POST", "/api/scripts/snapshot",
-                {"Host": HOST, **cli_credential.authorization(self.run_dir)})
-        self.assertEqual(status, 200)
+        self.assertEqual(cli_credential.read(port, self.run_dir), survivor)
+
+    def test_a_port_is_a_port(self) -> None:
+        for bad in (0, -1, 65536, "8800", 8800.0, True, None, "../x"):
+            with self.subTest(port=bad), self.assertRaises(ValueError):
+                cli_credential.path_for(bad, self.run_dir)
+        self.assertEqual(cli_credential.path_for(8800, self.run_dir),
+                         self.run_dir / "cli-token.8800")
+        self.assertEqual(cli_credential.path_for(8800),
+                         ENGINE / "run" / "api" / "cli-token.8800")
 
     def test_nothing_removes_the_credential_file(self) -> None:
         for name in ("api/server.py", "scripts/cli_credential.py"):
@@ -1505,6 +1514,39 @@ class ShellAndCliCredentials(GateCase):
                         "os.unlink(tmp)", ""), name)
 
 
+class _Listener:
+    """One more real listener on a free loopback port, stopped with the test."""
+
+    def __init__(self, case) -> None:
+        self.loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        async def no_ws(reader, writer, head_raw):  # pragma: no cover
+            writer.close()
+
+        def run():
+            asyncio.set_event_loop(self.loop)
+            self.transport = transport_mod.Transport(
+                "127.0.0.1", 0, server.dispatch_http, no_ws, log=lambda *_: None,
+                stream_handler=conversation_routes.stream_events)
+            self.loop.run_until_complete(self.transport.start())
+            self.port = self.transport.port
+            ready.set()
+            self.loop.run_forever()
+
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+        case.assertTrue(ready.wait(10), "second transport did not start")
+        case.addCleanup(self.stop)
+
+    def stop(self) -> None:
+        asyncio.run_coroutine_threadsafe(
+            self.transport.stop(), self.loop).result(timeout=10)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=10)
+        self.loop.close()
+
+
 class AuditedCliCallers(GateCase):
     """Each `sc` caller of `/api/*`, against a real listener on a free port."""
 
@@ -1513,7 +1555,7 @@ class AuditedCliCallers(GateCase):
         signed_out(self)
         self.run_dir = Path(tempfile.mkdtemp(prefix="sc-cli-token-"))
         self.addCleanup(lambda: __import__("shutil").rmtree(self.run_dir, True))
-        self.token = cli_credential.provision(self.run_dir)
+        self.token = cli_credential.mint()
         for target, name, value in (
             (browser_gate, "CLI_TOKEN", self.token),
             (cli_credential, "RUN_DIR", self.run_dir),
@@ -1551,6 +1593,10 @@ class AuditedCliCallers(GateCase):
         self.assertTrue(ready.wait(10), "transport did not start")
         self.addCleanup(self._stop)
         self.base = f"http://127.0.0.1:{self.port}"
+        # As `_on_listening` does: published once the port is held, under it.
+        with mock.patch.object(server, "_LISTEN_PORT", self.port), \
+                mock.patch.object(server, "start_runtime_services"):
+            server._on_listening()
 
     def _stop(self) -> None:
         asyncio.run_coroutine_threadsafe(
@@ -1592,7 +1638,11 @@ class AuditedCliCallers(GateCase):
                       self.seen)
 
     def test_sc_snapshot_without_a_credential_is_refused_and_says_why(self) -> None:
-        (self.run_dir / cli_credential.FILE_NAME).unlink()
+        """No file for the port being called: one clear message, which says
+        what that means. Another port's file is not borrowed."""
+        cli_credential.path_for(self.port, self.run_dir).unlink()
+        cli_credential.publish(self.token, self.port + 1 if self.port < 65535
+                               else self.port - 1, self.run_dir)
         with mock.patch.object(snapshot_cli.ports, "resolve",
                                return_value={"port": self.port}), \
                 mock.patch.object(snapshot_cli, "_owns_this_checkout",
@@ -1601,9 +1651,76 @@ class AuditedCliCallers(GateCase):
             with self.assertRaises(SystemExit) as raised:
                 snapshot_cli._snapshot_via_runtime_api()
         ran.assert_not_called()
-        self.assertIn("refused this verb's credential (HTTP 401)",
-                      str(raised.exception))
+        message = str(raised.exception)
+        self.assertEqual(message, "snapshot: " + cli_credential.refused(
+            self.port, 401, self.run_dir))
+        self.assertIn(f"none is published for that port at "
+                      f"{self.run_dir / ('cli-token.' + str(self.port))}", message)
+        self.assertIn("no server of this checkout is running on that port, or "
+                      "the server answering there is not this checkout's", message)
         self.assertIn(("POST", "/api/scripts/snapshot", None), self.seen)
+
+    def test_a_stale_file_for_the_port_is_named_as_such(self) -> None:
+        cli_credential.publish(cli_credential.mint(), self.port, self.run_dir)
+        with mock.patch.object(snapshot_cli.ports, "resolve",
+                               return_value={"port": self.port}), \
+                mock.patch.object(snapshot_cli, "_owns_this_checkout",
+                                  return_value=True), \
+                mock.patch.object(server, "run_script") as ran:
+            with self.assertRaises(SystemExit) as raised:
+                snapshot_cli._snapshot_via_runtime_api()
+        ran.assert_not_called()
+        self.assertIn("refused the engine CLI credential published at",
+                      str(raised.exception))
+        self.assertIn("no longer the one listening there", str(raised.exception))
+
+    def test_two_servers_of_one_checkout_each_keep_their_caller(self) -> None:
+        """Codex pass 2: a second server for the same checkout, on another
+        port, publishes without taking the first server's credential away."""
+        first_port, first_token = self.port, self.token
+        second = _Listener(self)                       # a second real listener
+        second_token = cli_credential.mint()
+        with mock.patch.object(browser_gate, "CLI_TOKEN", second_token), \
+                mock.patch.object(server, "_LISTEN_PORT", second.port), \
+                mock.patch.object(server, "start_runtime_services"):
+            server._on_listening()
+        self.assertNotEqual(first_port, second.port)
+        self.assertEqual(sorted(p.name for p in self.run_dir.iterdir()),
+                         sorted([f"cli-token.{first_port}",
+                                 f"cli-token.{second.port}"]))
+        self.assertEqual(cli_credential.read(first_port, self.run_dir), first_token)
+        self.assertEqual(cli_credential.read(second.port, self.run_dir), second_token)
+
+        def snapshot(port, token):
+            # Each "server" holds its own token in memory, as two processes do.
+            with mock.patch.object(browser_gate, "CLI_TOKEN", token), \
+                    mock.patch.object(snapshot_cli.ports, "resolve",
+                                      return_value={"port": port}), \
+                    mock.patch.object(snapshot_cli, "_owns_this_checkout",
+                                      return_value=True), \
+                    mock.patch.object(server, "run_script", return_value={
+                        "ok": True, "output": f"snapshot: wrote on {port}"}):
+                return snapshot_cli._snapshot_via_runtime_api()
+
+        self.assertEqual(snapshot(first_port, first_token),
+                         f"snapshot: wrote on {first_port}")
+        self.assertEqual(snapshot(second.port, second_token),
+                         f"snapshot: wrote on {second.port}")
+        # And in the other order, after the second server restarts (a new
+        # token under its own port): the first caller is still served.
+        third_token = cli_credential.mint()
+        with mock.patch.object(browser_gate, "CLI_TOKEN", third_token), \
+                mock.patch.object(server, "_LISTEN_PORT", second.port), \
+                mock.patch.object(server, "start_runtime_services"):
+            server._on_listening()
+        self.assertEqual(snapshot(first_port, first_token),
+                         f"snapshot: wrote on {first_port}")
+        self.assertEqual(snapshot(second.port, third_token),
+                         f"snapshot: wrote on {second.port}")
+        # One server's token is not the other's.
+        status, _, _ = self.http("POST", "/api/scripts/snapshot",
+                                 {"Authorization": f"Bearer {third_token}"})
+        self.assertEqual(status, 401)
 
     def test_sc_models_refresh_presents_the_shells_own_token(self) -> None:
         out = io.StringIO()
@@ -1763,7 +1880,7 @@ class AuditedCliCallers(GateCase):
             "scripts/services.py": ["/api/pm2", "/api/pm2/status",
                                     "/api/pm2/validate/", "/api/ts/status"],
             "scripts/preview.py": ["/api/"],
-            "scripts/cli_credential.py": ["/api/", "/api/cli-token"],
+            "scripts/cli_credential.py": ["/api/", "/api/cli-token."],
             "adapters/claude/README.md": ["/api/harnesses/claude/conversion/verify"],
             # Another service's URL.
             "scripts/quota_probes/anthropic.py": ["/api/oauth/usage",
