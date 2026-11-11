@@ -91,6 +91,18 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 """
 
 
+# The router state and browser globals the new-chat watch reads.
+WATCH_ENV = r"""
+let activeTab = "interface";
+const hashListeners = new Set(), cleared = [];
+globalThis.window = {
+  addEventListener: (type, fn) => { if (type === "hashchange") hashListeners.add(fn); },
+  removeEventListener: (type, fn) => { hashListeners.delete(fn); },
+};
+globalThis.clearTimeout = (id) => { cleared.push(id); };
+"""
+
+
 def run_js(script: str) -> dict:
     proc = subprocess.run(["node", "-e", script], text=True, capture_output=True, check=False)
     assert proc.returncode == 0, proc.stderr
@@ -120,12 +132,13 @@ def test_token_section_reads_stored_sessions_and_never_sweeps():
 
 
 def test_models_section_shows_server_freshness_and_refreshes_on_demand():
-    assert "catalog.refresh_completed_at || catalog.fetched_at" in MODELS
+    assert "const age = catalogueAge(catalog.fetched_at);" in MODELS
+    assert "catalogueAge(catalog.refresh_completed_at)" in MODELS
     assert "catalog.stale_reason" in MODELS
     for reason in ("ttl", "generation_mismatch", "local_source_changed"):
         assert f"  {reason}: " in MODELS
     assert 'textContent: "Refresh models"' in MODELS
-    assert "await loadModelCatalogue(true)" in MODELS
+    assert "await read(true);" in MODELS and "loadModelCatalogue(refreshing)" in MODELS
     assert 'refresh ? "/models?refresh=1" : "/models"' in CATALOGUE
 
 
@@ -138,13 +151,13 @@ def test_engine_section_holds_a_neutral_placeholder():
 
 def test_configure_refresh_and_new_chat_use_only_the_server_stale_flag():
     assert 'textContent: "Refresh models"' in RENDER_NEW
-    assert "const refreshed = await loadModelCatalogue(true);" in RENDER_NEW
+    assert "const refreshed = currentCatalogue(await loadModelCatalogue(true));" in RENDER_NEW
     assert 'el("div", { className: "chat-refresh-row" }, refreshModels, refreshNote)' in RENDER_NEW
     assert "watchCatalogueOnNewChat();" in NEW_CHAT
     assert "await watchCatalogueOnNewChat" not in APP
     assert NEW_CHAT.index("watchCatalogueOnNewChat();") < NEW_CHAT.index("chatCreateConversation(shell)")
     # No client-side staleness rule: no clock, TTL or timestamp comparison.
-    assert "if (!catalog.stale || catalogueWatching) return;" in WATCH
+    assert "if (!catalog.stale || catalogueWatch || !catalogueWatchInView()) return;" in WATCH
     for clock in ("Date.", "fetched_at", "refresh_completed_at", "ttl"):
         assert clock not in WATCH
 
@@ -249,15 +262,15 @@ globalThis.fetch = async (url) => {
 const recent = new Date(Date.now() - 5 * 60000).toISOString();
 responses.push({catalogue_generation: "a", stale: true, stale_reason: "ttl",
   fetched_at: "2020-01-01T00:00:00+00:00", harnesses: {}});
-responses.push({catalogue_generation: "b", stale: false, fetched_at: "2020-01-01T00:00:00+00:00",
+responses.push({catalogue_generation: "b", stale: false, fetched_at: recent,
   refresh_completed_at: recent, harnesses: {}});
 responses.push({catalogue_generation: "b", stale: true, stale_reason: "odd_reason",
-  refresh_completed_at: recent, harnesses: {}});
+  fetched_at: recent, refresh_completed_at: recent, harnesses: {}});
 (async () => {
   const mount = el("div");
   renderDrawerModels(mount);
   await tick(); await tick();
-  const [age, state, actions] = mount.children;
+  const [age, state, attempt, actions] = mount.children;
   const button = actions.children[0];
   const first = {age: age.textContent.split(" · ")[0], state: state.textContent, cls: state.className};
   const pending = button.onclick();
@@ -266,7 +279,7 @@ responses.push({catalogue_generation: "b", stale: true, stale_reason: "odd_reaso
   const second = {age: age.textContent.split(" · ")[0], state: state.textContent,
     cls: state.className, disabled: button.disabled, label: button.textContent};
   await button.onclick();
-  const third = {state: state.textContent, cls: state.className};
+  const third = {state: state.textContent, cls: state.className, attempt: attempt.textContent};
   console.log(JSON.stringify({calls, first, during, second, third,
     never: catalogueFreshness({stale: false}).age}));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
@@ -280,14 +293,14 @@ responses.push({catalogue_generation: "b", stale: true, stale_reason: "odd_reaso
     assert result["second"] == {"age": "Fetched 5 min ago", "state": "Current",
                                 "cls": "drawer-model-state", "disabled": False,
                                 "label": "Refresh models"}
-    assert result["third"] == {"state": "Stale — odd_reason (the refresh did not complete)",
-                               "cls": "drawer-model-state stale"}
+    assert result["third"] == {"state": "Stale — odd_reason", "cls": "drawer-model-state stale",
+                               "attempt": "The refresh did not complete."}
     assert result["never"] == "Never fetched"
 
 
 @needs_node
 def test_new_chat_issues_the_catalogue_get_and_creates_without_waiting_for_it():
-    script = FAKE_DOM + API + CATALOGUE + WATCH + r"""
+    script = FAKE_DOM + API + CATALOGUE + WATCH_ENV + WATCH + r"""
 const calls = [], notices = [];
 function toast(message) { notices.push(message); }
 // The catalogue read never answers: creation must finish regardless.
@@ -327,7 +340,7 @@ const chatBusyToast = (error) => { throw error; };
     ("double", {"notices": 1, "reads": 4, "timers": 2, "watching": False}),
 ])
 def test_stale_catalogue_gets_one_notice_and_one_bounded_watch(scenario, expected):
-    script = WATCH + r"""
+    script = WATCH_ENV + WATCH + r"""
 const SCENARIO = "__SCENARIO__";
 const notices = [], timers = [];
 let reads = 0, scheduled = 0;
@@ -355,7 +368,7 @@ const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((r) =
     await settle();
   }
   console.log(JSON.stringify({notices: notices.length, reads, timers: scheduled,
-    watching: catalogueWatching, delays: [...delays], limit: CATALOGUE_WATCH_LIMIT,
+    watching: catalogueWatch !== null, delays: [...delays], limit: CATALOGUE_WATCH_LIMIT,
     notice: notices[0] || null}));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
@@ -374,6 +387,7 @@ const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__";
 const CHAT_HARNESSES_FROM_SERVER = () => ["claude", "codex"];
 const chatHarnessUnavailableReason = () => "";
 const refreshes = [], responses = [], efforts = [];
+const currentCatalogue = (response) => response;   // nothing is superseded in this test
 let dropdownRefreshes = 0;
 async function loadModelCatalogue(refresh = false) {
   refreshes.push(refresh);
@@ -507,7 +521,7 @@ def test_forced_stale_cache_file_reports_stale_and_new_chat_does_not_wait(tmp_pa
     assert refresh.call_count == 1, "a stale read starts the server's own refresh"
     assert json.loads(cache.read_text())["stale"] is False, "the read does not rewrite the cache"
 
-    script = FAKE_DOM + API + CATALOGUE + WATCH + r"""
+    script = FAKE_DOM + API + CATALOGUE + WATCH_ENV + WATCH + r"""
 const SERVED = __SERVED__;
 const calls = [], notices = [], timers = [];
 let answerModels;
@@ -542,3 +556,199 @@ const chatBusyToast = (error) => { throw error; };
     assert result["notices"] == ["Model catalogue is stale — refreshing in the background."]
     assert result["timers"] == [3000], "one bounded watch is armed"
     assert result["adopted"] is True
+
+
+# ── Review findings on PR 1774 ────────────────────────────────────────────────
+
+@needs_node
+@pytest.mark.parametrize("scenario,expected", [
+    # the operator left before the stale answer arrived: no notice, nothing armed
+    ("before_answer", {"notices": 0, "reads": 1, "scheduled": 0, "listeners": 0, "watching": False}),
+    # navigation cancels the pending timer at once; a stray firing does nothing
+    ("hashchange", {"notices": 1, "reads": 1, "scheduled": 1, "listeners": 0, "watching": False,
+                    "cleared": [1]}),
+    # the view changed without a hash event: the next tick stops without a read
+    ("show_only", {"notices": 1, "reads": 1, "scheduled": 1, "listeners": 0, "watching": False}),
+    # the operator left while a poll's read was out: no further timer
+    ("during_read", {"notices": 1, "reads": 2, "scheduled": 1, "listeners": 0, "watching": False}),
+    # back on Chats, a new click starts exactly one new watch; the old timer is dead
+    ("again", {"notices": 2, "reads": 2, "scheduled": 2, "listeners": 1, "watching": True,
+               "cleared": [1]}),
+])
+def test_new_chat_watch_stops_when_the_operator_leaves_the_chats_view(scenario, expected):
+    script = WATCH_ENV + WATCH + r"""
+const SCENARIO = "__SCENARIO__";
+const notices = [], timers = [], pending = [];
+let reads = 0, scheduled = 0;
+const location = {hash: "#interface/DEV1"};
+function toast(message) { notices.push(message); }
+globalThis.setTimeout = (fn, ms) => { scheduled += 1; timers.push(fn); return scheduled; };
+function loadModelCatalogue() {
+  reads += 1;
+  return new Promise((resolve) => pending.push(() => resolve({stale: true})));
+}
+const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
+const answer = async () => { pending.shift()(); await settle(); };
+const leave = (viaHash) => {
+  activeTab = "shells";
+  if (viaHash) { location.hash = "#shells"; for (const fn of [...hashListeners]) fn(); }
+};
+(async () => {
+  watchCatalogueOnNewChat();
+  if (SCENARIO === "before_answer") { leave(true); await answer(); }
+  else {
+    await answer();                                  // stale: the watch is armed
+    if (SCENARIO === "hashchange" || SCENARIO === "again") {
+      leave(true);
+      timers[0](); await settle();                   // a cancelled timer firing anyway
+    }
+    if (SCENARIO === "show_only") { leave(false); timers[0](); await settle(); }
+    if (SCENARIO === "during_read") { timers[0](); await settle(); leave(false); await answer(); }
+    if (SCENARIO === "again") {
+      activeTab = "interface"; location.hash = "#interface/DEV1";
+      watchCatalogueOnNewChat(); await answer();
+      timers[0](); await settle();                   // the first watch's timer stays dead
+    }
+  }
+  console.log(JSON.stringify({notices: notices.length, reads, scheduled, cleared,
+    listeners: hashListeners.size,
+    watching: typeof catalogueWatch === "undefined" ? catalogueWatching : catalogueWatch !== null}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("__SCENARIO__", scenario))
+    assert {key: result[key] for key in expected} == expected
+
+
+@needs_node
+def test_models_section_never_paints_a_superseded_response():
+    script = FAKE_DOM + API + CATALOGUE + MODELS + r"""
+const calls = [], answers = [];
+function toast() {}
+globalThis.fetch = (url) => {
+  calls.push(url);
+  return new Promise((resolve) => answers.push((catalog) => resolve({ok: true, json: async () => catalog})));
+};
+const settle = async () => { for (let i = 0; i < 5; i++) await tick(); };
+const now = new Date().toISOString();
+const old = {catalogue_generation: "g1", stale: true, stale_reason: "ttl",
+  fetched_at: "2020-01-01T00:00:00.000Z", refresh_completed_at: "2020-01-01T00:00:00.000Z", harnesses: {}};
+const fresh = (generation) => ({catalogue_generation: generation, stale: false,
+  fetched_at: now, refresh_completed_at: now, harnesses: {}});
+const shown = (mount) => ({age: mount.children[0].textContent.split(" · ")[0],
+  state: mount.children[1].textContent});
+(async () => {
+  // Refresh is pressed while the opening read is still out, and answers first.
+  const first = el("div");
+  renderDrawerModels(first);                       // answers[0]: the opening read
+  const button = all(first, (n) => n.tagName === "BUTTON")[0];
+  const refreshing = button.onclick();             // answers[1]: the refresh
+  answers[1](fresh("g2")); await refreshing; await settle();
+  const afterRefresh = shown(first);
+  answers[0](old); await settle();                 // the opening read lands late
+  const afterLateRead = shown(first);
+
+  // Reopen: a new section paints the stale answer it got, then follows a
+  // refresh that some other view completes.
+  first.isConnected = false;
+  const second = el("div");
+  renderDrawerModels(second);                      // answers[2]
+  answers[2]({...old, catalogue_generation: "g2"}); await settle();
+  const reopened = shown(second);
+  const elsewhere = loadModelCatalogue(true);      // answers[3]
+  answers[3]({...fresh("g3"), refresh_completed_at: new Date(Date.now() + 1000).toISOString()});
+  await elsewhere; await settle();
+  console.log(JSON.stringify({calls, afterRefresh, afterLateRead, reopened,
+    afterElsewhere: shown(second), closedSectionUntouched: shown(first),
+    generation: modelCatalogue.catalogue_generation}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    current = {"age": "Fetched just now", "state": "Current"}
+    assert result["afterRefresh"] == current
+    assert result["afterLateRead"] == current, "a late opening read must not undo the refresh"
+    assert result["reopened"]["state"] == "Stale — the cache is older than its time-to-live"
+    assert result["afterElsewhere"] == current
+    assert result["closedSectionUntouched"] == current
+    assert result["generation"] == "g3"
+
+
+@needs_node
+def test_configure_refresh_ignores_a_superseded_catalogue_response():
+    script = FAKE_DOM + API + CATALOGUE + r"""
+const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__";
+const CHAT_HARNESSES_FROM_SERVER = () => ["codex"];
+const chatHarnessUnavailableReason = () => "";
+const answers = [], painted = [];
+function toast() {}
+globalThis.fetch = () => new Promise((resolve) =>
+  answers.push((catalog) => resolve({ok: true, json: async () => catalog})));
+function chatModelOptions(select, catalog, harness) {
+  painted.push((catalog.harnesses[harness].models).map((model) => model.id));
+  select.replaceChildren(el("option", {value: ""}));
+}
+function chatModelDropdown(select) { return {root: el("div", {}, select), refresh() {}}; }
+function renderNativeOptionControl(select) {
+  select.replaceChildren(el("option", {value: ""}));
+  return {disabled: false, requiresConfirmation: false, native: true, selected: null, guidance: ""};
+}
+const catalogue = (generation, at, ...ids) => ({catalogue_generation: generation, stale: false,
+  fetched_at: at, refresh_completed_at: at, harnesses: {codex: {models: ids.map((id) => ({id}))}}});
+""" + RENDER_NEW + r"""
+(async () => {
+  const older = catalogue("g1", "2026-01-01T00:00:00.000000+00:00", "gpt-old");
+  const newer = catalogue("g2", "2026-01-02T00:00:00.000000+00:00", "gpt-old", "gpt-new");
+  const first = loadModelCatalogue(); answers[0](older); await first;
+  const second = loadModelCatalogue(); answers[1](newer); await second;   // the page now holds g2
+  const host = el("div");
+  await chatRenderNew(host, {flavor: "dev", display_name: "Dev"},
+    {flavors: {dev: [{harness: "codex", is_default: true, model: "gpt-old"}]}, harness_status: {}},
+    modelCatalogue);
+  const button = all(host, (n) => n.className === "chat-refresh-models")[0];
+  const note = all(host, (n) => n.className === "chat-refresh-note")[0];
+  const refreshing = button.onclick();
+  answers[2](older);                              // a superseded generation answers the refresh
+  await refreshing;
+  console.log(JSON.stringify({painted, note: note.textContent,
+    generation: modelCatalogue.catalogue_generation}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    assert result["generation"] == "g2"
+    assert result["painted"] == [["gpt-old", "gpt-new"], ["gpt-old", "gpt-new"]], \
+        "the pickers repaint from the page's catalogue, not the superseded answer"
+    assert result["note"] == "Models refreshed."
+
+
+@needs_node
+def test_failed_refresh_keeps_the_age_of_the_last_successful_fetch():
+    script = FAKE_DOM + API + CATALOGUE + MODELS + r"""
+const responses = [];
+function toast() {}
+globalThis.fetch = async () => ({ok: true, json: async () => responses.shift()});
+const threeDays = new Date(Date.now() - 3 * 864e5).toISOString();
+const good = {catalogue_generation: "g1", stale: false, fetched_at: threeDays,
+  refresh_completed_at: threeDays, harnesses: {}};
+// What the server returns when the fetch fails: the old catalogue, a new
+// completion time, `stale` and the error.
+const failed = {...good, stale: true, stale_reason: "ttl", error: "catalog offline",
+  refresh_completed_at: new Date().toISOString()};
+responses.push(good, failed);
+(async () => {
+  const mount = el("div");
+  renderDrawerModels(mount);
+  await tick(); await tick();
+  const lines = () => mount.children.slice(0, 3).map((node) => node.textContent.split(" · ")[0]);
+  const before = lines();
+  await all(mount, (n) => n.tagName === "BUTTON")[0].onclick();
+  console.log(JSON.stringify({before, after: lines(),
+    noAttempt: catalogueFreshness(good).attempt,
+    undated: catalogueFreshness({...failed, refresh_completed_at: null}).attempt}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    assert result["before"] == ["Fetched 3 d ago", "Current", ""]
+    assert result["after"] == ["Fetched 3 d ago",
+                               "Stale — the cache is older than its time-to-live",
+                               "Last refresh failed just now: catalog offline"]
+    assert result["noAttempt"] == ""
+    assert result["undated"] == "Last refresh failed: catalog offline"

@@ -1077,6 +1077,16 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
 
 let modelCatalogue = null;
 const supersededModelCatalogueGenerations = new Set();
+// Views that display the catalogue hear every adoption, whichever request
+// caused it. A listener that returns false (its view is gone) is dropped.
+const modelCatalogueListeners = new Set();
+// What a view should show for a response it received: a response whose
+// generation was superseded while it was in flight yields the page's catalogue.
+function currentCatalogue(response) {
+  return modelCatalogue
+    && supersededModelCatalogueGenerations.has(response.catalogue_generation)
+    ? modelCatalogue : response;
+}
 
 async function loadModelCatalogue(refresh = false) {
   const catalog = await api(refresh ? "/models?refresh=1" : "/models");
@@ -1115,6 +1125,8 @@ async function loadModelCatalogue(refresh = false) {
     if (baselineGeneration && generationChanged)
       supersededModelCatalogueGenerations.add(baselineGeneration);
     modelCatalogue = catalog;
+    for (const listener of [...modelCatalogueListeners])
+      if (listener(catalog) === false) modelCatalogueListeners.delete(listener);
   }
   return catalog;
 }
@@ -3055,45 +3067,68 @@ function catalogueAge(iso, now = Date.now()) {
   if (minutes < 48 * 60) return `${Math.round(minutes / 60)} h ago`;
   return `${Math.round(minutes / 1440)} d ago`;
 }
+// `fetched_at` is the last successful fetch. A failed refresh keeps the old
+// catalogue and still stamps `refresh_completed_at`, so that time dates the
+// attempt, never the catalogue.
 function catalogueFreshness(catalog) {
-  const at = catalog.refresh_completed_at || catalog.fetched_at;
-  const age = catalogueAge(at);
+  const age = catalogueAge(catalog.fetched_at);
+  const attempted = catalogueAge(catalog.refresh_completed_at);
   return {
-    age: age ? `Fetched ${age} · ${new Date(at).toLocaleString()}` : "Never fetched",
+    age: age ? `Fetched ${age} · ${new Date(catalog.fetched_at).toLocaleString()}`
+      : "Never fetched",
     stale: Boolean(catalog.stale),
     state: catalog.stale
       ? "Stale — " + (MODEL_STALE_REASONS[catalog.stale_reason]
         || catalog.stale_reason || "refresh pending")
       : "Current",
+    attempt: catalog.stale && catalog.error
+      ? `Last refresh failed${attempted ? " " + attempted : ""}: ${catalog.error}` : "",
   };
 }
 
 function renderDrawerModels(mount) {
   const age = el("div", { className: "drawer-note" }, "Loading…");
   const state = el("div", { className: "drawer-model-state" });
+  const attempt = el("div", { className: "drawer-model-state stale" });
   const refresh = el("button", { className: "act", type: "button", textContent: "Refresh models" });
-  const paint = (catalog, failed = false) => {
+  const paint = (catalog, refreshed = false) => {
     const fresh = catalogueFreshness(catalog);
     age.textContent = fresh.age;
-    state.textContent = fresh.state + (failed ? " (the refresh did not complete)" : "");
+    state.textContent = fresh.state;
     state.className = "drawer-model-state" + (fresh.stale ? " stale" : "");
+    attempt.textContent = fresh.attempt
+      || (refreshed && fresh.stale ? "The refresh did not complete." : "");
   };
-  const fail = (error) => {
-    age.textContent = "catalogue error: " + error.message;
-    state.textContent = "";
+  // Only this section's newest read paints its own answer, so a slow opening
+  // read cannot overwrite a refresh that finished first. Adoptions caused
+  // elsewhere (another drawer instance, Configure, the new-chat watch) arrive
+  // through the listener.
+  let newest = 0;
+  const read = (refreshing) => {
+    const mine = ++newest;
+    return loadModelCatalogue(refreshing).then((catalog) => {
+      if (mine === newest) paint(currentCatalogue(catalog), refreshing);
+    }, (error) => {
+      if (mine !== newest) return;
+      age.textContent = "catalogue error: " + error.message;
+      state.textContent = attempt.textContent = "";
+    });
   };
+  modelCatalogueListeners.add((catalog) => {
+    if (mount.isConnected === false) return false;
+    paint(catalog);
+    return true;
+  });
   refresh.onclick = async () => {
     refresh.disabled = true;
     refresh.textContent = "Refreshing…";
-    try {
-      const catalog = await loadModelCatalogue(true);
-      paint(catalog, Boolean(catalog.stale));
-    } catch (error) { fail(error); }
+    await read(true);
     refresh.disabled = false;
     refresh.textContent = "Refresh models";
   };
-  mount.replaceChildren(age, state, el("div", { className: "drawer-actions" }, refresh));
-  loadModelCatalogue().then((catalog) => paint(catalog), fail);
+  mount.replaceChildren(age, state, attempt,
+    el("div", { className: "drawer-actions" }, refresh));
+  read(false);
 }
 
 // Engine: the controls arrive with the host-side engine-ops service.
@@ -3115,24 +3150,42 @@ for (const [id, render] of [
 // past the cap it gives up quietly and the next read picks the result up.
 const CATALOGUE_WATCH_MS = 3000;
 const CATALOGUE_WATCH_LIMIT = 20;
-let catalogueWatching = false;
+// The watch belongs to the Chats view. `activeTab` is the router's own record
+// of the view, checked before the notice and around every read; the
+// hashchange listener cancels the pending timer as soon as the operator
+// navigates away, so nothing is left scheduled on another view.
+let catalogueWatch = null;   // { timer } while one watch is armed, else null
+const catalogueWatchInView = () => activeTab === "interface";
+function catalogueWatchOnHashChange() {
+  if (!location.hash.replace(/^#/, "").startsWith("interface")) stopCatalogueWatch();
+}
+function stopCatalogueWatch() {
+  if (!catalogueWatch) return;
+  clearTimeout(catalogueWatch.timer);
+  catalogueWatch = null;
+  window.removeEventListener("hashchange", catalogueWatchOnHashChange);
+}
 function watchCatalogueOnNewChat() {
   loadModelCatalogue().then((catalog) => {
-    if (!catalog.stale || catalogueWatching) return;
-    catalogueWatching = true;
+    if (!catalog.stale || catalogueWatch || !catalogueWatchInView()) return;
+    const watch = catalogueWatch = { timer: null };
+    window.addEventListener("hashchange", catalogueWatchOnHashChange);
     toast("Model catalogue is stale — refreshing in the background.");
     let polls = 0;
     const poll = async () => {
+      if (catalogueWatch !== watch) return;
+      if (!catalogueWatchInView()) { stopCatalogueWatch(); return; }
       polls += 1;
       let done = polls >= CATALOGUE_WATCH_LIMIT;
       // loadModelCatalogue adopts a fresh answer as the page's catalogue and
       // announces new models itself, so the successful poll is the reload.
       try { if (!(await loadModelCatalogue()).stale) done = true; }
       catch { /* a transient read failure spends one poll */ }
-      if (done) catalogueWatching = false;
-      else setTimeout(poll, CATALOGUE_WATCH_MS);
+      if (catalogueWatch !== watch) return;   // cancelled while the read was out
+      if (done || !catalogueWatchInView()) stopCatalogueWatch();
+      else watch.timer = setTimeout(poll, CATALOGUE_WATCH_MS);
     };
-    setTimeout(poll, CATALOGUE_WATCH_MS);
+    watch.timer = setTimeout(poll, CATALOGUE_WATCH_MS);
   }, () => { /* chat creation never depends on the catalogue */ });
 }
 
@@ -5370,7 +5423,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     refreshModels.textContent = "Refreshing…";
     refreshNote.textContent = "";
     try {
-      const refreshed = await loadModelCatalogue(true);
+      const refreshed = currentCatalogue(await loadModelCatalogue(true));
       const keptModel = modelSelect.value;
       const keptEffort = effortSelect.value;
       catalog = refreshed;

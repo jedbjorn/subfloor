@@ -838,7 +838,7 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
     assert "    watchCatalogueOnNewChat();  // fire-and-forget" in interface
     assert "await watchCatalogueOnNewChat" not in APP
     assert 'textContent: "Refresh models"' in interface
-    assert "const refreshed = await loadModelCatalogue(true);" in interface
+    assert "const refreshed = currentCatalogue(await loadModelCatalogue(true));" in interface
     assert "{ shell_id: shell.shell_id, ...fields }" in interface
     assert "chatRouteConversation === CHAT_CONFIGURE_ROUTE" in interface
     assert "await chatRenderNew(pane, shell, defaults, catalog)" in interface
