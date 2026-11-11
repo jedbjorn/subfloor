@@ -176,18 +176,27 @@ async function sessionFetch(url, init) {
 // wake-ups bring the next attempt forward instead of adding a timer: the tab
 // becoming visible, the browser coming back online, and the operator sending
 // a message.
+//
+// The probe belongs to the watch too. Stopping or replacing the stream aborts
+// a probe that is still out, so there is never more than one status request
+// in flight for the page; and a probe that gets no answer within
+// SESSION_PROBE_TIMEOUT_MS is aborted and counted as "unknown", so a stalled
+// route cannot hold the one probe slot.
 const SESSION_PROBE_MIN_MS = 5000;
 const SESSION_PROBE_MAX_MS = 60000;
+const SESSION_PROBE_TIMEOUT_MS = 10000;
 let sessionWatch = null;
 let sessionProbedAt = -Infinity;
 function stopSessionWatch() {
   if (!sessionWatch) return;
-  clearTimeout(sessionWatch.timer);
+  const watch = sessionWatch;
   sessionWatch = null;
+  clearTimeout(watch.timer);
+  if (watch.abortProbe) watch.abortProbe();
 }
-async function probeSession() {
+async function probeSession(signal) {
   try {
-    const response = await sessionFetch("/api/auth/status");
+    const response = await sessionFetch("/api/auth/status", { signal });
     if (!response.ok) return "unknown";
     const status = await response.json();
     return status?.signed_in === true ? "in" : status?.signed_in === false ? "out" : "unknown";
@@ -213,9 +222,14 @@ function startSessionWatch({ closed, reopen, wait = SESSION_PROBE_MIN_MS }) {
     if (!live()) return;
     watch.probing = true;
     sessionProbedAt = Date.now();
-    const outcome = await probeSession();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SESSION_PROBE_TIMEOUT_MS);
+    watch.abortProbe = () => { clearTimeout(timeout); controller.abort(); };
+    const outcome = await probeSession(controller.signal);
+    clearTimeout(timeout);
+    watch.abortProbe = null;
     watch.probing = false;
-    if (!live()) return;
+    if (!live()) return;   // stopped or replaced meanwhile: its answer is nobody's
     if (outcome === "out") {
       stopSessionWatch();
       goToSignIn();
@@ -235,10 +249,11 @@ function startSessionWatch({ closed, reopen, wait = SESSION_PROBE_MIN_MS }) {
     reopen({ wait: Math.min(watch.wait * 2, SESSION_PROBE_MAX_MS) });
   };
   // Bring the pending attempt forward (never sooner than the minimum gap
-  // since the last probe). Nothing to do for a stream that is open, or that
-  // the browser is retrying with no probe pending.
+  // since the last probe). Only a stream the browser has given up on needs
+  // it: an open stream has nothing pending, and one the browser is still
+  // retrying comes back by itself.
   watch.wake = () => {
-    if (!live() || watch.probing || (!closed() && !watch.timer)) return;
+    if (!live() || watch.probing || !closed()) return;
     clearTimeout(watch.timer);
     watch.timer = null;
     schedule(sessionProbedAt + SESSION_PROBE_MIN_MS - Date.now());
@@ -246,7 +261,13 @@ function startSessionWatch({ closed, reopen, wait = SESSION_PROBE_MIN_MS }) {
   return {
     // Every stream error lands here; it asks at most once per wait.
     errored: () => schedule(sessionProbedAt + watch.wait - Date.now()),
-    opened: () => { watch.wait = SESSION_PROBE_MIN_MS; },
+    // An open stream has nothing pending: a probe timer left from before it
+    // connected is dropped with the back-off.
+    opened: () => {
+      clearTimeout(watch.timer);
+      watch.timer = null;
+      watch.wait = SESSION_PROBE_MIN_MS;
+    },
     signedOut: () => { if (live()) { stopSessionWatch(); goToSignIn(); } },
   };
 }

@@ -223,10 +223,21 @@ const advance = async (ms) => {
   clock = end;
   await settle();
 };
-const server = {stream: "ok", session: true, reachable: true, authRoute: true, authBody: null};
+const server = {stream: "ok", session: true, reachable: true, authRoute: true, authBody: null,
+  stalled: false};
+const requests = {outstanding: 0, aborted: 0, peak: 0};
 const probes = [], opened = [], connections = [];
-globalThis.fetch = (url) => {
+globalThis.fetch = (url, init = {}) => {
   probes.push(clock);
+  if (server.stalled) return new Promise((resolve, reject) => {
+    // No answer ever comes; only an abort ends the request.
+    requests.outstanding += 1;
+    requests.peak = Math.max(requests.peak, requests.outstanding);
+    if (init.signal) init.signal.addEventListener("abort", () => {
+      requests.outstanding -= 1; requests.aborted += 1;
+      reject(new DOMException("The operation was aborted.", "AbortError"));
+    });
+  });
   if (!server.reachable) return Promise.reject(new TypeError("Failed to fetch"));
   return Promise.resolve(!server.authRoute ? answer(404, {error: "not found"})
     : answer(200, server.authBody || {enrolled: true, signed_in: server.session}));
@@ -1591,3 +1602,109 @@ def test_no_wait_separates_a_confirmation_from_its_post_without_a_closed_check()
     sign_out = account[account.index("signOut.onclick = async () => {"):account.index("const others =")]
     assert sign_out.index("await engineOpsRequest(state.base, \"/auth/sign-out\"") \
         == sign_out.index("await "), "nothing is awaited before the sign-out request"
+
+
+# ── Review pass 4: the probe is the watch's, and an open stream is left alone ──
+
+@needs_node
+def test_switching_chats_with_a_stalled_status_route_leaves_no_requests_behind():
+    script = STREAM_ENV + STREAM_SOURCE + WAKE + r"""
+(async () => {
+  server.stalled = true;
+  server.stream = "refuse";                 // every stream is refused, so every chat probes
+  for (let chat = 0; chat < 20; chat++) {
+    openStream();                           // opening a chat replaces the previous stream
+    await advance(6000);                    // past the probe gap, short of the probe timeout
+  }
+  const afterSwitches = {...requests, probes: probes.length, watch: watching()};
+  chatStopStream();                         // the operator leaves Chats
+  await settle();
+  const afterStop = {...requests, watch: watching(), pendingTimers: timers.length};
+  await advance(600000);
+  report({afterSwitches, afterStop, later: {...requests, probes: probes.length}});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    switches = result["afterSwitches"]
+    assert switches["probes"] == 20 and switches["peak"] == 1, "one status request in flight at any time"
+    assert switches["outstanding"] == 1 and switches["aborted"] == 19
+    assert result["afterStop"] == {"outstanding": 0, "aborted": 20, "peak": 1, "watch": None,
+                                   "pendingTimers": 0}
+    assert result["later"] == {"outstanding": 0, "aborted": 20, "peak": 1, "probes": 20}
+    assert result["navigations"] == []
+
+
+@needs_node
+def test_a_stalled_probe_times_out_to_unknown_and_the_watch_carries_on():
+    script = STREAM_ENV + STREAM_SOURCE + WAKE + r"""
+(async () => {
+  openStream();
+  await advance(100);
+  server.stream = "refuse";
+  server.stalled = true;
+  opened[0].drop();                         // probe 1 at t=100 stalls
+  await advance(9000);
+  const stalled = {...requests, probes: probes.length, watch: watching()};
+  await advance(2000);                      // past the ten-second timeout
+  const timedOut = {...requests, probes: probes.length, watch: watching(), streams: opened.length};
+  await advance(240000);                    // still stalled: backing off, one at a time
+  const backedOff = {probes: probes.length, peak: requests.peak, streams: opened.length,
+    state: states[states.length - 1], navigations: [...navigations]};
+  server.stalled = false; server.stream = "ok";
+  await advance(75000);                     // the route answers: signed in, so the stream reopens
+  report({stalled, timedOut, backedOff, timeout: SESSION_PROBE_TIMEOUT_MS, requests});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    assert result["timeout"] == 10000
+    assert result["stalled"] == {"outstanding": 1, "aborted": 0, "peak": 1, "probes": 1,
+                                 "watch": {"timer": False, "probing": True}}
+    timed_out = result["timedOut"]
+    assert timed_out["outstanding"] == 0 and timed_out["aborted"] == 1
+    assert timed_out["watch"] == {"timer": True, "probing": False}, "unknown: the next probe is scheduled"
+    assert timed_out["streams"] == 1, "a timeout is not evidence that the session holds"
+    backed = result["backedOff"]
+    assert 3 <= backed["probes"] <= 7 and backed["peak"] == 1
+    assert backed["streams"] == 1 and backed["state"] == "reconnecting" and backed["navigations"] == []
+    assert result["last"] == "connected" and result["requests"]["outstanding"] == 0
+    assert result["navigations"] == [] and result["pendingTimers"] == 0
+
+
+@needs_node
+def test_an_open_stream_is_never_probed_by_a_leftover_timer_or_a_wake_up():
+    # The reviewed sequence: an outage leaves a probe timer scheduled, the
+    # browser reconnects the stream by itself, then wake-ups arrive.
+    script = STREAM_ENV + STREAM_SOURCE + WAKE + r"""
+(async () => {
+  openStream();
+  await advance(100);
+  server.reachable = false;
+  opened[0].drop();
+  await advance(20000);                     // unknown answers; a back-off timer is pending
+  const during = {probes: probes.length, watch: watching()};
+  server.reachable = true;
+  await advance(3200);                      // the stream's own retry connects
+  const reconnected = {state: states[states.length - 1], watch: watching(), probes: probes.length,
+    timers: timers.length};
+  fire("online"); fire("visibilitychange"); wakeIfDefined();
+  await advance(600000);
+  report({during, reconnected, streams: opened.length});
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    assert result["during"]["watch"] == {"timer": True, "probing": False}
+    reconnected = result["reconnected"]
+    assert reconnected["state"] == "connected"
+    assert reconnected["watch"] == {"timer": False, "probing": False} and reconnected["timers"] == 0
+    assert len(result["probes"]) == reconnected["probes"], "no status request for an open stream"
+    assert result["streams"] == 1 and result["navigations"] == [] and result["pendingTimers"] == 0
+
+
+def test_the_probe_is_abortable_and_timed():
+    assert 'sessionFetch("/api/auth/status", { signal })' in function_source("probeSession")
+    stop = function_source("stopSessionWatch")
+    assert "if (watch.abortProbe) watch.abortProbe();" in stop
+    watch = function_source("startSessionWatch")
+    assert "setTimeout(() => controller.abort(), SESSION_PROBE_TIMEOUT_MS)" in watch
+    assert "if (!live() || watch.probing || !closed()) return;" in watch
+    assert "const SESSION_PROBE_TIMEOUT_MS = 10000;" in APP
