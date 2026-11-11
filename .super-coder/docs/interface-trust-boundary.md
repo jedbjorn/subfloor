@@ -278,7 +278,10 @@ disposable install it drives, not this checkout's, so the session is minted
 by that install's own `./sc`. Such an install has no GUI user; the tool runs
 its `./sc auth user add <engine user>` first (the canary always, the capture
 with `--enrol-user`). The session is labelled with the tool's name and revoked
-when the tool ends, including on failure and Ctrl-C. The cookie is held in
+when the tool ends, including on failure, on Ctrl-C, and when acquiring it is
+interrupted after the mint. A kill while the mint verb itself runs, or one
+that runs no cleanup, can leave the session listed under that label for
+manual revoke ([auth.md](auth.md#tool-sessions)). The cookie is held in
 memory only: never printed, logged, or written to a receipt or gallery. When
 no session can be had (no user and no leave to create one, the store not
 reachable, a checkout that is not the one serving the port) the tool stops

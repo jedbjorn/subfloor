@@ -8,7 +8,9 @@ Sign-in (Feature #94): an instance with GUI sign-in hands a browser with no
 session the sign-in page for every route. The capture therefore mints a
 labelled operator session in the documentation instance's own checkout
 (`--install`, through `tool_session.py`), gives the cookie to the capture
-browser, and revokes the session when it ends, however it ends. The instance
+browser, and revokes the session when it ends: normally, on a failure, or
+on Ctrl-C (a kill while the mint verb itself runs can leave it, listed under
+the tool's name, for `./sc auth sessions revoke`). The instance
 is disposable and may have no GUI user: `--enrol-user <engine user>` lets the
 tool create one there. The cookie is never written to the gallery.
 """

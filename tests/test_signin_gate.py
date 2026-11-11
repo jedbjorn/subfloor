@@ -2115,6 +2115,51 @@ class AuditedCliCallers(GateCase):
                 self.assertEqual(install.tokens, {})
                 self.assertEqual(self.http("GET", "/api/shells", headers)[0], 401)
 
+    def test_an_interrupted_acquisition_revokes_what_it_minted(self) -> None:
+        """The session exists before `open_session` returns it. Whatever
+        stops the check that follows the mint, it is revoked first."""
+        import http.client as http_client
+        import urllib.request as urllib_request
+
+        for leaving in (KeyboardInterrupt(), http_client.IncompleteRead(b"{"),
+                        MemoryError()):
+            for opening in ("open_session", "operator_session", "canary"):
+                with self.subTest(type(leaving).__name__, opening=opening):
+                    install = self.install(user=True)
+                    asked: list[str] = []
+
+                    def opener(request, timeout=None, _leaving=leaving,
+                               _asked=asked):
+                        _asked.append(request.get_header("Cookie") or "")
+                        if _asked[-1]:              # the check after the mint
+                            raise _leaving
+                        return urllib_request.urlopen(request, timeout=timeout)
+
+                    err = io.StringIO()
+                    with redirect_stderr(err), self.assertRaises(type(leaving)):
+                        if opening == "open_session":
+                            tool_session.open_session(
+                                install.root, self.base, "a tool",
+                                run=install.run, opener=opener)
+                        elif opening == "operator_session":
+                            with tool_session.operator_session(
+                                    install.root, self.base, "a tool",
+                                    run=install.run, opener=opener):
+                                self.fail("no session was to be handed out")
+                        else:
+                            canary.open_operator_session(
+                                install.root, self.base, run=install.run,
+                                opener=opener)
+                    token = install.token()
+                    self.assertEqual(asked, ["", f"{COOKIE_NAME}={token}"])
+                    self.assertEqual(
+                        [call[:2] for call in install.calls],
+                        [["sessions", "mint"], ["sessions", "revoke"]])
+                    self.assertEqual(install.tokens, {})
+                    self.assertEqual(self.http("GET", "/api/shells", {
+                        "Cookie": f"{COOKIE_NAME}={token}"})[0], 401)
+                    self.assertNotIn(token, err.getvalue())
+
     def test_a_tool_that_cannot_get_a_session_says_so(self) -> None:
         # No GUI user, and the tool may not make one.
         install = self.install()

@@ -10,8 +10,17 @@ revocable session.
 
 It shows in that install's `./sc auth sessions` under the tool's name and is
 revoked like any other. This module asks for it, hands the tool the `Cookie`
-and the same-origin `Origin` to send, and revokes it when the tool is done:
-on a normal exit, on a failure, and on Ctrl-C.
+and the same-origin `Origin` to send, and revokes it when the tool is done.
+
+What is guaranteed: from the moment the mint verb has answered, the session
+is revoked on every way out of this process that Python can run code on: a
+normal exit, a failure, Ctrl-C, and an interruption or error while the new
+session is still being checked against the server (`open_session` revokes
+before it re-raises). What is not: a Ctrl-C or kill that lands while the mint
+verb itself is running, or a kill of this process that runs no cleanup
+(SIGKILL, SIGTERM). The session may then exist with no one holding its id. It
+stays listed under the tool's label in `./sc auth sessions` and is revoked by
+hand.
 
 Which install: the one whose review server the tool calls, named by its
 checkout path, never this source checkout by assumption. The tools drive a
@@ -230,7 +239,13 @@ def open_session(install: Path | str | None, base_url: str, tool: str, *,
             "with a session. Check ./sc auth sessions there.") from None
     # The session must be one THIS server accepts: a checkout that is not the
     # one serving `base_url` mints a cookie its gate has never heard of.
-    seen = _status(base_url, opener=opener, headers=session.headers())
+    # From here the session exists and only this function knows its id: no
+    # way out may skip the revoke, an interruption included.
+    try:
+        seen = _status(base_url, opener=opener, headers=session.headers())
+    except BaseException:
+        session.revoke()
+        raise
     if seen is None or seen.get("signed_in") is not True:
         session.revoke()
         raise SessionUnavailable(
@@ -244,7 +259,8 @@ def open_session(install: Path | str | None, base_url: str, tool: str, *,
 def operator_session(install: Path | str | None, base_url: str, tool: str,
                      **options):
     """`open_session`, revoked on the way out: normal exit, exception, or
-    Ctrl-C."""
+    Ctrl-C. `open_session` covers its own failures after the mint; see the
+    module docstring for the one gap."""
     session = open_session(install, base_url, tool, **options)
     try:
         yield session

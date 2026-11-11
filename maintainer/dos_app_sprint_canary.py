@@ -26,7 +26,8 @@ runtime answers, the canary runs that install's own host verbs
 (``tool_session.py``): ``./sc auth user add canary`` for the engine user the
 install was made with, then ``./sc auth sessions mint``, labelled with the
 canary's name.  The session is revoked in cleanup, before the install is
-removed.  Its cookie is held in memory only and is never in the receipt.  If no
+removed, and on Ctrl-C; a kill while the mint verb itself runs can leave it,
+listed under that label, for ``./sc auth sessions revoke``.  Its cookie is held in memory only and is never in the receipt.  If no
 session can be had the canary stops with ``CANARY_SIGN_IN_REQUIRED`` and
 cleans up.  A candidate from before sign-in needs none.
 """
@@ -61,6 +62,8 @@ WORKSPACE_PREFIX = "subfloor-dos-app-canary-"
 REMOTE_PREFIX = "subfloor-canary"
 ENGINE_REMOTE = "super-coder"
 TOOL_NAME = "dos-app Sprint canary"
+# Ports the canary never takes, free or not: a real engine's review port.
+RESERVED_PORTS = frozenset({8837})
 # The engine user the disposable install is created with, and so the one its
 # GUI user and the canary's session are made for.
 ENGINE_USER = "canary"
@@ -586,6 +589,8 @@ class HostBackend:
     def _reserve_ports(self) -> tuple[int, int]:
         selected: list[int] = []
         for port in range(8800, 8900):
+            if port in RESERVED_PORTS:
+                continue
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:

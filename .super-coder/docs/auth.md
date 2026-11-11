@@ -334,7 +334,13 @@ The tool sends the cookie, and `Origin: http://<host>:<port>` of the review
 server it calls, as the GUI would. The source-maintainer tools do this through
 `maintainer/tool_session.py`, which mints in the install the tool drives,
 labels the session with the tool's name, keeps the cookie in memory only, and
-revokes on the way out: normal exit, failure, or Ctrl-C.
+revokes on the way out. Once the mint verb has answered, that covers a normal
+exit, a failure, Ctrl-C, and an interruption or error while the new session is
+still being checked against the server. The remaining gap: a Ctrl-C or kill
+that lands while the mint verb itself is running, or a kill of the tool that
+runs no cleanup (SIGKILL, SIGTERM), can leave a session nobody holds the id
+of. It stays listed under the tool's label; end it with
+`./sc auth sessions revoke <id>`.
 
 ## The `./sc auth` verbs
 
