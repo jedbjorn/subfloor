@@ -141,6 +141,8 @@ class SupervisionFixture:
                     print(18800)
                 elif sys.argv[1] == "devport":
                     print(15173)
+                elif sys.argv[1] == "engine-ops-port":
+                    print(18802)
                 elif sys.argv[1] == "ensure":
                     pass
                 """
@@ -308,7 +310,7 @@ class SupervisionFixture:
             printf ' %s' "$@" >> "$SC_TEST_LOG"
             printf '\\n' >> "$SC_TEST_LOG"
             [ "${SC_TEST_CURL_FAIL:-}" != 1 ] || exit 7
-            printf '{"ok": true}\\n'
+            printf '{"ok": true, "service": "engine-ops"}\\n'
             """,
         )
         self._write_executable(

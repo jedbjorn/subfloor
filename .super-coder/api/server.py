@@ -124,6 +124,7 @@ import sprint_participant_chats  # noqa: E402  (registry-backed Sprint wake chat
 import sprint_pr_watcher  # noqa: E402  (engine-wide PR subscription observation)
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import route_bindings  # noqa: E402  (shared durable model-route freshness gate)
+import engine_ops  # noqa: E402  (where the host-side engine-ops service is)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
 from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quota probes — doc #49)
@@ -218,7 +219,7 @@ def _resolve_vendor(rel: str) -> tuple:
 _CSP_HOSTS = ("127.0.0.1", "localhost")
 
 
-def _csp(port: int) -> str:
+def _csp(port: int, engine_ops_port: int | None = None) -> str:
     """Content-Security-Policy for the app shell (spec #20 Security And
     Privacy; spec #26 Trust Boundary, where same-origin script execution is
     operator-equivalent and this header is therefore release-critical):
@@ -242,6 +243,12 @@ def _csp(port: int) -> str:
     """
     sockets = " ".join(f"{scheme}://{host}:{port}"
                        for host in _CSP_HOSTS for scheme in ("ws", "wss"))
+    # The host-side engine-ops service is a second loopback origin the browser
+    # calls directly (spec #270). Port-exact, like the sockets, and absent
+    # until this install has allocated that port.
+    if engine_ops_port is not None:
+        sockets += "".join(f" http://{host}:{engine_ops_port}"
+                           for host in _CSP_HOSTS)
     return ("default-src 'self'; script-src 'self'; "
             "style-src 'self' 'unsafe-inline'; "
             f"connect-src 'self' {sockets}; img-src 'self' data:; "
@@ -5912,6 +5919,14 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 return self._send(200, {**browser_mod.status(), "config": browser_mod.read(),
                     "defaults": browser_mod.defaults()})
+            if path == "/api/engine-ops":
+                # Where the host-side engine-ops service is, and whether it
+                # answers. The browser calls that service directly; this API
+                # runs none of its verbs (spec #270 Engine controls).
+                if not self._require_browser_operator(con, "engine operations"):
+                    return
+                return self._send(200, engine_ops.discovery(
+                    in_container() or bool(os.environ.get("SC_SANDBOX"))))
             if path == "/api/web-search":
                 # Status only — configured / provider / last-four hint / when.
                 # The key itself never crosses this boundary (doc #215).
@@ -6717,7 +6732,7 @@ def _run_server(port: int) -> int:
     # The app shell's socket sources are port-exact (see `_csp`), so bind the
     # policy to the port actually being served before any request can render it.
     global _CSP
-    _CSP = _csp(port)
+    _CSP = _csp(port, ports_mod.stored_engine_ops_port())
     if not DB_PATH.exists():
         sys.exit(f"server: no DB at {DB_PATH} — run `./sc rebuild` first.")
     require_current_schema(DB_PATH)

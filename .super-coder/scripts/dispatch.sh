@@ -263,6 +263,8 @@ sc_host_server_pid() {
 sc_host_server_alive() { sc_host_server_pid >/dev/null; }
 sc_host_server_up() {
   "$PY" "$S/ports.py" ensure >/dev/null
+  # The review server names this port in its CSP when it starts.
+  sc_engine_ops_port >/dev/null 2>&1 || true
   host_port="$(port)"
   if sc_host_server_alive; then
     echo "→ host review server already running (pid $(sc_host_server_pid)) · http://127.0.0.1:$host_port"
@@ -919,6 +921,60 @@ sc_pm2_broker_uninstall() {
   echo "→ pm2-broker systemd unit removed ($PM2_BROKER_UNIT)"
 }
 
+# ── Engine-ops service (HOST-side; runs update / restart / update-harnesses) ──
+# Sibling of the brokers above with a different boundary. The review GUI's
+# engine controls need a host process to run `./sc update`, `./sc restart`, and
+# `./sc update-harnesses`: under docker the review API is inside the sandbox and
+# cannot drive the host's docker, and under the host runtime it would be
+# stopping itself. Because these verbs replace the engine, this service does
+# NOT listen on a unix socket in the bind-mounted engine dir (every sandboxed
+# shell can reach that). It listens on its own host loopback TCP port, which a
+# sandbox has no route to; the browser calls it directly. Refuses to run in the
+# sandbox (engine_ops_service.py guards on SC_SANDBOX). It needs no linked
+# block: `launch` always brings it up and `down` stops it. `down` stops only
+# the pidfile process; an operation it started runs detached from it and
+# finishes regardless (api/engine_ops.py). See .super-coder/docs/engine-ops.md.
+ENGINE_OPS_PID="$ENGINE/run/engine-ops.pid"
+ENGINE_OPS_LOG="$ENGINE/run/engine-ops.log"
+
+sc_engine_ops_port() { "$PY" "$S/ports.py" engine-ops-port; }
+sc_engine_ops_alive() {
+  curl -fsS "http://127.0.0.1:$(sc_engine_ops_port)/health" 2>/dev/null | grep -q '"service": "engine-ops"'
+}
+sc_engine_ops_up() {
+  if [ -n "${SC_SANDBOX:-}" ]; then
+    echo "→ engine-ops: NOT started — it is a host process and this is the sandbox"; return 0
+  fi
+  ops_port="$(sc_engine_ops_port 2>/dev/null || true)"
+  case "$ops_port" in
+    ''|*[!0-9]*) echo "✗ engine-ops: could not allocate its port (./sc engine-ops-port)" >&2; return 1 ;;
+  esac
+  if sc_engine_ops_alive; then echo "→ engine-ops already serving http://127.0.0.1:$ops_port"; return 0; fi
+  sc_broker_preflight engine-ops "$ENGINE_OPS_PID" "$ENGINE_OPS_LOG" "$ENGINE/run/engine-ops.json" || return 1
+  nohup "$PY" "$ENGINE/api/engine_ops_service.py" >"$ENGINE_OPS_LOG" 2>&1 &
+  ops_pid=$!
+  echo "$ops_pid" > "$ENGINE_OPS_PID"
+  # Unlike its siblings this one is always expected up, so say only what is
+  # true: wait for it to answer before reporting it.
+  if ! sc_wait_until sc_engine_ops_alive; then
+    echo "✗ engine-ops did not start; see $ENGINE_OPS_LOG" >&2
+    kill "$ops_pid" 2>/dev/null || true
+    rm -f "$ENGINE_OPS_PID"
+    return 1
+  fi
+  echo "→ engine-ops up (pid $ops_pid) · http://127.0.0.1:$ops_port (host loopback only) · log $ENGINE_OPS_LOG"
+}
+sc_engine_ops_down() {
+  if [ -f "$ENGINE_OPS_PID" ] && kill -0 "$(cat "$ENGINE_OPS_PID" 2>/dev/null)" 2>/dev/null; then
+    kill "$(cat "$ENGINE_OPS_PID")" && echo "→ engine-ops stopped"
+  elif sc_engine_ops_alive; then
+    echo "→ engine-ops is running but not from \`engine-ops-up\` (a foreground ./sc engine-ops?) — leaving it"
+  else
+    echo "→ engine-ops not running"
+  fi
+  rm -f "$ENGINE_OPS_PID"
+}
+
 # ── db broker (HOST-side; read-only diagnostic access to the LIVE app DB) ─────
 # A host-side broker that shells out to `psql` where the live DSN + route
 # resolve, exposing ONE narrow verb (a single allowlisted, capped, read-only
@@ -1215,6 +1271,16 @@ sc_restart_health_summary() {
   sc_restart_broker "db-broker" \
     sc_db_broker_configured sc_db_broker_alive sc_db_broker_up \
     sc_db_broker_down "$DB_BROKER_PID" "$DB_BROKER_UNIT"
+  # launch has already started it (pidfile, or a foreground one it left
+  # alone); it has no systemd form, so there is nothing to bounce — only to
+  # prove it answers.
+  sc_engine_ops_alive || sc_engine_ops_up >/dev/null 2>&1 || true
+  if sc_wait_until sc_engine_ops_alive; then
+    echo "  engine-ops: running"
+  else
+    echo "  engine-ops: failed (not answering)"
+    SC_RESTART_FAILED=1
+  fi
   if sc_pg_configured; then
     if sc_wait_until sc_pg_healthy; then
       echo "  postgres: restarted"
@@ -1244,7 +1310,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|engine-ops|engine-ops-up|engine-ops-down|engine-ops-port|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1500,6 +1566,18 @@ case "$cmd" in
   pm2-broker-sock)    exec "$PY" "$S/pm2.py" sock ;;
   pm2-broker-install)   sc_pm2_broker_install ;;
   pm2-broker-uninstall) sc_pm2_broker_uninstall ;;
+  # ── engine-ops service (HOST-side — runs update / restart / update-harnesses
+  # for the GUI). A linked worktree has no instance of its own, and this
+  # service would run the LIVE instance's lifecycle verbs, so every form but
+  # the port read refuses there.
+  engine-ops)         sc_refuse_linked engine-ops "the engine-ops service of $LIVE_ROOT"
+                      exec "$PY" "$ENGINE/api/engine_ops_service.py" "$@" ;;
+  engine-ops-up)      sc_refuse_linked engine-ops-up "the engine-ops service of $LIVE_ROOT"
+                      sc_engine_ops_up ;;
+  engine-ops-down)    sc_refuse_linked engine-ops-down "the engine-ops service of $LIVE_ROOT"
+                      sc_engine_ops_down ;;
+  engine-ops-port)    sc_refuse_linked engine-ops-port "the port allocation of $LIVE_ROOT"
+                      sc_engine_ops_port ;;
   # ── db broker (HOST-side primitive — runs where the live DSN + route live) ──
   db-broker)         exec "$PY" "$ENGINE/api/db_broker.py" "$@" ;;
   db-broker-up)      sc_db_broker_up ;;
@@ -1562,6 +1640,7 @@ case "$cmd" in
       sc_ts_broker_up || true
       sc_pm2_broker_up || true
       sc_db_broker_up || true
+      sc_engine_ops_up || true
       # The Postgres sidecar is a docker container even under the host runtime
       # (app-only, opt-in); it is started only when the fork linked it.
       if sc_pg_configured; then sc_pg_up || true; fi
@@ -1571,6 +1650,9 @@ case "$cmd" in
     if [ -n "$no_build" ]; then dimage_preflight; else dbuild; fi
     dcreds
     "$PY" "$S/ports.py" ensure >/dev/null
+    # The review server names this port in its CSP when it starts. It is not
+    # published into the container: the sandbox must have no route to it.
+    sc_engine_ops_port >/dev/null 2>&1 || true
     p="$(port)"
     dp="$(devport)"
     dnet
@@ -1731,6 +1813,9 @@ case "$cmd" in
     # Same for the read-only DB broker — it was previously omitted from the
     # sandbox lifecycle, so a restart could leave configured diagnostics down.
     sc_db_broker_up || true
+    # The engine-ops service runs the GUI's update / restart / harness update
+    # on the host; it needs no linked block, so it always comes up.
+    sc_engine_ops_up || true
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
   enter)
@@ -1782,6 +1867,7 @@ case "$cmd" in
                   sc_ts_broker_down
                   sc_pm2_broker_down
                   sc_db_broker_down
+                  sc_engine_ops_down
                   if sc_pg_configured; then sc_pg_down || down_rc=1; fi
                   exit "$down_rc"
                 fi
@@ -1790,6 +1876,7 @@ case "$cmd" in
                 sc_ts_broker_down
                 sc_pm2_broker_down
                 sc_db_broker_down
+                sc_engine_ops_down
                 sc_pg_down ;;
   # restart is a hard bounce — down runs `docker rm -f`, which SIGKILLs every
   # live session inside the sandbox along with whatever those sessions had not
@@ -1953,6 +2040,7 @@ Subfloor — forkable shell substrate for one repository
   Engine (Admin)        rebuild · migrate · migration · snapshot · render · render-check · verify
                         seed-skills · engine-ref · artifact-mode · clean-db
   Host brokers          browser · vm · remote · ts · vm-broker-* · ts-broker-* · pm2-broker-* · db-broker-*
+                        engine-ops-*
                         db-init · pg-*
   Primitives            serve · boot · run · deps · lint · typecheck · build · logs · health · ports
                         preview · visual-qa
@@ -2209,6 +2297,15 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc pm2-broker-sock     print the broker's socket path
   ./sc pm2-broker-install  supervise via a systemd --user unit (survives logout/reboot)
   ./sc pm2-broker-uninstall remove the systemd unit
+
+  engine-ops service (run on the HOST — runs update, restart, and
+  update-harnesses for the review GUI's engine controls, under both runtimes.
+  Host loopback TCP only, never a socket in the engine dir; the sandbox has no
+  route to it. See .super-coder/docs/engine-ops.md). `launch` always brings it up:
+  ./sc engine-ops          run the service in the foreground
+  ./sc engine-ops-up       start it in the background (nohup + pidfile); no-op if already up
+  ./sc engine-ops-down     stop the backgrounded service (a running operation finishes)
+  ./sc engine-ops-port     print (allocating once) its host loopback port
 
   db broker (run on the HOST — read-only diagnostic reads of the fork's LIVE app
   DB for a sandboxed shell, without handing it a DSN or a route. Shells out to
