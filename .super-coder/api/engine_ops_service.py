@@ -442,6 +442,11 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # The stdlib default is 5 pending connections. A page that opens makes
+    # several calls at once, and a burst beyond the queue is reset or stalls
+    # for a retransmit instead of being answered (with a 429, if that is
+    # what it deserves).
+    request_queue_size = 64
 
 
 def make_server(port: int) -> Server:
