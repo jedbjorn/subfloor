@@ -234,9 +234,14 @@ def _operator(con, headers) -> dict:
         )
     # No Authorization header proves nothing (Feature #94): the operator is
     # the user a verified session cookie belongs to, and nobody else.
-    session = browser_gate.session(headers)
+    session = browser_gate.operator_session(
+        headers,
+        lambda user_id: con.execute(
+            "SELECT 1 FROM users WHERE user_id=? AND is_active=1", (user_id,)
+        ).fetchone() is not None,
+    )
     row = None if session is None else con.execute(
-        "SELECT user_id,username FROM users WHERE user_id=? AND is_active=1",
+        "SELECT user_id,username FROM users WHERE user_id=?",
         (session["user_id"],),
     ).fetchone()
     if row is None:
@@ -3171,15 +3176,32 @@ def _stream_authorize(headers_raw: str, conversation_id: str):
     return headers
 
 
+def _active_user(user_id: int) -> bool:
+    """Whether a session's user is an active engine user (for the gate)."""
+    con = _db()
+    try:
+        return con.execute(
+            "SELECT 1 FROM users WHERE user_id=? AND is_active=1", (user_id,)
+        ).fetchone() is not None
+    finally:
+        con.close()
+
+
 def _stream_still_signed_in(headers) -> bool:
     """An open stream's authorisation point (Feature #94).
 
-    A stream outlives the request that opened it, so the session is checked
-    again at every turn of the loop: before each batch of events is read, and
-    after each wait. Revocation therefore ends an open stream at its next
-    event or its next heartbeat, whichever comes first.
+    A stream outlives the request that opened it, so the gate's one decision
+    (`browser_gate.operator_session`: the cookie still verifies AND its user
+    is still an active engine user) is made again at every turn of the loop:
+    before each batch of events is read, and after each wait. A revoked
+    session or a deactivated user therefore ends an open stream at its next
+    event or its next heartbeat, whichever comes first. If the check cannot
+    run, the stream ends: undecided is refused.
     """
-    return browser_gate.session(headers) is not None
+    try:
+        return browser_gate.operator_session(headers, _active_user) is not None
+    except Exception:  # noqa: BLE001 — undecided is refused
+        return False
 
 
 _STREAM_SIGNED_OUT = (
@@ -3296,7 +3318,7 @@ async def stream_events(
     await writer.drain()
     try:
         while True:
-            if not _stream_still_signed_in(headers):
+            if not await asyncio.to_thread(_stream_still_signed_in, headers):
                 # Named, so the page can tell "signed out" from "offline";
                 # its reconnect then meets the gate's 401.
                 writer.write(_STREAM_SIGNED_OUT)

@@ -3125,11 +3125,13 @@ class Handler(BaseHTTPRequestHandler):
         # is the user a verified session cookie belongs to. `dispatch_http`
         # has already refused a request without one; this is the same check,
         # held where the route is, for a caller that did not come that way.
-        session = browser_gate.session(self.headers)
-        operator = None if session is None else con.execute(
-            "SELECT 1 FROM users WHERE user_id=? AND is_active=1",
-            (session["user_id"],),
-        ).fetchone()
+        operator = browser_gate.operator_session(
+            self.headers,
+            lambda user_id: con.execute(
+                "SELECT 1 FROM users WHERE user_id=? AND is_active=1",
+                (user_id,),
+            ).fetchone() is not None,
+        )
         if operator is None:
             self._send(401, browser_gate.sign_in_required_payload(),
                        headers={"Cache-Control": "no-store"})
@@ -6769,6 +6771,33 @@ def require_loopback_bind(bind: str) -> None:
     )
 
 
+def publish_cli_credential() -> None:
+    """Publish this process's engine CLI token, owner-only, under run/.
+
+    Called only after the listener is bound, so the file always names the
+    token of the server that holds the port. Nothing removes the file at
+    shutdown: by then another server may have published its own, and a stale
+    token with no server behind it opens nothing.
+    """
+    token = browser_gate.CLI_TOKEN
+    if not token:
+        return
+    try:
+        cli_credential.publish(token)
+    except OSError as exc:
+        # Not a reason to refuse the GUI: with no token published, the CLI
+        # routes still take a shell token, and `./sc snapshot` says what it
+        # could not read.
+        print(f"server: could not publish the engine CLI credential ({exc}); "
+              "`./sc snapshot` will be refused until the next restart")
+
+
+def _on_listening() -> None:
+    """What may happen only once this process holds the port."""
+    publish_cli_credential()
+    start_runtime_services()
+
+
 def start_runtime_services() -> None:
     """Start commit-woken conversations and Sprint/engine services."""
     broker = conversation_broker.start_service(
@@ -6837,19 +6866,12 @@ def _run_server(port: int) -> int:
     # api_key rotation is picked up here. Lives under the gitignored,
     # never-snapshotted .super-coder/run/.
     mem_credentials.provision(str(DB_PATH), f"http://127.0.0.1:{port}")
-    # The engine CLI credential (Feature #94): a fresh token every boot, held
-    # in memory and published owner-only under the same gitignored run/. The
-    # `sc` verbs that call `/api/*` present it; the gate accepts it on
-    # `browser_gate.CLI_ROUTES` only.
-    try:
-        browser_gate.CLI_TOKEN = cli_credential.provision()
-    except OSError as exc:
-        # Not a reason to refuse the GUI: with no token published, the CLI
-        # routes still take a shell token, and `./sc snapshot` says what it
-        # could not read.
-        browser_gate.CLI_TOKEN = None
-        print(f"server: could not publish the engine CLI credential ({exc}); "
-              "`./sc snapshot` will be refused until the next restart")
+    # The engine CLI credential (Feature #94): a fresh token every boot. It
+    # is minted here, in memory only, so the gate knows it before the first
+    # request. It is PUBLISHED only once this process holds the port
+    # (`_on_listening`): a duplicate startup that loses the bind must not
+    # replace the file the surviving server's callers read.
+    browser_gate.CLI_TOKEN = cli_credential.mint()
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can
     # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which
@@ -6882,7 +6904,7 @@ def _run_server(port: int) -> int:
                 port,
                 dispatch_http,
                 _ws_unavailable,
-                on_started=start_runtime_services,
+                on_started=_on_listening,
                 stream_handler=conversation_routes.stream_events,
             )
         finally:
@@ -6918,8 +6940,9 @@ def main(argv):
     try:
         instance_state.active_database_path(ENGINE)
         state = instance_state.maintenance_state(ENGINE)
-        # `_run_server` retains the combined on_started=start_runtime_services
-        # callback while this outer scope retains runtime ownership.
+        # `_run_server` retains the combined on_started=_on_listening callback
+        # (which runs start_runtime_services) while this outer scope retains
+        # runtime ownership.
         with state_relocation.shared_runtime(state, command="api-server"):
             return _run_server(port)
     except instance_state.MaintenanceCutoverRequired as exc:

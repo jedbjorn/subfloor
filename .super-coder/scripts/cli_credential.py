@@ -7,9 +7,12 @@ signed-in browser session nor a credential it accepts. A few `sc` verbs call
 shell identity either (`./sc snapshot` and `./sc update` on the host). This is
 the credential they present.
 
-* The review server mints a fresh random token at every boot, keeps it in
-  memory, and writes it to `.super-coder/run/api/cli-token` (directory `0700`,
-  file `0600`), replacing the file by rename.
+* The review server mints a fresh random token at every boot and keeps it in
+  memory. Once it holds its port, and not before, it writes the token to
+  `.super-coder/run/api/cli-token` (directory `0700`, file `0600`), replacing
+  the file by rename. A second server that fails to bind never publishes, so
+  the file names the token of the server that is listening. Nothing deletes
+  the file at shutdown.
 * A caller reads the file and sends `Authorization: Bearer <token>`.
 * The server accepts it on the routes in `browser_gate.CLI_ROUTES` and nowhere
   else. It is never a browser session and never the operator.
@@ -44,12 +47,18 @@ def mint() -> str:
 
 
 def provision(run_dir: Path | None = None) -> str:
-    """Mint a token, publish it owner-only, and return it.
+    """Mint a token, publish it owner-only, and return it."""
+    token = mint()
+    publish(token, run_dir)
+    return token
+
+
+def publish(token: str, run_dir: Path | None = None) -> None:
+    """Publish `token` owner-only.
 
     The file is written as a new inode and renamed over the name, so a link
     planted at the path is replaced and never followed.
     """
-    token = mint()
     run_dir = run_dir or RUN_DIR
     run_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(run_dir, 0o700)
@@ -65,7 +74,6 @@ def provision(run_dir: Path | None = None) -> str:
         except OSError:
             pass
         raise
-    return token
 
 
 def read(run_dir: Path | None = None) -> str | None:

@@ -134,6 +134,11 @@ session's user is still an active engine user.
   host, the service's published hint inside the sandbox (`up_source`). `url`
   is `null` until the install has allocated the service's port.
 - A signed-in caller also has its cookie renewed (below).
+- The route is open, so a cross-origin caller is answered, but as a stranger:
+  `signed_in` is `false`, there is no `user_id`, and nothing is renewed,
+  whatever cookie its browser attached. "Signed in" here is the gate's own
+  answer for a `GET` under `/api/`: the operator's session on a request that
+  is not cross-origin. The GUI's own same-origin call is unaffected.
 
 ### The origin rule
 
@@ -156,16 +161,21 @@ or `::1`, and never beside an `Authorization` header: a request that names a
 Bearer credential is judged as that credential.
 
 The session's user must be an active engine user (`users.is_active`). A
-session whose user was deactivated is not signed in.
+session whose user was deactivated is not signed in. "The cookie verifies and
+its user is active" is one decision (`browser_gate.operator_session`), made by
+the gate, by the status route, at the routes, and at every turn of an open
+event stream.
 
 ### Revocation, and an open page
 
 The review server re-reads the published hash list whenever the file changes,
 so a revoked, signed-out or reset session is refused from the next request.
 
-An open event stream is checked again before each batch of events and after
-each wait, so it ends at its next event or its next heartbeat (15 seconds),
-whichever comes first. It ends with a named event, then closes:
+An open event stream makes that same decision again before each batch of
+events and after each wait, so a revoked session or a deactivated user ends
+it at its next event or its next heartbeat (15 seconds), whichever comes
+first. If the check cannot run, the stream ends. It ends with a named event,
+then closes:
 
     event: sign_in_required
     data: {"error": {"code": "sign_in_required", …}}
@@ -185,31 +195,44 @@ token the request carried, under the published cookie name, with the
 authority's own spelling of the cookie (`auth_sessions.set_cookie`). It writes
 no state and mints nothing.
 
+Only the GUI's own request is renewed. A request that says it came from
+another origin (an `Origin` that is not this one, or a `Sec-Fetch-Site` other
+than `same-origin` or `none`) is never answered with a `Set-Cookie`: the page
+is still served to a signed-in browser that followed a link from another
+local page, and the status route still answers, but neither renews.
+
 ## Shell and CLI authority
 
 `/_sc/*` is the shell surface. Its Bearer rules are unchanged: a shell token
 on every route, Planner flavor where a route says so. A browser session is not
 a shell.
 
-Two `/api/*` routes are called by `sc` verbs and accept a Bearer credential
-(`browser_gate.CLI_ROUTES`):
+Two `/api/*` requests are made by `sc` verbs and accept a Bearer credential
+(`browser_gate.CLI_ROUTES`). They are exact, to the query string:
 
-| Route | Caller | What it presents |
+| Request | Caller | What it presents |
 |---|---|---|
-| `POST /api/scripts/snapshot` | `./sc snapshot`, `./sc update` | the engine CLI credential |
-| `GET /api/models` | `./sc models refresh` | the calling shell's own token |
+| `POST /api/scripts/snapshot`, no query | `./sc snapshot`, `./sc update` | the engine CLI credential |
+| `GET /api/models?refresh=1`, exactly that query | `./sc models refresh` | the calling shell's own token |
 
-Either route accepts either credential:
+`GET /api/models` with no query, with another value, or with any parameter
+added or repeated is the GUI's request, and a credential is refused there
+like anywhere else.
+
+Either request accepts either credential:
 
 - **a shell token** (`shells.api_key`), the one the shell already holds;
 - **the engine CLI credential.** The review server mints a random token at
-  every boot, keeps it in memory, and writes it to
-  `.super-coder/run/api/cli-token` (directory `0700`, file `0600`), under the
-  gitignored `run/`. A host verb that has no shell identity reads it from
-  there. The server compares against the value in memory, so writing the file
-  grants nothing, and a restart retires the old token. It is worth exactly
-  what a shell token is worth on those two routes; it exists so that
-  `./sc snapshot` does not depend on a shell existing.
+  every boot and keeps it in memory. Once it holds its port, and not before,
+  it writes the token to `.super-coder/run/api/cli-token` (directory `0700`,
+  file `0600`), under the gitignored `run/`. A second server that starts and
+  fails to bind therefore never replaces the file, and it always names the
+  token of the server that is listening. Nothing deletes it at shutdown. A
+  host verb that has no shell identity reads it from there. The server
+  compares against the value in memory, so writing the file grants nothing,
+  and a restart retires the old token. It is worth exactly what a shell token
+  is worth on those two requests; it exists so that `./sc snapshot` does not
+  depend on a shell existing.
 
 Neither makes its holder the operator. On every other `/api/*` route a Bearer
 credential the engine issued is refused with `403 fnb_operator_required`; one
@@ -224,6 +247,13 @@ session.
 
 Work that runs inside the server process needs no HTTP authority and is
 unchanged: Sprint participant chats, the conversation broker, and the reaper.
+
+The source-maintainer tools under `maintainer/` (`dos_app_sprint_canary.py`,
+`capture_public_docs.py`) play the operator with no session, and an install
+that requires sign-in refuses them. They stop early with one message that
+names flag SC-1602, where it is being decided whether a host-side tool may be
+given an operator session without the password and the authenticator. Nothing
+in this server mints one.
 
 The Sprint Board distinguishes browser-operator actions from
 shell-authenticated Sprint commands. Shell commands use scoped Bearer identity

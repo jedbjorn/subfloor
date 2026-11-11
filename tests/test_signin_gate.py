@@ -44,6 +44,7 @@ ENGINE = REPO / ".super-coder"
 sys.path.insert(0, str(REPO / "tests"))
 sys.path.insert(0, str(ENGINE / "api"))
 
+sys.path.insert(0, str(REPO))
 import server  # noqa: E402  (adds scripts/ to the path on import)
 import auth_sessions  # noqa: E402
 import browser_gate  # noqa: E402
@@ -56,9 +57,20 @@ import sandbox_devkit  # noqa: E402
 import snapshot as snapshot_cli  # noqa: E402
 import transport as transport_mod  # noqa: E402
 from signin_fixture import publish, sign_in, signed_out  # noqa: E402
+from maintainer import capture_public_docs  # noqa: E402
+from maintainer import dos_app_sprint_canary as canary  # noqa: E402
+from maintainer import signin_guard  # noqa: E402
 
 HOST = "127.0.0.1:8800"
 ROUTE_MODULES = ("server.py", "conversation_routes.py", "review_routes.py")
+# Every module under api/ that names a `/api` or `/_sc` path at all, pinned.
+# The walk reads ALL of api/*.py, so a path named in a new module is walked
+# without anyone listing it; this pin makes that module's arrival a failure
+# someone has to look at (`test_the_walk_knows_every_module_that_names_a_route`).
+MODULES_NAMING_ROUTES = {"browser_gate.py", *ROUTE_MODULES}
+# The modules `dispatch_http` hands a request to, pinned for the same reason.
+DISPATCH_TARGETS = {"request_timing.handle", "review_routes.handle",
+                    "conversation_routes.handle"}
 METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 SHELL_TOKEN = "shell-token"
 CONVERSATION = "cv_" + "0" * 32
@@ -77,8 +89,8 @@ EXPECTED_OPEN = {
     ("HEAD", "/vendor/qrcode.js"),
 }
 EXPECTED_CLI = {
-    ("POST", "/api/scripts/snapshot"),
-    ("GET", "/api/models"),
+    ("POST", "/api/scripts/snapshot", ""),
+    ("GET", "/api/models", "refresh=1"),
 }
 
 _DB_DIR: tempfile.TemporaryDirectory | None = None
@@ -190,18 +202,35 @@ def _sample_pattern(pattern: str) -> list[str]:
     return samples
 
 
+def _route_literals(source: str) -> list[str]:
+    return [node.value for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and re.match(r"\^?/(api|_sc)(/|$)", node.value)]
+
+
 def derive_paths() -> set[str]:
-    """Every path the three route modules name, read from their source.
+    """Every path any module under api/ names, read from its source.
 
     Each string literal that is a path under `/api` or `/_sc`, each route
     regex, each key of the static table, and the vendor prefix. A prefix
     literal (`/api/shells/`) is also walked with something under it, in the
     shapes the handlers split on.
+
+    The limit of this enumeration, stated: it finds a route by the path
+    LITERAL that names it. A route whose path is assembled at run time, or
+    matched only by splitting (`parts[1:3] == ["api", "shells"]`), is not
+    named and is reached here only through the prefix expansions and strays
+    below. That does not leave such a route open: the gate decides by default
+    deny before any route is chosen, and `test_nothing_in_dispatch_runs_
+    before_the_gate` holds that. What enumeration adds is the proof, route by
+    route, for every route that is named. Two pins keep it honest as the
+    server grows: the set of modules that name a route, and the set of
+    modules `dispatch_http` hands a request to.
     """
     paths: set[str] = set(server._STATIC) | {"/vendor/", "/vendor/marked.umd.js",
                                               "/vendor/purify.min.js"}
-    for name in ROUTE_MODULES:
-        tree = ast.parse((ENGINE / "api" / name).read_text())
+    for module in sorted((ENGINE / "api").glob("*.py")):
+        tree = ast.parse(module.read_text())
         for node in ast.walk(tree):
             if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
                 continue
@@ -285,6 +314,37 @@ class NoRouteAnswersWithoutASession(GateCase):
                       "/_sc/mem/whoami", "/", "/index.html", "/app.js"):
             self.assertIn(known, paths)
         self.assertGreater(len(paths), 250)
+
+    def test_the_walk_knows_every_module_that_names_a_route(self) -> None:
+        """A new module that names `/api` or `/_sc` paths, or a new branch in
+        `dispatch_http`, fails here until someone has looked at it."""
+        naming = {module.name for module in (ENGINE / "api").glob("*.py")
+                  if _route_literals(module.read_text())}
+        self.assertEqual(naming, MODULES_NAMING_ROUTES)
+        tree = ast.parse((ENGINE / "api" / "server.py").read_text())
+        dispatch = next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == "dispatch_http")
+        handed_to = {ast.unparse(node.func) for node in ast.walk(dispatch)
+                     if isinstance(node, ast.Call)
+                     and isinstance(node.func, ast.Attribute)
+                     and node.func.attr == "handle"}
+        self.assertEqual(handed_to, DISPATCH_TARGETS)
+        # Each of those modules is one the walk reads, and each path prefix
+        # `dispatch_http` peels off is a literal the walk found.
+        for target in DISPATCH_TARGETS - {"request_timing.handle"}:
+            self.assertIn(target.split(".")[0] + ".py", ROUTE_MODULES)
+        paths = derive_paths()
+        for literal in _route_literals(ast.unparse(dispatch)):
+            self.assertIn(literal, paths)
+        # And the transport is given exactly these two ways in.
+        serve = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                     and ast.unparse(node.func) == "transport.serve")
+        self.assertEqual(ast.unparse(serve.args[2]), "dispatch_http")
+        self.assertEqual(
+            {keyword.arg: ast.unparse(keyword.value) for keyword in serve.keywords},
+            {"on_started": "_on_listening",
+             "stream_handler": "conversation_routes.stream_events"})
 
     def test_every_route_refuses_without_a_cookie(self) -> None:
         self.assertEqual(walk(self), [])
@@ -621,6 +681,92 @@ class SessionLifecycle(GateCase):
             "GET", f"/api/conversations/{CONVERSATION}/events",
             self.browser.raw(origin=False), writer))
         self.assertTrue(writer.data.startswith(b"HTTP/1.1 401 "))
+
+    def test_an_open_stream_ends_when_its_user_is_deactivated(self) -> None:
+        """The stream makes the gate's whole decision at each turn: the cookie
+        still verifies here, and the stream ends all the same."""
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / "engine.db"
+            source = sqlite3.connect(_DB_PATH)
+            target = sqlite3.connect(copy)
+            source.backup(target)
+            source.close()
+            target.close()
+
+            def connect():
+                con = sqlite3.connect(copy)
+                con.row_factory = sqlite3.Row
+                return con
+
+            async def script(writer):
+                while writer.data.count(b": keepalive") < 2:
+                    writer.wrote.clear()
+                    await asyncio.wait_for(writer.wrote.wait(), 10)
+                self.assertFalse(writer.closed)
+                with connect() as con:
+                    con.execute("UPDATE users SET is_active=0 WHERE user_id=1")
+                # Several heartbeats pass; a stream that only looked at the
+                # cookie would still be open after them.
+                for _ in range(40):
+                    if writer.closed:
+                        break
+                    await asyncio.sleep(0.05)
+                self.assertTrue(
+                    writer.closed,
+                    "the stream outlived its user: it re-checked the cookie "
+                    "but not users.is_active")
+
+            with mock.patch.object(conversation_routes, "_db", side_effect=connect), \
+                    mock.patch.object(server, "db", side_effect=connect):
+                # A fresh request is refused, and so is the open stream.
+                claimed, writer = self._stream(script)
+                self.assertEqual(
+                    self.call("GET", "/api/shells", self.browser.headers())[0], 401)
+        self.assertTrue(claimed)
+        self.assertIsNotNone(
+            auth_sessions.session_from_cookie_header(self.browser.cookie),
+            "the cookie itself was never revoked in this test")
+        tail = writer.data.rsplit(b"\n\n", 2)[-2]
+        self.assertTrue(tail.startswith(b"event: sign_in_required\ndata: "), tail)
+
+    def test_a_stream_that_cannot_check_ends(self) -> None:
+        async def script(writer):
+            while writer.data.count(b": keepalive") < 1:
+                writer.wrote.clear()
+                await asyncio.wait_for(writer.wrote.wait(), 10)
+            self.broken.start()
+
+        self.broken = mock.patch.object(
+            conversation_routes, "_db",
+            side_effect=sqlite3.OperationalError("database is locked"))
+        try:
+            claimed, writer = self._stream(script)
+        finally:
+            self.broken.stop()
+        self.assertTrue(writer.closed)
+        self.assertIn(b"event: sign_in_required", writer.data)
+
+    def test_one_decision_at_every_authorisation_point(self) -> None:
+        """No second copy of "signed in": each point calls operator_session."""
+        for module, function in (
+            ("conversation_routes.py", "_operator"),
+            ("conversation_routes.py", "_stream_still_signed_in"),
+            ("server.py", "_require_browser_operator"),
+            ("browser_gate.py", "_authorize"),
+            ("browser_gate.py", "auth_status"),
+        ):
+            tree = ast.parse((ENGINE / "api" / module).read_text())
+            node = next(n for n in ast.walk(tree)
+                        if isinstance(n, ast.FunctionDef) and n.name == function)
+            calls = {ast.unparse(c.func) for c in ast.walk(node)
+                     if isinstance(c, ast.Call)}
+            self.assertTrue(
+                calls & {"browser_gate.operator_session", "operator_session"},
+                f"{module}:{function} decides without operator_session")
+            self.assertFalse(
+                calls & {"browser_gate.session", "session",
+                         "auth_sessions.session_from_cookie_header"},
+                f"{module}:{function} makes a cookie-only decision")
 
     def test_an_open_stream_checks_before_every_batch(self) -> None:
         """Events are flowing, not idling: the check still runs each turn."""
@@ -967,6 +1113,78 @@ class SignedInStatusAndRenewal(GateCase):
         self.assertEqual(sorted(p.name for p in self.browser.directory.iterdir()), before)
         self.assertEqual(self.browser.path().stat().st_mtime_ns, stamp)
 
+    FOREIGN = (
+        ("another local page", {"Origin": "http://127.0.0.1:9999",
+                                "Sec-Fetch-Site": "same-site"}),
+        ("another port, no metadata", {"Origin": "http://127.0.0.1:9999"}),
+        ("localhost for 127.0.0.1", {"Origin": "http://localhost:8800"}),
+        ("a same-site subresource", {"Sec-Fetch-Site": "same-site"}),
+        ("a cross-site subresource", {"Sec-Fetch-Site": "cross-site"}),
+        ("an opaque origin", {"Origin": "null"}),
+    )
+
+    def test_a_cross_origin_status_call_is_answered_as_a_stranger(self) -> None:
+        """Open, so it is answered; but a valid cookie on a request from
+        another origin buys nothing: no user, no renewal."""
+        _, _, anonymous = self.json("GET", "/api/auth/status", {"Host": HOST})
+        self.assertFalse(anonymous["signed_in"])
+        for label, extra in self.FOREIGN:
+            with self.subTest(label):
+                status, headers, payload = self.json(
+                    "GET", "/api/auth/status",
+                    self.browser.headers(origin=False, **extra))
+                self.assertEqual(status, 200)
+                self.assertNotIn("Set-Cookie", headers)
+                self.assertEqual(payload, anonymous)
+                self.assertNotIn("user_id", payload)
+
+    def test_the_guis_own_status_poll_is_unaffected(self) -> None:
+        """What the sign-in page does after signing in: same-origin polls."""
+        expected = auth_sessions.set_cookie(
+            self.browser.cookie_name, self.browser.token)
+        for label, extra in (
+            ("a same-origin fetch", {"Sec-Fetch-Site": "same-origin"}),
+            ("with its own Origin", {"Origin": f"http://{HOST}",
+                                     "Sec-Fetch-Site": "same-origin"}),
+            ("typed into the address bar", {"Sec-Fetch-Site": "none"}),
+            ("no metadata at all", {}),
+        ):
+            with self.subTest(label):
+                status, headers, payload = self.json(
+                    "GET", "/api/auth/status",
+                    self.browser.headers(origin=False, **extra))
+                self.assertEqual((status, payload["signed_in"], payload["user_id"]),
+                                 (200, True, 1))
+                self.assertEqual(headers["Set-Cookie"], expected)
+        # The poll itself: signed out, then the authority publishes, then in.
+        self.browser.revoke()
+        poll = self.browser.headers(origin=False, **{"Sec-Fetch-Site": "same-origin"})
+        self.assertFalse(self.json("GET", "/api/auth/status", poll)[2]["signed_in"])
+        self.browser.publish()
+        self.assertTrue(self.json("GET", "/api/auth/status", poll)[2]["signed_in"])
+
+    def test_a_cross_origin_page_load_is_served_but_not_renewed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "index.html").write_text("<!doctype html><title>app</title>")
+            with mock.patch.object(server, "UI_DIR", Path(tmp)):
+                _, own, _ = self.call("GET", "/", self.browser.headers(origin=False))
+                etag = own["ETag"]
+                self.assertIn("Set-Cookie", own)
+                for label, extra in self.FOREIGN:
+                    for path in ("/", "/index.html"):
+                        with self.subTest(label, path=path):
+                            status, headers, _ = self.call(
+                                "GET", path,
+                                self.browser.headers(origin=False, **extra))
+                            self.assertEqual(status, 200)
+                            self.assertNotIn("Set-Cookie", headers)
+                            status, headers, _ = self.call(
+                                "GET", path, self.browser.headers(
+                                    origin=False, **extra,
+                                    **{"If-None-Match": etag}))
+                            self.assertEqual(status, 304)
+                            self.assertNotIn("Set-Cookie", headers)
+
     def test_status_is_the_gates_answer_for_an_inactive_user(self) -> None:
         publish(self.browser.directory, [(self.browser.token, 2)])
         status, headers, payload = self.json(
@@ -1132,17 +1350,33 @@ class ShellAndCliCredentials(GateCase):
             ("GET", "/api/diagnostics/request-timing"),
             ("GET", "/api/runs"), ("POST", "/api/models"),
             ("GET", "/api/models/x"), ("GET", "/"), ("GET", "/app.js"),
+            # The verb's requests, and nothing near them (Codex pass 1, 5).
+            ("GET", "/api/models"), ("GET", "/api/models?"),
+            ("GET", "/api/models?refresh=0"), ("GET", "/api/models?refresh=true"),
+            ("GET", "/api/models?refresh=1&x=1"), ("GET", "/api/models?x=1&refresh=1"),
+            ("GET", "/api/models?refresh=1&refresh=1"),
+            ("GET", "/api/models?refresh=1&refresh=0"),
+            ("GET", "/api/models?refresh=%31"), ("GET", "/api/models?REFRESH=1"),
+            ("GET", "/api/models;x?refresh=1"), ("GET", "/api/models?refresh=1#x"),
+            ("HEAD", "/api/models?refresh=1"),
+            ("POST", "/api/scripts/snapshot?x=1"),
+            ("POST", "/api/scripts/snapshot;x"), ("GET", "/api/scripts/snapshot"),
+            ("PUT", "/api/scripts/snapshot"),
         )
         for token in (self.token, SHELL_TOKEN):
             for method, path in operator_routes:
                 with self.subTest(token=token[:6], method=method, path=path):
-                    with mock.patch.object(server, "run_script") as ran:
-                        status, headers, payload = self.json(
+                    with mock.patch.object(server, "run_script") as ran, \
+                            mock.patch.object(server.model_catalog, "catalog") as catalog:
+                        status, headers, out = self.call(
                             method, path, self.bearer(token))
                     self.assertEqual(status, 403)
-                    self.assertEqual(payload["error"]["code"], "fnb_operator_required")
+                    if method != "HEAD":
+                        self.assertEqual(json.loads(out)["error"]["code"],
+                                         "fnb_operator_required")
                     self.assertNotIn("Set-Cookie", headers)
                     ran.assert_not_called()
+                    catalog.assert_not_called()
 
     def test_the_authority_is_not_on_the_review_server(self) -> None:
         """No sign-in or user-management route exists here to be reached."""
@@ -1206,16 +1440,69 @@ class ShellAndCliCredentials(GateCase):
         path.unlink()
         self.assertEqual(cli_credential.authorization(self.run_dir), {})
 
-    def test_the_boot_path_provisions_the_token(self) -> None:
-        source = (ENGINE / "api" / "server.py").read_text()
-        boot = source[source.index("def _run_server("):]
-        boot = boot[:boot.index("import transport")]
-        self.assertIn("browser_gate.CLI_TOKEN = cli_credential.provision()", boot)
-        # Before the listener exists: the token is published before a request
-        # can arrive.
-        self.assertLess(boot.index("cli_credential.provision()"),
-                        boot.index("require_loopback_bind(bind)"))
+    def test_the_token_is_minted_before_the_bind_and_published_after(self) -> None:
+        tree = ast.parse((ENGINE / "api" / "server.py").read_text())
+        boot = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef) and node.name == "_run_server")
+        calls = [ast.unparse(node.func) for node in ast.walk(boot)
+                 if isinstance(node, ast.Call)]
+        self.assertIn("cli_credential.mint", calls)
+        for writer in ("cli_credential.provision", "cli_credential.publish",
+                       "publish_cli_credential"):
+            self.assertNotIn(
+                writer, calls,
+                "the boot path writes the credential file before the bind")
         self.assertEqual(cli_credential.RUN_DIR, ENGINE / "run" / "api")
+        # `_on_listening` is the transport's on_started: it publishes, then
+        # starts the runtime services.
+        with mock.patch.object(cli_credential, "RUN_DIR", self.run_dir), \
+                mock.patch.object(browser_gate, "CLI_TOKEN", "sccli_this-process"), \
+                mock.patch.object(server, "start_runtime_services") as services:
+            server._on_listening()
+        services.assert_called_once_with()
+        self.assertEqual(cli_credential.read(self.run_dir), "sccli_this-process")
+
+    def test_a_startup_that_loses_the_bind_leaves_the_survivors_token(self) -> None:
+        """Two servers, one port. The loser never publishes, so a CLI caller
+        still reads the token the listening server accepts."""
+        survivor = self.token                       # published in setUp
+        holder = __import__("socket").socket()
+        self.addCleanup(holder.close)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        port = holder.getsockname()[1]
+
+        async def no_ws(reader, writer, head_raw):  # pragma: no cover
+            writer.close()
+
+        with mock.patch.object(cli_credential, "RUN_DIR", self.run_dir), \
+                mock.patch.object(browser_gate, "CLI_TOKEN", cli_credential.mint()), \
+                mock.patch.object(server, "start_runtime_services") as services:
+            loser = browser_gate.CLI_TOKEN
+            with self.assertRaises(OSError):
+                asyncio.run(transport_mod.serve(
+                    "127.0.0.1", port, server.dispatch_http, no_ws,
+                    log=lambda *_: None, on_started=server._on_listening,
+                    stream_handler=conversation_routes.stream_events))
+        services.assert_not_called()
+        self.assertNotEqual(loser, survivor)
+        self.assertEqual(cli_credential.read(self.run_dir), survivor)
+        with mock.patch.object(server, "run_script", return_value={
+                "ok": True, "output": "done"}):
+            status, _, _ = self.json(
+                "POST", "/api/scripts/snapshot",
+                {"Host": HOST, **cli_credential.authorization(self.run_dir)})
+        self.assertEqual(status, 200)
+
+    def test_nothing_removes_the_credential_file(self) -> None:
+        for name in ("api/server.py", "scripts/cli_credential.py"):
+            tree = ast.parse((ENGINE / name).read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and ast.unparse(node.func).endswith(
+                        ("unlink", "remove")):
+                    self.assertNotIn("FILE_NAME", ast.unparse(node), name)
+                    self.assertNotIn("cli", ast.unparse(node).lower().replace(
+                        "os.unlink(tmp)", ""), name)
 
 
 class AuditedCliCallers(GateCase):
@@ -1367,6 +1654,90 @@ class AuditedCliCallers(GateCase):
         browser.revoke()
         status, _, _ = self.http("GET", "/api/shells", browser.headers())
         self.assertEqual(status, 401)
+
+    def test_the_maintainer_tools_stop_early_and_say_why(self) -> None:
+        """Against a gated install: one message, naming flag SC-1602, instead
+        of a raw 401 or a page of sign-in HTML."""
+        self.assertTrue(signin_guard.requires_sign_in(self.base))
+        with self.assertRaises(canary.CanaryError) as raised:
+            canary.require_operator_api(self.base)
+        self.assertEqual(raised.exception.code, "CANARY_SIGN_IN_REQUIRED")
+        self.assertEqual(raised.exception.message,
+                         signin_guard.message("dos-app Sprint canary"))
+        self.assertIn("SC-1602", raised.exception.message)
+        self.assertIn("requires GUI sign-in", raised.exception.message)
+        self.assertEqual(raised.exception.details, {"flag": "SC-1602"})
+        # The same failure if an operator route is reached anyway.
+        with self.assertRaises(canary.CanaryError) as raised:
+            canary.JsonHttp(self.base, canary.Deadline(30, 30)).request(
+                "GET", "/api/shells")
+        self.assertEqual(raised.exception.code, "CANARY_SIGN_IN_REQUIRED")
+        # The check sits where the canary first has a runtime to ask, before
+        # it creates anything in it.
+        launch = next(
+            node for node in ast.walk(ast.parse(
+                (REPO / "maintainer" / "dos_app_sprint_canary.py").read_text()))
+            if isinstance(node, ast.FunctionDef) and node.name == "launch"
+            and "require_operator_api" in ast.unparse(node))
+        body = ast.unparse(launch)
+        self.assertLess(body.index("'/api/health'"), body.index("require_operator_api"))
+        self.assertLess(body.index("require_operator_api"), body.index("status = "))
+
+        # capture_public_docs: exit 2, the message on stderr, no page opened.
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as out, \
+                mock.patch.object(server, "health_payload", return_value={
+                    "ok": True, "repo": "subfloor-docs-f73-dos-app"}), \
+                mock.patch.object(capture_public_docs, "capture_gallery") as capture, \
+                mock.patch.object(sys, "argv", [
+                    "capture_public_docs.py", "--port", str(self.port),
+                    "--output", out]), \
+                mock.patch.object(sys, "stderr", stderr):
+            code = capture_public_docs.main()
+        self.assertEqual(code, 2)
+        capture.assert_not_called()
+        self.assertEqual(stderr.getvalue().strip(),
+                         signin_guard.message("capture_public_docs"))
+        self.assertIn("SC-1602", stderr.getvalue())
+
+    def test_the_maintainer_guard_lets_other_installs_through(self) -> None:
+        class Answer:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return self.body
+
+        def not_found(url, timeout=None):
+            raise __import__("urllib.error").error.HTTPError(url, 404, "x", {}, None)
+
+        def down(url, timeout=None):
+            raise ConnectionRefusedError()
+
+        cases = (
+            ("an engine from before sign-in", not_found, False),
+            ("nothing listening", down, False),
+            ("not JSON", lambda url, timeout=None: Answer(b"<html>"), False),
+            ("another JSON route", lambda url, timeout=None: Answer(b'{"ok":true}'), False),
+            ("a signed-in caller", lambda url, timeout=None: Answer(
+                b'{"enrolled":true,"signed_in":true}'), False),
+            ("gated, a user exists", lambda url, timeout=None: Answer(
+                b'{"enrolled":true,"signed_in":false}'), True),
+            ("gated, no user yet", lambda url, timeout=None: Answer(
+                b'{"enrolled":false,"signed_in":false}'), True),
+        )
+        for label, opener, expected in cases:
+            with self.subTest(label):
+                self.assertIs(signin_guard.requires_sign_in(
+                    "http://127.0.0.1:1", opener=opener), expected)
+                if not expected:
+                    canary.require_operator_api("http://127.0.0.1:1", opener=opener)
 
     def test_no_other_sc_script_calls_the_api_over_http(self) -> None:
         """The audit, held. Every `/api/...` the `sc` entry point, a script, a

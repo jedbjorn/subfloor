@@ -76,13 +76,17 @@ OPEN_ROUTES = frozenset({
     ("HEAD", "/vendor/qrcode.js"),
 })
 
-# `/api/*` routes an `sc` verb calls over HTTP. They accept a Bearer
+# `/api/*` requests an `sc` verb makes over HTTP. They accept a Bearer
 # credential the calling shell or host already holds: a live shell's API key,
 # or this install's engine CLI token (`scripts/cli_credential.py`). Neither
 # makes the caller the operator: off this list a Bearer credential is refused.
+#
+# Exact, to the query string: method, path, and the raw query the verb sends.
+# `GET /api/models` without `refresh=1`, with another value, or with anything
+# added or repeated, is the GUI's request and not the verb's.
 CLI_ROUTES = frozenset({
-    ("POST", "/api/scripts/snapshot"),   # ./sc snapshot, ./sc update
-    ("GET", "/api/models"),              # ./sc models refresh
+    ("POST", "/api/scripts/snapshot", ""),      # ./sc snapshot, ./sc update
+    ("GET", "/api/models", "refresh=1"),        # ./sc models refresh
 })
 
 LOOPBACK_HOSTS = frozenset(("127.0.0.1", "localhost", "::1"))
@@ -133,6 +137,14 @@ def _same_origin(origin: str, host: str) -> bool:
         and parsed.netloc == host
         and not (parsed.path or parsed.params or parsed.query or parsed.fragment)
     )
+
+
+def is_cli_route(method: str, target: str) -> bool:
+    """Whether this is exactly one of the requests an `sc` verb makes."""
+    parsed = urlparse(target)
+    if parsed.params or parsed.fragment:
+        return False
+    return (method, parsed.path, parsed.query) in CLI_ROUTES
 
 
 def is_api(path: str) -> bool:
@@ -192,20 +204,38 @@ def session(headers) -> dict | None:
     return found
 
 
+def operator_session(headers, user_active: Callable[[int], bool]) -> dict | None:
+    """THE decision "this request is the signed-in operator", or None.
+
+    A verified cookie (`session`) whose user is still an active engine user.
+    Every authorisation point uses this one function: the gate, the status
+    route, the route-level checks, and each turn of an open event stream.
+    There is no second, weaker copy.
+    """
+    found = session(headers)
+    if found is None or not user_active(found["user_id"]):
+        return None
+    return found
+
+
+def cross_origin(headers) -> bool:
+    """Whether the request says it came from another origin.
+
+    An `Origin` that is present and is not this one, or a `Sec-Fetch-Site`
+    that is present and is neither `same-origin` nor `none`. A same-origin
+    `GET` sends no `Origin`, so the absence of both is not cross-origin.
+    """
+    origin = headers.get("Origin")
+    if origin is not None and not _same_origin(origin, headers.get("Host") or ""):
+        return True
+    return headers.get("Sec-Fetch-Site") not in (None, "same-origin", "none")
+
+
 def site_ok(method: str, path: str, headers) -> bool:
     """The origin rule for a request that carries a session (module docstring)."""
-    origin = headers.get("Origin")
-    host = headers.get("Host") or ""
-    fetch_site = headers.get("Sec-Fetch-Site")
     if method in ("GET", "HEAD"):
-        if not is_api(path):
-            return True
-        if origin is not None and not _same_origin(origin, host):
-            return False
-        return fetch_site in (None, "same-origin", "none")
-    if origin is None or not _same_origin(origin, host):
-        return False
-    return fetch_site in (None, "same-origin", "none")
+        return not is_api(path) or not cross_origin(headers)
+    return headers.get("Origin") is not None and not cross_origin(headers)
 
 
 def renewal_headers(headers) -> dict:
@@ -215,8 +245,12 @@ def renewal_headers(headers) -> dict:
     about 400 days. Re-issuing the same token with a fresh `Max-Age` keeps a
     browser that is in use signed in. Nothing is written: the token is the one
     the request carried, and the name is the published one.
+
+    Only for the GUI's own request: a cross-origin one is never answered with
+    a `Set-Cookie`, whatever cookie the browser attached to it. The caller
+    has already established that the session is the operator's.
     """
-    if session(headers) is None:
+    if session(headers) is None or cross_origin(headers):
         return {}
     name = auth_sessions.cookie_name()
     for token in auth_sessions.presented_tokens(_cookie_header(headers), name):
@@ -367,14 +401,12 @@ def _authorize(method: str, target: str, headers,
         known = bool(token) and (_cli_token_matches(token) or shell_exists(token))
         if not known:
             return Verdict("deny", response=sign_in_required())
-        if (method, path) in CLI_ROUTES:
+        if is_cli_route(method, target):
             return Verdict("cli")
         # A credential this engine issued, on a route that belongs to the
         # operator: refused, and told why. It does not become a session.
         return Verdict("deny", response=_json(403, operator_required_payload(path)))
-    found = session(headers)
-    if found is not None and not user_active(found["user_id"]):
-        found = None
+    found = operator_session(headers, user_active)
     if found is None:
         if method == "GET" and is_document(path):
             return Verdict("deny", response=sign_in_redirect(target))
@@ -393,12 +425,13 @@ def auth_status(target: str, headers, discovery: dict,
     `discovery` is `engine_ops.discovery(...)`: the host auth authority is the
     engine-ops service. Its URL is built for the hostname the page was loaded
     from, because the session cookie is bound to that exact host.
-    `signed_in` is the gate's own answer: a verified cookie whose user is an
-    active engine user.
+    `signed_in` is the gate's own answer for a `GET` under `/api/`: the
+    operator's session (`operator_session`) on a request that is not
+    cross-origin. The route is open, so a cross-origin caller is answered,
+    but as a stranger: `signed_in` false and no `user_id`, whatever cookie
+    its browser attached.
     """
-    found = session(headers)
-    if found is not None and not user_active(found["user_id"]):
-        found = None
+    found = None if cross_origin(headers) else operator_session(headers, user_active)
     hostname = _hostname(headers.get("Host"))
     if hostname not in AUTHORITY_HOSTS:
         hostname = AUTHORITY_HOSTS[0]

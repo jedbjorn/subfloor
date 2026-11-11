@@ -45,7 +45,7 @@ in the [browser trust boundary](interface-trust-boundary.md#the-gate).
 | Session | this install's session cookie, verified against the hash list the host auth authority publishes, on a loopback `Host`, with the origin rule | `browser_gate.authorize`; again at `Handler._require_browser_operator` and `conversation_routes._operator` |
 | Shell token | `Authorization: Bearer <shells.api_key>` on `/_sc/*` | `Handler._require_shell_auth` (401 on absent or unknown) |
 | Planner shell token | the same, plus `shells.flavor == 'planner'` | `_resolve_planner_shell` (403 otherwise) |
-| CLI credential | `Authorization: Bearer` a shell token or the engine CLI token, on the two routes in `browser_gate.CLI_ROUTES` | `browser_gate.authorize` |
+| CLI credential | `Authorization: Bearer` a shell token or the engine CLI token, on the two requests in `browser_gate.CLI_ROUTES`, exact to the query string: `POST /api/scripts/snapshot` with no query and `GET /api/models?refresh=1` | `browser_gate.authorize` |
 | Runtime token | `X-SC-Runtime-Token` header | `runtime_flags.token_matches` |
 
 Every `/api/*` route and every static file needs a **session** unless its row
@@ -195,7 +195,7 @@ the last column. Every write additionally needs this origin's `Origin`.
 | `/api/git-state?fetch=1` | session | live git hygiene; `fetch=1` does the network fetch. `#repo` |
 | `/api/shells`, `/api/shells/{id}` | session | `{shells, repo_root}`; `404 no such shell`. `#view-shells` |
 | `/api/shell-templates`, `/api/flavor-defaults` | session | flavor catalogue and per-flavor model defaults |
-| `/api/models?refresh=1` | session, or CLI credential | model catalogue. `./sc models refresh` presents the calling shell's token |
+| `/api/models?refresh=1` | session; exactly `?refresh=1` also takes a CLI credential | model catalogue. `./sc models refresh` presents the calling shell's token. Without the query, or with any other, a credential is refused |
 | `/api/skills`, `/api/skills/{id}` | session | skill catalogue with origin tags |
 | `/api/roadmap` | session | `#view-roadmap` |
 | `/api/docs` | session | specs and docs with feature/work-stream metadata for `#view-docs` |
