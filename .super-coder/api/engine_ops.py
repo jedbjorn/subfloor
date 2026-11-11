@@ -23,10 +23,16 @@ DECIDES from lives there:
   where the mounts are made (`sandbox_devkit.docker_run` refuses the launch)
   and again here for what this side can know; otherwise nothing starts.
 * The GUI origin the service accepts is never taken from the checkout. It is
-  pinned by an explicit operator act in a host terminal (`./sc engine-ops-pin`)
-  and until then the service refuses every operation and says why. The port
-  is pinned on first use; `instance.json` only tells that walk which ports to
-  step past.
+  pinned by an explicit operator act in a host terminal (`./sc auth user add`,
+  which creates the GUI user and confirms the origin in one step; `./sc auth
+  origin` changes it later) and until then the service refuses every
+  operation and says why. The port is pinned on first use; `instance.json`
+  only tells that walk which ports to step past.
+* An operation starts, and the status is read, only for a signed-in browser
+  (spec #271): `start` and `status` ask the caller-supplied `signed_in` after
+  the origin decision, and refuse when it is absent or says no. The sign-in
+  credentials and sessions live in the same private directory
+  (`host_auth.py`).
 * The service never opens a path taken from a status record, and opens the
   files it does write with O_NOFOLLOW.
 * Two things are PUBLISHED into the checkout for the review API, which may be
@@ -144,6 +150,10 @@ class ForeignOrigin(Exception):
     """The request's origin is not the pinned GUI origin."""
 
 
+class SignInRequired(Exception):
+    """The request does not come from a signed-in browser session."""
+
+
 class StateError(Exception):
     """The host-private state directory cannot be trusted or used."""
 
@@ -253,6 +263,13 @@ def sandbox_visible_roots() -> list[Path]:
     if interpreter is not None:
         roots.append(interpreter)
     roots.extend(home_mounts)
+    # The session-hash directory is mounted (read-only) on purpose; the
+    # private state must not be reachable through it either.
+    try:
+        roots.append(sandbox_devkit.auth_sessions_dir(REPO_ROOT))
+    except Exception as exc:  # noqa: BLE001 — unknown mounts: fail closed
+        raise StateError(
+            f"cannot derive the session-hash directory: {exc}") from exc
     return [Path(os.path.realpath(root)) for root in roots]
 
 
@@ -824,7 +841,11 @@ def live_sessions() -> dict | None:
     }
 
 
-PIN_CLI = "./sc engine-ops-pin"
+# The verb that confirms the GUI origin by itself, and the one that does it as
+# part of creating the GUI user (spec #271), which is how an install first
+# gets a pin.
+PIN_CLI = "./sc auth origin"
+SETUP_CLI = "./sc auth user add <username>"
 
 
 def unpinned_status() -> dict:
@@ -835,26 +856,32 @@ def unpinned_status() -> dict:
         "pinned": False,
         "gui_origin": None,
         "pin_cli": PIN_CLI,
+        "setup_cli": SETUP_CLI,
         "reason": (
-            "engine operations are refused until the operator confirms this "
-            f"install's GUI origin in a host terminal: {PIN_CLI}"),
+            "the review GUI is locked until the operator creates its user in "
+            f"a host terminal: {SETUP_CLI} (that step also confirms this "
+            f"install's GUI origin; {PIN_CLI} changes it later)"),
         "running": False,
         "operation": None,
     }
 
 
-def status(origin: str | None = None) -> dict:
+def status(origin: str | None = None, signed_in=None) -> dict:
     """The service's status, decided against the pin read once, here.
 
     Unpinned: the stateless refusal, whoever asks. Pinned: the full status,
-    and a request that names an origin must name the pinned one — a request
-    admitted while no pin existed gets nothing once one does.
+    for a signed-in browser on the pinned origin only. A request that names an
+    origin must name the pinned one — a request admitted while no pin existed
+    gets nothing once one does — and `signed_in` (a callable, asked after the
+    origin decision) must say yes. With no `signed_in`, the answer is no.
     """
     gui_port = pinned_gui_port()
     if gui_port is None:
         return unpinned_status()
     if origin is not None and not origin_allowed(origin, gui_port):
         raise ForeignOrigin(origin)
+    if signed_in is None or not signed_in():
+        raise SignInRequired()
     runtime = detect_runtime()
     record = read_status()
     tail, truncated = log_tail(record)
@@ -1101,11 +1128,17 @@ def _wait_recorded(proc: subprocess.Popen, path: Path, started_at: str,
         time.sleep(0.05)
 
 
-def start(op: str, origin: str | None) -> dict:
+def start(op: str, origin: str | None, signed_in=None) -> dict:
     """Start one operation for a request from `origin`. Returns its public record.
 
-    Raises UnknownOp, Unpinned, ForeignOrigin, Busy, or StartFailed. `op` only
-    selects a row of the verb table.
+    Raises UnknownOp, Unpinned, ForeignOrigin, SignInRequired, Busy, or
+    StartFailed. `op` only selects a row of the verb table.
+
+    `signed_in` is a callable saying whether the request carries a valid
+    browser session. It is asked here, after the origin decision and before
+    anything is started; without one, nothing starts. The origin check alone
+    is not enough: a process that can reach this port (a sandbox launched on
+    the host network) can send any Origin header it likes.
 
     The origin decision is made here, once, against the pin as it is at the
     moment of starting — not earlier in the request. Whatever let the request
@@ -1113,13 +1146,16 @@ def start(op: str, origin: str | None) -> dict:
     unpinned refusal) authorises nothing: no pin, or an origin that is not the
     pinned one, starts nothing.
     """
-    argv = command(op)
     state_dir = private_dir()
     gui_port = pinned_gui_port()
     if gui_port is None:
         raise Unpinned(unpinned_status()["reason"])
     if not origin_allowed(origin, gui_port):
         raise ForeignOrigin(origin)
+    if signed_in is None or not signed_in():
+        raise SignInRequired()
+    # Only a signed-in request learns whether an operation name exists.
+    argv = command(op)
     path = state_dir / STATUS_NAME
     with _start_lock:
         current = read_status(path)
@@ -1237,7 +1273,7 @@ def service_up() -> tuple[int, str]:
     config = ensure_config()
     port = config["port"]
     url = f"http://{BIND}:{port}"
-    pin = pin_summary(pinned_gui_port())
+    pin = pin_summary(pinned_gui_port()) + sign_in_summary()
     if service_answers(port):
         return 0, f"→ engine-ops already serving {url}\n{pin}"
     log = private_dir() / SERVICE_LOG_NAME
@@ -1264,46 +1300,94 @@ def service_up() -> tuple[int, str]:
 def pin_summary(gui_port) -> str:
     if _valid_port(gui_port):
         return f"  engine-ops accepts the GUI at http://{BIND}:{gui_port}"
-    return ("  engine-ops: GUI origin NOT pinned — the GUI's engine controls are "
-            f"refused until you run: {PIN_CLI}")
+    return ("  engine-ops: GUI origin NOT pinned — the review GUI stays locked "
+            f"until you run: {SETUP_CLI}")
 
 
-def pin_command(argv: list[str]) -> int:
-    """`./sc engine-ops-pin [<port>|--show]` — the operator's explicit act."""
+def sign_in_summary() -> str:
+    """A line for `./sc launch` when a pin exists but no GUI user does (an
+    install pinned before sign-in existed). Empty otherwise, and on any doubt:
+    it is advice, never a decision."""
+    if pinned_gui_port() is None:
+        return ""                       # `pin_summary` already names the verb
+    try:
+        import host_auth  # noqa: PLC0415  (it imports this module; lazily here)
+
+        if host_auth.list_users():
+            return ""
+    except Exception:  # noqa: BLE001 — advisory only
+        return ""
+    return ("\n  sign-in: no GUI user yet — the review GUI stays locked until "
+            f"you run: {SETUP_CLI}")
+
+
+def choose_gui_port(argument: str | None, *, prog: str, keep: bool = False) -> int | None:
+    """The operator's explicit choice of the review GUI's port, or None.
+
+    With `argument`, that port. Otherwise the operator is asked at a terminal:
+    what `instance.json` suggests is displayed with where it came from, and
+    only a typed port is a choice. With `keep`, a port that is already pinned
+    stands when the operator presses Enter, or when there is no terminal.
+    None means nothing was chosen; why has been printed.
+    """
     current = pinned_gui_port()
+    if argument is not None:
+        if not argument.isdigit():
+            print(f"✗ {prog}: the review GUI port must be a number", file=sys.stderr)
+            return None
+        return int(argument)
+    if not sys.stdin.isatty():
+        if keep and current is not None:
+            return current
+        print(f"✗ {prog} needs a terminal, or the review GUI port as an "
+              "argument", file=sys.stderr)
+        return None
+    print("The host runs ./sc update, restart, and update-harnesses, and signs "
+          "the operator in, when the review GUI asks.")
+    print("It accepts those requests from ONE origin: this install's review GUI.")
+    if current is not None:
+        print(f"  currently pinned : http://{BIND}:{current}")
+    suggestion = suggested_gui_port()
+    if suggestion is not None:
+        print(f"  instance.json says the review GUI is at http://{BIND}:{suggestion}")
+        print("  (that file is writable from the sandbox — check it against "
+              "the address in your browser)")
+    prompt = "Type the review GUI's port to pin it"
+    if keep and current is not None:
+        prompt += f" (Enter keeps {current}; anything else aborts): "
+    else:
+        prompt += " (anything else aborts): "
+    try:
+        answer = input(prompt).strip()
+    except EOFError:
+        answer = ""
+    if keep and current is not None and answer == "":
+        return current
+    if not answer.isdigit():
+        print(f"→ {prog} aborted (nothing changed)")
+        return None
+    return int(answer)
+
+
+def pin_command(argv: list[str], prog: str = "auth origin") -> int:
+    """`./sc auth origin [<port>|--show]` — the operator's explicit act.
+
+    (`./sc engine-ops-pin` is the same verb under its first name.)
+    """
     if argv[:1] == ["--show"]:
+        current = pinned_gui_port()
         print(pin_summary(current).strip())
         return 0 if current is not None else 1
-    suggestion = suggested_gui_port()
-    if argv:
-        if len(argv) != 1 or not argv[0].isdigit():
-            print("usage: ./sc engine-ops-pin [<review GUI port> | --show]",
-                  file=sys.stderr)
-            return 2
-        chosen = int(argv[0])
-    else:
-        if not sys.stdin.isatty():
-            print("✗ engine-ops-pin needs a terminal, or the port as an argument: "
-                  "./sc engine-ops-pin <review GUI port>", file=sys.stderr)
-            return 1
-        print("The engine-ops service runs ./sc update, restart, and "
-              "update-harnesses when the review GUI asks.")
-        print("It accepts those requests from ONE origin: this install's review GUI.")
-        if current is not None:
-            print(f"  currently pinned : http://{BIND}:{current}")
-        if suggestion is not None:
-            print(f"  instance.json says the review GUI is at http://{BIND}:{suggestion}")
-            print("  (that file is writable from the sandbox — check it against "
-                  "the address in your browser)")
-        answer = input("Type the review GUI's port to pin it (anything else aborts): ").strip()
-        if not answer.isdigit():
-            print("→ engine-ops-pin aborted (nothing changed)")
-            return 1
-        chosen = int(answer)
+    if len(argv) > 1 or (argv and not argv[0].isdigit()):
+        print(f"usage: ./sc {prog} [<review GUI port> | --show]", file=sys.stderr)
+        return 2
+    chosen = choose_gui_port(argv[0] if argv else None, prog=prog)
+    if chosen is None:
+        return 1
     try:
         config = pin_gui_port(chosen)
     except ValueError as exc:
-        print(f"✗ engine-ops-pin: {exc}", file=sys.stderr)
+        print(f"✗ {prog}: {exc}", file=sys.stderr)
         return 1
     print(f"→ pinned: engine-ops accepts the GUI at http://{BIND}:{config['gui_port']} "
           "(takes effect immediately)")
@@ -1427,7 +1511,8 @@ USAGE = """usage: engine_ops.py <command>
   down    stop the service this install started
   alive   exit 0 when the service answers
   port    print the service's pinned host loopback port
-  pin     pin the GUI origin the service accepts (operator, host terminal)
+  pin     pin the GUI origin the service accepts (operator, host terminal;
+          the same act as `./sc auth origin`)
   run     (internal) run one operation detached"""
 
 
@@ -1452,7 +1537,7 @@ def main(argv: list[str]) -> int:
             print(ensure_config()["port"])
             return 0
         elif command_name == "pin":
-            return pin_command(argv[1:])
+            return pin_command(argv[1:], prog="engine-ops-pin")
         else:
             print(USAGE, file=sys.stderr)
             return 2

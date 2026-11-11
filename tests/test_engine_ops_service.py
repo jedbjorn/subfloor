@@ -12,6 +12,10 @@ Acceptance 6 — gated and fixed: a shell Bearer token is refused; a missing or
 wrong Origin is refused on POST; a non-loopback Host is refused; an unknown
 operation is 404; a second POST while one runs is 409; the service refuses to
 start with SC_SANDBOX set; it binds loopback only.
+Since spec #271 `/status` and `/ops/*` also need a signed-in browser session,
+so every fixture here signs in: it holds a session in the private store and
+presents its cookie, the way the GUI does (tests/test_host_auth.py covers
+sign-in itself, and what a request without the cookie gets).
 Acceptance 7 — an operation outlives the review server and the service's own
 stop path: a stub verb stops a test review server and the service that started
 it, then exits, and the status shows its exit code afterwards. A second form
@@ -51,9 +55,12 @@ from unittest import mock
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "api"))
 import server  # noqa: E402  (adds scripts/ to the path on import)
+import auth_sessions  # noqa: E402
 import engine_ops  # noqa: E402
 import engine_ops_service  # noqa: E402
+import host_auth  # noqa: E402
 import ports  # noqa: E402
+import sandbox_devkit  # noqa: E402
 
 GUI_PORT = 8800
 GUI = f"http://127.0.0.1:{GUI_PORT}"
@@ -171,11 +178,12 @@ SERVICE_LAUNCHER = textwrap.dedent('''\
     engine, root, private, scope = sys.argv[1:5]
     sys.path.insert(0, str(Path(engine) / "api"))
     sys.path.insert(0, str(Path(engine) / "scripts"))
-    import engine_ops, engine_ops_service, ports
+    import engine_ops, engine_ops_service, host_auth, ports
 
     engine_ops.REPO_ROOT = Path(root)
     engine_ops.ENGINE = Path(root) / ".super-coder"
     engine_ops.PRIVATE_DIR = Path(private)
+    host_auth.PUBLIC_DIR = Path(private).parent / "public"
     engine_ops.SERVICE_SCRIPT = Path(sys.argv[0]).resolve()
     engine_ops.live_sessions = lambda: None
     engine_ops.VERBS["restart"] = tuple(json.loads(sys.argv[5]))
@@ -220,8 +228,35 @@ def make_private(base: Path) -> Path:
     return private
 
 
+def cookie_for(root: Path, token: str) -> str:
+    """The `Cookie` header a signed-in browser of the install at `root` sends."""
+    key = sandbox_devkit.install_key(root).rsplit("-", 1)[1][:8]
+    return f"{auth_sessions.COOKIE_PREFIX}{key}={token}"
+
+
+def seed_session(username: str = "operator", device: str = "test browser") -> str:
+    """An active GUI user with one session, written through the authority's
+    own store functions (without the scrypt and TOTP steps `test_host_auth`
+    covers). Returns the session token; only its hash is on disk.
+
+    The caller has pointed `engine_ops.PRIVATE_DIR` and `host_auth.PUBLIC_DIR`
+    at temporary directories.
+    """
+    with host_auth._locked():
+        store = host_auth.load()
+        user = host_auth._find_user(store, username)
+        if user is None:
+            user = {"user_id": 1, "username": username, "state": host_auth.ACTIVE,
+                    "password": None, "totp_secret": None, "totp_last_step": None,
+                    "claim": None, "created": time.time(), "activated": time.time()}
+            store["users"].append(user)
+        token, _session = host_auth._new_session(store, user, device, None)
+        host_auth._commit(store)
+    return token
+
+
 def operator_pins(private: Path, gui_port: int = GUI_PORT, port: int | None = None) -> None:
-    """The state an operator's `./sc engine-ops-pin` leaves, written directly
+    """The state an operator's `./sc auth origin` leaves, written directly
     so that no test touches a real instance config."""
     config = {"gui_port": gui_port, "pinned_at": "2026-01-01T00:00:00Z"}
     if port is not None:
@@ -242,7 +277,7 @@ def wait_for(predicate, timeout: float = 15.0, step: float = 0.05):
 def http_call(port: int, method: str, path: str, *, host: str | None = "",
               origin: str | None = None, token: str | None = None,
               body: dict | None = None, headers: dict | None = None,
-              address: str = "127.0.0.1"):
+              address: str = "127.0.0.1", cookie: str | None = None):
     """One request. `host=""` sends the service's own loopback Host."""
     conn = http.client.HTTPConnection(address, port, timeout=20)
     try:
@@ -255,6 +290,8 @@ def http_call(port: int, method: str, path: str, *, host: str | None = "",
             conn.putheader("Origin", origin)
         if token is not None:
             conn.putheader("Authorization", f"Bearer {token}")
+        if cookie is not None:
+            conn.putheader("Cookie", cookie)
         for key, value in (headers or {}).items():
             conn.putheader(key, value)
         raw = json.dumps(body).encode() if body is not None else b""
@@ -286,6 +323,8 @@ class ServiceFixture(unittest.TestCase):
 
     runtime = "host"
     pinned = True
+    # Hold a signed-in session and present its cookie on every `self.call`.
+    signed_in = True
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -295,11 +334,15 @@ class ServiceFixture(unittest.TestCase):
         self.root = base / "root"
         write_stub_root(self.root)
         self.private = make_private(base)
+        self.public = base / "public"
         self.status_file = self.private / engine_ops.STATUS_NAME
+        host_auth._pending.clear()
         for patcher in (
             mock.patch.object(engine_ops, "REPO_ROOT", self.root),
             mock.patch.object(engine_ops, "ENGINE", self.root / ".super-coder"),
             mock.patch.object(engine_ops, "PRIVATE_DIR", self.private),
+            mock.patch.object(host_auth, "PUBLIC_DIR", self.public),
+            mock.patch.object(auth_sessions, "DIR", self.public),
             mock.patch.object(engine_ops, "detect_runtime",
                               side_effect=lambda: self.runtime),
             mock.patch.object(engine_ops, "scope_prefix", return_value=[]),
@@ -314,6 +357,8 @@ class ServiceFixture(unittest.TestCase):
         engine_ops._host_private_checked.clear()
         if self.pinned:
             operator_pins(self.private)
+        self.token = seed_session() if self.signed_in else None
+        self.cookie = cookie_for(self.root, self.token) if self.token else None
         self.service = engine_ops_service.make_server(0)
         self.port = self.service.server_address[1]
         thread = threading.Thread(target=self.service.serve_forever, daemon=True)
@@ -330,6 +375,7 @@ class ServiceFixture(unittest.TestCase):
             engine_ops.read_status(self.status_file)))
 
     def call(self, method, path, **kwargs):
+        kwargs.setdefault("cookie", self.cookie)
         return http_call(self.port, method, path, **kwargs)
 
     def post(self, op, **kwargs):
@@ -654,19 +700,24 @@ class UnpinnedTest(ServiceFixture):
         self.assertEqual(status, 200, out)
         self.assertIs(out["pinned"], False)
         self.assertIsNone(out["gui_origin"])
-        self.assertEqual(out["pin_cli"], "./sc engine-ops-pin")
-        self.assertIn("./sc engine-ops-pin", out["reason"])
+        self.assertEqual(out["pin_cli"], "./sc auth origin")
+        self.assertEqual(out["setup_cli"], "./sc auth user add <username>")
+        self.assertIn("./sc auth user add <username>", out["reason"])
+        # Readable, but never with credentials: no pinned origin exists yet.
+        self.assertNotIn("Access-Control-Allow-Credentials", headers)
         # Readable by the GUI page so it can show the reason; carries no state.
         self.assertEqual(headers["Access-Control-Allow-Origin"], GUI)
         self.assertEqual(
             sorted(out), ["gui_origin", "ok", "operation", "pin_cli", "pinned",
-                          "reason", "running", "service"])
+                          "reason", "running", "service", "setup_cli"])
 
         for op in ("update", "restart", "update-harnesses"):
             status, headers, out = self.post(op)
             self.assertEqual(status, 409, (op, out))
             self.assertEqual(out["error"]["code"], "gui_origin_unpinned")
-            self.assertEqual(out["error"]["details"]["pin_cli"], "./sc engine-ops-pin")
+            self.assertEqual(out["error"]["details"]["pin_cli"], "./sc auth origin")
+            self.assertEqual(out["error"]["details"]["setup_cli"],
+                             "./sc auth user add <username>")
             self.assertEqual(headers["Access-Control-Allow-Origin"], GUI)
         # Whatever loopback page asks, the answer is the same refusal.
         status, _headers, out = self.post("update", origin="http://127.0.0.1:8813")
@@ -760,21 +811,52 @@ class PinTransitionTest(ServiceFixture):
         self.assertEqual(self.stub_argv(), ["noop"])
 
     def test_start_decides_the_origin_itself(self):
+        def yes():
+            return True
+
         with mock.patch.dict(engine_ops.VERBS, {"update": ("noop",)}):
             with self.assertRaises(engine_ops.Unpinned):
-                engine_ops.start("update", GUI)
+                engine_ops.start("update", GUI, yes)
             operator_pins(self.private)
             for origin in (self.DEV, None, "", "null", f"https://127.0.0.1:{GUI_PORT}",
                            GUI + "/", GUI_PORT):
                 with self.assertRaises(engine_ops.ForeignOrigin, msg=repr(origin)):
-                    engine_ops.start("update", origin)
+                    engine_ops.start("update", origin, yes)
             with self.assertRaises(engine_ops.ForeignOrigin):
-                engine_ops.status(self.DEV)
+                engine_ops.status(self.DEV, yes)
             self.assert_nothing_ran()
-            self.assertEqual(engine_ops.status(GUI)["pinned"], True)
-            self.assertEqual(engine_ops.status(None)["pinned"], True)
-            self.assertEqual(engine_ops.start("update", GUI)["op"], "update")
+            self.assertEqual(engine_ops.status(GUI, yes)["pinned"], True)
+            self.assertEqual(engine_ops.status(None, yes)["pinned"], True)
+            self.assertEqual(engine_ops.start("update", GUI, yes)["op"], "update")
             self.finished()
+
+    def test_start_and_status_decide_the_session_themselves(self):
+        """The pinned origin is not enough, and the default is no."""
+        operator_pins(self.private)
+        asked = []
+
+        def no():
+            asked.append(True)
+            return False
+
+        with mock.patch.dict(engine_ops.VERBS, {"update": ("noop",)}):
+            for signed_in in (None, no):
+                with self.assertRaises(engine_ops.SignInRequired):
+                    engine_ops.start("update", GUI, signed_in)
+                with self.assertRaises(engine_ops.SignInRequired):
+                    engine_ops.status(GUI, signed_in)
+                with self.assertRaises(engine_ops.SignInRequired):
+                    engine_ops.status(None, signed_in)
+            # Without a session not even the operation's existence is told.
+            with self.assertRaises(engine_ops.SignInRequired):
+                engine_ops.start("no-such-op", GUI, no)
+            # A foreign origin is refused before the session is looked at.
+            asked.clear()
+            with self.assertRaises(engine_ops.ForeignOrigin):
+                engine_ops.start("update", self.DEV, no)
+            self.assertEqual(asked, [])
+        time.sleep(0.3)
+        self.assert_nothing_ran()
 
 
 class CorsTest(ServiceFixture):
@@ -784,9 +866,15 @@ class CorsTest(ServiceFixture):
             self.assertEqual(status, 200, out)
             self.assertEqual(headers["Access-Control-Allow-Origin"], origin)
             self.assertEqual(headers["Vary"], "Origin")
-        status, headers, _out = self.call("GET", "/status")
-        self.assertEqual(status, 200)
+            # The session cookie travels: credentials, for this exact origin.
+            self.assertEqual(headers["Access-Control-Allow-Credentials"], "true")
+        # A cookie counts only with the pinned GUI origin. A request with no
+        # Origin is not the GUI, whatever cookie it carries.
+        status, headers, out = self.call("GET", "/status")
+        self.assertEqual(status, 401, out)
+        self.assertEqual(out["error"]["code"], "sign_in_required")
         self.assertNotIn("Access-Control-Allow-Origin", headers)
+        self.assertNotIn("Access-Control-Allow-Credentials", headers)
         status, headers, _out = self.post("launch")
         self.assertEqual(status, 404)
         self.assertEqual(headers["Access-Control-Allow-Origin"], GUI)
@@ -798,6 +886,7 @@ class CorsTest(ServiceFixture):
                      "Access-Control-Request-Headers": "content-type"})
         self.assertEqual(status, 204, out)
         self.assertEqual(headers["Access-Control-Allow-Origin"], GUI)
+        self.assertEqual(headers["Access-Control-Allow-Credentials"], "true")
         self.assertIn("POST", headers["Access-Control-Allow-Methods"])
         self.assertIn("Content-Type", headers["Access-Control-Allow-Headers"])
         self.assertNotIn("Authorization", headers["Access-Control-Allow-Headers"])
@@ -807,6 +896,7 @@ class CorsTest(ServiceFixture):
                 headers={"Access-Control-Request-Method": "POST"})
             self.assertEqual(status, 403, (origin, out))
             self.assertNotIn("Access-Control-Allow-Origin", headers)
+            self.assertNotIn("Access-Control-Allow-Credentials", headers)
             self.assertNotIn("Access-Control-Allow-Methods", headers)
         self.assert_nothing_ran()
 
@@ -2159,9 +2249,18 @@ class ServiceProcessFixture(unittest.TestCase):
         for patcher in (
             mock.patch.object(engine_ops, "PRIVATE_DIR", self.private),
             mock.patch.object(engine_ops, "SERVICE_SCRIPT", self.script),
+            mock.patch.object(host_auth, "PUBLIC_DIR", base / "public"),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
+        # The signed-in browser: its session is in the private store, which
+        # the service process reads for every request.
+        self.cookie = cookie_for(self.root, seed_session())
+
+    def http(self, port: int, method: str, path: str, **kwargs):
+        """One request from the signed-in browser."""
+        kwargs.setdefault("cookie", self.cookie)
+        return http_call(port, method, path, **kwargs)
 
     def service_argv(self, scope: str, verb: str) -> list[str]:
         return [sys.executable, str(self.script), str(ENGINE), str(self.root),
@@ -2235,7 +2334,7 @@ class OutlivesTheEngineTest(ServiceProcessFixture):
         # The engine returns: a new service reads the same record back.
         self.start_service()
         new_port = self.port()
-        status, _headers, out = http_call(new_port, "GET", "/status", origin=GUI)
+        status, _headers, out = self.http(new_port, "GET", "/status", origin=GUI)
         self.assertEqual(status, 200, out)
         self.assertFalse(out["running"])
         self.assertEqual(out["operation"]["op"], "restart")
@@ -2251,7 +2350,7 @@ class OutlivesTheEngineTest(ServiceProcessFixture):
         record = engine_ops.service_record()
         self.assertEqual((record["pid"], record["port"]), (service.pid, port))
 
-        status, _headers, out = http_call(port, "POST", "/ops/restart", origin=GUI)
+        status, _headers, out = self.http(port, "POST", "/ops/restart", origin=GUI)
         self.assertEqual(status, 202, out)
         self.assertEqual(out["operation"]["detach"], "session")
         self.assertNotEqual(out["operation"]["pid"], service.pid)
@@ -2271,7 +2370,7 @@ class OutlivesTheEngineTest(ServiceProcessFixture):
         the operation is not in it."""
         self.start_unit("systemd")
         port = self.port()
-        status, _headers, out = http_call(port, "POST", "/ops/restart", origin=GUI)
+        status, _headers, out = self.http(port, "POST", "/ops/restart", origin=GUI)
         self.assertEqual(status, 202, out)
         self.assertEqual(out["operation"]["detach"], "systemd-scope")
         self.assert_recorded_after_the_engine_is_gone(port, "systemd-scope")
@@ -2280,7 +2379,7 @@ class OutlivesTheEngineTest(ServiceProcessFixture):
         """The control: without the scope, the unit stop takes the runner too."""
         self.start_unit("session")
         port = self.port()
-        status, _headers, out = http_call(port, "POST", "/ops/restart", origin=GUI)
+        status, _headers, out = self.http(port, "POST", "/ops/restart", origin=GUI)
         self.assertEqual(status, 202, out)
         self.assertEqual(out["operation"]["detach"], "session")
         pid = out["operation"]["pid"]
@@ -2346,14 +2445,14 @@ class SandboxCannotSteerTest(ServiceProcessFixture):
 
         service = self.start_service()
         port = self.port()
-        self.assertEqual(http_call(port, "GET", "/status", origin=self.GUI)[0], 200)
+        self.assertEqual(self.http(port, "GET", "/status", origin=self.GUI)[0], 200)
 
         self.sandbox_rewrites_the_engine_directory(canary, victim)
 
         # 1. Which origin is accepted.
         for method, path in (("POST", "/ops/update"), ("OPTIONS", "/ops/update"),
                              ("GET", "/status")):
-            status, headers, out = http_call(port, method, path, origin=self.EVIL)
+            status, headers, out = self.http(port, method, path, origin=self.EVIL)
             self.assertEqual(status, 403, (method, out))
             self.assertEqual(out["error"]["code"], "same_origin_required")
             self.assertNotIn("Access-Control-Allow-Origin", headers)
@@ -2361,7 +2460,7 @@ class SandboxCannotSteerTest(ServiceProcessFixture):
         self.assertFalse((self.root / "argv.json").exists())
 
         # 2. Which files are read: the forged status and its `log` are not.
-        status, headers, out = http_call(port, "GET", "/status", origin=self.GUI)
+        status, headers, out = self.http(port, "GET", "/status", origin=self.GUI)
         self.assertEqual(status, 200, out)
         self.assertEqual(headers["Access-Control-Allow-Origin"], self.GUI)
         self.assertIsNone(out["operation"])
@@ -2370,14 +2469,14 @@ class SandboxCannotSteerTest(ServiceProcessFixture):
 
         # 3. Which files are written: an operation from the real GUI runs, and
         #    its status and log land in the private directory only.
-        status, _headers, out = http_call(port, "POST", "/ops/update", origin=self.GUI)
+        status, _headers, out = self.http(port, "POST", "/ops/update", origin=self.GUI)
         self.assertEqual(status, 202, out)
         record = self.finished_record()
         self.assertEqual(record["exit_code"], 0)
         self.assertEqual(json.loads((self.root / "argv.json").read_text()), ["update"])
         self.assertEqual(victim.read_text(), "HOST SECRET CONTENT\n")
         self.assertIn("stub sc update", (self.private / "engine-op-update.log").read_text())
-        _status, _headers, out = http_call(port, "GET", "/status", origin=self.GUI)
+        _status, _headers, out = self.http(port, "GET", "/status", origin=self.GUI)
         self.assertEqual(out["operation"]["log"],
                          str(self.private / "engine-op-update.log"))
         self.assertIn("stub sc update", out["log_tail"])
@@ -2396,10 +2495,10 @@ class SandboxCannotSteerTest(ServiceProcessFixture):
         self.assertEqual(pinned["gui_port"], self.review_port)
         self.start_service()
         new_port = self.port()
-        status, _headers, out = http_call(new_port, "POST", "/ops/update",
+        status, _headers, out = self.http(new_port, "POST", "/ops/update",
                                           origin=self.EVIL)
         self.assertEqual(status, 403, out)
-        status, _headers, out = http_call(new_port, "POST", "/ops/update",
+        status, _headers, out = self.http(new_port, "POST", "/ops/update",
                                           origin=self.GUI)
         self.assertEqual(status, 202, out)
         self.finished_record()

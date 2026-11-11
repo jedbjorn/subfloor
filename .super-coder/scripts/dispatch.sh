@@ -230,6 +230,17 @@ sc_refuse_linked() {
   exit 1
 }
 
+# $1 = the command as the operator typed it. For verbs that manage host-only
+# state: inside the sandbox there is nothing for them to act on.
+sc_refuse_sandbox() {
+  [ -n "${SC_SANDBOX:-}" ] || return 0
+  {
+    echo "✗ ./sc $1 refused: this is the sandbox, and ./sc $1 manages state that is kept on the HOST, outside every sandbox mount."
+    echo "  Nothing was read or changed. Run it in a host terminal, from the main checkout."
+  } >&2
+  exit 1
+}
+
 port() { "$PY" "$S/ports.py" port; }
 devport() { "$PY" "$S/ports.py" devport; }
 
@@ -1280,7 +1291,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|engine-ops|engine-ops-up|engine-ops-down|engine-ops-port|engine-ops-pin|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|engine-ops|engine-ops-up|engine-ops-down|engine-ops-port|engine-ops-pin|auth|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1550,8 +1561,18 @@ case "$cmd" in
                       sc_engine_ops down ;;
   engine-ops-port)    sc_refuse_linked engine-ops-port "the engine-ops service of $LIVE_ROOT"
                       sc_engine_ops_port ;;
+  # The first name of `./sc auth origin`, kept as an alias.
   engine-ops-pin)     sc_refuse_linked engine-ops-pin "the engine-ops service of $LIVE_ROOT"
-                      sc_engine_ops pin "$@" ;;
+                      sc_refuse_sandbox engine-ops-pin
+                      exec "$PY" "$ENGINE/api/host_auth.py" origin "$@" ;;
+  # ── GUI sign-in (HOST-side — spec #271). Users, claim codes, sessions and
+  # the GUI origin are kept by the engine-ops service in host-private state,
+  # and these verbs are the operator's side of it: a host terminal in the main
+  # checkout. Refused from a linked worktree (it has no instance of its own)
+  # and inside the sandbox (the state is not there, and must not be).
+  auth)               sc_help_form "$@" || sc_refuse_linked auth "the sign-in state of $LIVE_ROOT"
+                      sc_help_form "$@" || sc_refuse_sandbox auth
+                      exec "$PY" "$ENGINE/api/host_auth.py" "$@" ;;
   # ── db broker (HOST-side primitive — runs where the live DSN + route live) ──
   db-broker)         exec "$PY" "$ENGINE/api/db_broker.py" "$@" ;;
   db-broker-up)      sc_db_broker_up ;;
@@ -2008,7 +2029,7 @@ Subfloor — forkable shell substrate for one repository
   Engine (Admin)        rebuild · migrate · migration · snapshot · render · render-check · verify
                         seed-skills · engine-ref · artifact-mode · clean-db
   Host brokers          browser · vm · remote · ts · vm-broker-* · ts-broker-* · pm2-broker-* · db-broker-*
-                        engine-ops-*
+                        engine-ops-* · auth
                         db-init · pg-*
   Primitives            serve · boot · run · deps · lint · typecheck · build · logs · health · ports
                         preview · visual-qa
@@ -2274,9 +2295,22 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc engine-ops-up       start it in the background; no-op if already up
   ./sc engine-ops-down     stop the backgrounded service (a running operation finishes)
   ./sc engine-ops-port     print (pinning once) its host loopback port
-  ./sc engine-ops-pin      pin the ONE GUI origin it accepts (asks you to type the review
-                           port; or: engine-ops-pin <port> · engine-ops-pin --show).
-                           Until pinned, the GUI's engine controls are refused.
+  ./sc engine-ops-pin      the first name of `./sc auth origin` (below); kept as an alias
+
+  GUI sign-in (run on the HOST, in the main checkout — the review GUI asks for a
+  password and an authenticator code; users, sessions and the GUI origin are kept
+  by the engine-ops service in host-private state. See .super-coder/docs/auth.md):
+  ./sc auth user add <username>   create the GUI user for an engine user: prints a
+                           one-time claim code for first sign-in in the GUI and asks
+                           you to confirm the review GUI's port (or: --port <port>).
+                           Until a user exists the GUI shows only this instruction.
+  ./sc auth user reset <username> clear the password, the authenticator and every
+                           session; prints a new claim code (lost-device recovery)
+  ./sc auth user list      each GUI user's state
+  ./sc auth sessions       signed-in devices · auth sessions revoke <id> | --all
+  ./sc auth unlock         clear the delay that follows repeated failed sign-ins
+  ./sc auth origin         confirm the ONE GUI origin the host accepts (asks you to
+                           type the review port; or: auth origin <port> · --show)
 
   db broker (run on the HOST — read-only diagnostic reads of the fork's LIVE app
   DB for a sandboxed shell, without handing it a DSN or a route. Shells out to
