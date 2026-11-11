@@ -1,11 +1,13 @@
 /* Sign-in page (spec 271). Layout only: every colour is a style.css theme
    token, so the page follows the light and dark themes with the app. */
 body.signin-page {
-  min-height: 100dvh; margin: 0; display: flex; align-items: flex-start; justify-content: center;
+  min-height: 100dvh; margin: 0; display: flex; flex-direction: column; align-items: center;
+  justify-content: flex-start;
   padding: clamp(1rem, 8vh, 5rem) 1rem 2rem; background: var(--bg); color: var(--ink);
 }
+/* style.css lets the app's <main> grow to fill the page; the card does not. */
 .signin-card {
-  width: min(26rem, 100%); padding: 1.5rem; background: var(--panel);
+  flex: none; width: min(26rem, 100%); padding: 1.5rem; background: var(--panel);
   border: 1px solid var(--line); border-radius: var(--r);
 }
 .signin-brand { flex: none; margin: 0 0 1rem; font-size: 1.05rem; color: var(--text-strong); }

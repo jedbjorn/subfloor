@@ -330,7 +330,8 @@ const fetchStub = async (url, init = {}) => {
     headers: {get: (name) => name === "Retry-After" ? retry : null}};
 };
 let clock = 5000000, sleeps = 0;
-const intervals = [], navigations = [];
+const intervals = new Map(), navigations = [];
+let intervalId = 0;
 const root = new FakeElement("div");
 const page = createSignIn({
   root, document: {createElement: (tag) => new FakeElement(tag)},
@@ -338,8 +339,8 @@ const page = createSignIn({
     search: "?next=%2F%3Fa%3D1", hash: "#interface/DEV1"},
   fetch: fetchStub, qrcode,
   now: () => clock,
-  setInterval: (fn) => { intervals.push(fn); return intervals.length; },
-  clearInterval: () => {},
+  setInterval: (fn) => { intervals.set(++intervalId, fn); return intervalId; },
+  clearInterval: (id) => { intervals.delete(id); },
   sleep: async () => { sleeps += 1; },
   navigate: (to) => { navigations.push(to); },
 });
@@ -356,7 +357,7 @@ const submitButton = () => all(root, (n) => n.tagName === "BUTTON" && n.type ===
 const buttons = () => all(root, (n) => n.tagName === "BUTTON").map((n) => n.textContent);
 const fill = (values) => { for (const [id, value] of Object.entries(values)) input(id).value = value; };
 const submit = async (values = {}) => { fill(values); await formNode().onsubmit({preventDefault() {}}); await settle(); };
-const tickClock = (seconds) => { clock += seconds * 1000; intervals[intervals.length - 1](); };
+const tickClock = (seconds) => { clock += seconds * 1000; for (const fn of intervals.values()) fn(); };
 const posts = () => requests.filter((r) => r.method === "POST");
 const view = () => ({heading: heading(), fields: inputs().map((n) => n.id), notice: notice(),
   text: root.children.map(txt).join(" | "), focus: focused ? focused.id || focused.tagName : null});
@@ -442,6 +443,7 @@ server.auth.retry_after = 30;
   server.routes["/auth/sign-in"] = () => [429, {}, "4"];
   await submit({password: "correct horse", code: "123456"});
   out.fromHeader = notice();
+  out.liveTimers = intervals.size;      // one view, one countdown
   finish({out, leaks});
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
@@ -455,6 +457,7 @@ server.auth.retry_after = 30;
     assert out["limited"] == {"notice": wait.format(8), "disabled": True, "heading": "Sign in",
                               "password": ""}
     assert out["fromHeader"] == wait.format(4)
+    assert out["liveTimers"] == 1
     assert result["leaks"] == []
 
 

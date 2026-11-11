@@ -82,7 +82,8 @@ function createSignIn(env) {
   let base = null;          // the authority, once known
   let limitedUntil = 0;     // ms timestamp; attempts are refused until then
   let unlockCli = SIGNIN_UNLOCK_CLI;
-  let ticker = null;        // the current view's countdown
+  let ticker = null;        // the shown view's countdown timer
+  let countdown = null;     // a form's countdown, waiting for its view to be shown
   let enrolment = null;     // first sign-in only: { enrolment, secret, otpauth_uri, ... }
 
   const call = async (origin, path, method = "GET", body = {}) => {
@@ -99,9 +100,12 @@ function createSignIn(env) {
   const errorCode = (answer) => answer.data?.error?.code || answer.data?.error || "";
 
   // ── view plumbing ──
+  // One view at a time: showing a view stops the previous view's countdown
+  // and starts this one's, if it has a form.
   const show = (heading, ...nodes) => {
     if (ticker) env.clearInterval(ticker);
-    ticker = null;
+    ticker = countdown ? env.setInterval(countdown, 1000) : null;
+    countdown = null;
     const title = el("h2", { tabIndex: -1 }, heading);
     root.replaceChildren(title, ...nodes);
     return title;
@@ -148,7 +152,7 @@ function createSignIn(env) {
     const finish = (...before) => {
       node.append(...before, notice, actions);
       paintLimit();
-      ticker = env.setInterval(paintLimit, 1000);
+      countdown = paintLimit;
       return node;
     };
     return { node, actions, finish, say: (message) => { notice.textContent = message; } };
