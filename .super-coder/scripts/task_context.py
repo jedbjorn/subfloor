@@ -77,19 +77,22 @@ LANE_WALLS = {
 LANE_ACTIONS = {
     "active": (
         "sc sprint register-pr --sprint {sprint} --repository <owner/name> --pr <n> --work-unit {unit}",
-        "sc sprint request-review --sprint {sprint} --work-unit {unit} ...",
+        "sc sprint request-review --sprint {sprint} --registered-pr {pr} --intent <submit|resubmit> --key <stable-key>",
         "sc sprint complete-unit --sprint {sprint} --work-unit {unit} --result-file <path>  (report/no-code units only)",
     ),
     "fixing": (
-        "sc sprint request-review --sprint {sprint} --work-unit {unit} ...",
+        "sc sprint request-review --sprint {sprint} --registered-pr {pr} --intent resubmit --key <stable-key>",
     ),
     "blocked": (
         "sc sprint send --sprint {sprint} --to <planner> --body-file <path> --intent blocker --requires-reply --work-unit {unit} --key <stable-key>",
     ),
     "merge_ready": (
-        "sc sprint authorize-merge --sprint {sprint} --registered-pr <id>",
+        "sc sprint authorize-merge --sprint {sprint} --registered-pr {pr}",
     ),
 }
+# Printed in place of a registered PR id the lane does not (uniquely) hold yet.
+REGISTERED_PR_PLACEHOLDER = "<id>"
+REGISTERED_PR_HINT = "  (<id> = registered PR id: `sc sprint show --sprint {sprint}`)"
 SPRINT_WALLS = {
     "prepared": "Sprint not armed — nothing is dispatched",
     "armed": "Sprint armed — assignments and handoffs flow",
@@ -406,6 +409,10 @@ def _select_work_unit(con, work_unit_id: int, caller: dict) -> dict:
     participant = con.execute(
         "SELECT role FROM sprint_participants WHERE sprint_id=? AND shell_id=?",
         (sprint_id, caller["shell_id"])).fetchone()
+    registered_prs = [int(r["registered_pr_id"]) for r in con.execute(
+        "SELECT registered_pr_id FROM sprint_pr_work_units "
+        "WHERE sprint_id=? AND work_unit_id=? AND superseded_at IS NULL "
+        "ORDER BY registered_pr_id", (sprint_id, work_unit_id))]
     return {
         "selector": "work_unit",
         "feature": {
@@ -429,6 +436,7 @@ def _select_work_unit(con, work_unit_id: int, caller: dict) -> dict:
             "dependencies": dependencies,
             "unit_blockers": blockers,
             "pending_assignment_message_id": int(pending["message_id"]) if pending else None,
+            "registered_pr_ids": registered_prs,
         },
     }
 
@@ -671,8 +679,15 @@ def project(con, *, task_id: int | None = None, work_unit_id: int | None = None,
             boundaries["actions"].append(
                 f"sc sprint accept --sprint {sid} --message {unit['pending_assignment_message_id']}")
         if is_developer and sprint["lifecycle"] == "armed":
-            boundaries["actions"].extend(
-                a.format(sprint=sid, unit=uid) for a in LANE_ACTIONS.get(unit["disposition"], ()))
+            # One linked PR -> print its real id; none or several -> placeholder
+            # plus where to read it. Guidance only: the endpoint revalidates.
+            prs = unit["registered_pr_ids"]
+            pr = str(prs[0]) if len(prs) == 1 else REGISTERED_PR_PLACEHOLDER
+            for a in LANE_ACTIONS.get(unit["disposition"], ()):
+                hint = (REGISTERED_PR_HINT
+                        if "{pr}" in a and pr == REGISTERED_PR_PLACEHOLDER else "")
+                boundaries["actions"].append(
+                    (a + hint).format(sprint=sid, unit=uid, pr=pr))
         if is_reviewer and sprint["lifecycle"] == "armed" and unit["disposition"] == "in_review":
             boundaries["actions"].append(
                 f"sc sprint record-review --sprint {sid} --registered-pr <id> "
