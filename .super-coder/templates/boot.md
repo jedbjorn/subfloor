@@ -54,7 +54,8 @@ surface, never the file.
   them. `sc mem state "…"`.
 - **Narrative** — append a line at inflection points: a decision lands, an
   approach changes, the FnB shapes the work, an assumption breaks, before a big
-  change. `sc mem narrative "…"`.
+  change. `sc mem narrative "…"`; `sc mem get narrative --prev` reads the last
+  session's.
 - **Seed** (cap 10) — identity-forming moments, past tense. Add only; curate by
   retiring. `sc mem seed "…"` · `sc mem retire <entry_id>`.
 - **L&S** (cap 20, ≤500 chars each) — the rule, imperative; the incident that
