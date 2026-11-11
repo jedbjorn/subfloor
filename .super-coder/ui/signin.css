@@ -1,0 +1,52 @@
+/* Sign-in page (spec 271). Layout only: every colour is a style.css theme
+   token, so the page follows the light and dark themes with the app. */
+body.signin-page {
+  min-height: 100dvh; margin: 0; display: flex; align-items: flex-start; justify-content: center;
+  padding: clamp(1rem, 8vh, 5rem) 1rem 2rem; background: var(--bg); color: var(--ink);
+}
+.signin-card {
+  width: min(26rem, 100%); padding: 1.5rem; background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--r);
+}
+.signin-brand { flex: none; margin: 0 0 1rem; font-size: 1.05rem; color: var(--text-strong); }
+.signin-body { display: grid; gap: .75rem; min-width: 0; }
+.signin-body h2 { margin: 0; font-size: 1.1rem; font-weight: 600; color: var(--text-strong); }
+.signin-body h2:focus { outline: none; }
+.signin-text { margin: 0; color: var(--text-mid); font-size: .9rem; line-height: 1.5; overflow-wrap: anywhere; }
+.signin-form { display: grid; gap: .3rem; }
+.signin-form label { margin-top: .5rem; color: var(--text-mid); font-size: .85rem; }
+.signin-form input {
+  width: 100%; padding: .55rem .65rem; font: inherit; font-size: 1rem;
+  background: var(--panel2); color: var(--ink);
+  border: 1px solid var(--control-border); border-radius: var(--r-sm);
+}
+.signin-form input:focus-visible { outline: none; border-color: var(--accent); box-shadow: var(--focus-ring); }
+.signin-form input[readonly] { color: var(--text-mid); }
+.signin-hint { color: var(--text-low); font-size: .78rem; }
+.signin-actions { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-top: .9rem; }
+.signin-actions button.act { margin-top: 0; padding: .5rem 1rem; }
+.signin-link {
+  background: none; border: none; padding: 0; font: inherit; font-size: .85rem;
+  color: var(--accent); cursor: pointer; text-decoration: underline;
+}
+.signin-notice { margin: 0; font-size: .88rem; line-height: 1.45; color: var(--danger); overflow-wrap: anywhere; }
+.signin-notice:empty { display: none; }
+.signin-notice.wait { color: var(--warn); }
+.signin-cli {
+  display: block; padding: .55rem .65rem; background: var(--panel2); color: var(--ink);
+  border: 1px solid var(--line-soft); border-radius: var(--r-sm);
+  font: .85rem ui-monospace, monospace; overflow-wrap: anywhere; user-select: all;
+}
+.signin-qr {
+  display: block; width: min(15rem, 100%); height: auto; margin: .25rem auto;
+  image-rendering: pixelated; border-radius: var(--r-sm);
+}
+.signin-key {
+  display: block; padding: .55rem .65rem; text-align: center; letter-spacing: .08em;
+  background: var(--panel2); color: var(--ink); border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm); font: .95rem ui-monospace, monospace; overflow-wrap: anywhere;
+  user-select: all;
+}
+.signin-body details { color: var(--text-mid); font-size: .82rem; }
+.signin-body summary { cursor: pointer; }
+.signin-uri { display: block; margin-top: .4rem; font: .75rem ui-monospace, monospace; overflow-wrap: anywhere; user-select: all; }
