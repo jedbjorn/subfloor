@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -28,6 +29,7 @@ MIGRATIONS = (
     ENGINE / "migrations" / "0262_reseed_sprint_resume_reentry.sql",
     ENGINE / "migrations" / "0280_remove_sprint_followups.sql",
     ENGINE / "migrations" / "0282_skills_dedupe_posture.sql",
+    ENGINE / "migrations" / "0283_reseed_sprint_consistency.sql",
 )
 sys.path.insert(0, str(ENGINE / "scripts"))
 
@@ -104,6 +106,10 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
         bodies["dev"] = (ENGINE / "templates" / "shells" / "dev.md").read_text()
 
         normalized = {name: " ".join(body.split()) for name, body in bodies.items()}
+        dev_pack = json.loads(
+            (ENGINE / "templates" / "shells" / "dev.json").read_text())
+        planner_pack = json.loads(
+            (ENGINE / "templates" / "shells" / "planner.json").read_text())
         self.assertIn("TESTING POSTURE", normalized["sprint_dev"])
         self.assertIn("Verification follows TESTING POSTURE", normalized["dev"])
         self.assertIn("Verification", normalized["dev"])
@@ -112,15 +118,32 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
             "Register complete code even when a local gate is unavailable",
             normalized["sprint_dev"],
         )
-        for state in (
-            "pending ->",
-            "red ->",
-            "green ->",
-            "none or untrustworthy watcher",
-        ):
+        # The full pending/red/green rule and the failure definitions have one
+        # home, `spec_execution` (granted to the Developer pack); sprint_dev
+        # keeps only the Sprint-specific actions and points there.
+        self.assertIn("spec_execution", dev_pack["skills"])
+        self.assertIn("TESTING POSTURE's (`spec_execution`)", normalized["sprint_dev"])
+        for state in ("pending -> stop for the native wake",
+                      "green -> judge, then request review",
+                      "blocked gate -> report it to the Planner as a blocker"):
             self.assertIn(state, normalized["sprint_dev"])
-        self.assertIn("incomplete code = failure", normalized["sprint_dev"])
-        self.assertIn("Optional browser skip = non-failing", normalized["sprint_dev"])
+        for moved in ("incomplete code = failure",
+                      "Optional browser skip = non-failing"):
+            self.assertNotIn(moved, normalized["sprint_dev"])
+        posture = " ".join(
+            (ASSETS / "spec_execution" / "SKILL.md").read_text().split())
+        for rule in (
+            "Required checks pending -> wait; red -> diagnose, fix, and push; "
+            "green -> review readiness.",
+            "red CI result, or incomplete code is a failure",
+            "No configured checks or an untrustworthy watcher after one bounded "
+            "read -> block",
+            "browser-capability skip is informational and non-failing",
+        ):
+            self.assertIn(rule, posture)
+        # The Planner pack has no `spec_execution`, so sprint_pln keeps its own
+        # statement (asserted below).
+        self.assertNotIn("spec_execution", planner_pack["skills"])
 
         self.assertIn("## Canonical states", bodies["dev_kit"])
         self.assertIn("`deps`, `test`, `lint`, and `typecheck`", normalized["dev_kit"])

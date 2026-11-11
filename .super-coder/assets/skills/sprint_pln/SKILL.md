@@ -17,6 +17,7 @@ paths, receipt recovery, and authority boundary. This skill holds only the Plann
 | Need | Read |
 |---|---|
 | Whole Sprint: lifecycle, participants with current routes, units, dependencies, PRs, health | `sc sprint show --sprint <id>` |
+| Full append-only event log — the authoritative lifecycle read (look for `lifecycle.completed` / `lifecycle.aborted`) | `sc sprint timeline --sprint <id> [--last <n>]` |
 | Messages addressed to you | `sc sprint inbox --sprint <id>` |
 | Exact bound spec body | `sc sprint spec-revision --sprint <id> --document <id> [--body-only]` |
 | PR-watcher evidence behind a stalled gate | `sc sprint watcher-state --sprint <id>` |
@@ -75,7 +76,7 @@ occupied lanes make dispatch repeat-safe.
 
 For a required-reply Reviewer decision, keep this order:
 
-1. Re-run `sc sprint inbox --sprint <id>`; verify the assigned Reviewer + retain the id.
+1. From this wake's inbox read, verify the assigned Reviewer + retain the id.
 2. Send a linked acknowledgement (`--intent information --reply-to <decision-message-id>`).
 3. Require the reply command to confirm its durable message and wake; retry the
    same command/key if ambiguous.
@@ -93,7 +94,9 @@ substitute nothing, and stop.
 ### Pause or resume
 
 Pause for a Reviewer decision or safe Planner restructuring; preserve partial
-artifacts, interrupt intent, judgment, and evidence:
+artifacts, interrupt intent, judgment, and evidence. A Developer or Reviewer
+may also pause for integrity; the pause notice carries the reason — reconcile
+it, then resume as below:
 
 ```text
 sc sprint pause --sprint <id> --reason <decision-or-restructure-reason>
@@ -220,8 +223,12 @@ engine sends the next delivery-terminal wake; you do not initiate conformance.
 Clean `record-conformance` by the Reviewer atomically stores conformance,
 the Reviewer-authored final report, completion, and your
 informational receipt. On it, verify Sprint/reports/outcome/completed state.
-Do not run `complete`; do not author a second report; do not manually close
-peer chats.
+Do not run `complete` after it; do not author a second report; do not manually
+close peer chats. `sc sprint complete --sprint <id> --reason <reason>
+--outcome <outcome> [--report-file <path> --key <stable-key>]` is a recovery
+close, not the normal one: use it only when every unit is terminal and the
+Reviewer's `record-conformance` cannot close the Sprint, and say why in the
+reason. It refuses non-terminal work and records no conformance report.
 
 The completion receipt is the only success wake: it names the Developer chats
 the engine closed and the artifact directory it deletes. Your chat and every
@@ -244,15 +251,19 @@ sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
 
 ## Handoffs and stop
 
-Never dispatch the next wave from merge observation. The merged-work handoff
-wake is the only normal next-wave dispatch trigger. On it:
+The engine releases dependency-ready lanes itself when it observes a merge;
+the Developer's merged-work handoff is the lane's result record, not a
+dispatch trigger. On that handoff wake:
 
-1. Run `sc sprint inbox --sprint <id>`; inspect the merged handoff + unit/dependency state.
-2. Handle earlier informational items and `accept` each, including the handoff.
-3. Finish reconciliation and Planner bookkeeping; no work remains.
-4. As the literal final action run `sc sprint dispatch --sprint <id>`.
-5. Require durable assignments + wakes, then stop. Run no trailing command.
-   Empty dispatch remains final; investigate only on a later durable wake.
+1. Read `sc sprint inbox --sprint <id>` once; inspect the merged handoff +
+   unit/dependency state.
+2. Handle informational items and `accept` each, including the handoff.
+3. Finish reconciliation and Planner bookkeeping, then stop.
+
+Run `sc sprint dispatch --sprint <id>` yourself only after a restructure or
+resume, or when `sc sprint show` has a ready lane undispatched. Then it is the
+literal final action: require durable assignments + wakes and run no trailing
+command. An empty dispatch remains final.
 
 On a clean completion receipt, verify the named Sprint is terminal and record
 the closed Developer chats; run no close command. Then stop — a cleanup wake

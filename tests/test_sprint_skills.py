@@ -41,6 +41,7 @@ RECONCILIATION = (
     ENGINE / "migrations" / "0262_reseed_sprint_resume_reentry.sql",
     ENGINE / "migrations" / "0280_remove_sprint_followups.sql",
     ENGINE / "migrations" / "0282_skills_dedupe_posture.sql",
+    ENGINE / "migrations" / "0283_reseed_sprint_consistency.sql",
 )
 RETIRED = (
     "memory", "db_map", "bootstrap", "surface_catalogue", "messaging", "flags",
@@ -142,7 +143,12 @@ class SprintSkillTest(unittest.TestCase):
         self.assertEqual(protocol.count("wc -m < <path>"), 1)
         flat = " ".join(protocol.split())
         self.assertIn("The engine refuses anything over 8,000", flat)
-        self.assertIn("Re-run `sc sprint inbox --sprint <id>` once", flat)
+        # Sprint communication is by wake only: one inbox read per wake, and
+        # no skill tells a participant to re-read it before a handoff.
+        self.assertIn("read the inbox once per wake", flat)
+        self.assertIn("Do not run the inbox before or after it", flat)
+        for name in SKILLS:
+            self.assertNotIn("Re-run `sc sprint inbox", skill_text(name), name)
         self.assertIn("no trailing Git, Sprint, inbox, cleanup, or status command", flat)
         # The limit the protocol names is the one the relay enforces.
         store_source = (ENGINE / "scripts" / "sprint_message_delivery.py").read_text()
@@ -155,9 +161,10 @@ class SprintSkillTest(unittest.TestCase):
             self.assertIn("Your typed handoffs are", flat)
             for handoff in handoffs:
                 self.assertIn(handoff, flat)
-        # The reopened-PR route keeps its one-check exception.
-        self.assertIn("a single pre-handoff inbox check covers",
-                      " ".join(skill_text("sprint_dev").split()))
+        # No pre-handoff inbox check remains, so the reopened-PR route needs
+        # no exception to one.
+        self.assertNotIn("pre-handoff inbox check",
+                         " ".join(skill_text("sprint_dev").split()))
 
     def test_reviewer_verdict_path_replaces_the_boot_gated_handoff_in_sprint(self):
         flat = " ".join(skill_text("sprint_rev").split())
@@ -189,10 +196,11 @@ class SprintSkillTest(unittest.TestCase):
             "cleanup-status", "cleanup", "show", "timeline",
         }
         combined = "\n".join(skill_text(name) for name in SKILLS)
-        # `timeline` is a CLI-only read; the skills do not teach it yet.
-        for command in expected - {"monitor", "spec-revision", "complete",
-                                   "timeline"}:
+        for command in expected - {"monitor"}:
             self.assertIn(f"sc sprint {command}", combined)
+        # The Planner's read table names the authoritative lifecycle read.
+        self.assertIn("`sc sprint timeline --sprint <id> [--last <n>]`",
+                      skill_text("sprint_pln"))
         for gone in ("sc sprint monitor", "record-qaqc"):
             self.assertNotIn(gone, combined)
         parser = sprint_cli.build_parser()

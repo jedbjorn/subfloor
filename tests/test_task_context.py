@@ -994,12 +994,13 @@ class GuidanceTest(unittest.TestCase):
             "PRIMARY KEY(flavor, skill_id));")
         con.executescript(path.read_text())
         con.executescript(path.read_text())          # idempotent
-        # 0255, 0257 (F72), 0258, then 0282 re-own sprint_dev; compare once all
-        # replayed.
+        # 0255, 0257 (F72), 0258, 0282, then 0283 re-own sprint_dev; compare
+        # once all replayed.
         for later in ("0255_reseed_merge_gate_one_rule.sql",
                       "0257_guidance_reconciliation.sql",
                       "0258_reseed_non_sprint_green_wake.sql",
-                      "0282_skills_dedupe_posture.sql"):
+                      "0282_skills_dedupe_posture.sql",
+                      "0283_reseed_sprint_consistency.sql"):
             text = (ENGINE / "migrations" / later).read_text()
             con.executescript(text)
             con.executescript(text)

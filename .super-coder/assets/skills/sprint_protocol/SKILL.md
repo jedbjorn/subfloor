@@ -25,9 +25,10 @@ with one Developer and one Reviewer, ordered by dependencies and waves.
 (terminal; nothing deleted). One Sprint is armed at a time. A lane: dispatched
 -> Developer builds, registers the PR, requests review -> Reviewer records a
 verdict -> Developer merges under the Sprint grant once `authorize-merge`
-returns live green + approved -> the merged handoff wakes the Planner, who
-dispatches what became ready. After the last lane the conformance Reviewer
-records the whole-Sprint report; the engine closes the Sprint, closes the
+returns live green + approved -> the engine observes the merge, completes the
+unit, and releases the lanes that became ready; the Developer's merged handoff
+is the lane's result record for the Planner. After the last lane the
+conformance Reviewer records the whole-Sprint report; the engine closes the Sprint, closes the
 Developer chats, and deletes the Sprint artifact directory. Planner and
 Reviewer chats persist; no worktree is reset.
 
@@ -63,7 +64,9 @@ sc sprint accept --sprint <id> --message <message-id>
 sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
-Inspect the inbox once per trigger. Accepting an assignment starts ownership;
+Sprint communication is by wake only: read the inbox once per wake and never
+re-read it within the turn; a new message arrives as its own wake. Accepting
+an assignment starts ownership;
 decline only with a concrete reason. After an informational message, `accept`
 marks it read and changes no Sprint or work-unit state.
 
@@ -111,13 +114,13 @@ A typed handoff is a command that passes work to another seat: a relay `send`,
 handoffs and add only what differs.
 
 1. Finish the work, the bookkeeping, and every body file first.
-2. Re-run `sc sprint inbox --sprint <id>` once; handle and `accept` new items.
-3. Keep each body, result, verdict, and report file near 6,000 characters. The
+2. Keep each body, result, verdict, and report file near 6,000 characters. The
    engine refuses anything over 8,000 and writes nothing, so check with
    `wc -m < <path>`.
-4. Run the command. It is complete only when it exits successfully and
+3. Run the command. It is complete only when it exits successfully and
    confirms the durable write and the wake.
-5. Do not run the inbox again. A handoff a role skill marks **final** ends the
+4. Do not run the inbox before or after it. A handoff a role skill marks
+   **final** ends the
    turn: it is the literal last action, with no trailing Git, Sprint, inbox,
    cleanup, or status command after it. Stop and wait for the next wake.
 
@@ -145,7 +148,8 @@ decisions in the relay.
 Reviewers own judgments: verdicts, conformance, re-enter and abort decisions.
 The Planner owns plan structure — lanes, dependencies, waves, assignment,
 routes, pause, resume, dispatch — and executes Reviewer decisions without
-re-adjudicating them. A Developer owns one lane and its PR. The FnB may
+re-adjudicating them. A Developer owns one lane and its PR. Any participant
+may pause the Sprint for integrity; the role skills say when. The FnB may
 override any of it from the GUI Sprints tab; name that authority in the
 durable evidence when acting under it. A command that rejects a transition
 returns the durable state to the deciding role; substitute nothing.

@@ -43,9 +43,15 @@ Reviewers never receive PR-event wakes.
 You own review, re-enter, abort, and conclude judgments. The Planner
 independently owns operational plan structure: safe-edit pauses, recalling
 unreleased work, lane changes/repeats, assignment/routing, unreleased-scope
-cancellation, and validated resume. Never run standalone pause, replan,
-recall, reroute, cancel, resume, complete, or abort actions; clean
+cancellation, and validated resume. Never run standalone replan, recall,
+reroute, cancel, resume, complete, or abort actions; clean
 `record-conformance` alone performs its narrow atomic close.
+
+Pause the Sprint yourself only for an integrity problem that makes continuing
+unsafe. First send the Planner the evidence, impact, and recommendation (the
+relay is off once paused), then run
+`sc sprint pause --sprint <id> --reason <what is unsafe>`; the pause notifies
+the Planner, who reconciles and resumes.
 
 Base judgment on durable Sprint state, bound revisions, current work/PR facts,
 progress-carrier evidence, and ratified judgments. A decision body names:
@@ -125,10 +131,10 @@ unrecorded verdict cannot unlock merge.
 ## Delivery-terminal closeout
 
 Retain the exact notification message id + delivered wake as this closeout
-episode's identity. Proceed only when the notification names this shell as the
-selected conformance owner for its current ownership generation. A different
-Reviewer accepts the informational notification if received and records no
-conformance. Inspect inbox, lifecycle, and units first:
+episode's identity. The engine sends this notification only to the selected
+conformance owner for the current ownership generation, and its body names no
+owner: receiving it means you are that owner. Inspect inbox, lifecycle, and
+units first:
 
 - Already completed/aborted -> `accept` notification and stop.
 - Any non-terminal unit visible -> the wake is stale: `accept`, stop, and
