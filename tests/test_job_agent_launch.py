@@ -383,7 +383,154 @@ class OrphanStopTest(DelegationCase, unittest.TestCase):
         self.assertIn(
             f"harness process {other.pid} is still running and was not stopped",
             json.loads(final["terminal_json"])["spawn_error"])
-        self.assertIn(") lost; exit=unknown;", self.wake(final))
+        wake = self.wake(final)
+        self.assertIn(") lost; exit=unknown;", wake)
+        # The wake says it too, on a line of its own, before the worktree line.
+        lines = wake.splitlines()
+        self.assertEqual(
+            lines[1],
+            f"Still running: harness process {other.pid} is still running and was not "
+            "stopped: it could not be tied to this run's worktree.")
+        self.assertTrue(lines[2].startswith("Worktree "))
+
+    def test_a_lost_run_whose_harness_was_stopped_has_no_such_line(self):
+        row = job._api("POST", "/_sc/runs", {
+            "registration_key": "nothing-left", "kind": "agent", "argv": ["x"],
+            "commit": self.base,
+            "agent": {"harness": "codex", "requested_model": "m", "brief_bytes": 1}})
+        job._api("POST", f"/_sc/runs/{row['run_id']}/running", {
+            "supervisor_pid": 1, "supervisor_start_ticks": 1, "boot_id": runs.boot_id()})
+        self.store.reconcile()
+        final = job._api("GET", f"/_sc/runs/{row['run_id']}")
+        self.assertEqual(final["state"], "lost")
+        self.assertNotIn("Still running", self.wake(final))
+
+    def test_the_worktree_for_the_check_is_the_ledgers_never_meta_json(self):
+        # The run's owner writes meta.json. It names a stranger as the harness
+        # and, as `cwd`, the directory that stranger really runs in: another
+        # engine-shaped worktree path. The ledger's cwd is this run's own.
+        row = job._api("POST", "/_sc/runs", {
+            "registration_key": "meta-names-a-cwd", "kind": "agent", "argv": ["x"],
+            "commit": self.base,
+            "agent": {"harness": "codex", "requested_model": "m", "brief_bytes": 1}})
+        elsewhere = Path(row["cwd"]).with_name(f"agent-{row['run_id'] + 500}")
+        elsewhere.mkdir(parents=True)
+        other = self.bystander(cwd=elsewhere)
+        ticks = int(Path(f"/proc/{other.pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        run_dir = Path(row["evidence_path"]).parent
+        run_dir.mkdir(parents=True)
+        (run_dir / "meta.json").write_text(json.dumps({
+            "run_id": row["run_id"], "pid": other.pid, "start_ticks": ticks,
+            "supervisor_pid": 1, "supervisor_start_ticks": 1, "boot_id": runs.boot_id(),
+            "started_at": "2026-11-12T10:00:00+00:00", "cwd": str(elsewhere),
+            "kind": "job", "owner_shell_id": 99}))
+        # Were meta.json believed, the stranger would be this run's harness.
+        self.assertTrue(self.store._tied_to_run(
+            {"pid": other.pid, "cwd": str(elsewhere)}))
+        self.store.reconcile()
+        final = job._api("GET", f"/_sc/runs/{row['run_id']}")
+        self.assertEqual((final["state"], final["cwd"]), ("lost", row["cwd"]))
+        self.assertTrue(self.alive(other.pid))
+        self.assertIn("was not stopped", json.loads(final["terminal_json"])["spawn_error"])
+
+    def test_a_process_in_the_worktree_that_leads_no_group_is_not_signalled(self):
+        # In the run's own worktree, in a session that is not the server's, but
+        # a member of another process's group: signalling "its" group would
+        # signal something that is not it.
+        row = job._api("POST", "/_sc/runs", {
+            "registration_key": "not-a-leader", "kind": "agent", "argv": ["x"],
+            "commit": self.base,
+            "agent": {"harness": "codex", "requested_model": "m", "brief_bytes": 1}})
+        Path(row["cwd"]).mkdir(parents=True)
+        leader = subprocess.Popen(
+            ["sh", "-c", "sleep 300 & echo $!; wait"], cwd=row["cwd"],
+            stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(leader.wait)
+        self.addCleanup(subprocess.run, ["pkill", "-KILL", "-s", str(leader.pid)], check=False)
+        member = int(leader.stdout.readline())
+        fields = Path(f"/proc/{member}/stat").read_text().rsplit(")", 1)[1].split()
+        self.assertEqual(int(fields[2]), leader.pid)   # its group is the leader's
+        self.assertNotEqual(leader.pid, os.getpgrp())
+        self.assertEqual(os.readlink(f"/proc/{member}/cwd"), os.path.realpath(row["cwd"]))
+        job._api("POST", f"/_sc/runs/{row['run_id']}/running", {
+            "pid": member, "start_ticks": int(fields[19]), "supervisor_pid": 1,
+            "supervisor_start_ticks": 1, "boot_id": runs.boot_id()})
+        stored = dict(self.con.execute(
+            "SELECT * FROM runs WHERE run_id=?", (row["run_id"],)).fetchone())
+        self.assertFalse(self.store._tied_to_run(stored))
+        # The leader of that group, in the same directory, is tied to the run.
+        self.assertTrue(self.store._tied_to_run({**stored, "pid": leader.pid}))
+        self.store.reconcile()
+        final = job._api("GET", f"/_sc/runs/{row['run_id']}")
+        self.assertEqual(final["state"], "lost")
+        self.assertTrue(self.alive(member))
+        self.assertTrue(self.alive(leader.pid))
+        self.assertIn("was not stopped", json.loads(final["terminal_json"])["spawn_error"])
+
+    def test_the_worktree_match_is_exact(self):
+        # Run N works in agent-N. A group leader in agent-N2, a sibling whose
+        # name merely begins the same, is not this run's harness; one in a
+        # directory beneath agent-N is.
+        row = job._api("POST", "/_sc/runs", {
+            "registration_key": "exact-path", "kind": "agent", "argv": ["x"],
+            "commit": self.base,
+            "agent": {"harness": "codex", "requested_model": "m", "brief_bytes": 1}})
+        worktree = Path(row["cwd"])
+        self.assertEqual(worktree.name, f"agent-{row['run_id']}")
+        sibling = worktree.with_name(f"{worktree.name}2")
+        beneath = worktree / "src" / "deep"
+        sibling.mkdir(parents=True)
+        beneath.mkdir(parents=True)
+        near, inside = self.bystander(cwd=sibling), self.bystander(cwd=beneath)
+        stored = dict(self.con.execute(
+            "SELECT * FROM runs WHERE run_id=?", (row["run_id"],)).fetchone())
+        self.assertFalse(self.store._tied_to_run({**stored, "pid": near.pid}))
+        self.assertTrue(self.store._tied_to_run({**stored, "pid": inside.pid}))
+        # The sibling path is itself engine-shaped: it is a worktree, only not this run's.
+        self.assertTrue(self.store._tied_to_run({"pid": near.pid, "cwd": str(sibling)}))
+        ticks = int(Path(f"/proc/{near.pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        job._api("POST", f"/_sc/runs/{row['run_id']}/running", {
+            "pid": near.pid, "start_ticks": ticks, "supervisor_pid": 1,
+            "supervisor_start_ticks": 1, "boot_id": runs.boot_id()})
+        self.store.reconcile()
+        self.assertEqual(job._api("GET", f"/_sc/runs/{row['run_id']}")["state"], "lost")
+        self.assertTrue(self.alive(near.pid))
+        self.assertTrue(self.alive(inside.pid))
+
+    def test_the_pid_guard_holds_when_every_other_check_would_pass(self):
+        # Pid 1 and the server are refused by pid, before /proc is read. Here
+        # /proc is made to say what a run's harness would say (leader of its
+        # own group, in the run's worktree), so only that guard can refuse.
+        row = job._api("POST", "/_sc/runs", {
+            "registration_key": "guard", "kind": "agent", "argv": ["x"], "commit": self.base,
+            "agent": {"harness": "codex", "requested_model": "m", "brief_bytes": 1}})
+        worktree = Path(row["cwd"])
+        worktree.mkdir(parents=True)
+        home = os.path.realpath(worktree)
+        read_text = Path.read_text
+
+        def stat(path, *args, **kwargs):
+            parts = path.parts
+            if len(parts) == 4 and parts[1] == "proc" and parts[3] == "stat":
+                return f"{parts[2]} (harness) S 1 {parts[2]} {parts[2]} 0 -1"
+            return read_text(path, *args, **kwargs)
+
+        server_pid, server_group = os.getpid(), os.getpgrp()
+        with unittest.mock.patch.object(runs.Path, "read_text", stat), \
+                unittest.mock.patch.object(runs.os, "readlink", lambda path: home):
+            # The stand-in /proc is believed for an ordinary pid.
+            self.assertTrue(self.store._tied_to_run({"pid": 4242, "cwd": str(worktree)}))
+            for pid in (1, 0, -1, server_pid, server_group):
+                with self.subTest(pid=pid):
+                    self.assertFalse(
+                        self.store._tied_to_run({"pid": pid, "cwd": str(worktree)}))
+            with unittest.mock.patch.object(runs.os, "getpgrp", lambda: 4242):
+                # The server's own pid, when it is not the leader of its group.
+                self.assertFalse(
+                    self.store._tied_to_run({"pid": server_pid, "cwd": str(worktree)}))
+                # A process that leads the server's own group is refused as well.
+                self.assertFalse(
+                    self.store._tied_to_run({"pid": 4242, "cwd": str(worktree)}))
 
     def test_pid_one_and_the_server_itself_are_never_the_answer(self):
         row = self.orphan("names-the-server", os.getpid())

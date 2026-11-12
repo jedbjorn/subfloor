@@ -221,11 +221,20 @@ def agent_wake_body(row: dict, payload: dict) -> str:
     if dirty is None and removed:
         dirty = False
     size = agent.get("result_bytes")
+    # The engine's own note on how the run ended: why it never started, or,
+    # for a lost run, that its harness process was left running.
+    note = payload.get("spawn_error")
+    noted = (
+        f"{'Still running' if payload['state'] == 'lost' else 'Reason'}: "
+        f"{str(note).rstrip('.')}.\n"
+        if note else ""
+    )
     return (
         f"Run {rid} (agent: {row['label']}) {payload['state']}; "
         f"exit={payload.get('exit_code', 'unknown')}; {agent.get('harness', '?')} · "
         f"{agent.get('requested_model', '?')} · {agent.get('effective_effort') or 'default'}; "
         f"ran {ran} of {_span(row.get('timeout_seconds'))}.\n"
+        f"{noted}"
         f"Worktree {where}; "
         f"{agent.get('branch') or 'detached at ' + (base[:12] or 'unknown')}; "
         f"HEAD {head[:12] if head else 'unknown'}; uncommitted changes: "
@@ -1154,8 +1163,15 @@ class RunStore:
             self.terminal(row["run_id"], row["owner_shell_id"], terminal_payload(meta))
             return
         if meta.get("supervisor_pid"):
-            self.running(row["run_id"], row["owner_shell_id"], meta)
-            row.update(meta)
+            # The check-in is refused when it conflicts with what the ledger
+            # holds. What follows reads the ledger row it returns, never
+            # `meta.json`: that file is written by the run's owner, and the
+            # orphan stop below ties a process to the run by the ledger's
+            # `cwd`, the worktree the engine assigned.
+            ledger = self.running(row["run_id"], row["owner_shell_id"], meta)
+            for key in ("pid", "start_ticks", "supervisor_pid",
+                        "supervisor_start_ticks", "boot_id", "started_at"):
+                row[key] = ledger[key]
         alive = process_alive(
             row.get("supervisor_pid"),
             row.get("supervisor_start_ticks"),
