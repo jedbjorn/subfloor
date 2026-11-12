@@ -3190,55 +3190,79 @@ async function renderWorktrees(root, opts = {}) {
 // Each renderer is assigned onto its DRAWER_SECTIONS entry, so the section
 // order and labels stay with the drawer and only the bodies live here.
 
-// Tokens: one read of the stored session cards, never a sweep. The drawer is
-// a quick look; the sweep that ingests new harness logs belongs to the full
-// Analytics view, which the link opens. "Today" is the local day, as in the
-// Analytics chart; the 7-day figure is the server's rolling window.
-const DRAWER_TOKEN_DAYS = 7;
-function drawerTokenSummary(sessions, now = new Date()) {
-  const today = now.toDateString();
-  const total = { today: 0, week: 0 };
-  const byHarness = new Map();
-  for (const card of sessions || []) {
-    const tokens = cardTotal(card);
-    const isToday = Boolean(card.started_at)
-      && new Date(card.started_at).toDateString() === today;
-    const name = card.harness || "unknown";
-    const row = byHarness.get(name) || { harness: name, today: 0, week: 0 };
-    row.week += tokens;
-    total.week += tokens;
-    if (isToday) { row.today += tokens; total.today += tokens; }
-    byHarness.set(name, row);
+// Tokens: how close each provider is to its WEEKLY limit, as percent used.
+// One GET of the same route the Analytics → Provider Quota view reads. The
+// server answers from the stored reading, first re-probing the providers
+// itself when its last attempt is older than its 60s TTL — so opening the
+// drawer can cost one probe a minute at most. The drawer never calls the
+// forced route; that control lives in the full view, which the link opens.
+//
+// below 75 normal · 75+ amber · 90+ red. These are the drawer's own, earlier
+// than the full view's 80/95 (anQuotaClass): this is the early-warning glance.
+// The colour is chosen from the figure as DISPLAYED (anPct rounds to one
+// decimal), so a row reading "75%" is amber and one reading "74.9%" is not.
+// NULL has no class: an absent number is not a low one.
+const drawerQuotaClass = (pct) => {
+  if (pct == null) return "";
+  const shown = Math.round(pct * 10) / 10;
+  return shown >= 90 ? " red" : shown >= 75 ? " amber" : "";
+};
+const DRAWER_WEEKLY_KINDS = ["weekly", "weekly_scoped"];
+// One row per weekly window, and every provider gets at least one row: a
+// provider with no weekly window reads "n/a", never 0% and never a missing
+// line. Percent is always percent USED — Kimi included — so the column means
+// one thing and the thresholds apply to it directly.
+function drawerWeeklyRows(providers) {
+  const rows = [];
+  for (const prov of providers || []) {
+    const name = AN_PROVIDER_LABEL[prov.provider] || prov.provider;
+    const weekly = (prov.windows || [])
+      .filter((w) => DRAWER_WEEKLY_KINDS.includes(w.window_kind))
+      .sort((a, b) => anWindowRank(a) - anWindowRank(b));
+    if (!weekly.length) { rows.push({ name, pct: null, resets_at: null }); continue; }
+    for (const w of weekly) {
+      const scope = w.scope || (w.window_kind === "weekly_scoped" ? "scoped" : "");
+      rows.push({
+        name: name + (scope ? " · " + scope : ""),
+        pct: w.used_percent ?? null, resets_at: w.resets_at || null,
+      });
+    }
   }
-  const harnesses = [...byHarness.values()].sort(
-    (a, b) => b.week - a.week || a.harness.localeCompare(b.harness));
-  return { total, harnesses };
+  return rows;
 }
 
 function renderDrawerTokens(mount, { close }) {
   const link = el("a", {
-    className: "drawer-link", href: "#analytics", textContent: "Open full analytics →",
+    className: "drawer-link", href: "#analytics-quota", textContent: "Open full analytics →",
   });
   link.onclick = () => close();  // the href navigates; the drawer just gets out of the way
   const body = el("div", { className: "drawer-note" }, "Loading…");
   mount.replaceChildren(body, link);
   let closed = false;
-  api("/analytics/sessions?days=" + DRAWER_TOKEN_DAYS).then((data) => {
+  api("/analytics/quota").then((data) => {
     if (closed) return;
-    const { total, harnesses } = drawerTokenSummary(data.sessions);
-    const table = el("div", { className: "drawer-tokens" });
-    const row = (label, today, week, cls = "") => table.append(
-      el("span", { className: "drawer-tok-name " + cls }, label),
-      el("span", { className: "drawer-tok-num " + cls }, today),
-      el("span", { className: "drawer-tok-num " + cls }, week));
-    row("", "Today", `${DRAWER_TOKEN_DAYS} days`, "drawer-tok-head");
-    row("Total", fmtTok(total.today), fmtTok(total.week), "drawer-tok-total");
-    for (const h of harnesses) row(h.harness, fmtTok(h.today), fmtTok(h.week));
+    // The server lists every provider it knows, read or not, so there is no
+    // empty state: a provider never read is a row reading "n/a".
+    const providers = data.providers || [];
+    const table = el("div", { className: "drawer-quota" });
+    table.append(
+      el("span", { className: "drawer-quota-head" }, "Weekly limit"),
+      el("span", { className: "drawer-quota-head" }, "Resets"),
+      el("span", { className: "drawer-quota-head drawer-quota-pct" }, "Used"));
+    for (const r of drawerWeeklyRows(providers)) {
+      const reset = el("span", { className: "drawer-quota-reset" }, anCountdown(r.resets_at));
+      if (r.resets_at) reset.title = "resets " + r.resets_at;
+      table.append(
+        el("span", { className: "drawer-quota-name" }, r.name), reset,
+        el("span", { className: "drawer-quota-pct" + drawerQuotaClass(r.pct) }, anPct(r.pct)));
+    }
     const shown = [table];
-    if (!harnesses.length) shown.push(el("div", { className: "drawer-note" },
-      `No recorded sessions in the last ${DRAWER_TOKEN_DAYS} days.`));
+    // The age of the OLDEST reading shown: a stale figure is never passed off
+    // as fresh, and one line cannot overstate any provider's freshness.
+    const oldest = providers.map((p) => p.captured_at).filter(Boolean).sort()[0];
+    if (oldest) shown.push(el("div", { className: "drawer-note" }, "as of " + anAge(oldest)));
     mount.replaceChildren(...shown, link);
-  }, (error) => { if (!closed) body.textContent = "token summary error: " + error.message; });
+  }, (error) => { if (!closed) body.textContent = "quota error: " + error.message; });
   return () => { closed = true; };
 }
 
@@ -9006,16 +9030,12 @@ function setDocumentTitle(tab) {
 }
 function show(tab) {
   activeTab = tab;
-  // A view in the More group marks its trigger too, so the header always
-  // shows where you are while the menu is closed.
-  let inMore = false;
   for (const b of document.querySelectorAll("nav button")) {
     const on = b.dataset.tab === tab;
     b.classList.toggle("active", on);
-    if (on && b.closest(".nav-more")) inMore = true;
+    // Where the nav scrolls sideways (narrower windows), keep the active tab in view.
+    if (on) b.scrollIntoView?.({ block: "nearest", inline: "nearest" });
   }
-  for (const b of document.querySelectorAll(".nav-more-btn")) b.classList.toggle("active", inMore);
-  setNavMore(false);
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "interface") {
@@ -9029,12 +9049,6 @@ function show(tab) {
   if (tab !== "sprints") sprintStopPolling();
   setDocumentTitle(tab);
   load(tab);
-}
-// The More group: a popover of the secondary views. It is a .gmenu, so the
-// outside-click handler at boot closes it; this keeps aria-expanded honest.
-function setNavMore(open) {
-  for (const menu of document.querySelectorAll(".nav-more-menu")) menu.hidden = !open;
-  for (const b of document.querySelectorAll(".nav-more-btn")) b.setAttribute("aria-expanded", String(open));
 }
 // Hash routing: the active tab lives in the URL (#roadmap), so a refresh stays
 // put (and re-fetches that tab) instead of snapping back to Shells. Tabs set the
@@ -9112,7 +9126,6 @@ window.addEventListener("online", () => wakeSessionWatch());
 document.addEventListener("mousedown", (e) => {
   for (const m of document.querySelectorAll(".gmenu:not([hidden])"))
     if (!m.parentElement.contains(e.target)) m.hidden = true;
-  if ($("#nav-more-menu").hidden) $("#nav-more").setAttribute("aria-expanded", "false");
 });
 // Esc dismisses the topmost modal.
 document.addEventListener("keydown", (e) => {
@@ -9131,15 +9144,21 @@ $("#snapshot").onclick = async () => {
   }
   catch (e) { toast("error: " + e.message); }
 };
-// Header chrome (spec #270): the More trigger and the settings drawer button.
-// The More trigger has no data-tab, so the nav-wide handler above is replaced.
-$("#nav-more").onclick = () => setNavMore($("#nav-more-menu").hidden);
-$("#nav-more-menu").addEventListener("keydown", (e) => {
-  if (e.key !== "Escape") return;
-  e.stopPropagation();
-  setNavMore(false);
-  $("#nav-more").focus();
-});
+// In a window too narrow for all ten tabs the nav scrolls sideways with no
+// scrollbar; a plain mouse wheel has no sideways axis, so turn it into one
+// there. Everything else is left to the browser: ctrl+wheel and trackpad pinch
+// (zoom), a gesture that is already sideways, a nav that fits, and a nav
+// already at the end the wheel is heading for — so the page still scrolls.
+function navWheel(e) {
+  const nav = e.currentTarget;
+  const room = nav.scrollWidth - nav.clientWidth;
+  if (e.ctrlKey || room <= 0 || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+  if (e.deltaY < 0 ? nav.scrollLeft <= 0 : nav.scrollLeft >= room - 1) return;
+  nav.scrollLeft += e.deltaY;
+  e.preventDefault();
+}
+document.querySelector("nav").addEventListener("wheel", navWheel, { passive: false });
+// Header chrome (spec #270): the settings drawer button.
 $("#drawer-open").onclick = openSettingsDrawer;
 (async () => {
   try {
