@@ -61,7 +61,7 @@ submit execution outcomes. Cancellation verifies boot id, pid and start ticks.
 
 | Route | Contract |
 | --- | --- |
-| `POST /_sc/runs` | `{registration_key,kind,label,argv,cwd,commit,foreground?}`; returns registered run with engine-allocated evidence path; retries require identical input |
+| `POST /_sc/runs` | `{registration_key,kind,label,argv,cwd,commit,foreground?,timeout_seconds?}`; returns registered run with engine-allocated evidence path; retries require identical input. An `agent` run adds an `agent` object and omits `cwd` (see Subagent ledger) |
 | `GET /_sc/runs` | Owner's runs, newest first |
 | `GET /_sc/runs/<id>` | Owner's authoritative state and wake receipt |
 | `POST /_sc/runs/<id>/running` | Supervisor/child pid, start ticks, boot id, started timestamp |
@@ -69,13 +69,56 @@ submit execution outcomes. Cancellation verifies boot id, pid and start ticks.
 | `GET /_sc/runs/<id>/tail` | Bounded log text; absent evidence is identified |
 | `POST /_sc/runs/<id>/receipt` | Owner-only immutable dev-kit receipt; duplicate identical submissions are idempotent |
 | `POST /_sc/runs/<id>/prune-evidence` | Record pruned completed receipt evidence; preserve the row and parsed receipt |
+| `POST /_sc/runs/<id>/facts` | Owner-only facts an agent run reports: `session_ref`, `provider_model`, `result_bytes`, `worktree_removed_at`; each is written once, an identical repeat is idempotent, a different value is refused |
+| `GET /_sc/runs/<id>/result` | An agent run's final message, at most 256 KiB, with `truncated` and its recorded facts |
 | `POST /_sc/runs/<id>/kill` | Owner cancellation request; supervisor retains authoritative exit |
-| `GET /api/runs[/<id>[/tail]]` | Operator projection |
+| `GET /api/runs[/<id>[/tail\|/result]]` | Operator projection |
 | `POST /api/runs/<id>/kill` | Operator cancellation, guarded browser origin |
 
-`kind` registration accepts `job`, `devkit`, and `probe`. Native process
+`kind` registration accepts `job`, `devkit`, `probe`, and `agent`. Native process
 observations are reserved for the process-tree lane. Attachment columns remain reserved for their downstream lane. The snapshot includes runs
 and delivery evidence after their message/conversation parents.
+
+## Subagent ledger
+
+Feature #96 (spec #273) adds the ledger half of `sc job` subagents. The
+`sc job agent` verb, its supervisor path, the wake body and the GUI rows are
+not shipped yet; until they are, nothing registers an `agent` run.
+
+Every run may record `timeout_seconds`, its time limit, fixed at registration;
+`sc job start` sends its `--timeout`. Rows registered before this column
+exist carry none.
+
+An `agent` run is one headless harness run. Its registration carries
+`commit` (the base commit, a full object id) and an `agent` object:
+`harness`, `requested_model`, `requested_effort`, `effective_effort`, `branch`,
+`adapter_version`, `brief_bytes`, `launched_from_run`. The engine assigns its
+`cwd`, the worktree `.sc-worktrees/agent-<run_id>`. The facts live in
+`run_agents`, keyed by `run_id`, and appear as `agent` on the run row in
+`GET /_sc/runs`, `GET /_sc/runs/<id>` and the operator routes; a run of any
+other kind has no `agent` key. The result route reads `result.md` beside the
+run's log.
+
+Registration holds the limits, inside its write transaction:
+
+| Limit | Value | Refusal |
+| --- | --- | --- |
+| Live subagents for one shell | 3 | 429, naming the count and the runs holding the slots |
+| Live subagents on the install | 6 | 429, naming each run and its shell |
+| Run time | default 7,200 s; at most 28,800 s | 400 |
+| Brief size | 64 KiB | 400 |
+| Nesting | depth 1 | 403: a registration carrying `launched_from_run` (the `SC_JOB_AGENT_RUN` of a subagent's environment) is refused. It prevents delegated work whose owner can no longer be traced. A command job or probe from the same environment registers and belongs to the launching shell |
+| Reviewer of an armed or paused Sprint | may not launch | 403. It prevents a review verdict that rests on a reader nobody assigned. Developers and the Planner of that Sprint register, as does a Reviewer outside one |
+
+A live run is one in state `registered` or `running`; a finished, stopped or
+lost run frees its slot.
+
+A subagent runs in its own worktree so that it is not counted as its launching
+shell's live session and does not read that shell's boot file. Shell shortnames
+beginning `agent-` are refused at creation. Its environment is the launching
+shell's, with `SC_SEAT` cleared and `SC_JOB_AGENT_RUN` set: it acts under the
+launching shell's identity with exactly that shell's authority, and the engine
+adds no refusal for what it writes.
 
 ## Dev-kit receipts
 

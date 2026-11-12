@@ -4406,7 +4406,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, out)
 
     def _runs_request(self, path: str, *, post: bool = False):
-        from runs import RunStore
+        from runs import RunLimitError, RunStore
 
         operator = path.startswith('/api/')
         con = db()
@@ -4467,6 +4467,8 @@ class Handler(BaseHTTPRequestHandler):
                     handle.seek(max(0, log.stat().st_size - 65536))
                     text = handle.read(65536).decode(errors='replace')
                 return self._send(200, {'text': text, 'evidence_pruned': False})
+            if action == 'result' and not post:
+                return self._send(200, store.result(rid, sid))
             if action == 'kill' and post:
                 return self._send(200, store.kill(rid, sid))
             if operator:
@@ -4477,9 +4479,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, store.terminal(rid, sid, self._body()))
             if post and action == 'receipt':
                 return self._send(200, store.receipt(rid, sid, self._body()))
+            if post and action == 'facts':
+                return self._send(200, store.facts(rid, sid, self._body()))
             if post and action == 'prune-evidence':
                 return self._send(200, store.prune_evidence(rid, sid))
             return self._send(404, {'error': 'unknown run action'})
+        except RunLimitError as exc:
+            return self._send(429, {'error': str(exc)})
         except PermissionError as exc:
             return self._send(403, {'error': str(exc)})
         except KeyError as exc:

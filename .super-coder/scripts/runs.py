@@ -16,6 +16,40 @@ import db_driver
 TERMINAL = frozenset({"done", "failed", "timeout", "killed", "lost"})
 ENGINE = Path(__file__).resolve().parents[1]
 PROBE_EXCERPT = 160
+# Subagent limits (spec #273 "Limits"). Each is held at registration, inside
+# the write transaction, so parallel launches cannot share one slot.
+AGENT_LIVE_PER_SHELL = 3
+AGENT_LIVE_PER_INSTALL = 6
+AGENT_DEFAULT_TIMEOUT = 7200
+AGENT_MAX_TIMEOUT = 28800
+AGENT_BRIEF_MAX = 65536
+AGENT_RESULT_MAX = 262144
+AGENT_WORKTREE_PREFIX = "agent-"
+# Decision #428: each refusal names the confusion it prevents, first.
+NESTING_CONFUSION = "delegated work whose owner can no longer be traced"
+REVIEWER_CONFUSION = "a review verdict that rests on a reader nobody assigned"
+_AGENT_REQUEST = frozenset({
+    "harness", "requested_model", "requested_effort", "effective_effort",
+    "branch", "adapter_version", "brief_bytes", "launched_from_run",
+})
+_AGENT_FACTS = ("session_ref", "provider_model", "result_bytes", "worktree_removed_at")
+
+
+class RunLimitError(ValueError):
+    """A registration refused because a concurrency limit is full."""
+
+
+def _text(value: object, name: str, *, limit: int = 512, required: bool = True) -> str | None:
+    if value is None and not required:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > limit
+        or any(ord(c) < 32 for c in value)
+    ):
+        raise ValueError(f"{name} must be display text (maximum {limit} characters)")
+    return value
 
 
 def validate_probe_attempt(attempt: object) -> dict:
@@ -101,6 +135,7 @@ class RunStore:
         self.con = con
         con.row_factory = sqlite3.Row
         self.root = engine / "run" / "runs"
+        self.worktrees = engine.parent / ".sc-worktrees"
 
     def get(self, run_id: int, owner: int | None = None) -> dict:
         row = self.con.execute(
@@ -112,6 +147,8 @@ class RunStore:
             raise PermissionError("run belongs to another shell")
         out = dict(row)
         out["argv"] = json.loads(out["argv"])
+        if out["kind"] == "agent":
+            out["agent"] = self._agent(run_id)
         if out["receipt_json"]:
             out["receipt_json"] = json.loads(out["receipt_json"])
         if out["message_id"] is not None:
@@ -146,6 +183,103 @@ class RunStore:
             (owner, owner, kind, kind, state, state),
         ).fetchone()[0]
 
+    def _agent(self, run_id: int) -> dict | None:
+        row = self.con.execute(
+            "SELECT * FROM run_agents WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        out.pop("run_id")
+        if out["usage_json"]:
+            out["usage_json"] = json.loads(out["usage_json"])
+        return out
+
+    def _agent_request(self, data: dict) -> dict:
+        """Validate what a subagent launch asks for; no state is read."""
+        agent = data.get("agent")
+        if not isinstance(agent, dict):
+            raise ValueError("an agent run requires an agent object")
+        unknown = set(agent) - _AGENT_REQUEST
+        if unknown:
+            raise ValueError(f"unknown agent field: {sorted(unknown)[0]}")
+        launched_from = agent.get("launched_from_run")
+        if launched_from is not None:
+            raise PermissionError(
+                f"refused — {NESTING_CONFUSION}: this call comes from inside "
+                f"subagent run {str(launched_from)[:32]}, and a subagent cannot launch "
+                "or continue a subagent (nesting depth 1). Command jobs and "
+                "watchers remain available; they belong to the launching shell."
+            )
+        if data.get("cwd") is not None:
+            raise ValueError("an agent run's cwd is its engine-assigned worktree")
+        commit = data.get("commit")
+        if not isinstance(commit, str) or not (
+            len(commit) in (40, 64) and all(c in "0123456789abcdef" for c in commit)
+        ):
+            raise ValueError("an agent run requires its base commit as a full object id")
+        brief = agent.get("brief_bytes")
+        if type(brief) is not int or brief < 1:
+            raise ValueError("brief_bytes must be a positive integer")
+        if brief > AGENT_BRIEF_MAX:
+            raise ValueError(
+                f"brief is {brief} bytes; the limit is {AGENT_BRIEF_MAX} bytes (64 KiB)"
+            )
+        branch = _text(agent.get("branch"), "branch", limit=255, required=False)
+        if branch is not None and (branch.startswith("-") or " " in branch):
+            raise ValueError("branch must be a branch name")
+        return {
+            "harness": _text(agent.get("harness"), "harness", limit=64),
+            "requested_model": _text(agent.get("requested_model"), "requested_model"),
+            "requested_effort": _text(
+                agent.get("requested_effort"), "requested_effort", limit=64, required=False
+            ),
+            "effective_effort": _text(
+                agent.get("effective_effort"), "effective_effort", limit=64, required=False
+            ),
+            "branch": branch,
+            "adapter_version": _text(
+                agent.get("adapter_version"), "adapter_version", limit=128, required=False
+            ),
+            "base_commit": commit,
+        }
+
+    def _agent_admission(self, owner: int) -> None:
+        """Who may launch and how many may run; called inside the write transaction."""
+        reviewing = self.con.execute(
+            "SELECT s.sprint_id,s.lifecycle FROM sprint_participants p "
+            "JOIN sprints s USING(sprint_id) WHERE p.shell_id=? AND p.role='reviewer' "
+            "AND s.lifecycle IN ('armed','paused') ORDER BY s.sprint_id LIMIT 1",
+            (owner,),
+        ).fetchone()
+        if reviewing:
+            raise PermissionError(
+                f"refused — {REVIEWER_CONFUSION}: this shell is a Reviewer of "
+                f"Sprint {reviewing['sprint_id']} ({reviewing['lifecycle']}), and a Reviewer "
+                "does not delegate while its Sprint is armed or paused."
+            )
+        live = self.con.execute(
+            "SELECT r.run_id,r.owner_shell_id,s.shortname FROM runs r "
+            "LEFT JOIN shells s ON s.shell_id=r.owner_shell_id "
+            "WHERE r.kind='agent' AND r.state IN ('registered','running') ORDER BY r.run_id"
+        ).fetchall()
+        mine = [row["run_id"] for row in live if row["owner_shell_id"] == owner]
+        if len(mine) >= AGENT_LIVE_PER_SHELL:
+            raise RunLimitError(
+                f"live subagent limit for one shell reached: {len(mine)} of "
+                f"{AGENT_LIVE_PER_SHELL} live (runs {', '.join(map(str, mine))}). "
+                "Wait for one to finish or stop one with `sc job kill <id>`."
+            )
+        if len(live) >= AGENT_LIVE_PER_INSTALL:
+            holders = ", ".join(
+                f"{row['run_id']} ({row['shortname'] or row['owner_shell_id']})" for row in live
+            )
+            raise RunLimitError(
+                f"live subagent limit for this install reached: {len(live)} of "
+                f"{AGENT_LIVE_PER_INSTALL} live (runs {holders}). "
+                "Wait for one to finish."
+            )
+
     def register(self, owner: int, data: dict) -> dict:
         argv = data.get("argv")
         if (
@@ -155,19 +289,33 @@ class RunStore:
         ):
             raise ValueError("argv must be a nonempty array of strings")
         kind = data.get("kind", "job")
-        if kind not in {"job", "devkit", "probe"}:
+        if kind not in {"job", "devkit", "probe", "agent"}:
             raise ValueError("invalid run kind")
+        agent = self._agent_request(data) if kind == "agent" else None
+        if agent is None and data.get("agent") is not None:
+            raise ValueError("agent facts require an agent run")
+        timeout = data.get("timeout_seconds")
+        if timeout is None and agent is not None:
+            timeout = AGENT_DEFAULT_TIMEOUT
+        if timeout is not None and (type(timeout) is not int or timeout <= 0):
+            raise ValueError("timeout_seconds must be a positive integer")
+        if agent is not None and timeout > AGENT_MAX_TIMEOUT:
+            raise ValueError(
+                f"a subagent run is limited to {AGENT_MAX_TIMEOUT} seconds (8 hours); "
+                f"{timeout} was requested"
+            )
         foreground = data.get("foreground", False)
         if type(foreground) is not bool or (foreground and kind != "devkit"):
             raise ValueError("foreground must be a boolean and requires a devkit run")
         key, cwd, label = (
             data.get("registration_key"),
             data.get("cwd"),
-            data.get("label") or argv[0],
+            data.get("label")
+            or (f"{agent['harness']}:{agent['requested_model']}"[:256] if agent else argv[0]),
         )
         if not isinstance(key, str) or not 1 <= len(key) <= 128:
             raise ValueError("registration_key is required (maximum 128 characters)")
-        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+        if agent is None and (not isinstance(cwd, str) or not Path(cwd).is_absolute()):
             raise ValueError("cwd must be absolute")
         if (
             not isinstance(label, str)
@@ -175,7 +323,10 @@ class RunStore:
             or any(ord(c) < 32 for c in label)
         ):
             raise ValueError("label must be display text (maximum 256 characters)")
-        identity = (kind, label, json.dumps(argv), cwd, data.get("commit"), int(foreground))
+        identity = (
+            kind, label, json.dumps(argv), cwd, data.get("commit"), int(foreground), timeout,
+        )
+        columns = ("kind", "label", "argv", "cwd", "commit", "foreground", "timeout_seconds")
         legacy = self.root.parent / "jobs"
         legacy_floor = (
             max(
@@ -195,26 +346,100 @@ class RunStore:
                 (owner, key),
             ).fetchone()
             if existing:
-                if (
-                    tuple(
-                        existing[k] for k in ("kind", "label", "argv", "cwd", "commit", "foreground")
-                    )
-                    != identity
-                ):
+                # An agent's cwd is assigned below, so it is not part of the request.
+                compared = [k for k in columns if agent is None or k != "cwd"]
+                same = all(existing[k] == identity[columns.index(k)] for k in compared)
+                if same and agent is not None:
+                    stored = self._agent(existing["run_id"]) or {}
+                    same = all(stored.get(k) == v for k, v in agent.items())
+                if not same:
                     raise ValueError("registration key reused with different input")
                 return self.get(existing["run_id"], owner)
+            if agent is not None:
+                self._agent_admission(owner)
             # Allocate above both the ledger high-water mark and legacy names,
             # so `status 1` never changes meaning after an upgrade.
             sequence = self.con.execute(
                 "SELECT seq FROM sqlite_sequence WHERE name='runs'"
             ).fetchone()
             rid = max(int(sequence[0]) if sequence else 0, legacy_floor) + 1
+            if agent is not None:
+                # The worktree name carries the run id, so it is assigned here.
+                cwd = str(self.worktrees / f"{AGENT_WORKTREE_PREFIX}{rid}")
+                identity = (*identity[:3], cwd, *identity[4:])
             self.con.execute(
                 'INSERT INTO runs(run_id,owner_shell_id,registration_key,kind,label,argv,cwd,"commit",'
-                "foreground,evidence_path) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "foreground,timeout_seconds,evidence_path) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (rid, owner, key, *identity, str(self.root / str(rid) / "log")),
             )
+            if agent is not None:
+                self.con.execute(
+                    "INSERT INTO run_agents(run_id,harness,requested_model,requested_effort,"
+                    "effective_effort,worktree,base_commit,branch,adapter_version) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        rid, agent["harness"], agent["requested_model"],
+                        agent["requested_effort"], agent["effective_effort"], cwd,
+                        agent["base_commit"], agent["branch"], agent["adapter_version"],
+                    ),
+                )
         return self.get(rid, owner)
+
+    def facts(self, run_id: int, owner: int, data: dict) -> dict:
+        """Record what a subagent run reported; each fact is written once."""
+        row = self.get(run_id, owner)
+        if row["kind"] != "agent":
+            raise ValueError("facts require an agent run")
+        if not isinstance(data, dict) or not data or set(data) - set(_AGENT_FACTS):
+            raise ValueError(f"facts accept only: {', '.join(_AGENT_FACTS)}")
+        for key in ("session_ref", "provider_model"):
+            if key in data:
+                _text(data[key], key)
+        if "result_bytes" in data and (
+            type(data["result_bytes"]) is not int or data["result_bytes"] < 0
+        ):
+            raise ValueError("result_bytes must be a non-negative integer")
+        if "worktree_removed_at" in data:
+            try:
+                datetime.fromisoformat(data["worktree_removed_at"].replace("Z", "+00:00"))
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError("worktree_removed_at must be a timestamp") from exc
+        with db_driver.write_transaction(self.con, "runs.facts"):
+            stored = self._agent(run_id)
+            if stored is None:
+                raise ValueError("agent run has no facts row")
+            for key, value in data.items():
+                if stored[key] is not None and stored[key] != value:
+                    raise ValueError(f"conflicting agent fact: {key}")
+            self.con.execute(
+                "UPDATE run_agents SET "
+                + ",".join(f"{key}=?" for key in data)
+                + " WHERE run_id=?",
+                (*data.values(), run_id),
+            )
+        return self.get(run_id, owner)
+
+    def result(self, run_id: int, owner: int | None) -> dict:
+        """A subagent's final message, bounded, with its recorded facts."""
+        row = self.get(run_id, owner)
+        if row["kind"] != "agent":
+            raise ValueError("only an agent run has a result")
+        path = Path(row["evidence_path"]).with_name("result.md")
+        out = {
+            "run_id": run_id, "state": row["state"], "exit_code": row["exit_code"],
+            "available": False, "text": "", "truncated": False,
+            "result_bytes": (row["agent"] or {}).get("result_bytes"),
+            "agent": row["agent"],
+        }
+        # Only the registered engine path is read, never caller input.
+        if path.is_file():
+            size = path.stat().st_size
+            with path.open("rb") as handle:
+                text = handle.read(AGENT_RESULT_MAX).decode(errors="replace")
+            out.update(available=True, text=text, truncated=size > AGENT_RESULT_MAX)
+            if out["result_bytes"] is None:
+                out["result_bytes"] = size
+        return out
 
     def running(self, run_id: int, owner: int, data: dict) -> dict:
         existing = self.get(run_id, owner)
