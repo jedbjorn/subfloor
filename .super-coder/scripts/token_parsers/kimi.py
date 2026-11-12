@@ -7,8 +7,14 @@ session): `state.json` carries createdAt/updatedAt, workDir
 to the four token classes (inputOther IS fresh input — no arithmetic).
 Sessions can run multiple agents (swarm mode) — usage sums across every
 agents/*/wire.jsonl, grouped per model (`usage.record.model`, the
-"kimi-code/k3" alias form). Provider comes from `llm.request` events, which
-report provider="kimi" natively — the same value run.py pins at boot.
+"kimi-code/k3" alias form). Provider is pinned to "kimi" — the same value run.py pins at boot.
+
+State format drift (Kimi Code 2.x, `"version": 2`): `workDir` became `cwd`
+and createdAt/updatedAt became epoch milliseconds; both shapes are read.
+`llm.request.provider` now names the wire protocol ("openai"), not the
+vendor, so the row provider is pinned to "kimi" (run.session_provider's
+boot value) instead of read from the wire. `usage.record` with
+usageScope="session" is a compaction call — real spend, summed like turns.
 
 Ref = the session directory; incrementality is the max mtime of state.json
 + wire files (a live session keeps its dir "changed" and re-sums — the
@@ -19,10 +25,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from . import in_repo, norm_iso, row
+from . import in_repo, iso_utc, norm_iso, row
 
 HARNESS = "kimi"
-PARSER_VERSION = "1"
+PARSER_VERSION = "2"
 DATA_DIR = Path.home() / ".kimi-code/sessions"
 
 USAGE_MAP = {  # wire.jsonl usage.record field → row key, 1:1
@@ -31,6 +37,13 @@ USAGE_MAP = {  # wire.jsonl usage.record field → row key, 1:1
     "inputCacheRead": "cache_read_tokens",
     "inputCacheCreation": "cache_write_tokens",
 }
+
+
+def _ts(value) -> "str | None":
+    """v1 ISO string or v2 epoch-milliseconds → ISO UTC."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return iso_utc(value / 1000)
+    return norm_iso(value)
 
 
 def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
@@ -54,11 +67,10 @@ def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
         except (json.JSONDecodeError, OSError) as e:
             log(f"kimi: unreadable {sess_dir.name}/state.json: {e} — skipped")
             continue
-        cwd = state.get("workDir")
+        cwd = state.get("workDir") or state.get("cwd")
         if not in_repo(cwd, repo_root):
             continue
         per_model: dict[str, dict] = {}
-        provider = None
         for wire in wires:
             try:
                 fh = open(wire, encoding="utf-8", errors="replace")
@@ -73,18 +85,16 @@ def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
                         continue
                     if not isinstance(rec, dict):
                         continue
-                    if rec.get("type") == "llm.request":
-                        provider = rec.get("provider") or provider
-                    elif rec.get("type") == "usage.record":
+                    if rec.get("type") == "usage.record":
                         usage = rec.get("usage") or {}
                         agg = per_model.setdefault(rec.get("model") or "unknown", {})
                         for src, dst in USAGE_MAP.items():
                             if usage.get(src) is not None:
                                 agg[dst] = agg.get(dst, 0) + usage[src]
         common = dict(harness=HARNESS, ref=str(sess_dir), parser_version=PARSER_VERSION,
-                      provider=provider or "kimi", title=state.get("title"),
-                      started_at=norm_iso(state.get("createdAt")),
-                      ended_at=norm_iso(state.get("updatedAt")), cwd=cwd)
+                      provider="kimi", title=state.get("title"),
+                      started_at=_ts(state.get("createdAt")),
+                      ended_at=_ts(state.get("updatedAt")), cwd=cwd)
         if not per_model:
             rows.append(row(model=None, status="no_usage", **common))
             continue

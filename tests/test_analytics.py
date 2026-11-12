@@ -309,6 +309,48 @@ class KimiParserTest(unittest.TestCase):
         self.assertEqual(r["provider"], "kimi")
         self.assertEqual(r["title"], "swarm run")
 
+    def test_v2_state_cwd_epoch_ms_and_wire_protocol_provider(self):
+        # Kimi Code 2.x state.json (version 2): workDir -> cwd, createdAt /
+        # updatedAt in epoch ms; llm.request.provider names the wire protocol
+        # ("openai"), so the row keeps the boot-pinned "kimi"; the
+        # session-scope compaction record is real spend and is summed.
+        tmp = Path(tempfile.mkdtemp())
+        repo = tmp / "r"
+        (repo / ".sc-worktrees/dev1").mkdir(parents=True)
+        sess = tmp / "sessions/wd_dev1_x/session_2"
+        (sess / "agents/main").mkdir(parents=True)
+        (sess / "state.json").write_text(json.dumps({
+            "id": "session_2", "version": 2,
+            "cwd": str(repo / ".sc-worktrees/dev1"),
+            "createdAt": 1794517874258, "updatedAt": 1794518434320,
+            "archived": False, "agents": {}, "custom": {}}))
+        def rec(i, o, scope):
+            return json.dumps({"type": "usage.record", "model": "kimi-code/k3.1-pro",
+                               "usage": {"inputOther": i, "output": o,
+                                         "inputCacheRead": 3, "inputCacheCreation": 0},
+                               "usageScope": scope})
+        (sess / "agents/main/wire.jsonl").write_text("\n".join([
+            json.dumps({"type": "llm.request", "provider": "openai",
+                        "model": "k3.1-pro", "modelAlias": "kimi-code/k3.1-pro"}),
+            rec(10, 2, "turn"), rec(100, 4, "session")]))
+        orig = p_kimi.DATA_DIR
+        p_kimi.DATA_DIR = tmp / "sessions"
+        try:
+            rows = p_kimi.sweep(repo, lambda ref: None, lambda m: None)
+        finally:
+            p_kimi.DATA_DIR = orig
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["model"], "kimi-code/k3.1-pro")
+        self.assertEqual(r["input_tokens"], 110)
+        self.assertEqual(r["output_tokens"], 6)
+        self.assertEqual(r["provider"], "kimi")
+        self.assertEqual(r["cwd"], str(repo / ".sc-worktrees/dev1"))
+        self.assertEqual(r["started_at"], "2026-11-12T21:11:14Z")
+        self.assertEqual(r["ended_at"], "2026-11-12T21:20:34Z")
+        self.assertIsNone(r["title"])
+
 
 class OpencodeParserTest(unittest.TestCase):
     def test_reasoning_folds_into_output(self):
