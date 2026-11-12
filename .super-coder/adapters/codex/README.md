@@ -210,7 +210,7 @@ is introduced by this lane.
 Checked on `codex-cli 0.167.1`, 2026-11-12, with one small model request.
 
 - **Earlier compact window.** A browser chat is given
-  `model_auto_compact_token_limit` (default 120,000; `SC_CHAT_COMPACT_WINDOW_CODEX`
+  `model_auto_compact_token_limit` (default 250,000; `SC_CHAT_COMPACT_WINDOW_CODEX`
   sets it, `off` restores Codex's default). It is stated twice, and both forms
   were accepted: as `-c model_auto_compact_token_limit=<n>` on the
   `codex … app-server --stdio` launch, where `config/read` then reports the

@@ -34,7 +34,7 @@ REGROUND_LINE = (
 
 # One engine setting per harness, read from the server process environment
 # like the reaper's. A token count, or ``off`` for the harness default.
-DEFAULT_COMPACT_WINDOW = 120_000
+DEFAULT_COMPACT_WINDOW = 250_000
 COMPACT_WINDOW_OFF = "off"
 COMPACT_WINDOW_ENV = {
     "claude": "SC_CHAT_COMPACT_WINDOW_CLAUDE",

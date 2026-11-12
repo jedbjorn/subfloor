@@ -968,13 +968,13 @@ class RegroundLineTest(DispatchCase):
 class CompactWindowSettingTest(unittest.TestCase):
     def test_default_off_and_passthrough(self) -> None:
         window = conversation_compaction.compact_window
-        self.assertEqual(window("claude", {}), 120000)
-        self.assertEqual(window("codex", {}), 120000)
+        self.assertEqual(window("claude", {}), 250000)
+        self.assertEqual(window("codex", {}), 250000)
         self.assertIsNone(window("claude", {"SC_CHAT_COMPACT_WINDOW_CLAUDE": "off"}))
         self.assertIsNone(window("codex", {"SC_CHAT_COMPACT_WINDOW_CODEX": " OFF "}))
         # One setting per harness: turning Claude off leaves Codex on.
         self.assertEqual(
-            window("codex", {"SC_CHAT_COMPACT_WINDOW_CLAUDE": "off"}), 120000
+            window("codex", {"SC_CHAT_COMPACT_WINDOW_CLAUDE": "off"}), 250000
         )
         # Passed through as set; the engine invents no floor.
         self.assertEqual(
@@ -993,7 +993,7 @@ class CompactWindowSettingTest(unittest.TestCase):
                 conversation_compaction.compact_window(
                     "claude", {"SC_CHAT_COMPACT_WINDOW_CLAUDE": "soon"}
                 ),
-                120000,
+                250000,
             )
 
 
@@ -1011,7 +1011,7 @@ class ClaudeCompactWindowTest(AdapterCase):
     def test_default_window_is_on_the_command_and_the_env_override_is_cleared(self):
         default = conversation_compaction.compact_window("claude", {})
         argv, env = self.launch(compact_window=default)
-        self.assertEqual(argv[argv.index("--autocompact") + 1], "120000")
+        self.assertEqual(argv[argv.index("--autocompact") + 1], "250000")
         self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", env)
 
     def test_resume_carries_the_window_too(self) -> None:
@@ -1061,11 +1061,11 @@ class CodexCompactWindowTest(AdapterCase):
         for resume in (False, True):
             with self.subTest(resume=resume):
                 argv, params = self.launch(resume=resume, compact_window=default)
-                override = argv.index("model_auto_compact_token_limit=120000")
+                override = argv.index("model_auto_compact_token_limit=250000")
                 self.assertEqual(argv[override - 1], "-c")
                 self.assertLess(override, argv.index("app-server"))
                 self.assertEqual(
-                    params["config"], {"model_auto_compact_token_limit": 120000}
+                    params["config"], {"model_auto_compact_token_limit": 250000}
                 )
 
     def test_off_restores_the_harness_default(self) -> None:
@@ -1113,9 +1113,9 @@ class BrokerCompactWindowTest(DispatchCase):
         return adapter.contexts[0]
 
     def test_window_is_present_by_default_and_absent_when_off(self) -> None:
-        self.assertEqual(self.dispatch_context("codex", {}).compact_window, 120000)
+        self.assertEqual(self.dispatch_context("codex", {}).compact_window, 250000)
         self.assertEqual(
-            self.dispatch_context("claude", {}).effective_compact_window(), 120000
+            self.dispatch_context("claude", {}).effective_compact_window(), 250000
         )
         self.assertIsNone(
             self.dispatch_context(
@@ -1143,7 +1143,7 @@ class BrokerCompactWindowTest(DispatchCase):
             self.deliver(broker, conversation_id, "one")
             self.deliver(broker, conversation_id, "two")
         first, second = adapter.contexts
-        self.assertEqual(first.effective_compact_window(), 120000)
+        self.assertEqual(first.effective_compact_window(), 250000)
         self.assertEqual(second.context_window, 96000)
         self.assertEqual(second.context_tokens, 9000)
         self.assertIsNone(second.effective_compact_window())
@@ -1246,7 +1246,7 @@ class TranscriptMarkerAndMeterTest(ConversationApiCase):
                 "context_window": 200000,
                 "measured_at": transcript["context"]["measured_at"],
                 "sequence": transcript["context"]["sequence"],
-                "compact_window": 120000,
+                "compact_window": None,
             },
         )
 
@@ -1275,7 +1275,7 @@ class TranscriptMarkerAndMeterTest(ConversationApiCase):
         cleared = {"SC_CHAT_COMPACT_WINDOW_CODEX": ""}
         with mock.patch.dict(os.environ, cleared):
             transcript = self.transcript(events, number=805)
-        self.assertEqual(transcript["context"]["compact_window"], 120000)
+        self.assertEqual(transcript["context"]["compact_window"], 250000)
         assistant = next(i for i in transcript["items"] if i["kind"] == "assistant")
         self.assertTrue(assistant["context_measured"])
 
