@@ -765,6 +765,118 @@ class ClaudeAdapter(ConversationAdapter):
                 text = entry_text
         return offset + end + 1, events, text
 
+    _LOCAL_COMMAND_OUTPUT = re.compile(
+        r"<local-command-(stdout|stderr)>(.*?)</local-command-\1>", re.DOTALL
+    )
+
+    @classmethod
+    def _transcript_refusal(cls, raw: Mapping[str, Any]) -> str | None:
+        """Why a ``/compact`` run did not compact, as the transcript keeps it.
+
+        2.1.322 stores the command's own output as a ``system`` entry with
+        subtype ``local_command`` and the text in ``content``:
+        ``<local-command-stderr>Error: No messages to compact</…>`` on an
+        empty session, ``<local-command-stdout>Not enough messages to
+        compact.</…>`` on one already compacted. (A compaction that happened
+        writes "Compacted" as a ``user`` entry instead, after its boundary.)
+        The stream's shapes are read too, for a build that stores those.
+        """
+        if raw.get("type") == "system" and raw.get("subtype") == "local_command":
+            content = raw.get("content")
+            if not isinstance(content, str):
+                return None
+            found = cls._LOCAL_COMMAND_OUTPUT.search(content)
+            text = (found.group(2) if found else content).strip()
+            if not text or text.startswith("Compacted"):
+                return None
+            return text.removeprefix("Error:").strip() or text
+        return cls._compact_refusal(raw)
+
+    def _compact_transcript_outcome(
+        self,
+        path: Path,
+        offset: int,
+    ) -> tuple[bool, str | None]:
+        """(compacted, refusal) from what a ``/compact`` run appended.
+
+        Only entries at or after ``offset`` are the run's own: a boundary or
+        a reason left by an earlier run proves nothing about this one.
+        """
+        compacted = False
+        refusal: str | None = None
+        try:
+            with path.open("rb") as stream:
+                stream.seek(max(0, offset))
+                data = stream.read()
+        except FileNotFoundError:
+            return False, None
+        except OSError as exc:
+            raise AdapterError(
+                "HARNESS_SESSION_INSPECTION_FAILED",
+                f"cannot read Claude session: {exc}",
+                retryable=True,
+            ) from exc
+        for line in data.decode("utf-8", "replace").splitlines():
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            if self._compaction(raw, "transcript.compact_boundary"):
+                compacted = True
+            else:
+                refusal = self._transcript_refusal(raw) or refusal
+        return compacted, refusal
+
+    def recovered_events(
+        self,
+        turn: NativeTurn,
+        context: ConversationContext,
+    ) -> list[NormalizedEvent]:
+        """The compaction a recovered ``/compact`` run wrote, if it wrote one.
+
+        A recovered run whose process is gone is reconciled, not streamed,
+        so nothing has passed its boundary on. The marker is read from what
+        the run appended; one already recorded from the pipe is dropped by
+        the store (the boundary's ``uuid`` names it).
+        """
+        if not turn.metadata.get("compaction"):
+            return []
+        path, offset = self._run_transcript(turn, context)
+        events: list[NormalizedEvent] = []
+        try:
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                data = stream.read()
+        except OSError:
+            return []
+        for line in data.decode("utf-8", "replace").splitlines():
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(raw, dict):
+                events.extend(
+                    self._compaction(raw, "transcript.compact_boundary")
+                )
+        return events
+
+    def _run_transcript(
+        self,
+        turn: NativeTurn,
+        context: ConversationContext,
+    ) -> tuple[Path, int]:
+        """The session file of a turn and where the turn's entries begin."""
+        recorded = turn.metadata.get("transcript_path")
+        path = (
+            Path(str(recorded))
+            if recorded
+            else self._session_path(turn.session_ref, context.checked_worktree())
+        )
+        offset = turn.metadata.get("transcript_offset")
+        return path, offset if isinstance(offset, int) and offset > 0 else 0
+
     def attach(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
         """Re-observe a live turn through the session file it keeps writing."""
         transcript = turn.metadata.get("transcript_path")
@@ -775,6 +887,7 @@ class ClaudeAdapter(ConversationAdapter):
             )
         path = Path(str(transcript))
         offset = int(turn.metadata.get("transcript_offset") or 0)
+        run_offset = offset
         yield NormalizedEvent(
             "session.started",
             {
@@ -801,6 +914,27 @@ class ClaudeAdapter(ConversationAdapter):
         # clears the run's process identity on this evidence exactly as it
         # does on a returncode, so the reaper never has to record the exit.
         turn.metadata["process_exited"] = True
+        if turn.metadata.get("compaction"):
+            # A ``/compact`` run writes no reply. What it did is in what it
+            # appended: a boundary (already passed on above), or its reason.
+            compacted, refusal = self._compact_transcript_outcome(
+                path, run_offset
+            )
+            if refusal and not compacted:
+                yield NormalizedEvent(
+                    "run.failed",
+                    {
+                        "status": "failed",
+                        "error": "HARNESS_COMPACT_REFUSED",
+                        "detail": refusal,
+                    },
+                    "process.exit",
+                )
+                return
+            yield NormalizedEvent(
+                "run.completed", {"status": "completed"}, "process.exit"
+            )
+            return
         if last_text is None:
             yield NormalizedEvent(
                 "run.failed",
@@ -964,6 +1098,25 @@ class ClaudeAdapter(ConversationAdapter):
                 "running",
                 True,
                 "Claude process is still running",
+            )
+        if turn.metadata.get("compaction"):
+            # A ``/compact`` run writes no reply, so the reply test below
+            # cannot settle it: its boundary or its reason does.
+            path, since = self._run_transcript(turn, context)
+            compacted, refusal = self._compact_transcript_outcome(path, since)
+            if compacted:
+                return ReconcileResult(
+                    "succeeded",
+                    True,
+                    "Claude transcript contains this run's compact boundary",
+                )
+            if refusal:
+                return ReconcileResult("failed", True, refusal)
+            return ReconcileResult(
+                "unknown",
+                False,
+                "Claude /compact run left neither a compact boundary nor a "
+                "reason in its transcript",
             )
         # Only what this run appended can prove it completed: after a broker
         # restart the previous turn's reply is still the file's last message

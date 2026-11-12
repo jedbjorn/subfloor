@@ -2204,6 +2204,36 @@ class ConversationBroker(threading.Thread):
             wait=True,
         )
 
+    def _record_recovered_events(
+        self,
+        active: _ActiveRun,
+        adapter: ConversationAdapter,
+        turn: NativeTurn,
+        context: ConversationContext,
+    ) -> None:
+        recover = getattr(adapter, "recovered_events", None)
+        if not callable(recover):
+            return
+        try:
+            events = [
+                event
+                for event in recover(turn, context)
+                if event.type not in TERMINAL_EVENTS
+            ]
+            if events:
+                self._retry_busy(
+                    partial(self.store.append_events, active.run_id, events),
+                    wait=True,
+                )
+        except Exception as exc:
+            # The run is finished either way; without the marker its result
+            # line says the compaction was not reported.
+            print(
+                f"conversation-broker: run {active.run_id} recovered events "
+                f"not recorded: {exc}",
+                flush=True,
+            )
+
     def _reconcile_loop(
         self,
         active: _ActiveRun,
@@ -2263,6 +2293,11 @@ class ConversationBroker(threading.Thread):
                 self._stop_event.wait(self.recovery_seconds)
                 continue
             outcome = result.outcome if result.proven else "unknown"
+            if active.run.compaction:
+                # A reconciled manual compaction was never streamed, so its
+                # marker has to be read back before the run is finished and
+                # its result line decided.
+                self._record_recovered_events(active, adapter, turn, context)
             terminal_payload = {
                 "reconciled": True,
                 "proven": result.proven,
@@ -2417,10 +2452,14 @@ class ConversationBroker(threading.Thread):
                 process_ref=str(run.process_pid) if attach else None,
                 metadata={
                     "recovered": True,
+                    # A recovered manual compaction is still one: the adapter
+                    # reads its outcome differently from a turn's reply.
+                    **({"compaction": True} if run.compaction else {}),
                     **self._transcript_metadata(run),
                     **attach,
                 },
             )
+            active.runner_ref = run.runner_ref
             self._deliver_interrupt(active)
             recovery = getattr(self.launch_preparer, "recovery", None)
             context = recovery(run) if callable(recovery) else run.context()

@@ -192,6 +192,22 @@ Checked on `2.1.322 (Claude Code)`, 2026-11-12, with three small requests.
   usage. A refused run has no `modelUsage` and reports none.
   **Not checked:** a manual compaction of a large session, and one
   interrupted part-way.
+- **A recovered `/compact` run.** After a broker restart the run is read
+  from the session file, from the run's own offset on, and a `/compact` run
+  writes no reply there, so the reply test that settles an ordinary turn
+  cannot settle it. The recovered turn keeps its compaction flag and is
+  settled by what it appended instead. A compaction leaves the
+  `compact_boundary` entry, which is passed on as the marker (also when the
+  process is gone and the run is reconciled, not tailed). A refusal is not
+  an assistant message in the file, unlike on the stream: it is the
+  command's own output, a `system` entry with subtype `local_command` whose
+  `content` is `<local-command-stderr>Error: No messages to
+  compact</local-command-stderr>` on an empty session or
+  `<local-command-stdout>Not enough messages to
+  compact.</local-command-stdout>` on one already compacted. Both shapes
+  were read from the scratch sessions the live checks left; the run then
+  ends failed with that reason. A run that appended neither is unproven and
+  ends as the error line. Recovery itself is covered by test only.
 
 **Compatibility caution.** `--autocompact` is present in the 2.1.319, 2.1.321
 and 2.1.322 binaries and named in the changelog at 2.1.304; nothing earlier is

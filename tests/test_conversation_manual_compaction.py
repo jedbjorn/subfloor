@@ -39,6 +39,7 @@ from conversation_broker import BrokerStore  # noqa: E402
 from conversation_adapters import (  # noqa: E402
     ADAPTER_TYPES,
     AdapterError,
+    ClaudeAdapter,
     CodexAdapter,
     ConversationContext,
     KimiAdapter,
@@ -1241,10 +1242,13 @@ class CancelledRequestTest(DispatchCase):
     events = ManualCompactBrokerTest.events
     results = ManualCompactBrokerTest.results
 
-    def running_request(self, *, ordinary: bool = False) -> tuple[str, int, int]:
+    def running_request(
+        self, *, ordinary: bool = False, harness: str = "codex",
+        session_ref: str = "native-session",
+    ) -> tuple[str, int, int]:
         """A manual compaction (or an ordinary turn) a dead broker left running."""
         conversation_id = self.add_conversation(
-            state="running", session_ref="native-session")
+            state="running", session_ref=session_ref, harness=harness)
         message_id = (
             self.send(conversation_id, "hello") if ordinary
             else self.press(conversation_id)
@@ -1336,6 +1340,225 @@ class CancelledRequestTest(DispatchCase):
             "outcome": "cancelled", "error": "CONVERSATION_DISPLACED",
             "request_message_id": message_id,
         })
+
+
+RECOVERED_SESSION = "77777777-7777-4777-8777-000000000002"
+
+
+def stored(kind: str, **fields: Any) -> dict[str, Any]:
+    return {"type": kind, "sessionId": RECOVERED_SESSION, **fields}
+
+
+def stored_message(kind: str, content: Any) -> dict[str, Any]:
+    return stored(kind, message={"role": kind, "content": content})
+
+
+# What a ``/compact`` run appends to the session file (Claude 2.1.322), read
+# from the scratch sessions the live checks left behind.
+STORED_COMMAND = [
+    stored_message("user", "<local-command-caveat>The command below was run "
+                           "directly in Claude Code</local-command-caveat>"),
+    stored_message("user", "<command-name>/compact</command-name>"),
+]
+STORED_BOUNDARY = stored(
+    "system", subtype="compact_boundary",
+    uuid="cccccccc-dddd-4eee-8fff-000000000001",
+    content="Conversation compacted",
+    compactMetadata={"trigger": "manual", "preTokens": 27888,
+                     "postTokens": 7628, "durationMs": 4407},
+)
+STORED_COMPACTED = [
+    STORED_BOUNDARY,
+    stored_message("user", "This session is being continued from a previous "
+                           "conversation. PRIVATE SUMMARY TEXT"),
+    *STORED_COMMAND,
+    stored_message("user", "<local-command-stdout>Compacted </local-command-stdout>"),
+]
+# A refusal is not an assistant message in the file: it is the command's own
+# output, kept as a ``system`` entry.
+STORED_REFUSED = [
+    *STORED_COMMAND,
+    stored("system", subtype="local_command", level="info", content=(
+        "<local-command-stdout>Not enough messages to compact."
+        "</local-command-stdout>")),
+]
+STORED_NOTHING_TO_COMPACT = stored(
+    "system", subtype="local_command", level="info", content=(
+        "<local-command-stderr>Error: No messages to compact"
+        "</local-command-stderr>"))
+# What an earlier run left before this one launched. None of it is this
+# run's: an old boundary and an old refusal prove nothing about it.
+STORED_EARLIER = [
+    stored_message("user", "first"),
+    stored_message("assistant", [{"type": "text", "text": "stale reply"}]),
+    {**STORED_BOUNDARY, "uuid": "cccccccc-dddd-4eee-8fff-00000000000f"},
+    STORED_NOTHING_TO_COMPACT,
+    stored("cost-state"),
+]
+
+
+def stored_lines(rows: list[dict[str, Any]]) -> str:
+    return "".join(json.dumps(row) + "\n" for row in rows)
+
+
+class RecoveredClaudeCompactionTest(DispatchCase):
+    """A ``/compact`` run recovered after a broker restart, with its process
+    gone: reconciled from what it appended to the session file."""
+
+    press = ManualCompactBrokerTest.press
+    events = ManualCompactBrokerTest.events
+    results = ManualCompactBrokerTest.results
+    state = ManualCompactBrokerTest.state
+    running_request = CancelledRequestTest.running_request
+
+    def recover(self, appended: list[dict[str, Any]], *, ordinary: bool = False):
+        conversation_id, message_id, run_id = self.running_request(
+            ordinary=ordinary, harness="claude", session_ref=RECOVERED_SESSION)
+        adapter = ClaudeAdapter(config_dir=self.root / "claude-config")
+        transcript = adapter._session_path(
+            RECOVERED_SESSION, self.worktree.resolve())
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(stored_lines(STORED_EARLIER))
+        offset = transcript.stat().st_size
+        with transcript.open("a") as stream:
+            stream.write(stored_lines(appended))
+        con = self.connect()
+        con.execute(
+            "UPDATE conversation_runs SET harness_session_after=?,"
+            "runner_ref='claude-run' WHERE run_id=?",
+            (RECOVERED_SESSION, run_id),
+        )
+        con.commit()
+        con.close()
+        # A process identity nothing alive answers to: reconcile, not attach.
+        self.name_live_process(
+            conversation_id, run_id, pid=4194305, start_ticks=9001,
+            transcript_path=str(transcript), transcript_offset=offset,
+        )
+        seen: dict = {}
+        reconcile = adapter.reconcile
+
+        def recording(turn, context):
+            seen.update(turn.metadata)
+            return reconcile(turn, context)
+
+        adapter.reconcile = recording
+        broker = self.start_broker(lambda _harness: adapter)
+        deadline = time.monotonic() + 5
+        outcome = None
+        while time.monotonic() < deadline:
+            con = self.connect()
+            outcome = con.execute(
+                "SELECT state FROM conversation_runs WHERE run_id=?", (run_id,),
+            ).fetchone()[0]
+            con.close()
+            if outcome in ("succeeded", "failed", "cancelled", "unknown"):
+                break
+            time.sleep(0.01)
+        self.assertTrue(broker.wait_idle())
+        return conversation_id, message_id, outcome, seen
+
+    def test_the_recovered_turn_is_still_a_compaction(self) -> None:
+        _conversation_id, _message_id, _outcome, seen = self.recover(
+            STORED_COMPACTED)
+        self.assertIs(seen["compaction"], True)
+        self.assertTrue(seen["recovered"])
+
+    def test_an_ordinary_recovered_turn_carries_no_such_flag(self) -> None:
+        _conversation_id, _message_id, outcome, seen = self.recover(
+            [stored_message("user", "second"),
+             stored_message("assistant", [{"type": "text", "text": "own reply"}])],
+            ordinary=True)
+        self.assertNotIn("compaction", seen)
+        # And is still settled by its own reply, as before.
+        self.assertEqual(outcome, "succeeded")
+
+    def test_a_recovered_compaction_keeps_its_marker(self) -> None:
+        conversation_id, message_id, outcome, _seen = self.recover(STORED_COMPACTED)
+        self.assertEqual(outcome, "succeeded")
+        [marker] = self.results(conversation_id, 0)
+        self.assertEqual(marker["type"], "context.compacted")
+        self.assertEqual(marker["payload"]["trigger"], "manual")
+        self.assertEqual(marker["payload"]["tokens_before"], 27888)
+        self.assertEqual(marker["payload"]["tokens_after"], 7628)
+        self.assertEqual(marker["payload"]["request_message_id"], message_id)
+        self.assertIsNone(marker["run_id"])
+        self.assertEqual(self.state(conversation_id), "idle")
+        self.assertNotIn(
+            "PRIVATE SUMMARY TEXT", json.dumps(self.events(conversation_id)))
+
+    def test_a_recovered_refusal_is_the_error_line_with_claudes_reason(self):
+        conversation_id, message_id, outcome, _seen = self.recover(STORED_REFUSED)
+        self.assertEqual(outcome, "failed")
+        [failed] = self.results(conversation_id, 0)
+        self.assertEqual(failed["type"], "compaction.failed")
+        self.assertEqual(
+            failed["payload"]["detail"], "Not enough messages to compact.")
+        self.assertEqual(failed["payload"]["request_message_id"], message_id)
+        self.assertEqual(
+            conversation_routes._compaction_failed_label(failed["payload"]),
+            "Compaction failed — Not enough messages to compact.",
+        )
+        self.assertEqual(self.state(conversation_id), "idle")
+
+    def test_the_other_refusal_claude_writes_reads_the_same_way(self) -> None:
+        conversation_id, _message_id, outcome, _seen = self.recover(
+            [*STORED_COMMAND, STORED_NOTHING_TO_COMPACT])
+        self.assertEqual(outcome, "failed")
+        [failed] = self.results(conversation_id, 0)
+        self.assertEqual(failed["payload"]["detail"], "No messages to compact")
+
+    def test_a_run_that_appended_nothing_is_not_settled_by_an_earlier_one(self):
+        # The file holds an older boundary and an older refusal, both before
+        # this run's offset.
+        conversation_id, _message_id, outcome, _seen = self.recover([])
+        self.assertEqual(outcome, "unknown")
+        [failed] = self.results(conversation_id, 0)
+        self.assertEqual(failed["type"], "compaction.failed")
+        self.assertEqual(failed["payload"]["error"], "HARNESS_OUTCOME_UNKNOWN")
+
+
+class AttachedClaudeCompactionTest(AdapterCase):
+    """The same recovery while the process is still alive: the transcript is
+    tailed, and the run ends on what it appended, not on a reply."""
+
+    def attach(self, appended: list[dict[str, Any]]) -> list[NormalizedEvent]:
+        adapter, _runner = self.claude()
+        path = adapter._session_path(RECOVERED_SESSION, self.worktree)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(stored_lines(STORED_EARLIER))
+        offset = path.stat().st_size
+        with path.open("a") as stream:
+            stream.write(stored_lines(appended))
+        turn = NativeTurn(
+            harness="claude", session_ref=RECOVERED_SESSION,
+            run_ref="claude-recovered", worktree=self.worktree,
+            metadata={"transcript_path": str(path), "transcript_offset": offset,
+                      "compaction": True},
+        )
+        with mock.patch.object(
+            type(adapter), "_identity_alive", side_effect=[True, False]
+        ):
+            return list(adapter.attach(turn))
+
+    def test_a_boundary_is_passed_on_and_the_run_completes(self) -> None:
+        events = self.attach(STORED_COMPACTED)
+        [compacted] = of_type(events, "context.compacted")
+        self.assertEqual(compacted.payload["trigger"], "manual")
+        self.assertEqual(events[-1].type, "run.completed")
+
+    def test_a_refusal_fails_the_run_with_claudes_reason(self) -> None:
+        events = self.attach(STORED_REFUSED)
+        self.assertEqual(of_type(events, "context.compacted"), [])
+        self.assertEqual(events[-1].type, "run.failed")
+        self.assertEqual(events[-1].payload["error"], "HARNESS_COMPACT_REFUSED")
+        self.assertEqual(
+            events[-1].payload["detail"], "Not enough messages to compact.")
+
+    def test_nothing_appended_completes_unreported(self) -> None:
+        events = self.attach([])
+        self.assertEqual(of_type(events, "context.compacted"), [])
+        self.assertEqual(events[-1].type, "run.completed")
 
 
 # ── AC14, AC15: the route and what the chat view is told ────────────────────

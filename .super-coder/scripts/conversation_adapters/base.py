@@ -442,6 +442,16 @@ class ConversationAdapter(abc.ABC):
             f"{self.harness} cannot attach to a running native turn",
         )
 
+    def recovered_events(
+        self,
+        turn: NativeTurn,
+        context: ConversationContext,
+    ) -> list[NormalizedEvent]:
+        """Events a recovered turn left on a durable channel, for a run the
+        broker reconciles instead of streaming. Only a manual compaction is
+        asked: its marker would otherwise be lost with the pipe."""
+        return []
+
     @abc.abstractmethod
     def interrupt(self, turn: NativeTurn) -> InterruptResult:
         raise NotImplementedError
