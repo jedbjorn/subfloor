@@ -421,7 +421,9 @@ sc job agent --harness <name> --model <selector> [--effort <level>] \
   wake is the signal. On a terminal seat the result waits in your inbox for
   your next boot; `sc job wait <id>` is a bounded foreground wait.
 - `sc job list --kind agent` shows your live subagents with the time each has
-  left. `sc job status <id>` shows one run. `sc job tail <id>` shows its log.
+  left, and the input + output tokens of each once a usage sweep has read them
+  (cache reads and writes are not counted there; the Analytics tab counts
+  them). `sc job status <id>` shows one run. `sc job tail <id>` shows its log.
 
 ## Read the result
 
@@ -439,8 +441,12 @@ sc job result <id> --json   # the structured form
   `result.md` beside the run''s log.
 - States: `done`, `failed`, `timeout` (the time limit stopped it), `killed`
   (you or the operator stopped it), `lost` (its supervisor died; the outcome is
-  unknown, never success, and nothing is rerun). When a lost run''s harness
-  process could not be stopped, the wake says it is still running.
+  unknown, never success, and nothing is rerun). For a lost run the wake has
+  a line `When the run was marked lost:` that says what the engine found of
+  the harness process then: that it stopped it; that it was left running,
+  because it could not be tied to the run or could not be signalled; or that
+  it could not be checked, so it may still be running. No such line means the
+  harness was found gone.
 - Check every claim against the branch, the PR and its checks before you act
   on it or repeat it to the FnB.
 

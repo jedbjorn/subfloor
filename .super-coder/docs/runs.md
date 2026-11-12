@@ -138,8 +138,10 @@ run of that number, the run ends `failed` with exit code 127 and the reason,
 and the launching shell is told as for any finished run.
 
 A subagent runs in its own worktree so that it is not counted as its launching
-shell's live session and does not read that shell's boot file. Shell shortnames
-beginning `agent-` are refused at creation. Its environment is the launching
+shell's live session and does not read that shell's boot file. A shell
+shortname of the form `agent-<number>` is refused at creation (other names
+beginning `agent-` are allowed), and while any shell holds such a name every
+subagent launch on the install is refused (403). Its environment is the launching
 shell's, with `SC_SEAT` cleared and `SC_JOB_AGENT_RUN` set: it acts under the
 launching shell's identity with exactly that shell's authority, and the engine
 adds no refusal for what it writes. `SC_JOB_AGENT_RUN` marks that one process
@@ -177,14 +179,19 @@ sc job list [--kind agent|probe|job] [--all]
   kernel also says the process is this run's harness: it leads its own process
   group, and its working directory is the worktree the engine assigned to the
   run. Pid 1, the server and the server's own process group are never
-  signalled. The worktree path used for that check is the ledger's `cwd`,
-  never the path a run's `meta.json` carries. A process that is running but
-  cannot be tied to the run is left alone, and the `lost` result says so
-  (`spawn_error`); the wake repeats it on a line beginning `Still running:`,
-  and the run row in the browser shows it. A harness whose leader has already
-  exited is not signalled. A row whose reconciliation was blocked
-  gets the same stop, on the same evidence, once its supervisor is proven gone;
-  it stays blocked, with what was done added to `last_error`.
+  signalled. The process identity and the worktree path used for that check
+  are the ones the ledger held before the pass, never values a run's
+  `meta.json` carries; a check-in that omits a value never clears one the
+  ledger holds. The `lost` result (`spawn_error`) states what was found:
+  that the engine stopped the harness; that it was running and was left
+  running, because it could not be tied to the run or the signal was not
+  permitted; or that it could not be checked because the ledger holds no
+  complete identity for it, so it may still be running. A harness proven
+  gone gets no note. The wake repeats the note on a line beginning
+  `When the run was marked lost:`, and the run row in the browser shows it.
+  A row whose reconciliation was blocked gets the same stop, on the same
+  evidence, once its supervisor is proven gone; it stays blocked, with what
+  was found added to `last_error`.
 - **Result and facts.** Before the terminal result is submitted the supervisor
   writes `result.md` (the final message, or a line saying there was none) and
   `facts.json` (`session_ref`, `result_bytes`, `worktree_removed_at`), and
@@ -198,8 +205,8 @@ sc job list [--kind agent|probe|job] [--all]
   and the result, tail, continue and clean commands. It carries no part of the
   final message. When the terminal result carries the engine's own note
   (`spawn_error`), the wake has one more line: `Reason:` with why a run never
-  started, or `Still running:` for a lost run whose harness process was left
-  running.
+  started, or `When the run was marked lost:` with what the engine found of
+  the harness process at that time.
 - **Worktree.** When a run ends with no uncommitted change and HEAD still at
   the base commit, the supervisor removes the worktree and records
   `worktree_removed_at`; a branch the run created is kept. Untracked files
@@ -275,14 +282,17 @@ operator sees and stops.
   `GET /api/runs/<id>/result`; a truncated result says so.
 - **A continued subagent is one thread.** The newest run is the row; the
   earlier runs of the same worktree are folded beneath it. The thread's tokens
-  are shown on that newest row, because the usage sweep counts a thread's
-  usage on its first run. Tokens appear once a sweep has read them.
+  are shown on that newest row, and on the folded first run labelled as the
+  thread's, because the usage sweep counts a thread's usage on its first run.
+  Tokens appear once a sweep has read them. The figure is input + output
+  tokens only, on the row and in `sc job list`; the Analytics tab also counts
+  cache reads and writes, so its figures are larger.
 - **A watcher row** (kind `probe`) shows its form (`until`, `pr` or `timer`),
   its condition, and its last attempt. A finished watcher's last attempt is in
   its terminal result; a live one's is read from the end of its log.
 - **Notes.** A row whose terminal result carries the engine's note
-  (`spawn_error`) shows it: `Reason:`, or `Still running:` for a lost run
-  whose harness process was left running. A row blocked for operator recovery
+  (`spawn_error`) shows it: `Reason:`, or `When the run was marked lost:`
+  with what the engine found of the harness process at that time. A row blocked for operator recovery
   shows its `last_error`.
 - **Limits** are stated once at the head of each list, from the `limits` object
   of the list response: live subagents for the shell against 3 and on the
