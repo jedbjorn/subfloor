@@ -767,6 +767,14 @@ Sprint work explicitly); the mechanics live here for the operator.
   the owning Developer, inside or outside a Sprint — see
   [Pull-request wakes](#pull-request-wakes). Planner and Reviewer receive no
   PR-event wakes.
+- **Job wakes.** Every `sc job` run that ends — a command, a subagent, a
+  watch — writes its terminal result, a `result` message in the owner's inbox
+  and a `re-enter` wake in one transaction. The wake resumes the owner's chat
+  at its next boundary, or opens a chat when the shell has none. Several runs
+  ending close together write one message each and may share one wake turn. A
+  shell in a terminal session is never interrupted: the message waits in its
+  inbox for the next boot. A wake states an outcome; it grants no review,
+  merge or Sprint authority.
 - **Coordinate mode.** Closing the Planner chat during an armed Sprint sets
   coordinate mode: idle Planner `re-enter` wakes open fresh ticket chats.
   Pause/resume from the GUI returns to supervise mode; automatic pauses
@@ -824,9 +832,89 @@ skill's after-merge cleanup. Watcher internals, health and recovery:
 ```
 
 A job is a detached supervised one-shot. It outlives the shell session that
-started it, captures bounded output, group-kills on timeout, and posts a
-`result` message to the starting shell when it completes. Use it for suites,
-builds, and benchmarks that would otherwise die with the harness process.
+started it, captures bounded output, and group-kills on timeout. When it ends
+it writes a `result` message to the starting shell and wakes that shell (see
+[Wakes](#wakes)). Use it for suites, builds, and benchmarks that would
+otherwise die with the harness process.
+
+#### Subagents
+
+```bash
+./sc job agent --harness <name> --model <selector> [--effort <level>] \
+  (--brief-file <path> | --brief "<text>") \
+  [--base <ref>] [--branch <name>] [--label <text>] [--timeout <seconds>]
+./sc job list --kind agent
+./sc job result <id>
+./sc job continue <id> --brief-file <path>
+./sc job kill <id>
+./sc job clean <id> [--discard]
+```
+
+A subagent is one headless harness run that a shell launches for small,
+bounded work: a check, a review by another model family, a research question,
+one contained change. Big work that needs several shells, review and a merge
+is a Sprint. A Claude shell can launch a Codex subagent and the reverse; Kimi
+and OpenCode are offered too, and Vibe is refused because its adapter has no
+headless mode.
+
+- **Identity.** A subagent is not a shell. It acts as the shell that launched
+  it, with that shell's token and git identity, and holds exactly that
+  shell's authority, no more and no less. The engine adds no refusal for what
+  it writes. The brief governs what it does, and the launching shell is
+  accountable for it.
+- **Model and effort.** The harness and model are required. Effort is
+  optional; omitted, the harness's own default for that model applies.
+- **Where it runs.** The engine creates a worktree for it,
+  `.sc-worktrees/agent-<run_id>`, at the launching shell's current commit or
+  at `--base`. `--branch` creates a new branch there; without it the worktree
+  is detached. When the run ends with the worktree unchanged the engine
+  removes it. Files that git ignores do not count as a change and are not
+  kept. A changed worktree stays until its shell runs `sc job clean`.
+- **Result.** The wake states the facts of the run and carries no part of the
+  subagent's final message. `sc job result <id>` prints that message.
+  `sc job continue <id>` resumes the same harness session in the same worktree
+  as a new run.
+- **Who may launch.** Every non-Admin flavor, from a browser chat or a
+  terminal. Inside an armed or paused Sprint, Developers and the Planner may;
+  a Reviewer of that Sprint may not. The operator has no launch control in
+  the browser: shells launch, the operator sees and stops.
+
+| Limit | Value |
+|---|---|
+| Live subagents for one shell | 3 |
+| Live subagents on the install | 6 |
+| Run time of one subagent run | 2 hours by default; `--timeout` up to 8 hours |
+| Nesting | a subagent cannot launch or continue a subagent |
+| Brief size | 64 KiB |
+| Live watchers for one shell | 10 |
+
+A launch that would pass a limit is refused before anything starts, and the
+refusal names the runs that hold the slots.
+
+#### Watchers
+
+```bash
+./sc job start --until "<shell command>" [--every <seconds>] [--timeout <seconds>]
+./sc job watch pr --pr <n> [--repository owner/name] [--every <seconds>] [--timeout <seconds>]
+./sc job watch timer --after <seconds>
+```
+
+A watcher is a job that ends when a condition holds and wakes its shell once.
+`--until` repeats a shell command until it exits 0 (every 30 seconds, for at
+most an hour, unless set). `watch pr` ends when a PR's checks settle green or
+red, or it is merged or closed (read every 60 seconds, for at most an hour,
+unless set); any shell may watch any PR it can read, and the wake grants no
+merge authority. `watch timer` ends after a delay of at most 24 hours. Nothing
+recurs: each watcher has one outcome. A Developer's own PR still gets its
+facts from the [PR watcher](#pull-request-wakes).
+
+The **Runs** drawer in a chat and **Shells → Runs** show each subagent's
+harness, model, effort, state, time elapsed and time left, with **Result**,
+**Tail** and **Kill**; a continued subagent is one folded thread; watchers
+show their form, condition and last attempt; the limits are stated at the head
+of each list. The **Worktrees** tab labels a subagent's worktree with its run
+and launching shell. Reference:
+[`.super-coder/docs/runs.md`](../.super-coder/docs/runs.md).
 
 ### Generic headless launch
 

@@ -265,3 +265,30 @@ found"; a second `--session-id` launch with an id already used exits 1 with
 "is already in use", so a continue must use `--resume`. The session store is
 keyed by working directory: a resume must run from the directory of the
 first run.
+
+### What a subagent on this harness is
+
+`sc job agent --harness claude --model <selector> [--effort <level>]` runs Claude Code
+once, headless, in a worktree the engine creates
+(`.sc-worktrees/agent-<run_id>`), and wakes the launching shell when the run
+ends. `sc job continue <id>` resumes the same session in that worktree as a
+new run. Any shell may launch it, whatever harness that shell itself runs on.
+
+- **Identity.** The run has the launching shell's environment: its API token,
+  its shell identity and its git identity. It holds exactly that shell's
+  authority, no more and no less, and that shell is accountable for what it
+  does. The engine adds no refusal for what it writes. The worktree carries no
+  boot file, so the CLI starts plain and learns its task from the brief.
+- **Model and effort.** The model is required. Effort is optional: when given,
+  it travels as `--effort <level>`; when omitted, no effort setting is sent and the CLI's own default
+  for that model applies.
+- **Limits.** One shell may have 3 subagents live and the install 6. A run is
+  stopped after 2 hours by default, or after `--timeout` seconds, at most 8
+  hours. A subagent cannot launch or continue a subagent. A brief is at most
+  64 KiB.
+- **Watches.** `sc job start --until`, `sc job watch pr` and
+  `sc job watch timer` are engine jobs, not harness runs, and behave the same
+  on every harness. One shell may have 10 live.
+
+The verbs, the worktree rule and the wake are in
+[`docs/runs.md`](../../docs/runs.md).

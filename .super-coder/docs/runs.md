@@ -62,7 +62,7 @@ submit execution outcomes. Cancellation verifies boot id, pid and start ticks.
 | Route | Contract |
 | --- | --- |
 | `POST /_sc/runs` | `{registration_key,kind,label,argv,cwd,commit,foreground?,timeout_seconds?}`; returns registered run with engine-allocated evidence path; retries require identical input. An `agent` run adds an `agent` object and omits `cwd` (see Subagent ledger) |
-| `GET /_sc/runs` | Owner's runs, newest first |
+| `GET /_sc/runs` | Owner's runs, newest first, with `total`, `attention_count` and `limits` (see The Runs view) |
 | `GET /_sc/runs/<id>` | Owner's authoritative state and wake receipt |
 | `POST /_sc/runs/<id>/running` | Supervisor/child pid, start ticks, boot id, started timestamp. Refused (409) once the run has a terminal result; a supervisor that receives that launches nothing and submits nothing |
 | `POST /_sc/runs/<id>/terminal` | `{state,exit_code,finished_at,spawn_error?}`; one immutable terminal payload. An `agent` run may add `agent: {head_commit?, uncommitted?}`, what the supervisor found in the worktree |
@@ -73,7 +73,7 @@ submit execution outcomes. Cancellation verifies boot id, pid and start ticks.
 | `GET /_sc/runs/<id>/result` | An agent run's final message, at most 256 KiB, with `truncated` and its recorded facts |
 | `POST /_sc/runs/<id>/clean` | Owner-only, `{discard}`: records that an agent run's worktree is being removed by `sc job clean`; refused (400) while a run is live in that worktree |
 | `POST /_sc/runs/<id>/kill` | Owner cancellation request; supervisor retains authoritative exit |
-| `GET /api/runs[/<id>[/tail\|/result]]` | Operator projection |
+| `GET /api/runs[/<id>[/tail\|/result]]` | Operator projection; `?shell_id=`, `?kind=` and `?state=` filter the list |
 | `POST /api/runs/<id>/kill` | Operator cancellation, guarded browser origin |
 
 `kind` registration accepts `job`, `devkit`, `probe`, and `agent`. Native process
@@ -84,8 +84,13 @@ and delivery evidence after their message/conversation parents.
 
 Feature #96 (spec #273) adds `sc job` subagents. `sc job agent` registers an
 `agent` run and detaches the job supervisor, which creates the worktree, runs
-the harness, and ends the run (see Running a subagent). The GUI rows are not
-shipped yet.
+the harness, and ends the run (see Running a subagent). `sc job watch` adds two
+watch forms (see Watchers). The browser shows both (see The Runs view), and the
+`delegation` engine skill, granted to every non-Admin flavor, tells a shell
+how to use them.
+
+The two are for small delegated work with a clear report. Big work that needs
+several shells, review and a merge is a Sprint.
 
 Every run may record `timeout_seconds`, its time limit, fixed at registration;
 `sc job start` sends its `--timeout`. Rows registered before this column
@@ -172,9 +177,12 @@ sc job list [--kind agent|probe|job] [--all]
   kernel also says the process is this run's harness: it leads its own process
   group, and its working directory is the worktree the engine assigned to the
   run. Pid 1, the server and the server's own process group are never
-  signalled. A process that is running but cannot be tied to the run is left
-  alone, and the `lost` result says so (`spawn_error`). A harness whose leader
-  has already exited is not signalled. A row whose reconciliation was blocked
+  signalled. The worktree path used for that check is the ledger's `cwd`,
+  never the path a run's `meta.json` carries. A process that is running but
+  cannot be tied to the run is left alone, and the `lost` result says so
+  (`spawn_error`); the wake repeats it on a line beginning `Still running:`,
+  and the run row in the browser shows it. A harness whose leader has already
+  exited is not signalled. A row whose reconciliation was blocked
   gets the same stop, on the same evidence, once its supervisor is proven gone;
   it stays blocked, with what was done added to `last_error`.
 - **Result and facts.** Before the terminal result is submitted the supervisor
@@ -188,7 +196,10 @@ sc job list [--kind agent|probe|job] [--all]
   effort, time run against its limit, the worktree (or that it was removed
   unchanged), branch, HEAD, whether uncommitted changes exist, the result size,
   and the result, tail, continue and clean commands. It carries no part of the
-  final message.
+  final message. When the terminal result carries the engine's own note
+  (`spawn_error`), the wake has one more line: `Reason:` with why a run never
+  started, or `Still running:` for a lost run whose harness process was left
+  running.
 - **Worktree.** When a run ends with no uncommitted change and HEAD still at
   the base commit, the supervisor removes the worktree and records
   `worktree_removed_at`; a branch the run created is kept. Untracked files
@@ -212,6 +223,21 @@ sc job list [--kind agent|probe|job] [--all]
   `usage_json`. A continued subagent works in the first run's worktree, so its
   usage is counted on that first run.
 
+## Identity and authority
+
+A subagent is not a shell. It has no shell row, no boot file, no seed, no inbox
+and no chat. It acts under the launching shell's identity, with that shell's
+API token and git identity, and holds exactly that shell's authority, no more
+and no less. The engine sees its `sc` calls as the launching shell's and adds
+no refusal for what it writes to `sc mem`, to git or to GitHub. The brief
+governs what it does, and the launching shell is accountable for it: a merge by
+a subagent is a merge by the launching shell and needs what that shell's merge
+needs. A subagent's report is input to the launching shell, never proof.
+
+The run belongs to the launching shell. Another shell's token cannot read,
+stop, continue or clean it. The operator sees every run and may stop any of
+them; the operator cannot launch one.
+
 ## Watchers
 
 Every `probe` run is a watcher: `sc job start --until`, and two named forms on
@@ -230,6 +256,51 @@ registration is refused (429) naming the runs that hold the slots.
 Their ledger `argv` is `sc job watch <form> ...`, which is how the condition is
 read back. The wake names the condition, the final state and, for a PR, the
 head commit, and grants no merge authority.
+
+## The Runs view
+
+The browser shows runs in two places: the **Runs** drawer in a shell's chat
+rail, and **Shells → Runs**, the fleet view. Both draw the same rows from
+`GET /api/runs`. There is no control that launches a run: shells launch, the
+operator sees and stops.
+
+- **Every row** shows the owner, kind, state, exit code and wake state, then
+  the time: a live run shows the time elapsed and the time left against its
+  limit; a finished run shows how long it ran and its limit. The time comes
+  from the ledger's start time and `timeout_seconds`; a run registered without
+  a limit says so. **Tail**, **Copy status command**, **Kill** (live runs) and
+  **Attach receipt** (finished runs) are on every row.
+- **A subagent row** adds harness, model and effort, and a **Result** action
+  that opens the final message with its recorded facts. It reads
+  `GET /api/runs/<id>/result`; a truncated result says so.
+- **A continued subagent is one thread.** The newest run is the row; the
+  earlier runs of the same worktree are folded beneath it. The thread's tokens
+  are shown on that newest row, because the usage sweep counts a thread's
+  usage on its first run. Tokens appear once a sweep has read them.
+- **A watcher row** (kind `probe`) shows its form (`until`, `pr` or `timer`),
+  its condition, and its last attempt. A finished watcher's last attempt is in
+  its terminal result; a live one's is read from the end of its log.
+- **Notes.** A row whose terminal result carries the engine's note
+  (`spawn_error`) shows it: `Reason:`, or `Still running:` for a lost run
+  whose harness process was left running. A row blocked for operator recovery
+  shows its `last_error`.
+- **Limits** are stated once at the head of each list, from the `limits` object
+  of the list response: live subagents for the shell against 3 and on the
+  install against 6, and live watchers for the shell against 10. A list at a
+  limit says so in words. The fleet view with no shell selected gives the
+  install's counts and names each shell that is at a limit.
+- **The kind filter** of the fleet view offers `job`, `agent`, `probe` and
+  `devkit`. The tab's badge counts running and blocked runs of every kind.
+
+`limits` is `{agents: {per_shell, per_install, install_live, shell_live?,
+by_shell?}, watchers: {per_shell, install_live, shell_live?, by_shell?}}`. A
+run is counted as registration counts it. `shell_live` is present when the
+list is for one shell; `by_shell` is given to the operator routes only.
+
+The **Worktrees** tab labels a worktree named `agent-<run_id>` with that run
+and the shell that launched it, the harness and model, and the newest run that
+worked there and its state (`agent` on the entry in `GET /api/git-state`). A
+directory of that form with no run in the ledger is labelled as such.
 
 ## Dev-kit receipts
 

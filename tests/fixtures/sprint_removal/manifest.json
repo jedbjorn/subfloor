@@ -958,7 +958,11 @@
         "Sprint it points at the Sprint's own gate; outside one, a green wake says",
         "[`.super-coder/docs/sprint-pr-watcher.md`](../.super-coder/docs/sprint-pr-watcher.md).",
         "> **UI** this IS the GUI — Chats · Sprints · Shells · Roadmap · Documents · Flags · Worktrees · Repo Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)",
-        "you mean: `#sprints/<id>`, `#roadmap-feature-<id>`, `#roadmap-flow`,"
+        "you mean: `#sprints/<id>`, `#roadmap-feature-<id>`, `#roadmap-flow`,",
+        "merge or Sprint authority.",
+        "is a Sprint. A Claude shell can launch a Codex subagent and the reverse; Kimi",
+        "terminal. Inside an armed or paused Sprint, Developers and the Planner may;",
+        "a Reviewer of that Sprint may not. The operator has no launch control in"
       ],
       "README.md": [
         "- **Sprints v2.** Have a Planner prepare independent work lanes, choose routes",
