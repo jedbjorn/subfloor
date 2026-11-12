@@ -827,6 +827,18 @@ def launch_mode_flags(adapter: dict, headless: bool) -> list[str]:
     return flags
 
 
+def sandbox_launch_env(adapter: dict, environ=None) -> dict[str, str]:
+    """The adapter's sandbox-only launch environment (`sandbox.env`), applied
+    only when booting inside the docker sandbox (SC_SANDBOX) — e.g. claude's
+    IS_SANDBOX=1, required because the rootless container runs the harness as
+    uid 0 and claude refuses bypass-permissions mode as root unless the env
+    marks it as sandboxed. Shell launches, chats and subagents all read it here."""
+    if not (os.environ if environ is None else environ).get("SC_SANDBOX"):
+        return {}
+    scfg = adapter.get("sandbox") or {}
+    return {k: str(v) for k, v in (scfg.get("env") or {}).items()}
+
+
 def execution_mode() -> str:
     """Name the seat that the current launcher process actually occupies."""
     return "container" if os.environ.get("SC_SANDBOX") else "host"
@@ -2050,10 +2062,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     # Permission flags, main()'s split kept: launch_flags for the TUI,
     # headless_flags for a non-interactive plan, plus sandbox-only env.
     mode_flags = launch_mode_flags(adapter, headless)
-    sandbox_env: dict[str, str] = {}
-    if os.environ.get("SC_SANDBOX"):
-        scfg = adapter.get("sandbox") or {}
-        sandbox_env = {k: str(v) for k, v in (scfg.get("env") or {}).items()}
+    sandbox_env = sandbox_launch_env(adapter)
 
     name_args: list[str] = []
     ncfg = adapter.get("name") or {}
@@ -2629,15 +2638,10 @@ def main() -> None:
     mode_flags = launch_mode_flags(adapter, headless)
     if mode_flags:
         print(f"→ launch flags → {' '.join(mode_flags)}")
-    sandbox_env: dict[str, str] = {}
-    if os.environ.get("SC_SANDBOX"):
-        scfg = adapter.get("sandbox") or {}
-        # Sandbox-only launch env — e.g. claude's IS_SANDBOX=1, required because
-        # the rootless container runs the harness as uid 0 and claude refuses
-        # bypass-permissions mode as root unless the env marks it as sandboxed.
-        sandbox_env = {k: str(v) for k, v in (scfg.get("env") or {}).items()}
-        if sandbox_env:
-            print(f"→ sandbox: launch env → {' '.join(sandbox_env)}")
+    # Sandbox-only launch env (see sandbox_launch_env).
+    sandbox_env = sandbox_launch_env(adapter)
+    if sandbox_env:
+        print(f"→ sandbox: launch env → {' '.join(sandbox_env)}")
 
     # Headless: resolve the non-interactive argv now (before RENDER_ONLY) so a
     # render-only run still validates the adapter + prints what would exec.

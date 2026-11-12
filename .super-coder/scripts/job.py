@@ -51,6 +51,7 @@ POLL = 2                    # supervisor/wait poll interval (seconds)
 PROBE_TIMEOUT = 3600        # probes always have a finite overall deadline
 WATCH_PR_EVERY = 60         # `watch pr` default delay between reads (seconds)
 AGENT_START_WAIT = 60       # how long `agent` waits for its harness to start
+START_WAIT = 30             # how long `start` and `watch` wait for the supervisor
 SETTLED_PR_STATES = frozenset({"green", "red", "merged", "closed"})
 REPOSITORY = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_.][A-Za-z0-9_.-]*")
 
@@ -355,8 +356,11 @@ def supervise_agent(jobdir: Path, meta: dict, notify) -> int:
     The worktree is created here, under a supervisor that has already checked
     in, so a slow creation is a running run and never a registered row with no
     process. Ending the run, by exit, time limit, stop or a signal to this
-    supervisor, signals the harness's whole process group, so no harness
-    process outlives its run.
+    supervisor, signals the harness's whole process group, then the
+    processes it started outside that group (its descendants, and any
+    process carrying this run's SC_JOB_AGENT_RUN left working in the run's
+    worktree), so no harness process outlives its run. Without /proc only
+    the group is signalled.
     """
     import job_agent as agent
 
@@ -421,6 +425,7 @@ def supervise_agent(jobdir: Path, meta: dict, notify) -> int:
                 pass  # local identity is durable; the runtime pulse recovers it
             timeout = meta.get('timeout')
             deadline = time.monotonic() + timeout if timeout else None
+            strays: dict[int, int] = {}
             while True:
                 try:
                     rc = child.wait(timeout=POLL)
@@ -428,11 +433,17 @@ def supervise_agent(jobdir: Path, meta: dict, notify) -> int:
                 except subprocess.TimeoutExpired:
                     timed_out = bool(deadline and time.monotonic() >= deadline)
                     if timed_out or stopped_by or (jobdir / 'kill_requested').exists():
+                        strays = _descendants(child.pid)
                         _kill_group(child.pid, child)
                         rc = child.wait()
                         break
-            # The leader is gone; whatever it left in its group goes with it.
+            # The leader is gone; whatever it left in its group goes with it,
+            # and so does what it started outside the group: its descendants
+            # read before the stop, and any process of this run (its run id in
+            # the environment) still working in the worktree.
             _kill_group(child.pid)
+            marker = f'{agent.RUN_VARIABLE}={int(run_id)}'.encode()
+            _stop_strays({**strays, **_in_worktree(worktree, marker)})
     finally:
         for number, handler in previous.items():
             signal.signal(number, handler)
@@ -600,6 +611,108 @@ def _kill_group(pid: int, child: subprocess.Popen | None = None) -> None:
             time.sleep(0.2)
 
 
+def _processes() -> dict[int, tuple[int, int]]:
+    """Every visible process: pid -> (parent pid, start ticks), from /proc."""
+    table = {}
+    try:
+        entries = [entry for entry in os.listdir('/proc') if entry.isdigit()]
+    except OSError:
+        return table
+    for entry in entries:
+        try:
+            fields = Path(f'/proc/{entry}/stat').read_text().rsplit(')', 1)[1].split()
+            table[int(entry)] = (int(fields[1]), int(fields[19]))
+        except (OSError, IndexError, ValueError):
+            continue
+    return table
+
+
+def _descendants(pid: int) -> dict[int, int]:
+    """The processes below `pid`, by parent pid, with their start ticks.
+
+    Read before the harness is signalled: a harness can start commands in
+    their own process group and session (Codex does), and once it is gone
+    they are reparented and no longer traceable to it.
+    """
+    table = _processes()
+    children: dict[int, list[int]] = {}
+    for child, (parent, _) in table.items():
+        children.setdefault(parent, []).append(child)
+    found: dict[int, int] = {}
+    stack = [pid]
+    while stack:
+        for child in children.get(stack.pop(), ()):
+            if child not in found:
+                found[child] = table[child][1]
+                stack.append(child)
+    return found
+
+
+def _in_worktree(worktree: Path, marker: bytes) -> dict[int, int]:
+    """The run's processes still working inside its worktree.
+
+    A working directory alone is not the run's: an operator's terminal or a
+    shell's `git log` can sit there too. A process counts only when its
+    environment also holds `marker`, the exact `SC_JOB_AGENT_RUN=<run id>`
+    entry the harness was started with and its descendants inherit. An
+    environment that cannot be read leaves the process alone.
+    """
+    home = os.path.realpath(worktree)
+    found = {}
+    for pid, (_, ticks) in _processes().items():
+        try:
+            cwd = os.readlink(f'/proc/{pid}/cwd')
+            if not (cwd == home or cwd.startswith(home + os.sep)):
+                continue
+            environ = Path(f'/proc/{pid}/environ').read_bytes()
+        except OSError:
+            continue
+        if marker in environ.split(b'\0'):
+            found[pid] = ticks
+    return found
+
+
+def _alive(pid: int, ticks: int) -> bool:
+    """Whether this incarnation of `pid` still runs (a zombie does not)."""
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        return fields[0] != 'Z' and int(fields[19]) == ticks
+    except (OSError, IndexError, ValueError):
+        return False
+
+
+def _stop_strays(strays: dict[int, int]) -> None:
+    """SIGTERM what a subagent's harness left outside its group; SIGKILL what
+    remains after the grace period. Never pid 1, this supervisor or its own
+    process group; a pid whose start ticks changed is a stranger, left alone."""
+    own_group = os.getpgrp()
+
+    def ours(pid: int, ticks: int) -> bool:
+        if pid <= 1 or pid == os.getpid() or not _alive(pid, ticks):
+            return False
+        try:
+            return os.getpgid(pid) != own_group
+        except OSError:
+            return False
+
+    targets = {pid: ticks for pid, ticks in strays.items() if ours(pid, ticks)}
+    for sig, wait_s in ((signal.SIGTERM, KILL_GRACE), (signal.SIGKILL, 0)):
+        for pid, ticks in list(targets.items()):
+            if not _alive(pid, ticks):
+                targets.pop(pid)
+                continue
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                targets.pop(pid)
+        end = time.monotonic() + wait_s
+        while targets and time.monotonic() < end:
+            targets = {pid: ticks for pid, ticks in targets.items() if _alive(pid, ticks)}
+            time.sleep(0.2)
+        if not targets:
+            return
+
+
 def cmd_supervise(args) -> int:
     return supervise(Path(args.jobdir))
 
@@ -656,20 +769,37 @@ def cmd_start(args) -> int:
     # Only the supervisor writes meta after this point (no lost-update races);
     # wait for its first write so an immediate `status`/`wait` never reads a
     # pre-supervisor meta and mis-calls the job 'lost'.
-    end = time.monotonic() + 5
-    while time.monotonic() < end:
-        started = read_meta(jobdir)
-        ready = started.get('probe_ready') if until is not None else started.get('pid')
-        if ready or started.get('finished_at'):
-            break
-        time.sleep(0.05)
-    else:
-        die(f'supervisor startup unconfirmed; registered run {job_id} will reconcile; '
-            f'inspect `sc job status {job_id}` before starting dependent work')
+    if not _await_supervisor(jobdir, job_id, sup, 'probe_ready' if until is not None else 'pid'):
+        print(f"job: {job_id} registered; its supervisor (pid {sup.pid}) is running but "
+              f"had not reported its start after {START_WAIT}s. End your turn; completion "
+              f"wakes you. `sc job status {job_id}` before starting dependent work")
+        return 0
     print(f"job: {job_id} started (supervisor pid {sup.pid}) — "
           f"end your turn; completion wakes you "
           f"(TUI delivery waits for the CLI slot). `sc job status {job_id}`")
     return 0
+
+
+def _await_supervisor(jobdir: Path, job_id: str, sup: subprocess.Popen, ready: str) -> bool:
+    """Wait up to START_WAIT for the detached supervisor's first report.
+
+    True when it reported `ready` or finished. False when it had not yet but
+    is still running: the run is registered and will report. Dies when the
+    supervisor exited without reporting.
+    """
+    end = time.monotonic() + START_WAIT
+    while time.monotonic() < end:
+        started = read_meta(jobdir)
+        if started.get(ready) or started.get('finished_at'):
+            return True
+        time.sleep(0.05)
+    started = read_meta(jobdir)
+    if started.get(ready) or started.get('finished_at'):
+        return True
+    if sup.poll() is None:
+        return False
+    die(f'supervisor startup unconfirmed; registered run {job_id} will reconcile; '
+        f'inspect `sc job status {job_id}` before starting dependent work')
 
 
 def _refused(exc: Exception) -> str:
@@ -911,16 +1041,13 @@ def _register_watch(args, *, argv, cmd, every, timeout, label, extra) -> int:
         'run_id': registered['run_id'], 'job_id': job_id, 'kind': 'probe',
         'label': label, 'cmd': cmd, 'cwd': cwd, 'every': every, 'timeout': timeout,
         'started_at': _now(), 'log': str(jobdir / 'log'), **extra})
-    _detach_supervisor(jobdir)
-    end = time.monotonic() + 5
-    while time.monotonic() < end:
-        started = read_meta(jobdir)
-        if started.get('probe_ready') or started.get('finished_at'):
-            break
-        time.sleep(0.05)
-    else:
-        die(f'supervisor startup unconfirmed; registered run {job_id} will reconcile; '
-            f'inspect `sc job status {job_id}`')
+    sup = _detach_supervisor(jobdir)
+    if not _await_supervisor(jobdir, job_id, sup, 'probe_ready'):
+        print(f"job: {job_id} registered — {watch_form(registered)[1]}; its supervisor "
+              f"(pid {sup.pid}) is running but had not reported its start after "
+              f"{START_WAIT}s. End your turn; it wakes you once. This watch grants no "
+              f"merge authority. `sc job status {job_id}`")
+        return 0
     print(f"job: {job_id} watching — {watch_form(registered)[1]}; ends within {timeout}s. "
           f"End your turn; it wakes you once. This watch grants no merge authority. "
           f"`sc job status {job_id}`")

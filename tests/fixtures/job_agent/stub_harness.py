@@ -11,6 +11,8 @@ Instructions are brief lines of the form `NAME:value`:
   SLEEP:<s>       wait before reporting      EXIT:<code>  exit status
   WRITE:<name>    leave an uncommitted file  COMMIT:<name> commit a new file
   SPAWN:1         leave a child in the process group
+  DETACH:1        leave a child in its own process group and session
+                  (DETACH:out: that child also works outside the worktree)
   STDERR:<text>   a line on standard error  SESSION:<ref> report this session reference
   REPLAY:1        print the output recorded for this harness in harness_controls.json
 """
@@ -49,6 +51,11 @@ def main() -> int:
     }
     if "SPAWN" in instructions:
         record["spawned"] = subprocess.Popen(["sleep", "300"]).pid
+    if "DETACH" in instructions:
+        # As Codex runs its commands: outside the harness's group and session.
+        record["detached"] = subprocess.Popen(
+            ["sleep", "300"], start_new_session=True,
+            cwd="/" if instructions["DETACH"] == "out" else None).pid
     with open(os.environ["STUB_RECORD"], "a") as handle:
         handle.write(json.dumps(record) + "\n")
     if "STDERR" in instructions:

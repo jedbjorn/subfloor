@@ -187,6 +187,27 @@ class OmittedEffortTest(unittest.TestCase):
         self.assertEqual(chosen["KIMI_MODEL_THINKING_EFFORT"], "low")
 
 
+class SandboxEnvironmentTest(unittest.TestCase):
+    """A subagent in the docker sandbox gets the adapter's sandbox env, as a chat does."""
+
+    def test_the_sandbox_env_of_the_manifest_reaches_the_subagent_only_in_the_sandbox(self):
+        for harness in ("claude", "codex", "kimi", "opencode"):
+            adapter = json.loads((ENGINE / f"adapters/{harness}/adapter.json").read_text())
+            declared = {k: str(v) for k, v in
+                        ((adapter.get("sandbox") or {}).get("env") or {}).items()}
+            with self.subTest(harness=harness):
+                inside = build(harness, effort="low", env={"SC_SANDBOX": "1"})
+                for name, value in declared.items():
+                    self.assertEqual(inside.env[name], value)
+                child = job_agent.child_environment(9, inside, {"PATH": "/bin"})
+                self.assertEqual({k: child[k] for k in declared}, declared)
+                host = build(harness, effort="low")
+                self.assertFalse(set(declared) & set(host.env))
+        # Claude's is the one that matters: as root it refuses its bypass flag without it.
+        self.assertEqual(build("claude", env={"SC_SANDBOX": "1"}).env, {"IS_SANDBOX": "1"})
+        self.assertEqual(build("claude").env, {})
+
+
 class RefusalTest(unittest.TestCase):
     """AC 2: every refusal is raised by the builder, before a run is registered."""
 
