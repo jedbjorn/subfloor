@@ -2692,7 +2692,8 @@ const open = async (overrides = {}) => {
       conversation_version: 1, active_run_id: null, close_requested_at: null,
       compaction: overrides.compaction ?? {supported: true, available: true,
         enabled: true, pending: false, message_id: null}},
-    context: {context_tokens: overrides.tokens ?? 90400, context_window: 258400},
+    context: {context_tokens: overrides.tokens ?? 90400, context_window: 258400,
+      compact_window: 120000},
     cold_return: {threshold_tokens: 60000, threshold_minutes: 60,
       last_model_activity_at: ago(overrides.minutes ?? 120),
       server_time: ago(0)},
@@ -2792,7 +2793,8 @@ def test_button_sits_bottom_left_and_one_press_is_one_request() -> None:
     placed = result["placed"]
     assert placed["inLeft"] is True
     assert placed["order"] == ["chat-context-meter", "act chat-compact"]
-    assert placed["meter"] == "Context 90k · 35% of 258k"
+    # The share is of the compact window, not the model's 258k (#451).
+    assert placed["meter"] == "Context 90k · 75% of 120k compact window"
     assert (placed["hidden"], placed["disabled"], placed["label"]) == (
         False, False, "Compact")
     assert "costs one model request" in placed["title"]
@@ -2804,9 +2806,9 @@ def test_button_sits_bottom_left_and_one_press_is_one_request() -> None:
     assert result["pressed"]["disabled"] is True
     assert result["inert"] == 1
     assert result["done"] == {
-        "disabled": False, "label": "Compact", "meter": "Context 12k · 5% of 258k"}
+        "disabled": False, "label": "Compact", "meter": "Context 12k · 10% of 120k compact window"}
     assert result["reread"] == {
-        "meter": "Context 12k · 5% of 258k", "hidden": False, "button": "Compact"}
+        "meter": "Context 12k · 10% of 120k compact window", "hidden": False, "button": "Compact"}
     # Greyed out and inert during a running turn.
     assert result["turn"] == {"hidden": False, "disabled": True}
     assert result["refusedByState"] == 0
