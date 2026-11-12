@@ -305,9 +305,15 @@ sc_host_server_up() {
   # The transient unit starts from the user manager's environment, not this
   # one. A non-default XDG_STATE_HOME selects where this install's private
   # engine state lives, so carry it across or the server resolves a different
-  # (or missing) instance than the launcher that started it.
+  # (or missing) instance than the launcher that started it. The browser-chat
+  # compaction settings are read by that server, so each one that is set here
+  # is carried across the same way; an unset one is left to its default.
   if ! systemd-run --user --quiet --collect --unit "$HOST_SERVER_UNIT" \
-      ${XDG_STATE_HOME:+"--setenv=XDG_STATE_HOME=$XDG_STATE_HOME"} -- \
+      ${XDG_STATE_HOME:+"--setenv=XDG_STATE_HOME=$XDG_STATE_HOME"} \
+      ${SC_CHAT_COMPACT_WINDOW_CLAUDE:+"--setenv=SC_CHAT_COMPACT_WINDOW_CLAUDE=$SC_CHAT_COMPACT_WINDOW_CLAUDE"} \
+      ${SC_CHAT_COMPACT_WINDOW_CODEX:+"--setenv=SC_CHAT_COMPACT_WINDOW_CODEX=$SC_CHAT_COMPACT_WINDOW_CODEX"} \
+      ${SC_CHAT_COLD_RETURN_TOKENS:+"--setenv=SC_CHAT_COLD_RETURN_TOKENS=$SC_CHAT_COLD_RETURN_TOKENS"} \
+      ${SC_CHAT_COLD_RETURN_MINUTES:+"--setenv=SC_CHAT_COLD_RETURN_MINUTES=$SC_CHAT_COLD_RETURN_MINUTES"} -- \
       /bin/sh -c 'printf "%s\n" "$$$$" > "$1"; exec env SC_BIND=127.0.0.1 PYTHONUNBUFFERED=1 "$2" "$3" --port "$4" >> "$5" 2>&1' \
       sc-host-server "$HOST_SERVER_PID" "$PY" "$ENGINE/api/server.py" "$host_port" "$HOST_SERVER_LOG"; then
     echo "✗ host-runtime: systemd could not start $HOST_SERVER_UNIT" >&2

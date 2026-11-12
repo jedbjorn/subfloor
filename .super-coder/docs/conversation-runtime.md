@@ -144,19 +144,17 @@ is not a positive whole number logs a warning and uses the default.
 
 ### Setting the four chat-compaction variables
 
-The server process reads them, so each runtime has its own route:
+The server process reads them. On both runtimes, export the variable in the
+shell that runs `./sc launch` or `./sc restart`; the launcher carries each of
+the four that is set across to the server, and an unset or empty one is left
+out so the default applies. A running server keeps the values it was started
+with, so a change needs `./sc restart`.
 
-- **Docker sandbox** (`./sc runtime sandbox`): export the variable in the
-  shell that runs `./sc launch` or `./sc restart`. The launcher forwards each
-  of the four that is set into the container by name; an unset one is left
-  out and the default applies. A running sandbox keeps the values it was
-  created with, so a change needs `./sc restart`.
+- **Docker sandbox** (`./sc runtime sandbox`): forwarded into the container
+  by name (`docker run -e NAME`).
 - **Host runtime** (`./sc runtime host`): the review server is a transient
-  systemd user unit, which starts from the user manager's environment and
-  not from the launching shell. Set the variable there
-  (`systemctl --user set-environment NAME=value`, or a file under
-  `~/.config/environment.d/` for one that survives a reboot), then
-  `./sc restart`.
+  systemd user unit, which does not inherit the launching shell; the launcher
+  passes each set variable to it (`systemd-run --setenv`).
 - **Foreground** (`./sc serve`): the server inherits the shell's
   environment directly.
 
