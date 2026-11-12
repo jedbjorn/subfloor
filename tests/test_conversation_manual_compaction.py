@@ -494,6 +494,167 @@ class CodexManualCompactTest(AdapterCase):
         self.assertEqual(turn.run_ref, COMPACT_TURN)
 
 
+# Recorded on a live install (Codex app-server, 258,400 window): three
+# compactions and the request that followed each. The zero-input update's
+# total is Codex's estimate of the rebuilt context (its instructions plus the
+# summary), about 25k whatever the chat held. On a small chat that is more
+# than the chat had, and more than the next request then reads.
+#   (trigger, tokens_before, tokens_after, next request's context_tokens)
+CODEX_LIVE_COMPACTIONS = (
+    ("manual", 21143, 24965, 22108),
+    ("manual", 22492, 25101, 22232),
+    ("auto", 118967, 26343, 23306),
+)
+
+
+def live_usage(*, input_tokens: int, total: int) -> dict[str, Any]:
+    note = codex_usage(input_tokens=input_tokens, total=total, window=258400)
+    note["params"]["turnId"] = COMPACT_TURN
+    return note
+
+
+class CompactionThatFreedNothingTest(AdapterCase):
+    """A figure after that is not lower than the figure before is not shown
+    as a reduction; the event keeps both figures and the meter moves on."""
+
+    def manual(self, before: int, after: int) -> NormalizedEvent:
+        native = CompactingCodexRpc([
+            {"method": "thread/status/changed",
+             "params": {"threadId": "thread-1", "status": {"type": "idle"}}},
+            # The last turn's usage, replayed: 5 output tokens on the input.
+            codex_usage(input_tokens=before - 5, total=before, window=258400),
+            CODEX_COMPACT_STARTED,
+            compact_note("item/started", item=CODEX_COMPACT_ITEM),
+            live_usage(input_tokens=0, total=after),
+            compact_note("item/completed", item=CODEX_COMPACT_ITEM),
+            CODEX_COMPACT_COMPLETED,
+        ])
+        adapter = CodexAdapter(rpc=native)
+        turn = adapter.compact("thread-1", self.context(context_tokens=before))
+        [compacted] = of_type(list(adapter.stream(turn)), "context.compacted")
+        return compacted
+
+    def test_recorded_small_chat_keeps_both_figures_and_says_nothing_dropped(
+        self,
+    ) -> None:
+        label = conversation_routes._compaction_label
+        expected = {21143: "21k", 22492: "22k"}
+        for trigger, before, after, _next in CODEX_LIVE_COMPACTIONS[:2]:
+            with self.subTest(before=before):
+                compacted = self.manual(before, after)
+                # The stored event is what the harness stated, unchanged.
+                self.assertEqual(compacted.payload["trigger"], trigger)
+                self.assertEqual(compacted.payload["tokens_before"], before)
+                self.assertEqual(compacted.payload["tokens_after"], after)
+                self.assertGreater(after, before)
+                self.assertEqual(
+                    label(dict(compacted.payload), "codex"),
+                    f"Context compacted · {expected[before]}, "
+                    "nothing to drop · manual",
+                )
+
+    def test_recorded_automatic_compaction_still_shows_the_reduction(self) -> None:
+        trigger, before, after, _next = CODEX_LIVE_COMPACTIONS[2]
+        self.assertEqual(
+            conversation_routes._compaction_label(
+                {"trigger": trigger, "tokens_before": before,
+                 "tokens_after": after}, "codex"),
+            "Context compacted · 119k → 26k · automatic",
+        )
+
+    def test_the_rule_is_the_same_for_every_harness_and_for_equal_figures(
+        self,
+    ) -> None:
+        label = conversation_routes._compaction_label
+        grew = {"trigger": "manual", "tokens_before": 21143,
+                "tokens_after": 24965}
+        same = {"trigger": "auto", "tokens_before": 8000, "tokens_after": 8000}
+        for harness in ("claude", "codex", "opencode", None):
+            with self.subTest(harness=harness):
+                self.assertEqual(
+                    label(grew, harness),
+                    "Context compacted · 21k, nothing to drop · manual")
+                self.assertEqual(
+                    label(same, harness),
+                    "Context compacted · 8k, nothing to drop · automatic")
+        # One token lower is a reduction, and is shown as one.
+        self.assertEqual(
+            label({"trigger": "manual", "tokens_before": 21143,
+                   "tokens_after": 21142}, "codex"),
+            "Context compacted · 21k → 21k · manual")
+        # A single stated figure is worded as before.
+        self.assertEqual(
+            label({"trigger": "manual", "tokens_before": 21143}),
+            "Context compacted · from 21k · manual")
+
+    def test_the_meter_settles_on_the_next_requests_own_figure(self) -> None:
+        read = conversation_compaction.meter_reading
+        for trigger, before, after, following in CODEX_LIVE_COMPACTIONS:
+            with self.subTest(before=before):
+                last = {"sequence": 1, "event_type": "usage", "created_at": "t1",
+                        "payload": {"scope": "request",
+                                    "context_tokens": before - 5}}
+                marker = {"sequence": 2, "event_type": "context.compacted",
+                          "created_at": "t2",
+                          "payload": {"trigger": trigger,
+                                      "tokens_before": before,
+                                      "tokens_after": after}}
+                request = {"sequence": 3, "event_type": "usage",
+                           "created_at": "t3",
+                           "payload": {"scope": "request",
+                                       "context_tokens": following}}
+                # Until a request reports, the harness's own figure stands.
+                self.assertEqual(read([marker, last])["context_tokens"], after)
+                settled = read([request, marker, last])
+                self.assertEqual(settled["context_tokens"], following)
+                self.assertEqual(settled["sequence"], 3)
+                self.assertLess(following, after)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_page_marker_and_meter_for_a_compaction_that_freed_nothing() -> None:
+    script = JS_PRELUDE + HELPERS + r"""
+const live = %s;
+const out = {labels: [], meter: [], claude: null, equal: null};
+for (const [trigger, before, after, following] of live) {
+  const payload = {trigger, tokens_before: before, tokens_after: after};
+  out.labels.push(chatCompactionLabel(payload, "codex"));
+  const context = {context_tokens: before - 5, context_window: 258400};
+  chatApplyContextEvent(context,
+    {event_type: "context.compacted", payload, created_at: "t2"});
+  const atMarker = context.context_tokens;
+  chatApplyContextEvent(context, {event_type: "usage", created_at: "t3",
+    payload: {scope: "request", context_tokens: following}});
+  out.meter.push([atMarker, context.context_tokens]);
+}
+out.claude = chatCompactionLabel(
+  {trigger: "manual", tokens_before: 21143, tokens_after: 24965}, "claude");
+out.equal = chatCompactionLabel(
+  {trigger: "auto", tokens_before: 8000, tokens_after: 8000});
+console.log(JSON.stringify(out));
+""" % json.dumps(CODEX_LIVE_COMPACTIONS)
+    result = run_js(script)
+    label = conversation_routes._compaction_label
+    assert result["labels"] == [
+        "Context compacted · 21k, nothing to drop · manual",
+        "Context compacted · 22k, nothing to drop · manual",
+        "Context compacted · 119k → 26k · automatic",
+    ]
+    # The page and the server word every recorded marker the same way.
+    assert result["labels"] == [
+        label({"trigger": trigger, "tokens_before": before,
+               "tokens_after": after}, "codex")
+        for trigger, before, after, _next in CODEX_LIVE_COMPACTIONS
+    ]
+    assert result["claude"] == "Context compacted · 21k, nothing to drop · manual"
+    assert result["equal"] == "Context compacted · 8k, nothing to drop · automatic"
+    # The live meter ends on the next request's own figure each time.
+    assert result["meter"] == [
+        [after, following]
+        for _trigger, _before, after, following in CODEX_LIVE_COMPACTIONS
+    ]
+
+
 class OpenCodeManualCompactTest(AdapterCase):
     """OpenCode: ``POST /session/{id}/summarize`` on the engine-owned server."""
 
@@ -1893,7 +2054,7 @@ class ColdReturnRuleTest(unittest.TestCase):
     def test_thresholds_are_sixty_thousand_tokens_and_sixty_minutes(self) -> None:
         self.assertEqual(
             conversation_compaction.cold_return_settings({}),
-            {"context_tokens": 60000, "idle_minutes": 60},
+            {"threshold_tokens": 60000, "threshold_minutes": 60},
         )
 
     def test_due_only_when_large_and_idle(self) -> None:
@@ -1920,7 +2081,7 @@ class ColdReturnRuleTest(unittest.TestCase):
             "SC_CHAT_COLD_RETURN_TOKENS": "20_000",
             "SC_CHAT_COLD_RETURN_MINUTES": "5",
         })
-        self.assertEqual(limits, {"context_tokens": 20000, "idle_minutes": 5})
+        self.assertEqual(limits, {"threshold_tokens": 20000, "threshold_minutes": 5})
         self.assertTrue(
             conversation_compaction.cold_return_due(25000, ago(6), NOW, limits))
         # An unusable value falls back to the default.
@@ -1929,7 +2090,7 @@ class ColdReturnRuleTest(unittest.TestCase):
                 "SC_CHAT_COLD_RETURN_TOKENS": "lots",
                 "SC_CHAT_COLD_RETURN_MINUTES": "0",
             }),
-            {"context_tokens": 60000, "idle_minutes": 60},
+            {"threshold_tokens": 60000, "threshold_minutes": 60},
         )
 
 
@@ -2006,7 +2167,7 @@ class ColdReturnProjectionTest(ManualCompactApiCase):
         # The single-chat read reports the same two settings.
         self.assertEqual(
             self.detail(conversation_id)["cold_return"],
-            {key: cold[key] for key in ("context_tokens", "idle_minutes")},
+            {key: cold[key] for key in ("threshold_tokens", "threshold_minutes")},
         )
         self.assertEqual(cold["last_model_activity_at"], stamp)
         return cold
@@ -2077,7 +2238,11 @@ class ColdReturnProjectionTest(ManualCompactApiCase):
         cold = self.cold(number=931, tokens=90000, minutes=120)
         self.assertTrue(cold["due"])
         self.assertEqual(
-            (cold["context_tokens"], cold["idle_minutes"]), (60000, 60))
+            (cold["threshold_tokens"], cold["threshold_minutes"]), (60000, 60))
+        # The names say these are the settings: the chat's own size (90,000
+        # here) is the meter's ``context_tokens``, never a field of this one.
+        self.assertNotIn("context_tokens", cold)
+        self.assertNotIn("idle_minutes", cold)
 
     def test_not_due_for_a_small_chat(self) -> None:
         self.assertFalse(self.cold(number=932, tokens=20000, minutes=600)["due"])
@@ -2096,7 +2261,7 @@ class ColdReturnProjectionTest(ManualCompactApiCase):
             cold = self.cold(number=935, tokens=20000, minutes=5)
         self.assertTrue(cold["due"])
         self.assertEqual(
-            (cold["context_tokens"], cold["idle_minutes"]), (10000, 1))
+            (cold["threshold_tokens"], cold["threshold_minutes"]), (10000, 1))
 
 
 # ── The chat view ───────────────────────────────────────────────────────────
@@ -2244,7 +2409,7 @@ const chat = (tokens, minutes, extra = {}) => ({
   // The conversation row's own stamp is never the rule's clock.
   last_activity_at: ago(0),
   context: {context_tokens: tokens},
-  cold_return: {context_tokens: 60000, idle_minutes: 60,
+  cold_return: {threshold_tokens: 60000, threshold_minutes: 60,
     last_model_activity_at: ago(minutes)}, ...extra});
 const due = (...args) => chatColdReturnDue(chat(...args), now);
 // A browser clock three hours fast, corrected by the server's stated time.
@@ -2275,7 +2440,7 @@ console.log(JSON.stringify({
   skewedRecent: skewed(5),
   skewedIdle: skewed(120),
   keptClock: chatColdReturnClock(null, now, {clock_offset_ms: 7}),
-  noServerTime: chatColdReturnClock({idle_minutes: 60}, now).clock_offset_ms,
+  noServerTime: chatColdReturnClock({threshold_minutes: 60}, now).clock_offset_ms,
   returnable: [chatColdReturnable({state: "idle"}),
     chatColdReturnable({state: "closed", scope: "normal"}),
     chatColdReturnable({state: "closed", scope: "other"}),
@@ -2284,11 +2449,11 @@ console.log(JSON.stringify({
   compacting: due(90000, 120, {compaction: {pending: true}}),
   unknownSize: due(null, 120),
   unknownTime: chatColdReturnDue({...chat(90000, 120),
-    cold_return: {context_tokens: 60000, idle_minutes: 60}}, now),
+    cold_return: {threshold_tokens: 60000, threshold_minutes: 60}}, now),
   defaults: chatColdReturnDue({...chat(90000, 120),
     cold_return: {last_model_activity_at: ago(120)}}, now),
   settings: chatColdReturnDue({...chat(25000, 6),
-    cold_return: {context_tokens: 20000, idle_minutes: 5,
+    cold_return: {threshold_tokens: 20000, threshold_minutes: 5,
       last_model_activity_at: ago(6)}}, now),
   text: chatColdReturnText(chat(90400, 120)),
   textUnknown: chatColdReturnText({}),
@@ -2528,7 +2693,7 @@ const open = async (overrides = {}) => {
       compaction: overrides.compaction ?? {supported: true, available: true,
         enabled: true, pending: false, message_id: null}},
     context: {context_tokens: overrides.tokens ?? 90400, context_window: 258400},
-    cold_return: {context_tokens: 60000, idle_minutes: 60,
+    cold_return: {threshold_tokens: 60000, threshold_minutes: 60,
       last_model_activity_at: ago(overrides.minutes ?? 120),
       server_time: ago(0)},
     items: []};
@@ -2601,7 +2766,7 @@ def test_button_sits_bottom_left_and_one_press_is_one_request() -> None:
     route: {harness: "codex"}, shell: {shortname: "dev", shell_id: 1},
     version: 2, compaction: {supported: true, available: true, enabled: true,
       pending: false, message_id: null},
-    cold_return: {context_tokens: 60000, idle_minutes: 60}}, []);
+    cold_return: {threshold_tokens: 60000, threshold_minutes: 60}}, []);
   const reread = {meter: view.meter.textContent, hidden: view.meter.hidden,
     button: view.compact.textContent};
 

@@ -217,10 +217,10 @@ def _positive_setting(
 def cold_return_settings(env: Mapping[str, str] | None = None) -> dict[str, int]:
     """The two thresholds of the cold-return notice."""
     return {
-        "context_tokens": _positive_setting(
+        "threshold_tokens": _positive_setting(
             COLD_RETURN_TOKENS_ENV, COLD_RETURN_TOKENS, env
         ),
-        "idle_minutes": _positive_setting(
+        "threshold_minutes": _positive_setting(
             COLD_RETURN_IDLE_MINUTES_ENV, COLD_RETURN_IDLE_MINUTES, env
         ),
     }
@@ -260,9 +260,9 @@ def cold_return_due(
     last, current = _instant(last_activity_at), _instant(now)
     if size is None or last is None or current is None:
         return False
-    if size < limits["context_tokens"]:
+    if size < limits["threshold_tokens"]:
         return False
-    return (current - last).total_seconds() > limits["idle_minutes"] * 60
+    return (current - last).total_seconds() > limits["threshold_minutes"] * 60
 
 
 def with_reground(body: str) -> str:

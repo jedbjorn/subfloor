@@ -1667,6 +1667,15 @@ case "$cmd" in
     [ -n "${MISTRAL_API_KEY:-}" ] && mistral_env="-e MISTRAL_API_KEY=${MISTRAL_API_KEY}"
     disabled_harnesses_env=""
     [ -n "${SC_DISABLED_HARNESSES:-}" ] && disabled_harnesses_env="-e SC_DISABLED_HARNESSES"
+    # The browser-chat compaction settings are read by the review server, which
+    # runs inside the container: forward each one that is set, by name, so the
+    # value comes from the launch environment like SC_DISABLED_HARNESSES. An
+    # unset one is left out and the server uses its default.
+    chat_settings_env=""
+    [ -n "${SC_CHAT_COMPACT_WINDOW_CLAUDE:-}" ] && chat_settings_env="$chat_settings_env -e SC_CHAT_COMPACT_WINDOW_CLAUDE"
+    [ -n "${SC_CHAT_COMPACT_WINDOW_CODEX:-}" ] && chat_settings_env="$chat_settings_env -e SC_CHAT_COMPACT_WINDOW_CODEX"
+    [ -n "${SC_CHAT_COLD_RETURN_TOKENS:-}" ] && chat_settings_env="$chat_settings_env -e SC_CHAT_COLD_RETURN_TOKENS"
+    [ -n "${SC_CHAT_COLD_RETURN_MINUTES:-}" ] && chat_settings_env="$chat_settings_env -e SC_CHAT_COLD_RETURN_MINUTES"
     # Forward DATABASE_URL into the sandbox when a pg sidecar is configured, so
     # the fork's APP can connect to it. Default tracks the sidecar's container
     # name + baked sc/sc/sc creds (one source of truth); SC_DATABASE_URL overrides
@@ -1761,7 +1770,7 @@ case "$cmd" in
         SC_GITHUB_AUTH_ARGS \
         -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
         -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
-        $mistral_env $disabled_harnesses_env $pg_env \
+        $mistral_env $disabled_harnesses_env $chat_settings_env $pg_env \
         -w "$here" \
         -v "$here:$here" \
         $state_namespace_mounts \

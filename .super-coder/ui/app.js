@@ -5111,12 +5111,16 @@ function chatPaintContextMeter(node, context, harness = null) {
 // Claude's figure after is the summary alone: the next request also carries
 // the system prompt and tools and is several times larger, so its marker
 // says "summary". The stored event is the same for every harness.
+// A figure after that is not lower than the figure before is not shown as a
+// reduction: "Context compacted · 21k, nothing to drop · manual".
 function chatCompactionLabel(payload, harness = null) {
   const before = chatTokenCount(payload?.tokens_before);
   const after = chatTokenCount(payload?.tokens_after);
   const summary = harness === "claude" ? " summary" : "";
   const parts = ["Context compacted"];
-  if (before !== null && after !== null)
+  if (before !== null && after !== null && after >= before)
+    parts.push(`${chatShortTokens(before)}, nothing to drop`);
+  else if (before !== null && after !== null)
     parts.push(
       `${chatShortTokens(before)} → ${chatShortTokens(after)}${summary}`);
   else if (before !== null) parts.push(`from ${chatShortTokens(before)}`);
@@ -5232,8 +5236,9 @@ function chatColdReturnable(conversation) {
 // recorded context size, so it is never due.
 function chatColdReturnDue(conversation, nowMs) {
   const limits = conversation?.cold_return || {};
-  const tokens = chatTokenCount(limits.context_tokens) || CHAT_COLD_RETURN_TOKENS;
-  const minutes = chatTokenCount(limits.idle_minutes)
+  const tokens = chatTokenCount(limits.threshold_tokens)
+    || CHAT_COLD_RETURN_TOKENS;
+  const minutes = chatTokenCount(limits.threshold_minutes)
     || CHAT_COLD_RETURN_IDLE_MINUTES;
   if (!chatColdReturnable(conversation)) return false;
   if (conversation?.active_run_id != null) return false;

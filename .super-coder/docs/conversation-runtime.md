@@ -142,6 +142,24 @@ warning and uses the default. Kimi and OpenCode have no window setting. The
 two cold-return settings are read whenever a chat is projected; a value that
 is not a positive whole number logs a warning and uses the default.
 
+### Setting the four chat-compaction variables
+
+The server process reads them, so each runtime has its own route:
+
+- **Docker sandbox** (`./sc runtime sandbox`): export the variable in the
+  shell that runs `./sc launch` or `./sc restart`. The launcher forwards each
+  of the four that is set into the container by name; an unset one is left
+  out and the default applies. A running sandbox keeps the values it was
+  created with, so a change needs `./sc restart`.
+- **Host runtime** (`./sc runtime host`): the review server is a transient
+  systemd user unit, which starts from the user manager's environment and
+  not from the launching shell. Set the variable there
+  (`systemctl --user set-environment NAME=value`, or a file under
+  `~/.config/environment.d/` for one that survives a reboot), then
+  `./sc restart`.
+- **Foreground** (`./sc serve`): the server inherits the shell's
+  environment directly.
+
 ## Compaction, the context meter and the re-ground line
 
 Feature #95, spec #272. The engine summarises nothing; it makes each
@@ -152,7 +170,14 @@ harness's own compaction earlier and visible.
   or the adapter can read them, and never any summary text. One event per
   compaction. The chat shows it as a marker, for example
   `Context compacted · 123k → 28k · automatic`; a figure that was not reported
-  is left out. Claude, Codex and OpenCode are mapped; Kimi is not (see each
+  is left out. When the figure after is not lower than the figure before, the
+  marker does not show a reduction: it reads
+  `Context compacted · 21k, nothing to drop · manual`. That happens on a
+  small Codex chat, where the figure after is Codex's own estimate of the
+  rebuilt context (its instructions plus the summary) and exceeds the few
+  thousand tokens the chat held. The event keeps both figures as stated, the
+  rule is the same for every harness, and the meter moves to the next
+  request's own figure as soon as that request reports. Claude, Codex and OpenCode are mapped; Kimi is not (see each
   adapter's README).
 - **`usage`** now says what it measures. `scope: request` is one model request
   of the chat and carries `context_tokens` (uncached input, cache read and
@@ -262,8 +287,10 @@ composer, one line above the composer says so, with the size.
   participant. On a closed chat there is no live session to compact, so it
   offers no compaction there.
 - **Data.** The transcript projection returns `cold_return`
-  (`context_tokens`, `idle_minutes`, `last_model_activity_at`, `server_time`,
-  and `due` as of that read); the single-chat read returns the two settings.
+  (`threshold_tokens`, `threshold_minutes`, `last_model_activity_at`,
+  `server_time`, and `due` as of that read); the single-chat read returns
+  the two thresholds under the same names. Both are the settings, not the
+  chat's own size or idle time: the size is `context.context_tokens`.
   The page re-checks the rule while it stays open, so a tab left open is
   covered without a reload. It does so on the server's clock: it records how
   far its own clock is from `server_time` and corrects for it, so a browser
