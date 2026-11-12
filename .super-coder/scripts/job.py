@@ -1041,8 +1041,10 @@ def _row_detail(row: dict, kind: str | None) -> str:
     agent = row.get('agent')
     if agent:
         usage = agent.get('usage_json') or {}
-        tokens = (f" · {usage.get('input_tokens', 0) + usage.get('output_tokens', 0)} tokens"
-                  if usage else '')
+        # Input + output only, as the run row shows; cache reads and writes
+        # are not counted here (the Analytics tab counts them).
+        tokens = (f" · {usage.get('input_tokens', 0) + usage.get('output_tokens', 0)} "
+                  "input + output tokens" if usage else '')
         return (f" [{agent['harness']} · {agent['requested_model']} · "
                 f"{agent['effective_effort'] or 'default'} · {_remaining(row)}{tokens}]")
     if kind == 'probe':

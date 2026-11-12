@@ -15,6 +15,7 @@
     "sprint_protocol",
     "sprint_prep",
     "sprint_pln",
-    "cli_orchestration"
+    "cli_orchestration",
+    "delegation"
   ]
 }

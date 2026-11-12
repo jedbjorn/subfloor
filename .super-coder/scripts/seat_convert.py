@@ -15,6 +15,21 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parents[1]
 INSTRUCTION = "Use sc job start for long work; end your turn and completion wakes you."
 SCHEDULERS = {"Monitor", "CronCreate", "ScheduleWakeup"}
+# Decision #425, wording refined by decision #450 (spec #273): small delegated
+# work is an `sc job` subagent, big multi-shell work is a Sprint.
+SCHEDULER_REFUSAL = (
+    "In-session timers and monitors end with your turn. Use the engine's bounded "
+    "watches, then end your turn; each wakes you once: `sc job start --until "
+    "\"<command>\"` for a condition, `sc job watch pr --pr <n>` for a pull request "
+    "whose checks settle or that is merged or closed, `sc job watch timer --after "
+    "<seconds>` for a delay. Sprint and PR wakes already deliver their outcomes."
+)
+AGENT_REFUSAL = (
+    "A background Agent dies when your turn ends, and its work with it. Run Agent "
+    "in the foreground. For small delegated work that should outlive this turn, "
+    "launch a subagent with `sc job agent` (see the `delegation` skill); it wakes "
+    "you when it finishes. Big multi-shell work is a Sprint."
+)
 
 
 def timeout_seconds(value: object) -> int:
@@ -66,11 +81,11 @@ def convert(event: dict, tier: str) -> dict | None:
         return None
     name, tool_input = event.get("tool_name"), event.get("tool_input")
     if name in SCHEDULERS:
-        return deny("Use sc job start --until for bounded polling; Sprint and PR wakes already deliver their outcomes.")
+        return deny(SCHEDULER_REFUSAL)
     if name not in {"Bash", "Agent"} or not isinstance(tool_input, dict) or tool_input.get("run_in_background") is not True:
         return None
     if tier == "deny-only":
-        return deny(INSTRUCTION if name == "Bash" else "Run Agent in the foreground; use Sprint lanes for background agents.")
+        return deny(INSTRUCTION if name == "Bash" else AGENT_REFUSAL)
     updated = dict(tool_input)
     updated["run_in_background"] = False
     if name == "Bash":

@@ -49,6 +49,19 @@ _AGENT_OUTCOME = frozenset({"head_commit", "uncommitted"})
 
 ADMIN_CONFUSION = "a subagent launched from the Admin seat, which the delegation rules do not cover"
 RESERVED_NAME_CONFUSION = "a subagent worktree that is also a shell's worktree"
+# A lost subagent's note states what the engine found of its harness process
+# when it recorded the loss, in the past tense: it may have changed since.
+LOST_NOTE_LABEL = "When the run was marked lost"
+ORPHAN_NOTES = {
+    "stopped": "the engine stopped harness process {pid}: its supervisor was gone",
+    "unverified": "harness process {pid} was running and was left running: it could "
+                  "not be tied to this run's worktree",
+    "denied": "harness process {pid} was running and was left running: the engine "
+              "was not permitted to signal it",
+    "unknown": "the harness process could not be checked, because the ledger holds "
+               "no complete identity for it (pid, start ticks, boot id); it may "
+               "still be running",
+}
 _HARNESS_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _RESERVED_SHELL_NAME = re.compile(r"agent-[0-9]+")
 
@@ -221,11 +234,20 @@ def agent_wake_body(row: dict, payload: dict) -> str:
     if dirty is None and removed:
         dirty = False
     size = agent.get("result_bytes")
+    # The engine's own note on how the run ended: why it never started, or,
+    # for a lost run, what the engine found of its harness process then.
+    note = payload.get("spawn_error")
+    noted = (
+        f"{LOST_NOTE_LABEL if payload['state'] == 'lost' else 'Reason'}: "
+        f"{str(note).rstrip('.')}.\n"
+        if note else ""
+    )
     return (
         f"Run {rid} (agent: {row['label']}) {payload['state']}; "
         f"exit={payload.get('exit_code', 'unknown')}; {agent.get('harness', '?')} · "
         f"{agent.get('requested_model', '?')} · {agent.get('effective_effort') or 'default'}; "
         f"ran {ran} of {_span(row.get('timeout_seconds'))}.\n"
+        f"{noted}"
         f"Worktree {where}; "
         f"{agent.get('branch') or 'detached at ' + (base[:12] or 'unknown')}; "
         f"HEAD {head[:12] if head else 'unknown'}; uncommitted changes: "
@@ -334,6 +356,69 @@ class RunStore:
             "AND (? IS NULL OR kind=?) AND (? IS NULL OR state=?)",
             (owner, owner, kind, kind, state, state),
         ).fetchone()[0]
+
+    def limits(self, owner: int | None = None, *, fleet: bool = False) -> dict:
+        """Live subagents and watchers against their limits, for a list's head.
+
+        A run is counted as registration counts it: unfinished, and not
+        proven to have no process. `shell_live` is the owner's count, absent
+        without an owner; `by_shell` is given to the operator's fleet view only.
+        """
+        out = {}
+        for name, kind, per_shell in (
+            ("agents", "agent", AGENT_LIVE_PER_SHELL),
+            ("watchers", "probe", WATCH_LIVE_PER_SHELL),
+        ):
+            gone = self._runs_without_a_process(kind)
+            owners = [
+                row["owner_shell_id"] for row in self.con.execute(
+                    "SELECT run_id,owner_shell_id FROM runs WHERE kind=? "
+                    "AND state IN ('registered','running')", (kind,),
+                )
+                if row["run_id"] not in gone
+            ]
+            entry = {"per_shell": per_shell, "install_live": len(owners)}
+            if owner is not None:
+                entry["shell_live"] = owners.count(owner)
+            if fleet:
+                entry["by_shell"] = {
+                    str(shell): owners.count(shell) for shell in sorted(set(owners))
+                }
+            out[name] = entry
+        out["agents"]["per_install"] = AGENT_LIVE_PER_INSTALL
+        return out
+
+    def label_worktrees(self, worktrees: list[dict]) -> None:
+        """Name the run and launching shell of each `agent-<run_id>` worktree.
+
+        Adds an `agent` object to the entries of a worktree listing whose
+        directory is a subagent's. The directory name carries the first run
+        of its thread; `latest_run_id` is the newest run that worked there.
+        """
+        for entry in worktrees:
+            path = Path(str(entry.get("abs") or ""))
+            if path.parent != self.worktrees or not _RESERVED_SHELL_NAME.fullmatch(path.name):
+                continue
+            run_id = int(path.name[len(AGENT_WORKTREE_PREFIX):])
+            row = self.con.execute(
+                "SELECT r.label,r.owner_shell_id,s.shortname,a.harness,"
+                "a.requested_model,a.worktree FROM runs r JOIN run_agents a USING(run_id) "
+                "LEFT JOIN shells s ON s.shell_id=r.owner_shell_id WHERE r.run_id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None or Path(row["worktree"]).name != path.name:
+                entry["agent"] = {"run_id": run_id, "known": False}
+                continue
+            latest = self.con.execute(
+                "SELECT r.run_id,r.state FROM runs r JOIN run_agents a USING(run_id) "
+                "WHERE a.worktree=? ORDER BY r.run_id DESC LIMIT 1", (row["worktree"],),
+            ).fetchone()
+            entry["agent"] = {
+                "run_id": run_id, "known": True, "label": row["label"],
+                "owner_shell_id": row["owner_shell_id"], "owner": row["shortname"],
+                "harness": row["harness"], "requested_model": row["requested_model"],
+                "latest_run_id": latest["run_id"], "state": latest["state"],
+            }
 
     def _agent(self, run_id: int) -> dict | None:
         row = self.con.execute(
@@ -797,9 +882,11 @@ class RunStore:
             ):
                 raise ValueError(f"conflicting run incarnation: {key}")
         with db_driver.write_transaction(self.con, "runs.running"):
+            # A check-in that omits a key leaves the ledger's value: a value,
+            # once recorded, is never cleared by a later, shorter check-in.
             self.con.execute(
                 "UPDATE runs SET state='running',"
-                + ",".join(f"{k}=?" for k in keys)
+                + ",".join(f"{k}=COALESCE(?,{k})" for k in keys)
                 + " WHERE run_id=? AND state IN ('registered','running')",
                 (*(data.get(k) for k in keys), run_id),
             )
@@ -1062,27 +1149,47 @@ class RunStore:
         a supervisor that was killed. Nothing would then stop it at its time
         limit, and it would go on working under a run recorded as lost.
 
-        Returns `gone` when the recorded process is not running, `stopped`
-        when its group was signalled, and `unverified` when it is running but
-        could not be tied to this run (`_tied_to_run`); that one is left alone.
+        `row` carries the process identity the ledger holds, never one read
+        from `meta.json`. Returns `not_started` when no supervisor ever
+        checked in (a supervisor launches nothing before its check-in is
+        accepted), `gone` when the harness is proven not running, `stopped`
+        when its group was signalled, `unverified` when it is running but
+        could not be tied to this run (`_tied_to_run`), `denied` when the
+        signal was not permitted, and `unknown` when the ledger's identity is
+        incomplete or /proc could not answer, so whether it runs is not known.
+        Only `stopped` signals anything.
         """
-        if process_alive(row.get("pid"), row.get("start_ticks"), row.get("boot_id")) is not True:
+        if not row.get("supervisor_pid"):
+            return "not_started"
+        alive = process_alive(row.get("pid"), row.get("start_ticks"), row.get("boot_id"))
+        if alive is False:
             return "gone"
+        if alive is None:
+            return "unknown"
         if not self._tied_to_run(row):
             return "unverified"
         try:
             os.killpg(int(row["pid"]), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+        except ProcessLookupError:
             return "gone"
+        except PermissionError:
+            return "denied"
         return "stopped"
+
+    @staticmethod
+    def _orphan_note(outcome: str, row: dict) -> str | None:
+        """What the engine found of a lost subagent's harness, for its wake and row."""
+        note = ORPHAN_NOTES.get(outcome)
+        return note.format(pid=row.get("pid")) if note else None
 
     def _stop_blocked_orphans(self) -> None:
         """A blocked subagent row is skipped by reconciliation, not by its limits.
 
         Its supervisor is what enforces the time limit. When that supervisor is
         proven gone, a harness still running under the row is stopped, on the
-        same evidence as for any other row. The row stays blocked for operator
-        recovery; what was done is added to its error text once.
+        same evidence as for any other row: the process identity the ledger
+        holds. The row stays blocked for operator recovery; what was found is
+        added to its error text once.
         """
         rows = self.con.execute(
             "SELECT * FROM runs WHERE kind='agent' AND state IN ('registered','running') "
@@ -1090,31 +1197,17 @@ class RunStore:
         ).fetchall()
         for raw in rows:
             row = dict(raw)
-            try:
-                meta = json.loads(Path(row["evidence_path"]).with_name("meta.json").read_text())
-            except (OSError, ValueError):
-                meta = {}
-            if isinstance(meta, dict) and meta.get("run_id") == row["run_id"]:
-                for key in ("pid", "start_ticks", "supervisor_pid",
-                            "supervisor_start_ticks", "boot_id"):
-                    if row.get(key) is None and meta.get(key) is not None:
-                        row[key] = meta[key]
             if process_alive(
                 row.get("supervisor_pid"), row.get("supervisor_start_ticks"), row.get("boot_id")
             ) is not False:
                 continue
-            outcome = self._stop_orphan(row)
-            note = {
-                "stopped": "; harness stopped: its supervisor is gone",
-                "unverified": "; harness process still running and not stopped: "
-                              "it could not be tied to this run's worktree",
-            }.get(outcome)
+            note = self._orphan_note(self._stop_orphan(row), row)
             if note and note not in (row["last_error"] or ""):
                 with db_driver.write_transaction(self.con, "runs.blocked_orphan"):
                     self.con.execute(
                         "UPDATE runs SET last_error=? WHERE run_id=? "
                         "AND state IN ('registered','running')",
-                        (((row["last_error"] or "") + note)[:1024], row["run_id"]),
+                        (((row["last_error"] or "") + "; " + note)[:1024], row["run_id"]),
                     )
 
     def reconcile(self) -> None:
@@ -1153,9 +1246,19 @@ class RunStore:
         if meta.get("finished_at"):
             self.terminal(row["run_id"], row["owner_shell_id"], terminal_payload(meta))
             return
+        # The orphan stop below acts only on what the ledger held before this
+        # pass: `meta.json` is written by the run's owner, and nothing read
+        # from it may name the process the engine signals, nor the worktree
+        # (`cwd`) that ties a process to the run.
+        orphan = dict(row)
         if meta.get("supervisor_pid"):
-            self.running(row["run_id"], row["owner_shell_id"], meta)
-            row.update(meta)
+            # The check-in is refused when it conflicts with what the ledger
+            # holds; the supervisor's liveness below is read from the row it
+            # returns.
+            ledger = self.running(row["run_id"], row["owner_shell_id"], meta)
+            for key in ("pid", "start_ticks", "supervisor_pid",
+                        "supervisor_start_ticks", "boot_id", "started_at"):
+                row[key] = ledger[key]
         alive = process_alive(
             row.get("supervisor_pid"),
             row.get("supervisor_start_ticks"),
@@ -1181,10 +1284,10 @@ class RunStore:
             self.terminal(row["run_id"], row["owner_shell_id"], terminal_payload(final))
             return
         lost = {"state": "lost", "finished_at": datetime.now(timezone.utc).isoformat()}
-        if row["kind"] == "agent" and self._stop_orphan(row) == "unverified":
-            # Truthful: the run is lost and something is still running under it.
-            lost["spawn_error"] = (
-                f"harness process {row.get('pid')} is still running and was not stopped: "
-                "it could not be tied to this run's worktree"
-            )
+        if row["kind"] == "agent":
+            # Truthful: the wake says what was found of the harness, and
+            # whether the engine stopped it.
+            note = self._orphan_note(self._stop_orphan(orphan), orphan)
+            if note:
+                lost["spawn_error"] = note
         self.terminal(row["run_id"], row["owner_shell_id"], lost)

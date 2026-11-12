@@ -4445,7 +4445,8 @@ class Handler(BaseHTTPRequestHandler):
                         "AND (state='running' OR wake_state='blocked')", (owner, owner),
                     ).fetchone()[0]
                     return self._send(200, {'runs': listed, 'total': store.count(owner, **filters),
-                                            'attention_count': attention})
+                                            'attention_count': attention,
+                                            'limits': store.limits(owner, fleet=operator)})
                 if operator:
                     raise PermissionError('registration requires shell authentication')
                 return self._send(201, store.register(sid, self._body()))
@@ -5740,7 +5741,16 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(urlparse(self.path).query)
             fetch = q.get("fetch", ["0"])[0] in ("1", "true", "yes")
             try:
-                return self._send(200, git_hygiene.compute(fetch=fetch))
+                state = git_hygiene.compute(fetch=fetch)
+                # A subagent's worktree is named for its run, not for a shell:
+                # say which run it is and which shell launched it.
+                from runs import RunStore
+                con = db()
+                try:
+                    RunStore(con, ENGINE).label_worktrees(state["worktrees"])
+                finally:
+                    con.close()
+                return self._send(200, state)
             except Exception as e:
                 return self._fail(e)
         # Rolling webapp event log — no DB, just the last LOG_MAX_EVENTS events.

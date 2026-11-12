@@ -36,7 +36,8 @@ def boot_block(flavor: str | None, seat: str | None, conversion: dict | None = N
     block = (
         "\n\n## SEAT\n\n"
         "You run headless. Native background tasks die when your turn ends. "
-        "Long work goes through `sc job`; dev-kit hooks are wrapped for you; "
+        "Long work goes through `sc job`, and so do subagents (`sc job agent`) "
+        "and bounded watches (`sc job watch`); dev-kit hooks are wrapped for you; "
         "completion wakes you. Do not schedule in-session timers."
     )
     if conversion and conversion.get("tier") == "disarmed":

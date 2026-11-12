@@ -191,7 +191,12 @@
     "tests/test_signin_gate.py",
     ".super-coder/migrations/0285_run_agents_and_time_limit.sql",
     "tests/test_job_agent_ledger.py",
-    "tests/test_job_watch.py"
+    "tests/test_job_watch.py",
+    "tests/test_runs_agent_ui.py",
+    "tests/test_runs_browser.py",
+    ".super-coder/assets/skills/delegation/SKILL.md",
+    ".super-coder/migrations/0287_seed_delegation_skill.sql",
+    "tests/test_delegation_skill.py"
   ],
   "baseline_migration_ledger": {
     "count": 142,
@@ -953,7 +958,11 @@
         "Sprint it points at the Sprint's own gate; outside one, a green wake says",
         "[`.super-coder/docs/sprint-pr-watcher.md`](../.super-coder/docs/sprint-pr-watcher.md).",
         "> **UI** this IS the GUI — Chats · Sprints · Shells · Roadmap · Documents · Flags · Worktrees · Repo Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)",
-        "you mean: `#sprints/<id>`, `#roadmap-feature-<id>`, `#roadmap-flow`,"
+        "you mean: `#sprints/<id>`, `#roadmap-feature-<id>`, `#roadmap-flow`,",
+        "merge or Sprint authority.",
+        "is a Sprint. A Claude shell can launch a Codex subagent and the reverse; Kimi",
+        "terminal. Inside an armed or paused Sprint, Developers and the Planner may;",
+        "a Reviewer of that Sprint may not. The operator has no launch control in"
       ],
       "README.md": [
         "- **Sprints v2.** Have a Planner prepare independent work lanes, choose routes",
