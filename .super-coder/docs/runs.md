@@ -109,16 +109,28 @@ Registration holds the limits, inside its write transaction:
 | Brief size | 64 KiB | 400 |
 | Nesting | depth 1 | 403: a registration carrying `launched_from_run` (the `SC_JOB_AGENT_RUN` of a subagent's environment) is refused. It prevents delegated work whose owner can no longer be traced. A command job or probe from the same environment registers and belongs to the launching shell |
 | Reviewer of an armed or paused Sprint | may not launch | 403. It prevents a review verdict that rests on a reader nobody assigned. Developers and the Planner of that Sprint register, as does a Reviewer outside one |
+| Admin | may not launch | 403. Every non-Admin flavor may launch; Admin's command jobs are unaffected |
+| A shell named `agent-<number>` exists | no shell may launch | 403, naming the shell. Its worktree is the path a run of that number would be given. Such a shell can only predate the reserved prefix; rename it. A name such as `agent-smith` names no run's worktree and refuses nothing |
+| Harness, model, effort shape | harness is a shipped harness name; model and effort carry no leading dash, quote, backslash or control character | 400 |
 
-A live run is one in state `registered` or `running`; a finished, stopped or
-lost run frees its slot.
+A slot is held by a run in state `registered` or `running` that can still be
+running. A finished, stopped or lost run frees its slot. So does an unfinished
+run with no process: one whose reconciliation was blocked (`wake_state`
+`blocked`, left for operator recovery) and one whose supervisor is proven gone.
+`sc job kill` stops only a run whose process is running.
+
+The run is registered before its worktree exists. If the worktree cannot be
+created, for example because `.sc-worktrees/agent-<run_id>` was left behind by
+an earlier run of that number, the run ends `failed` with exit code 127 and the
+reason, and the launching shell is told as for any finished run.
 
 A subagent runs in its own worktree so that it is not counted as its launching
 shell's live session and does not read that shell's boot file. Shell shortnames
 beginning `agent-` are refused at creation. Its environment is the launching
 shell's, with `SC_SEAT` cleared and `SC_JOB_AGENT_RUN` set: it acts under the
 launching shell's identity with exactly that shell's authority, and the engine
-adds no refusal for what it writes.
+adds no refusal for what it writes. `SC_JOB_AGENT_RUN` marks that one process
+tree only: a shell session launch and the API server both clear it at start.
 
 ## Dev-kit receipts
 

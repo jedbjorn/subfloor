@@ -7,6 +7,7 @@ paths; an absent supervisor never supplies an inferred command exit code.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,8 +36,40 @@ _AGENT_REQUEST = frozenset({
 _AGENT_FACTS = ("session_ref", "provider_model", "result_bytes", "worktree_removed_at")
 
 
+ADMIN_CONFUSION = "a subagent launched from the Admin seat, which the delegation rules do not cover"
+RESERVED_NAME_CONFUSION = "a subagent worktree that is also a shell's worktree"
+_HARNESS_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_RESERVED_SHELL_NAME = re.compile(r"agent-[0-9]+")
+
+
 class RunLimitError(ValueError):
     """A registration refused because a concurrency limit is full."""
+
+
+def harness_name(value: object) -> str:
+    """A harness is an adapter directory name, never free text."""
+    if not isinstance(value, str) or not _HARNESS_NAME.fullmatch(value):
+        raise ValueError("harness must be a shipped harness name (lowercase letters, digits, - and _)")
+    return value
+
+
+def route_value(value: object, name: str, *, limit: int = 512, required: bool = True) -> str | None:
+    """A model selector or effort level, safe to place in a command.
+
+    The value travels as one argv element, and for some harnesses inside a
+    quoted config value. A leading dash would be read as an option; a quote,
+    backslash, newline or other control character could end the quoted value
+    and add a setting of its own.
+    """
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > limit:
+        raise ValueError(f"{name} must be a non-empty value of at most {limit} characters")
+    if value != value.strip() or value.startswith("-"):
+        raise ValueError(f"{name} must not start with a dash or carry surrounding space")
+    if any(ord(c) < 32 or ord(c) == 127 or c in "\"'`\\" for c in value):
+        raise ValueError(f"{name} must not contain quotes, backslashes or control characters")
+    return value
 
 
 def _text(value: object, name: str, *, limit: int = 512, required: bool = True) -> str | None:
@@ -229,12 +262,12 @@ class RunStore:
         if branch is not None and (branch.startswith("-") or " " in branch):
             raise ValueError("branch must be a branch name")
         return {
-            "harness": _text(agent.get("harness"), "harness", limit=64),
-            "requested_model": _text(agent.get("requested_model"), "requested_model"),
-            "requested_effort": _text(
+            "harness": harness_name(agent.get("harness")),
+            "requested_model": route_value(agent.get("requested_model"), "requested_model"),
+            "requested_effort": route_value(
                 agent.get("requested_effort"), "requested_effort", limit=64, required=False
             ),
-            "effective_effort": _text(
+            "effective_effort": route_value(
                 agent.get("effective_effort"), "effective_effort", limit=64, required=False
             ),
             "branch": branch,
@@ -244,8 +277,46 @@ class RunStore:
             "base_commit": commit,
         }
 
-    def _agent_admission(self, owner: int) -> None:
+    def _agents_without_a_process(self) -> frozenset[int]:
+        """Unfinished agent runs whose supervisor is proven gone.
+
+        Read before the write transaction, because it probes /proc. A run that
+        registers after this read is absent from the set and so still counts.
+        """
+        rows = self.con.execute(
+            "SELECT run_id,supervisor_pid,supervisor_start_ticks,boot_id FROM runs "
+            "WHERE kind='agent' AND state IN ('registered','running')"
+        ).fetchall()
+        return frozenset(
+            row["run_id"] for row in rows
+            if process_alive(
+                row["supervisor_pid"], row["supervisor_start_ticks"], row["boot_id"]
+            ) is False
+        )
+
+    def _agent_admission(self, owner: int, gone: frozenset[int] = frozenset()) -> None:
         """Who may launch and how many may run; called inside the write transaction."""
+        flavor = self.con.execute(
+            "SELECT flavor FROM shells WHERE shell_id=?", (owner,)
+        ).fetchone()
+        if flavor and flavor["flavor"] == "admin":
+            raise PermissionError(
+                f"refused — {ADMIN_CONFUSION}: every non-Admin flavor may launch a "
+                "subagent; Admin may not."
+            )
+        taken = [
+            row["shortname"] for row in self.con.execute(
+                "SELECT shortname FROM shells WHERE COALESCE(is_deleted,0)=0 "
+                "AND lower(shortname) LIKE 'agent-%'"
+            )
+            if _RESERVED_SHELL_NAME.fullmatch(row["shortname"].lower())
+        ]
+        if taken:
+            raise PermissionError(
+                f"refused — {RESERVED_NAME_CONFUSION}: shell {taken[0]!r} holds a name "
+                "of the form agent-<number>, which is where a subagent run of that "
+                "number works. Rename that shell before any subagent is launched."
+            )
         reviewing = self.con.execute(
             "SELECT s.sprint_id,s.lifecycle FROM sprint_participants p "
             "JOIN sprints s USING(sprint_id) WHERE p.shell_id=? AND p.role='reviewer' "
@@ -258,17 +329,25 @@ class RunStore:
                 f"Sprint {reviewing['sprint_id']} ({reviewing['lifecycle']}), and a Reviewer "
                 "does not delegate while its Sprint is armed or paused."
             )
-        live = self.con.execute(
-            "SELECT r.run_id,r.owner_shell_id,s.shortname FROM runs r "
-            "LEFT JOIN shells s ON s.shell_id=r.owner_shell_id "
-            "WHERE r.kind='agent' AND r.state IN ('registered','running') ORDER BY r.run_id"
-        ).fetchall()
+        # A slot is held by a run that can still be running. A run whose
+        # reconciliation was blocked, or whose supervisor is proven gone, has no
+        # process: it waits for operator recovery without holding a slot.
+        live = [
+            row for row in self.con.execute(
+                "SELECT r.run_id,r.owner_shell_id,s.shortname FROM runs r "
+                "LEFT JOIN shells s ON s.shell_id=r.owner_shell_id "
+                "WHERE r.kind='agent' AND r.state IN ('registered','running') "
+                "AND r.wake_state<>'blocked' ORDER BY r.run_id"
+            )
+            if row["run_id"] not in gone
+        ]
         mine = [row["run_id"] for row in live if row["owner_shell_id"] == owner]
         if len(mine) >= AGENT_LIVE_PER_SHELL:
             raise RunLimitError(
                 f"live subagent limit for one shell reached: {len(mine)} of "
                 f"{AGENT_LIVE_PER_SHELL} live (runs {', '.join(map(str, mine))}). "
-                "Wait for one to finish or stop one with `sc job kill <id>`."
+                "Wait for one to finish. `sc job kill <id>` stops one that is "
+                "running; `sc job status <id>` shows whether it is."
             )
         if len(live) >= AGENT_LIVE_PER_INSTALL:
             holders = ", ".join(
@@ -340,6 +419,7 @@ class RunStore:
             if legacy.is_dir()
             else 0
         )
+        gone = self._agents_without_a_process() if agent is not None else frozenset()
         with db_driver.write_transaction(self.con, "runs.register"):
             existing = self.con.execute(
                 "SELECT * FROM runs WHERE owner_shell_id=? AND registration_key=?",
@@ -356,7 +436,7 @@ class RunStore:
                     raise ValueError("registration key reused with different input")
                 return self.get(existing["run_id"], owner)
             if agent is not None:
-                self._agent_admission(owner)
+                self._agent_admission(owner, gone)
             # Allocate above both the ledger high-water mark and legacy names,
             # so `status 1` never changes meaning after an upgrade.
             sequence = self.con.execute(

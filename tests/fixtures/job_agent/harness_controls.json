@@ -121,7 +121,7 @@
       "cli_version": "2.5.3",
       "live": true,
       "model": "kimi-code/kimi-for-coding-highspeed",
-      "requests": 2,
+      "requests": 4,
       "brief": "argument",
       "launch": {
         "argv": [
@@ -168,7 +168,33 @@
         "recalled_nonce": true
       },
       "observed": {},
-      "continue_works": true
+      "continue_works": true,
+      "dash_briefs": {
+        "about": "A brief that starts with dashes is accepted as the value of -p; both were fresh launches in stream-json.",
+        "argv": [
+          "kimi",
+          "-m",
+          "kimi-code/kimi-for-coding-highspeed",
+          "--output-format",
+          "stream-json",
+          "-p",
+          "{brief}"
+        ],
+        "runs": [
+          {
+            "brief_starts_with": "---\n",
+            "exit_code": 0,
+            "stdout": "{\"role\":\"meta\",\"type\":\"system.version\",\"version\":\"2.5.3\"}\n{\"role\":\"assistant\",\"content\":\"NONCE-7f3a\"}\n{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_00000000-0000-4000-8000-0000000000k2\",\"command\":\"kimi -r session_00000000-0000-4000-8000-0000000000k2\",\"content\":\"To resume this session: kimi -r session_00000000-0000-4000-8000-0000000000k2\"}\n",
+            "session_ref": "session_00000000-0000-4000-8000-0000000000k2"
+          },
+          {
+            "brief_starts_with": "-h ",
+            "exit_code": 0,
+            "stdout": "{\"role\":\"meta\",\"type\":\"system.version\",\"version\":\"2.5.3\"}\n{\"role\":\"assistant\",\"content\":\"NONCE-7f3a\"}\n{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_00000000-0000-4000-8000-0000000000k2\",\"command\":\"kimi -r session_00000000-0000-4000-8000-0000000000k2\",\"content\":\"To resume this session: kimi -r session_00000000-0000-4000-8000-0000000000k2\"}\n",
+            "session_ref": "session_00000000-0000-4000-8000-0000000000k2"
+          }
+        ]
+      }
     },
     "opencode": {
       "cli_version": "1.19.5",

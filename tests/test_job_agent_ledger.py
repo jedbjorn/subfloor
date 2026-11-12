@@ -50,6 +50,40 @@ def agent_payload(key: str, **changes) -> dict:
     }
 
 
+def _clauses(sql: str, keyword: str) -> list[str]:
+    """Every `<keyword>(...)` clause of a CREATE TABLE, whitespace removed."""
+    text = "".join(sql.split()).lower()
+    found, start = [], 0
+    while (at := text.find(keyword + "(", start)) != -1:
+        depth, end = 0, at + len(keyword)
+        while True:
+            depth += {"(": 1, ")": -1}.get(text[end], 0)
+            end += 1
+            if depth == 0:
+                break
+        found.append(text[at:end])
+        start = end
+    return sorted(found)
+
+
+def table_shape(con: sqlite3.Connection, table: str) -> dict:
+    sql = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()[0]
+    return {
+        "columns": {
+            row[1]: (row[2].upper(), row[3], row[4], row[5])
+            for row in con.execute(f"PRAGMA table_xinfo({table})")
+        },
+        "checks": _clauses(sql, "check"),
+        "uniques": _clauses(sql, "unique"),
+        "autoincrement": "autoincrement" in sql.lower(),
+        "foreign_keys": sorted(
+            (row[2], row[3], row[4]) for row in con.execute(f"PRAGMA foreign_key_list({table})")
+        ),
+    }
+
+
 class UpgradeTest(unittest.TestCase):
     """The rebuild carries a populated ledger through unchanged."""
 
@@ -149,6 +183,43 @@ class UpgradeTest(unittest.TestCase):
         self.assertEqual(row["run_id"], 21)
         self.assertNotIn("agent", row)
         self.assertEqual(store.get(3)["state"], "done")
+
+    def test_rebuilt_table_equals_the_prior_one_apart_from_the_intended_changes(self):
+        before = table_shape(self.con, "runs")
+        migrate.apply(self.con, ENGINE / "migrations" / MIGRATION)
+        after = table_shape(self.con, "runs")
+
+        old_kind = "check(kindin('job','devkit','probe','native'))"
+        new_kind = "check(kindin('job','devkit','probe','native','agent'))"
+        limit = "check(timeout_secondsisnullortimeout_seconds>0)"
+        self.assertIn(old_kind, before["checks"])
+        self.assertEqual(
+            after["checks"],
+            sorted([c for c in before["checks"] if c != old_kind] + [new_kind, limit]))
+        self.assertEqual(
+            after["columns"],
+            {**before["columns"], "timeout_seconds": ("INTEGER", 0, None, 0)})
+        self.assertEqual(list(after["columns"])[:-1], list(before["columns"]))
+        for key in ("uniques", "autoincrement", "foreign_keys"):
+            self.assertEqual(after[key], before[key], key)
+        # The two that a careless rebuild loses without any other test noticing.
+        self.assertEqual(after["columns"]["wake_state"][2], "'none'")
+        self.assertEqual(after["columns"]["state"][2], "'registered'")
+        self.assertIn(
+            "check(foregroundin(0,1)and(foreground=0orkind='devkit'))", after["checks"])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.con.execute(
+                "INSERT INTO runs(owner_shell_id,registration_key,kind,label,argv,cwd,"
+                "evidence_path,foreground) VALUES(1,'fg','job','l','[]','/repo','/e',1)")
+        self.con.rollback()
+        self.con.execute(
+            "INSERT INTO runs(owner_shell_id,registration_key,kind,label,argv,cwd,evidence_path) "
+            "VALUES(1,'d','job','l','[]','/repo','/e')")
+        self.assertEqual(
+            tuple(self.con.execute(
+                "SELECT state,wake_state,foreground,evidence_pruned FROM runs").fetchone()),
+            ("registered", "none", 0, 0))
+        self.con.rollback()
 
     def test_empty_ledger_upgrades_and_accepts_every_kind(self):
         migrate.apply(self.con, ENGINE / "migrations" / MIGRATION)
@@ -279,6 +350,97 @@ class RegistrationTest(AgentLedgerCase):
         self.assertEqual(self.con.execute("SELECT count(*) FROM runs").fetchone()[0], 0)
         self.assertEqual(self.con.execute("SELECT count(*) FROM run_agents").fetchone()[0], 0)
 
+    def test_harness_model_and_effort_shape_is_refused_with_400(self):
+        cases = [
+            ("harness must be a shipped harness name", {"harness": "Codex Exec"}),
+            ("harness must be a shipped harness name", {"harness": "-x"}),
+            ("requested_model must not start with a dash", {"requested_model": "-m"}),
+            ("requested_model must not contain quotes", {"requested_model": 'a"b'}),
+            ("requested_model must not contain quotes", {"requested_model": "a\nb"}),
+            ("requested_effort must not contain quotes",
+             {"requested_effort": 'low"\nsandbox_mode="read-only'}),
+            ("effective_effort must not start with a dash", {"effective_effort": "-c"}),
+        ]
+        for fragment, agent in cases:
+            with self.subTest(agent=agent):
+                code, error = self.api_error("POST", "/_sc/runs", agent_payload("bad", agent=agent))
+                self.assertEqual(code, 400)
+                self.assertIn(fragment, error)
+        self.assertEqual(self.con.execute("SELECT count(*) FROM runs").fetchone()[0], 0)
+
+    def test_admin_is_refused_with_403(self):
+        self.con.execute("UPDATE shells SET flavor='admin' WHERE shell_id=1")
+        self.con.commit()
+        code, error = self.api_error("POST", "/_sc/runs", agent_payload("admin"))
+        self.assertEqual(code, 403)
+        self.assertIn(runs.ADMIN_CONFUSION, error)
+        self.assertEqual(self.con.execute("SELECT count(*) FROM runs").fetchone()[0], 0)
+        # Admin's command jobs are untouched, and every other flavor registers.
+        self.assertEqual(self.register(registration_key="cmd")["kind"], "job")
+        for flavor in ("dev", "planner", "reviewer", None):
+            with self.subTest(flavor=flavor):
+                self.con.execute("UPDATE shells SET flavor=? WHERE shell_id=2", (flavor,))
+                self.con.commit()
+                row = self.store.register(2, agent_payload(f"as-{flavor}"))
+                self.assertEqual(row["state"], "registered")
+                self.finish(row, owner=2)
+
+    def test_a_shell_named_like_a_run_worktree_refuses_every_launch(self):
+        # Such a shell can only predate the reserved prefix. Its worktree is
+        # the path a run of that number would be given, so no launch proceeds.
+        self.con.execute("UPDATE shells SET shortname='Agent-12' WHERE shell_id=4")
+        self.con.commit()
+        code, error = self.api_error("POST", "/_sc/runs", agent_payload("clash"))
+        self.assertEqual(code, 403)
+        self.assertIn(runs.RESERVED_NAME_CONFUSION, error)
+        self.assertIn("'Agent-12'", error)
+        self.assertEqual(self.con.execute("SELECT count(*) FROM runs").fetchone()[0], 0)
+        # A name that is not agent-<number> names no run's worktree; a deleted shell holds none.
+        for change in ("shortname='agent-smith'", "shortname='agent-12', is_deleted=1"):
+            with self.subTest(change=change):
+                self.con.execute(f"UPDATE shells SET {change} WHERE shell_id=4")
+                self.con.commit()
+                row = job._api("POST", "/_sc/runs", agent_payload(change))
+                self.assertEqual(row["state"], "registered")
+                self.finish(row)
+
+    def test_branch_and_the_rest_of_the_request_are_immutable(self):
+        row = self.store.register(1, agent_payload("fixed", agent={"branch": "feat/x"}))
+        for column, value in (("branch", "feat/y"), ("harness", "claude"),
+                              ("requested_model", "m"), ("requested_effort", "high"),
+                              ("worktree", "/x"), ("base_commit", "b" * 40),
+                              ("continues_run_id", 1), ("run_id", 99)):
+            with self.subTest(column=column), self.assertRaises(sqlite3.IntegrityError):
+                self.con.execute(
+                    f"UPDATE run_agents SET {column}=? WHERE run_id=?", (value, row["run_id"]))
+            self.con.rollback()
+        self.assertEqual(self.store.get(row["run_id"])["agent"]["branch"], "feat/x")
+
+    def test_sc_job_start_records_its_time_limit(self):
+        timed = self.start_job("exit 0", "--timeout", "45")
+        self.assertEqual(timed["timeout_seconds"], 45)
+        self.finished(timed)
+        plain = self.start_job("exit 0")
+        self.assertIsNone(plain["timeout_seconds"])
+        self.finished(plain)
+
+    def test_a_worktree_that_cannot_be_created_ends_the_run_failed_and_frees_its_slot(self):
+        import job_agent
+
+        rows = [self.store.register(1, agent_payload(f"k{i}")) for i in range(3)]
+        doomed = rows[-1]
+        Path(doomed["cwd"]).mkdir(parents=True)  # left behind by an earlier run of this number
+        made = job_agent.create_worktree_or_fail(
+            doomed["run_id"], COMMIT, root=self.root,
+            submit=lambda payload: self.store.terminal(doomed["run_id"], 1, payload))
+        self.assertIsNone(made)
+        final = self.store.get(doomed["run_id"])
+        self.assertEqual((final["state"], final["exit_code"]), ("failed", 127))
+        self.assertIn("already exists, left by an earlier run",
+                      json.loads(final["terminal_json"])["spawn_error"])
+        self.assertEqual(final["wake_state"], "pending")
+        self.assertEqual(self.store.register(1, agent_payload("next"))["state"], "registered")
+
     def test_brief_size_is_capped_at_64_kib(self):
         row = job._api("POST", "/_sc/runs", agent_payload("fits", agent={"brief_bytes": 65536}))
         self.assertEqual(row["state"], "registered")
@@ -319,6 +481,87 @@ class ConcurrencyLimitTest(AgentLedgerCase):
             self.store.register(1, agent_payload("fourth"))
         self.finish(rows[0])
         self.assertEqual(self.store.register(1, agent_payload("fourth"))["state"], "registered")
+
+    def test_a_run_with_no_live_process_holds_no_slot(self):
+        rows = [self.store.register(1, agent_payload(f"k{i}")) for i in range(3)]
+        with self.assertRaises(runs.RunLimitError) as caught:
+            self.store.register(1, agent_payload("fourth"))
+        error = str(caught.exception)
+        # `kill` refuses a run whose process is gone, so it is offered only for a running one.
+        self.assertIn("`sc job kill <id>` stops one that is running", error)
+        self.assertNotIn("or stop one with", error)
+
+        # Reconciliation gave up on a registered row: it stays unfinished for
+        # operator recovery, is skipped by every later reconcile, and has no process.
+        self.con.execute(
+            "UPDATE runs SET wake_state='blocked', last_error='reconciliation blocked' "
+            "WHERE run_id=?", (rows[0]["run_id"],))
+        self.con.commit()
+        self.store.reconcile()
+        self.assertEqual(self.store.get(rows[0]["run_id"])["state"], "registered")
+        fourth = self.store.register(1, agent_payload("fourth"))
+        self.assertEqual(fourth["state"], "registered")
+
+        # A running row whose supervisor belonged to another boot is proven gone.
+        self.con.execute(
+            "UPDATE runs SET state='running', supervisor_pid=1, supervisor_start_ticks=1, "
+            "boot_id='an-earlier-boot', wake_state='blocked' WHERE run_id=?",
+            (rows[1]["run_id"],))
+        self.con.commit()
+        self.assertEqual(self.store.register(1, agent_payload("fifth"))["state"], "registered")
+        self.con.execute(
+            "UPDATE runs SET wake_state='none' WHERE run_id=?", (rows[1]["run_id"],))
+        self.con.commit()
+        with self.assertRaises(runs.RunLimitError) as caught:
+            self.store.register(1, agent_payload("sixth"))
+        held = [rows[2]["run_id"], fourth["run_id"], fourth["run_id"] + 1]
+        self.assertIn(f"3 of 3 live (runs {', '.join(map(str, held))})", str(caught.exception))
+        # The same two rows hold no install slot either.
+        for index in range(3):
+            self.store.register(2, agent_payload(f"other-{index}"))
+        with self.assertRaises(runs.RunLimitError) as caught:
+            self.store.register(3, agent_payload("seventh"))
+        self.assertIn("6 of 6 live", str(caught.exception))
+        for gone in rows[:2]:
+            self.assertNotIn(f"{gone['run_id']} (", str(caught.exception))
+
+    def test_a_live_supervisor_keeps_its_slot(self):
+        import os as _os
+
+        rows = [self.store.register(1, agent_payload(f"k{i}")) for i in range(3)]
+        me = _os.getpid()
+        ticks = int(Path(f"/proc/{me}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        self.con.execute(
+            "UPDATE runs SET state='running', supervisor_pid=?, supervisor_start_ticks=?, "
+            "boot_id=? WHERE run_id=?", (me, ticks, runs.boot_id(), rows[0]["run_id"]))
+        self.con.commit()
+        self.assertEqual(self.store._agents_without_a_process(), frozenset())
+        with self.assertRaises(runs.RunLimitError):
+            self.store.register(1, agent_payload("fourth"))
+
+    def test_admission_is_decided_inside_the_write_transaction(self):
+        # The interleaving of two registrations is not forced here; the parallel
+        # test above exercises it. This pins the structure that makes it safe:
+        # the count and the insert share one write transaction, and the /proc
+        # probe happens before it.
+        seen = []
+        admission = self.store._agent_admission
+        probe = self.store._agents_without_a_process
+
+        def admit(owner, gone=frozenset()):
+            seen.append(("admission", self.con.in_transaction))
+            return admission(owner, gone)
+
+        def probed():
+            seen.append(("probe", self.con.in_transaction))
+            return probe()
+
+        self.store._agent_admission = admit
+        self.store._agents_without_a_process = probed
+        row = self.store.register(1, agent_payload("one"))
+        self.assertEqual(seen, [("probe", False), ("admission", True)])
+        self.assertEqual(self.con.execute(
+            "SELECT count(*) FROM run_agents WHERE run_id=?", (row["run_id"],)).fetchone()[0], 1)
 
     def test_the_seventh_on_the_install_is_refused_naming_every_holder(self):
         held = []

@@ -6965,6 +6965,9 @@ def _run_server(port: int) -> int:
 
 
 def main(argv):
+    # A server started from inside a subagent's process tree is not that
+    # subagent; every chat it launches would otherwise inherit the run id.
+    os.environ.pop("SC_JOB_AGENT_RUN", None)
     # server.log is stdout+stderr as the dispatcher redirected them; stamp both
     # before the first line is written. basicConfig carries no time of its own
     # — the writer adds one per line, once.

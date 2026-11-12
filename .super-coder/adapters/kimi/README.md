@@ -193,9 +193,11 @@ and is unaffected otherwise.
 | `resume` | `-S` | `-S <id>` continues the session; the id is unchanged |
 
 Checked on Kimi Code 2.5.3, 2026-11-12, model alias
-`kimi-code/kimi-for-coding-highspeed`, two requests: a text-mode launch and a
-`stream-json` resume with `-S` that recalled the first reply. Text mode prints
-the reply on stdout behind a bullet and the resume hint on stderr, so the
-structured stream is used. `kimi session list --cwd <dir> --json` also lists
+`kimi-code/kimi-for-coding-highspeed`, four requests: a text-mode launch, a
+`stream-json` resume with `-S` that recalled the first reply, and two fresh
+`stream-json` launches whose briefs began with `---` and with `-h`. Both were
+accepted as the value of `-p`, so a brief may start with dashes. Text mode
+prints the reply on stdout behind a bullet and the resume hint on stderr, so
+the structured stream is used. `kimi session list --cwd <dir> --json` also lists
 the session without a request. Exit codes on stop and timeout were not
 observed.

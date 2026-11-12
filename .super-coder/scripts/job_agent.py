@@ -9,7 +9,9 @@ The command is built before the run is registered, so the run id is not yet
 known. Arguments that depend on the run's evidence directory carry the
 `{run_dir}` token, and a brief delivered as an argument is the `{brief}` token,
 so the ledger records the command without the brief's text. `materialize`
-replaces both once the run exists.
+replaces both once the run exists, and only at the positions the engine placed
+them: a model, effort, session or branch that happens to spell a token is
+passed through as the caller wrote it.
 
 The worktree and the child environment are mechanics, not containment
 (decision #427): a subagent acts under its launching shell's identity with
@@ -23,15 +25,19 @@ import shutil
 import subprocess
 import uuid
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
 import project_root
 import run as run_mod
-from runs import AGENT_BRIEF_MAX, AGENT_WORKTREE_PREFIX
+from runs import AGENT_BRIEF_MAX, AGENT_WORKTREE_PREFIX, harness_name, route_value
 
 RUN_DIR = "{run_dir}"
 BRIEF = "{brief}"
+# While a command is assembled the engine's own tokens carry a control
+# character no caller value may hold, so their positions are unambiguous.
+_MARK = "\x1f"
 BRIEF_FILE = "brief.md"
 LAST_MESSAGE_FILE = "last-message.md"
 RUN_VARIABLE = "SC_JOB_AGENT_RUN"
@@ -59,15 +65,21 @@ class AgentCommand(NamedTuple):
     session_ref: str | None
     resumes: str | None
     cli_version: str | None
+    brief_index: int | None = None
+    run_dir_indexes: tuple[int, ...] = ()
 
     def materialize(self, run_dir: Path) -> tuple[list[str], Path | None]:
-        """The argv to spawn and the file to open as standard input."""
-        brief = run_dir / BRIEF_FILE
-        argv = [
-            brief.read_text() if arg == BRIEF else arg.replace(RUN_DIR, str(run_dir))
-            for arg in self.argv
-        ]
-        return argv, (Path(self.stdin.replace(RUN_DIR, str(run_dir))) if self.stdin else None)
+        """The argv to spawn and the file to open as standard input.
+
+        Only the positions recorded at build time are replaced; every other
+        argument is passed exactly as recorded.
+        """
+        argv = list(self.argv)
+        for index in self.run_dir_indexes:
+            argv[index] = argv[index].replace(RUN_DIR, str(run_dir), 1)
+        if self.brief_index is not None:
+            argv[self.brief_index] = (run_dir / BRIEF_FILE).read_text()
+        return argv, (run_dir / BRIEF_FILE if self.stdin else None)
 
 
 def _disabled(env: Mapping[str, str]) -> frozenset[str]:
@@ -137,6 +149,14 @@ def build_command(
         )
     if effort is not None and (not isinstance(effort, str) or not effort.strip()):
         raise AgentRefusal("effort must be a non-empty level when given")
+    # Shape first: these values become argv elements and, for some harnesses,
+    # the inside of a quoted config value.
+    try:
+        harness_name(harness)
+        route_value(model, "model")
+        route_value(effort, "effort", limit=64, required=False)
+    except ValueError as exc:
+        raise AgentRefusal(str(exc)) from exc
     if adapter is None:
         try:
             adapter = run_mod.load_adapter(harness)
@@ -179,10 +199,12 @@ def build_command(
                 f"harness '{harness}' cannot continue a subagent: its adapter declares "
                 "no `headless.agent.resume` key"
             )
-        if not isinstance(resume_session, str) or not resume_session.strip() or (
-            resume_session.startswith("-")
-        ):
-            raise AgentRefusal("the earlier run recorded no usable session reference")
+        try:
+            route_value(resume_session, "session reference")
+        except ValueError as exc:
+            raise AgentRefusal(
+                f"the earlier run recorded no usable session reference: {exc}"
+            ) from exc
         session_ref = resume_session
         if resume.get("subcommand"):
             # A resume subcommand has its own option set: its declared launch
@@ -201,15 +223,16 @@ def build_command(
     result = agent["result"]
     flags += list(result.get("flags") or [])
     if result["source"] == "file":
-        flags += [result["file_flag"], f"{RUN_DIR}/{LAST_MESSAGE_FILE}"]
+        flags += [result["file_flag"], f"{_MARK}{RUN_DIR}/{LAST_MESSAGE_FILE}"]
 
     try:
         argv = run_mod.headless_command(
-            command_adapter, BRIEF, model=route.model, launch_flags=flags, effort=route.effort
+            command_adapter, _MARK + BRIEF, model=route.model, launch_flags=flags,
+            effort=route.effort,
         )
     except ValueError as exc:
         raise AgentRefusal(str(exc)) from exc
-    assert argv and argv[-1] == BRIEF  # the brief is always the final positional
+    assert argv and argv[-1] == _MARK + BRIEF  # the brief is always the final positional
     stdin = None
     if agent["brief"]["delivery"] == "stdin":
         stdin = f"{RUN_DIR}/{BRIEF_FILE}"
@@ -217,7 +240,13 @@ def build_command(
         if agent["brief"].get("argument"):
             argv.append(agent["brief"]["argument"])
     else:
-        argv = argv[:-1] + tail + [BRIEF]
+        argv = argv[:-1] + tail + [_MARK + BRIEF]
+    # Record where the engine's tokens sit, then show them without the mark.
+    brief_index = next((i for i, arg in enumerate(argv) if arg == _MARK + BRIEF), None)
+    run_dir_indexes = tuple(
+        i for i, arg in enumerate(argv) if arg.startswith(_MARK + RUN_DIR)
+    )
+    argv = [arg[len(_MARK):] if arg.startswith(_MARK) else arg for arg in argv]
 
     effort_env = (headless.get("effort") or {}).get("env")
     child_env = run_mod.headless_effort_env(adapter, route.effort)
@@ -236,6 +265,8 @@ def build_command(
         session_ref=session_ref,
         resumes=resume_session,
         cli_version=(cli_version or run_mod._cli_version)(binary),
+        brief_index=brief_index,
+        run_dir_indexes=run_dir_indexes,
     )
 
 
@@ -361,7 +392,10 @@ def create_worktree(
     root = root or project_root.ENGINE.parent
     path = worktree_path(run_id, root)
     if path.exists():
-        raise RuntimeError(f"subagent worktree already exists: {path}")
+        raise RuntimeError(
+            f"{path} already exists, left by an earlier run of this number; "
+            "remove it and launch again"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     command = ["worktree", "add"]
     command += ["-b", branch] if branch else ["--detach"]
@@ -371,6 +405,33 @@ def create_worktree(
             f"could not create subagent worktree {path}: {made.stderr.strip()}"
         )
     return path
+
+
+def create_worktree_or_fail(
+    run_id: int,
+    base_commit: str,
+    branch: str | None = None,
+    *,
+    submit,
+    root: Path | None = None,
+) -> Path | None:
+    """Create the worktree, or end the registered run as failed with the reason.
+
+    The run is registered before its worktree exists, so a creation that fails
+    must not leave a registered row with no process holding a slot. `submit`
+    takes the terminal payload (the run's terminal route). Returns None when
+    the run was ended.
+    """
+    try:
+        return create_worktree(run_id, base_commit, branch, root=root)
+    except (RuntimeError, OSError) as exc:
+        submit({
+            "state": "failed",
+            "exit_code": 127,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "spawn_error": f"subagent not started: {exc}"[:256],
+        })
+        return None
 
 
 # ── child environment ────────────────────────────────────────────────────────

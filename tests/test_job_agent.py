@@ -123,6 +123,42 @@ class CommandTransportTest(unittest.TestCase):
             self.assertNotIn("check the spec", " ".join(build(harness).argv))
 
 
+class EngineTokenTest(unittest.TestCase):
+    """Only the tokens the engine placed are replaced, never a caller's value."""
+
+    def test_a_model_that_spells_a_token_is_passed_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "brief.md").write_text("the real brief")
+            for harness in ("kimi", "codex", "claude", "opencode"):
+                for model in ("{brief}", "{run_dir}/last-message.md", "x{run_dir}y"):
+                    with self.subTest(harness=harness, model=model):
+                        command = build(harness, model)
+                        argv, _stdin = command.materialize(run_dir)
+                        self.assertEqual(argv.count(model), 1)
+                        self.assertEqual(argv.count("the real brief"),
+                                         1 if harness == "kimi" else 0)
+                        self.assertEqual(
+                            len(argv), len(command.argv))
+            resumed = build("opencode", "provider/m", resume_session="{brief}")
+            self.assertIn("{brief}", resumed.materialize(run_dir)[0])
+
+    def test_token_positions_are_recorded_at_build_time(self):
+        kimi = build("kimi")
+        self.assertEqual(kimi.argv[kimi.brief_index], "{brief}")
+        self.assertEqual(kimi.run_dir_indexes, ())
+        codex = build("codex")
+        self.assertIsNone(codex.brief_index)
+        self.assertEqual(
+            [codex.argv[i] for i in codex.run_dir_indexes], ["{run_dir}/last-message.md"])
+        for harness in ("claude", "opencode"):
+            command = build(harness)
+            self.assertEqual((command.brief_index, command.run_dir_indexes), (None, ()))
+        # No assembly mark survives into the recorded command.
+        for harness in ("claude", "codex", "kimi", "opencode"):
+            self.assertFalse(any("\x1f" in arg for arg in build(harness).argv))
+
+
 class OmittedEffortTest(unittest.TestCase):
     """AC 3: no effort flag, config key or variable; the default is recorded."""
 
@@ -187,6 +223,31 @@ class RefusalTest(unittest.TestCase):
             "harness 'claude' cannot apply effort 'high'", "claude", "model-x", "high",
             adapter={**adapter, "headless": {k: v for k, v in headless.items() if k != "effort"}})
         self.refuse("effort must be a non-empty level", "claude", "model-x", " ")
+
+    def test_model_effort_and_session_shape_is_checked_before_anything_starts(self):
+        bad = ["-m", "--config=x", 'a"b', "a'b", "a`b", "a\\b", "a\nb", "a\tb", "a\x1fb",
+               "a\x7fb", " lead", "trail ", "x" * 513]
+        for value in bad:
+            with self.subTest(model=value):
+                self.refuse("model must", "claude", value)
+        for value in bad[:-1] + ["x" * 65]:
+            with self.subTest(effort=value):
+                self.refuse("effort must", "codex", "model-x", value)
+        # The case that reached a second config key inside -c before this check.
+        self.refuse("effort must not contain quotes", "codex", "model-x",
+                    'low"\nsandbox_mode="read-only')
+        for value in ("-s", "--last", 'a"b', "a\nb", "", "  "):
+            with self.subTest(session=value):
+                self.refuse("no usable session reference", "claude", "haiku",
+                            resume_session=value)
+        for harness in ("Claude", "codex exec", "../codex", "co\ndex", "-x"):
+            with self.subTest(harness=harness):
+                self.refuse("harness must be a shipped harness name", harness)
+        # Ordinary selectors still pass.
+        for model in ("provider/model-x:1017", "kimi-code/k3.1-pro", "gpt-6-luna",
+                      "openrouter/~vendor/name-latest", "claude-haiku-5-5[1m]"):
+            with self.subTest(model=model):
+                self.assertEqual(build("opencode", model, "x-high").requested_model, model)
 
     def test_an_adapter_without_the_agent_keys_is_refused_naming_the_key(self):
         adapter = run_mod.load_adapter("opencode")
@@ -277,6 +338,27 @@ class RecordedRunTest(unittest.TestCase):
         self.assertEqual(
             job_agent.read_session(command.session, resumed["stdout"]), resumed["session_ref"])
         self.assertEqual(resumed["session_ref"], record["launch"]["session_ref"])
+
+    def test_kimi_accepts_a_brief_that_starts_with_dashes(self):
+        # Verified on the installed CLI: the value of -p may start with dashes,
+        # so the argument delivery needs no change. These were fresh launches in
+        # the structured stream, which the builder's launch produces exactly.
+        record = HARNESSES["kimi"]["dash_briefs"]
+        command = build("kimi", HARNESSES["kimi"]["model"])
+        self.assertEqual(command.argv, record["argv"])
+        with tempfile.TemporaryDirectory() as tmp:
+            for run in record["runs"]:
+                with self.subTest(starts=run["brief_starts_with"]):
+                    brief = run["brief_starts_with"] + "the rest of the brief"
+                    (Path(tmp) / "brief.md").write_text(brief)
+                    argv, stdin = command.materialize(Path(tmp))
+                    self.assertEqual(argv[-2:], ["-p", brief])
+                    self.assertIsNone(stdin)
+                    self.assertEqual(run["exit_code"], 0)
+                    self.assertEqual(job_agent.read_result(command.result, run["stdout"]), NONCE)
+                    self.assertEqual(
+                        job_agent.read_session(command.session, run["stdout"]),
+                        run["session_ref"])
 
     def test_resume_matches_the_recorded_run_where_continue_works(self):
         for harness in ("claude", "kimi", "opencode"):
@@ -409,6 +491,31 @@ class WorktreeTest(unittest.TestCase):
         self.assertFalse(job_agent.worktree_path(9, self.root).exists())
 
 
+    def test_a_failed_creation_ends_the_registered_run_as_failed(self):
+        leftover = job_agent.worktree_path(11, self.root)
+        leftover.mkdir(parents=True)
+        (leftover / "stale.txt").write_text("from an earlier run 11")
+        submitted = []
+        made = job_agent.create_worktree_or_fail(
+            11, self.base, root=self.root, submit=submitted.append)
+        self.assertIsNone(made)
+        (payload,) = submitted
+        self.assertEqual((payload["state"], payload["exit_code"]), ("failed", 127))
+        self.assertIn("subagent not started", payload["spawn_error"])
+        self.assertIn("already exists, left by an earlier run", payload["spawn_error"])
+        self.assertLessEqual(len(payload["spawn_error"]), 256)
+        self.assertEqual((leftover / "stale.txt").read_text(), "from an earlier run 11")
+        # A bad base ends the run the same way; a good one submits nothing.
+        self.assertIsNone(job_agent.create_worktree_or_fail(
+            12, "f" * 40, root=self.root, submit=submitted.append))
+        self.assertEqual(len(submitted), 2)
+        self.assertEqual(
+            job_agent.create_worktree_or_fail(
+                13, self.base, root=self.root, submit=submitted.append),
+            job_agent.worktree_path(13, self.root))
+        self.assertEqual(len(submitted), 2)
+
+
 class ReservedPrefixTest(unittest.TestCase):
     def test_a_shell_cannot_take_an_agent_worktree_name(self):
         for shortname in ("agent-7", "Agent-x", " AGENT-12 "):
@@ -446,6 +553,38 @@ class ChildEnvironmentTest(unittest.TestCase):
     def test_a_terminal_seat_shell_is_handled_the_same_way(self):
         shell = {**self.SHELL, "SC_SEAT": "tui"}
         self.assertNotIn("SC_SEAT", job_agent.child_environment(5, None, shell))
+
+
+class RunMarkerScopeTest(unittest.TestCase):
+    """The run id marks one subagent's process tree, not what is started from it."""
+
+    def test_a_shell_session_launch_clears_the_marker_for_every_seat(self):
+        import run_seat
+
+        for seat in ("gui", "tui", None):
+            with self.subTest(seat=seat):
+                env = {"SC_JOB_AGENT_RUN": "31", "SC_SEAT": "gui", "SC_HARNESS": "codex"}
+                run_seat.inject(env, seat)
+                self.assertNotIn("SC_JOB_AGENT_RUN", env)
+                self.assertIsNone(job_agent.launched_from_run(env))
+                self.assertEqual(env.get("SC_SEAT"), seat)
+                self.assertEqual(env["SC_HARNESS"], "codex")
+
+    def test_both_shell_launch_paths_build_their_environment_through_inject(self):
+        source = (ENGINE / "scripts" / "run.py").read_text()
+        self.assertEqual(source.count("run_seat.inject(env, seat)"), 2)
+
+    def test_the_api_server_drops_the_marker_at_start(self):
+        import server
+
+        class Stop(Exception):
+            pass
+
+        with mock.patch.dict(os.environ, {"SC_JOB_AGENT_RUN": "31"}), \
+                mock.patch.object(server.log_lines, "install", side_effect=Stop):
+            with self.assertRaises(Stop):
+                server.main([])
+            self.assertNotIn("SC_JOB_AGENT_RUN", os.environ)
 
 
 def liveness_with_harness_in(root: Path, worktree: str) -> dict:
