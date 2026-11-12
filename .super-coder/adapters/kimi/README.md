@@ -89,8 +89,13 @@ whose `.git` is a file — the exact shape of a shell seat at
 `PROJECT_BRAND_DIRS = [".kimi-code/skills"]`,
 `PROJECT_GENERIC_DIRS = [".agents/skills"]`.
 
-**That probe was run OUTSIDE the declared conversation window.** `conversation`
-still pins `[0.30.0, 0.34.0)` with `0.33.0` verified; 2.0.1 is far above it, and
+**That probe was run OUTSIDE the conversation window declared at the time.**
+`conversation` then pinned `[0.30.0, 0.34.0)` with `0.33.0` verified; 2.0.1 was
+far above it. On 2026-11-12 the ceiling was raised to `2.6.0` to cover the
+installed `2.5.3`, by operator ruling (flag SC-1610, Feature #95 spec #272):
+build against the installed version and assume its behaviour holds.
+`verified_cli_version` stays `0.33.0`, so an installed 2.5.3 reports
+`supported`, never `verified`:
 nothing here re-probes the `kimi-print` driver contract. Native skill delivery
 does not depend on that window — `skill_dirs` is not version-gated — and the
 failure mode is benign in both directions: an in-window `0.3x` build that does
@@ -146,3 +151,25 @@ normalized events from print mode, resumes with `-S`, and interrupts with
 `headless.effort.env` supplies `KIMI_MODEL_THINKING_EFFORT`. Session inspection
 uses native stored evidence. The manifest does not advertise interactive
 permission responses. See `scripts/conversation_adapters/kimi.py` in the engine.
+
+### Compaction: not mapped (Feature #95, spec #272)
+
+Kimi emits no `context.compacted`, shows no marker, and feeds no context
+meter; its per-reply token label is unchanged. Recorded on `2.5.3`,
+2026-11-12, from the installed binary and this host's session store, with no
+session run:
+
+- The binary names `compaction.started` / `compaction.completed`, and the
+  main wire (`agents/main/wire.jsonl`, the file this adapter already reads)
+  has its own records: `full_compaction.begin` (`source`),
+  `context.apply_compaction` (`tokensBefore`, `tokensAfter`) and
+  `full_compaction.complete`.
+- Across 648 stored wires there is exactly one compaction, and its `source`
+  is `manual`: an interactive `/compact` between turns. Nothing shows that a
+  `kimi -p` run compacts on its own, or what `source` an automatic one writes.
+
+So the store format can carry a compaction with real figures, but the mode the
+engine uses has not been seen to produce one. Mapping it is left to the
+verification task (spec #272 criterion 12). Kimi gets no compact-window
+setting in this delivery: its control is a ratio of the window, not a token
+count.

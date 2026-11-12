@@ -130,6 +130,43 @@ constructor default with no env override.
 | `SC_REAPER_KILL_GRACE_SECONDS` | `15` | `SIGTERM` → `SIGKILL` wait; `0` allowed |
 | `SC_REAPER_YOUNG_GRACE_SECONDS` | `30` | minimum run age before the ladder starts |
 | `SC_CHAT_INACTIVITY_CEILING` | `3600` | seconds of chat silence before the active chat is closed for inactivity |
+| `SC_CHAT_COMPACT_WINDOW_CLAUDE` | `120000` | auto-compact window (tokens) passed to Claude browser chats; `off` restores the harness default |
+| `SC_CHAT_COMPACT_WINDOW_CODEX` | `120000` | the same for Codex browser chats; `off` restores the harness default |
+
+The two compact-window settings are read at each dispatch, so a restart of the
+server process is what picks up a change; an open chat then takes it on its
+next turn. A value that is neither a positive whole number nor `off` logs a
+warning and uses the default. Kimi and OpenCode have no window setting.
+
+## Compaction, the context meter and the re-ground line
+
+Feature #95, spec #272. The engine summarises nothing; it makes each
+harness's own compaction earlier and visible.
+
+- **`context.compacted`** is a normalized event: `trigger` (`auto`, `manual`,
+  `unknown`), `tokens_before` and `tokens_after` when the harness states them
+  or the adapter can read them, and never any summary text. One event per
+  compaction. The chat shows it as a marker, for example
+  `Context compacted · 123k → 28k · automatic`; a figure that was not reported
+  is left out. Claude, Codex and OpenCode are mapped; Kimi is not (see each
+  adapter's README).
+- **`usage`** now says what it measures. `scope: request` is one model request
+  of the chat and carries `context_tokens` (uncached input, cache read and
+  cache write together) and, where the harness states it, `context_window`.
+  `scope: turn` is a whole-turn total and `scope: subagent` is a delegated
+  agent's request; neither is the size of the chat's context. An event with no
+  scope (recorded earlier, or from Kimi) still labels its reply as before but
+  never drives the meter.
+- **The meter** is the latest `request` reading, or the size a newer
+  compaction left behind, with a percentage only when a window is known. The
+  transcript projection returns it as `context`
+  (`context_tokens`, `context_window`, `measured_at`, `sequence`), each `null`
+  when unknown. Nothing is estimated.
+- **`message.reground`** records that the engine appended the re-ground line
+  to the text it dispatched for that message. The broker adds the line to the
+  first message sent to a resumed session after a compaction (operator
+  messages and engine wakes alike), once per compaction. The stored message,
+  the boot file and the system prompt are never changed.
 
 A non-numeric or non-positive reaper value raises at startup; a bad
 `SC_CHAT_INACTIVITY_CEILING` logs a warning and falls back to the default.
