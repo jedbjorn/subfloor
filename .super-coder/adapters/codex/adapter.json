@@ -42,7 +42,24 @@
   "headless": {
     "launch": ["codex", "exec"],
     "model_flag": "-m",
-    "effort": { "config_flag": "-c", "config_key": "model_reasoning_effort" }
+    "effort": { "config_flag": "-c", "config_key": "model_reasoning_effort" },
+    "agent": {
+      "brief": { "delivery": "stdin", "argument": "-" },
+      "result": {
+        "flags": ["--json"],
+        "source": "file",
+        "file_flag": "-o"
+      },
+      "session": {
+        "source": "event",
+        "select": { "type": "thread.started" },
+        "field": "thread_id"
+      },
+      "resume": {
+        "subcommand": ["resume"],
+        "launch_flags": ["-c", "sandbox_mode=\"danger-full-access\""]
+      }
+    }
   },
   "conversation": {
     "contract_version": 1,

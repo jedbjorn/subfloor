@@ -267,3 +267,26 @@ Checked on `codex-cli 0.167.1`, 2026-11-12, with one small model request.
   run. **Not checked live:** the request on a thread with a turn in progress
   (the engine never sends it then), Stop during a compaction, and recovery of
   a compaction after a broker restart.
+
+## Subagent keys (`headless.agent`, Feature #96, spec #273)
+
+`scripts/job_agent.py` builds an `sc job` subagent command from the `headless`
+block and these optional keys; no harness name appears in the job code. An
+adapter without them is refused for a subagent by the name of the missing key
+and is unaffected otherwise.
+
+| Key | Value | Meaning |
+|---|---|---|
+| `brief.delivery` | `stdin`, argument `-` | the prompt positional is `-`, so the prompt is read from standard input |
+| `result` | `--json`, `file`, `-o` | the final message is written to the `-o` file; events go to stdout as JSONL |
+| `session` | `event`, `thread.started`, field `thread_id` | the session reference is read from the event stream |
+| `resume` | subcommand `resume`, `-c sandbox_mode="danger-full-access"` | `codex exec resume <id> -`; that subcommand has no `--sandbox` or `-C` option, so the policy travels as config |
+
+From `codex exec --help` and `codex exec resume --help` on codex-cli 0.167.1,
+2026-11-12. **No model request was made**: the model named for this check
+matched two catalogue ids, so the live run is pending. The event names
+`thread.started` and `thread_id` are present in the installed binary; the
+`--json` stream, the `-o` file and the resume form have not been observed in a
+run, and continue is unproven until they are. Observed without a request:
+SIGTERM while `codex exec -` waits on standard input ends the process by the
+signal (status -15).

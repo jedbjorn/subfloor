@@ -231,3 +231,27 @@ Nothing stops a browser-chat launch, and an older Claude fails every
 browser-chat launch on the unknown `--autocompact` flag. The fix is to update
 Claude Code to 2.1.304 or later. `SC_CHAT_COMPACT_WINDOW_CLAUDE=off` stops
 the engine passing the flag and is a stopgap only.
+
+## Subagent keys (`headless.agent`, Feature #96, spec #273)
+
+`scripts/job_agent.py` builds an `sc job` subagent command from the `headless`
+block and these optional keys; no harness name appears in the job code. An
+adapter without them is refused for a subagent by the name of the missing key
+and is unaffected otherwise.
+
+| Key | Value | Meaning |
+|---|---|---|
+| `brief.delivery` | `stdin` | the brief is the run's standard input; `-p` is passed with no prompt |
+| `result` | `--output-format json`, `stdout_json`, field `result` | stdout is one JSON object; `result` is the final message |
+| `session` | `pinned`, `--session-id` | the engine generates the session id and passes it at launch |
+| `resume` | `--resume` | `--resume <id>` continues the session; the id is unchanged |
+
+Checked on Claude Code 2.1.322, 2026-11-12, model `haiku` (served as
+`claude-haiku-5-5`), two requests: one launch and one resume that recalled the
+first reply. Also observed without a request: with standard input open and
+empty, the CLI waits three seconds and then proceeds without it; SIGTERM while
+waiting exits 143; `--resume` with an unknown id exits 1 with "No conversation
+found"; a second `--session-id` launch with an id already used exits 1 with
+"is already in use", so a continue must use `--resume`. The session store is
+keyed by working directory: a resume must run from the directory of the
+first run.

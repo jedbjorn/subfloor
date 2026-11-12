@@ -41,7 +41,17 @@
     "launch": ["claude"],
     "prompt_flag": "-p",
     "model_flag": "--model",
-    "effort": { "flag": "--effort" }
+    "effort": { "flag": "--effort" },
+    "agent": {
+      "brief": { "delivery": "stdin" },
+      "result": {
+        "flags": ["--output-format", "json"],
+        "source": "stdout_json",
+        "field": "result"
+      },
+      "session": { "source": "pinned", "flag": "--session-id" },
+      "resume": { "flag": "--resume" }
+    }
   },
   "conversation": {
     "contract_version": 1,
