@@ -837,7 +837,7 @@ it writes a `result` message to the starting shell and wakes that shell (see
 [Wakes](#wakes)). Use it for suites, builds, and benchmarks that would
 otherwise die with the harness process.
 
-#### Subagents
+### Subagents
 
 ```bash
 ./sc job agent --harness <name> --model <selector> [--effort <level>] \
@@ -891,7 +891,7 @@ headless mode.
 A launch that would pass a limit is refused before anything starts, and the
 refusal names the runs that hold the slots.
 
-#### Watchers
+### Watchers
 
 ```bash
 ./sc job start --until "<shell command>" [--every <seconds>] [--timeout <seconds>]
