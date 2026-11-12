@@ -121,11 +121,51 @@ was not repeated; an installed 1.19.5 reports `supported`. CI still installs
 ### Compaction and the context meter (Feature #95, spec #272)
 
 - `session.compacted` is mapped to one `context.compacted`. OpenCode names the
-  session and nothing else, so the trigger is `unknown`, the size before is
-  the last request this stream saw, and the size after stays empty until the
-  next request reports it. The event name is present in the installed 1.19.5
-  binary; **no run has shown it**, and whether OpenCode auto-compacts under
+  session and nothing else, so the trigger is `unknown` and the size after
+  stays empty until the next request reports it. The size before is the
+  chat's last request before the summarising one: the latest this stream saw,
+  or the chat's last recorded reading when it compacts before any request of
+  the turn. The summarising request itself (an assistant message with
+  `summary: true`) runs under the compaction agent's own prompt and is never
+  read as the chat's context, for the marker or for the meter: on 1.19.5 it
+  reported 449 input tokens for a session whose last request was about
+  13,600.
+- **No summary text is stored.** The compaction agent's reply is an assistant
+  message carrying `summary: true`, `mode: "compaction"` and
+  `agent: "compaction"`; in the event stream recorded on 1.19.5 its
+  `message.updated` arrives before any of its text parts. The adapter passes
+  on none of that message's text, on an automatic compaction as on a manual
+  one: the chat shows the compaction marker instead. Either `summary: true`
+  or `mode: "compaction"` marks it. An operator message's `summary` is an
+  object and marks nothing, and ordinary replies before and after the
+  compaction stream as usual. A manual summarise on 1.19.5 emitted it (below);
+  **no automatic one has been seen**, and whether OpenCode auto-compacts under
   the engine is the open verification (spec #272 criterion 12).
+- **Manual compaction.** `POST /session/{id}/summarize` with
+  `{"providerID": …, "modelID": …}`; both are required (the server answers
+  `400` without them, and `404` for an unknown session). Run once on 1.19.5,
+  2026-11-12, against a private scratch `opencode serve` with a free model
+  (two model requests): the session went `busy`, an assistant message with
+  `summary: true` and `mode: compaction` streamed, then `session.compacted`,
+  `session.status` idle and `session.idle`; the request answered `true` as
+  the compaction finished. The adapter names the chat's own provider and
+  model, records the compaction as `manual`, and passes on neither the
+  summary text nor the summarising request's usage. The size before follows
+  the rule above. A chat with no named
+  model (a harness-default route) uses the model its session has been using,
+  read from `GET /session/{id}/message`: the newest reply's `providerID` and
+  `modelID` (the compaction agent's own `summary` reply is skipped), or
+  failing that the newest operator message's `model`. That stored shape was
+  read from a scratch session on 1.19.5; the lookup itself is covered by test
+  only. If neither names a model the chat gets the one-line error, which says
+  that the chat names no model and its session records none. Both waits are
+  bounded. If the request has not answered within 600 s it is abandoned and
+  aborted, and the chat shows the error line. If it answers and the session
+  does not report idle within 15 s, the run ends there; with no
+  `session.compacted` the chat says the harness did not report a compaction.
+  The summarising request's tokens are passed on as the run's usage, with no
+  context size. **Not checked:** the engine-owned
+  shared server (the check used a private one), and a large session.
 - The meter reads the assistant message's `tokens`
   (`input` + `cache.read` + `cache.write`). OpenCode states no window there,
   so the chat shows the size with no percentage.

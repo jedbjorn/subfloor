@@ -132,11 +132,15 @@ constructor default with no env override.
 | `SC_CHAT_INACTIVITY_CEILING` | `3600` | seconds of chat silence before the active chat is closed for inactivity |
 | `SC_CHAT_COMPACT_WINDOW_CLAUDE` | `120000` | auto-compact window (tokens) passed to Claude browser chats; `off` restores the harness default |
 | `SC_CHAT_COMPACT_WINDOW_CODEX` | `120000` | the same for Codex browser chats; `off` restores the harness default |
+| `SC_CHAT_COLD_RETURN_TOKENS` | `60000` | context size (tokens) at or above which an idle chat gets the cold-return notice |
+| `SC_CHAT_COLD_RETURN_MINUTES` | `60` | minutes since the chat's last activity after which that notice is due |
 
 The two compact-window settings are read at each dispatch, so a restart of the
 server process is what picks up a change; an open chat then takes it on its
 next turn. A value that is neither a positive whole number nor `off` logs a
-warning and uses the default. Kimi and OpenCode have no window setting.
+warning and uses the default. Kimi and OpenCode have no window setting. The
+two cold-return settings are read whenever a chat is projected; a value that
+is not a positive whole number logs a warning and uses the default.
 
 ## Compaction, the context meter and the re-ground line
 
@@ -172,6 +176,98 @@ harness's own compaction earlier and visible.
   first message sent to a resumed session after a compaction (operator
   messages and engine wakes alike), once per compaction. The stored message,
   the boot file and the system prompt are never changed.
+- **Claude's marker says "summary".** Claude's figure after is the summary
+  alone; the next request also carries the system prompt and tools and is
+  several times larger. Its marker reads
+  `Context compacted · 172k → 13k summary · automatic`. Only the wording
+  differs: the stored event is the same for every harness.
+
+## The manual compact button
+
+`POST /api/conversations/<cv_…>/compactions` (empty body, `Idempotency-Key`
+required) asks the chat's harness to compact its stored session now. The
+button sits at the bottom left of the composer, beside the meter.
+
+- **How it runs.** The request joins the chat's own queue as an engine-sent
+  control message (`sender_kind: engine`, `sender_ref: compact-button`,
+  `message_kind: control`). The broker runs it like a turn: one at a time, in
+  order, interruptible with Stop, and a message sent meanwhile waits behind
+  it. Instead of sending text it calls the adapter's `compact()`: Claude, a
+  resumed headless run whose prompt is `/compact`; Codex,
+  `thread/compact/start` on the resumed thread; OpenCode,
+  `POST /session/{id}/summarize`. Kimi has no confirmed trigger and no button.
+- **What is recorded.** `compaction.requested` (engine-initiated, with the
+  requesting user) when the button is pressed. No operator message is
+  created, and the transcript, which lists prompts only, never shows the
+  request. From the request's own run only `session.started`, `run.started`,
+  the compaction and the request's token usage are kept; the summary a
+  harness streams is dropped. That usage is stored with `scope: compaction`
+  and no `context_tokens`: it is a cost of the chat, never a reading of how
+  full its context is, so it does not move the meter. A request that spent
+  nothing (a refusal) records none. Claude's figure comes from the run's
+  `modelUsage`, OpenCode's from the summary message; Codex states none for a
+  compaction, so none is recorded.
+- **Exactly one result per press**, each written on the chat rather than on
+  the request's run so it shows without a turn:
+  `context.compacted` with `trigger: manual` (the marker, and the meter
+  drops); `compaction.failed` (one line: the harness refused, the request
+  broke, or it was stopped); or `compaction.not_reported` (the harness
+  accepted the request and finished without reporting a compaction, within a
+  bounded wait). A failed request does not put the chat in `error`: the
+  session is as it was. The paths that end a request without the broker
+  finishing it write the line too, as "Compaction stopped": the reaper
+  (a request orphaned by a broker death), and a chat closed or displaced
+  while its request is still queued.
+- **The re-ground line** is not added to the request and is not spent by it.
+  The first real message after a manual compaction carries it, exactly as
+  after an automatic one.
+- **What the page is told.** The single-chat read and the transcript's
+  `controls` carry `compaction`: `supported` (the harness has a trigger),
+  `available` (and the chat has a stored session and is open; this shows the
+  button), `enabled` (and nothing is in flight; otherwise it is greyed out),
+  `pending` and the pending request's `message_id`. The server refuses a
+  press it would have greyed out.
+
+| Code | Meaning |
+|---|---|
+| `COMPACTION_UNSUPPORTED` | the chat's harness has no manual trigger |
+| `COMPACTION_NO_SESSION` | the chat has not had a turn yet, so there is nothing to compact |
+| `COMPACTION_PENDING` | an earlier press is still in flight; one compaction runs |
+| `CONVERSATION_BUSY` | a turn is queued, running or waiting; press again when it has finished |
+
+## The cold-return notice
+
+A chat whose latest `context_tokens` is at or above
+`SC_CHAT_COLD_RETURN_TOKENS` and whose last model activity is more than
+`SC_CHAT_COLD_RETURN_MINUTES` ago has lost its provider cache: the next
+message re-reads the whole context uncached. When the operator opens such a
+chat, comes back to a tab left open on it, or puts the cursor in its
+composer, one line above the composer says so, with the size.
+
+- **Last model activity** is the time of the chat's newest `usage` or
+  `context.compacted` event: when the model last answered. It is not the
+  conversation row's `last_activity_at`, which closing, reopening, renaming,
+  Stop and a refused compact press all stamp without warming any cache.
+- **Which chats.** An idle chat, and a closed chat that a message would
+  reopen onto its stored session. Opening another chat on a shell closes the
+  previous one, so a closed chat is the usual way back.
+
+- **Actions.** *Compact now* (the button's own request, where the button is
+  available), *Continue here* (dismiss), and *New chat* (the history pane's
+  close-and-start path, after a reminder that only control-plane state
+  carries over).
+- **It is a suggestion.** It never disables the composer or Send. Sending,
+  compacting or *Continue here* dismisses it. It is not shown during a turn,
+  for a closing chat, or for a chat the engine still manages for a
+  participant. On a closed chat there is no live session to compact, so it
+  offers no compaction there.
+- **Data.** The transcript projection returns `cold_return`
+  (`context_tokens`, `idle_minutes`, `last_model_activity_at`, `server_time`,
+  and `due` as of that read); the single-chat read returns the two settings.
+  The page re-checks the rule while it stays open, so a tab left open is
+  covered without a reload. It does so on the server's clock: it records how
+  far its own clock is from `server_time` and corrects for it, so a browser
+  whose clock is wrong does not move the rule.
 
 A non-numeric or non-positive reaper value raises at startup; a bad
 `SC_CHAT_INACTIVITY_CEILING` logs a warning and falls back to the default.

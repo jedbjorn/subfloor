@@ -424,6 +424,16 @@ class ReaperStore:
                             (target, now, candidate.conversation_id),
                         )
                     self._append_interrupted_event(con, candidate, reason)
+                    # A reaped manual compaction still ends in its one line.
+                    import conversation_compaction
+
+                    conversation_compaction.settle_cancelled_requests(
+                        con,
+                        candidate.conversation_id,
+                        [candidate.message_id],
+                        error_code="CONVERSATION_RUN_REAPED",
+                        error_detail=reason,
+                    )
                 if process_exited:
                     con.execute(
                         "UPDATE conversation_runs SET process_pid=NULL,"

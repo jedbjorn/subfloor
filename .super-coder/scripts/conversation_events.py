@@ -28,6 +28,14 @@ CONVERSATION_EVENT_TYPES = NORMALIZED_EVENTS | frozenset(
         # re-ground line after a compaction (Feature #95). The stored
         # message body is the operator's text, unchanged.
         "message.reground",
+        # The manual compact button (Feature #95). ``requested`` records the
+        # engine-initiated request; a press then ends in a
+        # ``context.compacted`` marker, in ``failed`` (the harness refused or
+        # the request broke), or in ``not_reported`` (the harness finished
+        # without saying it compacted).
+        "compaction.requested",
+        "compaction.failed",
+        "compaction.not_reported",
         "run.resumed",
         "run.interrupt.requested",
         "run.unknown",

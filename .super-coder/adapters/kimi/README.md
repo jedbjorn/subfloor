@@ -173,3 +173,7 @@ engine uses has not been seen to produce one. Mapping it is left to the
 verification task (spec #272 criterion 12). Kimi gets no compact-window
 setting in this delivery: its control is a ratio of the window, not a token
 count.
+
+Kimi has no compact button either. Its `/compact` is an interactive command
+and no headless trigger has been confirmed, so the adapter declares none
+(`manual_compaction` is false) and the chat hides the button.

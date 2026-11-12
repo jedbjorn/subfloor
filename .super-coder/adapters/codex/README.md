@@ -240,3 +240,30 @@ Checked on `codex-cli 0.167.1`, 2026-11-12, with one small model request.
   is kept as the window, exactly as Codex reports it (258,400 for a 272,000
   model: Codex states 95%). The zero-input update after a compaction reads as
   its total, never as 0.
+- **Manual compaction.** `thread/compact/start` with `{"threadId": …}`, sent
+  after `thread/resume` in a new app-server (the engine's process-per-message
+  shape). Run once on 0.167.1, 2026-11-12, on a one-turn scratch thread with
+  the default model (two model requests): the request answered `{}` at once;
+  the app-server then replayed the last turn's `thread/tokenUsage/updated`
+  under its old turn id, and ran the compaction as a turn of its own:
+  `turn/started` with a new turn id, `item/started` (`contextCompaction`), a
+  usage update with `inputTokens: 0` and the new total, `item/completed`,
+  `turn/completed` (`status: completed`). So the thread must be resumed
+  first, and the request does not return the turn id: the adapter adopts it
+  from `turn/started` and applies its exact-turn checks from there. The
+  request sets `CodexAdapter.compaction_requested`, which is what tags the
+  compaction `manual`. Both waits are bounded: 30 s for the turn to start,
+  300 s for it to finish; a request that is accepted and then shows no
+  compaction in that time ends the run without one, and the chat says the
+  harness did not report a compaction. A refused request, or a compaction
+  turn that ends `failed`, is the chat's one-line error. The adopted turn id
+  replaces the placeholder on the run row as soon as it is known, so Stop and
+  recovery after a broker restart name the real turn. Stop before it is
+  known cannot be sent to Codex (there is no turn to name): it ends the wait
+  at once, the run is interrupted, the chat shows "Compaction stopped", and
+  the app-server is closed with the run. Codex states no token usage for the
+  compaction request (the updates around the item are the last turn's,
+  replayed, and its estimate of the new context), so none is recorded for the
+  run. **Not checked live:** the request on a thread with a turn in progress
+  (the engine never sends it then), Stop during a compaction, and recovery of
+  a compaction after a broker restart.
