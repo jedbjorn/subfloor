@@ -1560,6 +1560,58 @@ class LauncherGrammarParityTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
 
+    # The browser-chat settings the review server reads from its environment.
+    # The container gets a fixed argument list, so each is forwarded by name.
+    CHAT_SETTINGS = (
+        "SC_CHAT_COMPACT_WINDOW_CLAUDE",
+        "SC_CHAT_COMPACT_WINDOW_CODEX",
+        "SC_CHAT_COLD_RETURN_TOKENS",
+        "SC_CHAT_COLD_RETURN_MINUTES",
+    )
+
+    def test_chat_settings_are_forwarded_by_name_only_when_set(self):
+        import conversation_compaction
+
+        # The forwarded names are exactly the ones the server reads.
+        self.assertEqual(
+            set(self.CHAT_SETTINGS),
+            {
+                *conversation_compaction.COMPACT_WINDOW_ENV.values(),
+                conversation_compaction.COLD_RETURN_TOKENS_ENV,
+                conversation_compaction.COLD_RETURN_IDLE_MINUTES_ENV,
+            },
+        )
+        text = self.DISPATCH.read_text()
+        start = text.index('chat_settings_env=""')
+        end = text.index("pg_env=", start)
+        fragment = text[start:end]
+        cases = {
+            "none set": {},
+            "an empty value is not forwarded": {
+                "SC_CHAT_COLD_RETURN_TOKENS": ""},
+            "two set": {
+                "SC_CHAT_COMPACT_WINDOW_CODEX": "off",
+                "SC_CHAT_COLD_RETURN_MINUTES": "5"},
+            "all set": {name: "1000" for name in self.CHAT_SETTINGS},
+        }
+        for label, settings in cases.items():
+            with self.subTest(label):
+                env = {"PATH": os.environ["PATH"], **settings}
+                done = subprocess.run(
+                    ["sh", "-c",
+                     "set -e\n" + fragment
+                     + '\nprintf "%s" "$chat_settings_env"'],
+                    env=env, capture_output=True, text=True, check=True,
+                )
+                # Names only: the value is taken from the launch environment
+                # by Docker and never written into the argument list.
+                self.assertEqual(
+                    done.stdout.split(),
+                    [word for name in self.CHAT_SETTINGS if settings.get(name)
+                     for word in ("-e", name)],
+                )
+        self.assertIn("$chat_settings_env", self.launch_block())
+
     # The launch block of the dispatcher, as text: the `docker run` arguments
     # between `"$CNAME" -- ` and the provisioning status check.
     def launch_block(self) -> str:
@@ -1605,6 +1657,9 @@ class LauncherGrammarParityTest(unittest.TestCase):
             "IMG": plan.runtime_tag,
             "mistral_env": "-e MISTRAL_API_KEY=key" if optional else "",
             "disabled_harnesses_env": "-e SC_DISABLED_HARNESSES" if optional else "",
+            "chat_settings_env": (
+                " ".join(f"-e {name}" for name in self.CHAT_SETTINGS)
+                if optional else ""),
             "pg_env": ("-e DATABASE_URL=postgresql://sc:sc@sc-pg-fork:5432/sc"
                        if optional else ""),
             # Built the way the dispatcher builds them (asserted below).
@@ -1645,6 +1700,11 @@ class LauncherGrammarParityTest(unittest.TestCase):
             '--tmpfs $HOME/.local/state/subfloor/instances:uid=0,gid=0,mode=0700"',
             'mistral_env="-e MISTRAL_API_KEY=${MISTRAL_API_KEY}"',
             'disabled_harnesses_env="-e SC_DISABLED_HARNESSES"',
+            *(
+                f'[ -n "${{{name}:-}}" ] && '
+                f'chat_settings_env="$chat_settings_env -e {name}"'
+                for name in self.CHAT_SETTINGS
+            ),
             'pg_env="-e DATABASE_URL=',
         ):
             self.assertIn(formula, text)
