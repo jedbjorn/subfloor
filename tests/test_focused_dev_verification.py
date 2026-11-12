@@ -69,10 +69,19 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
         )
         probes = focus.split("## BOUNDED PROBES", 1)[1].split("## ", 1)[0]
         self.assertIn(
-            "Headless seat: the engine's wakes are the watcher; never poll "
-            "GitHub or replace its wakes with a polling job.",
+            "Headless seat: the engine's wakes are the watcher for a PR you own",
             probes,
         )
+        # Spec #273: a shell never loops on `gh`; a bounded watch is the
+        # engine's, and the Developer's own PR facts still come from the PR watcher.
+        self.assertIn(
+            "never loop on `gh` in your turn or replace those wakes with a "
+            "polling job.",
+            probes,
+        )
+        self.assertIn("`sc job watch pr --pr <n>` is one bounded watch", probes)
+        self.assertIn("`sc job watch timer --after <seconds>`", probes)
+        self.assertIn("it grants no merge authority", probes)
         self.assertIn(
             "Terminal seat: no wake reaches a running session, so set up your "
             "own bounded monitors",

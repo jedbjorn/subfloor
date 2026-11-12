@@ -144,9 +144,11 @@ events (red, green, closed, merged) are sent to the Developer who owns the PR,
 inside or outside a Sprint, with the fact stated in the message.
 
 Watching follows the same split. On a headless seat the engine's wakes are the
-watcher: never poll GitHub or schedule watchers. On a terminal seat no wake
-reaches a running session, so set up your own bounded monitors for what you
-are waiting on. On either seat you never boot participants.
+watcher: never loop on `gh` in your own turn or schedule watchers of your own.
+A bounded `sc job watch pr` or `sc job watch timer` is the engine watching on
+your behalf; it wakes you once and grants no authority. On a terminal seat no
+wake reaches a running session, so set up your own bounded monitors for what
+you are waiting on. On either seat you never boot participants.
 
 ---
 

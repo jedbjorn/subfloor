@@ -64,13 +64,14 @@ submit execution outcomes. Cancellation verifies boot id, pid and start ticks.
 | `POST /_sc/runs` | `{registration_key,kind,label,argv,cwd,commit,foreground?,timeout_seconds?}`; returns registered run with engine-allocated evidence path; retries require identical input. An `agent` run adds an `agent` object and omits `cwd` (see Subagent ledger) |
 | `GET /_sc/runs` | Owner's runs, newest first |
 | `GET /_sc/runs/<id>` | Owner's authoritative state and wake receipt |
-| `POST /_sc/runs/<id>/running` | Supervisor/child pid, start ticks, boot id, started timestamp |
-| `POST /_sc/runs/<id>/terminal` | `{state,exit_code,finished_at,spawn_error?}`; one immutable terminal payload |
+| `POST /_sc/runs/<id>/running` | Supervisor/child pid, start ticks, boot id, started timestamp. Refused (409) once the run has a terminal result; a supervisor that receives that launches nothing and submits nothing |
+| `POST /_sc/runs/<id>/terminal` | `{state,exit_code,finished_at,spawn_error?}`; one immutable terminal payload. An `agent` run may add `agent: {head_commit?, uncommitted?}`, what the supervisor found in the worktree |
 | `GET /_sc/runs/<id>/tail` | Bounded log text; absent evidence is identified |
 | `POST /_sc/runs/<id>/receipt` | Owner-only immutable dev-kit receipt; duplicate identical submissions are idempotent |
 | `POST /_sc/runs/<id>/prune-evidence` | Record pruned completed receipt evidence; preserve the row and parsed receipt |
 | `POST /_sc/runs/<id>/facts` | Owner-only facts an agent run reports: `session_ref`, `provider_model`, `result_bytes`, `worktree_removed_at`; each is written once, an identical repeat is idempotent, a different value is refused |
 | `GET /_sc/runs/<id>/result` | An agent run's final message, at most 256 KiB, with `truncated` and its recorded facts |
+| `POST /_sc/runs/<id>/clean` | Owner-only, `{discard}`: records that an agent run's worktree is being removed by `sc job clean`; refused (400) while a run is live in that worktree |
 | `POST /_sc/runs/<id>/kill` | Owner cancellation request; supervisor retains authoritative exit |
 | `GET /api/runs[/<id>[/tail\|/result]]` | Operator projection |
 | `POST /api/runs/<id>/kill` | Operator cancellation, guarded browser origin |
@@ -81,9 +82,10 @@ and delivery evidence after their message/conversation parents.
 
 ## Subagent ledger
 
-Feature #96 (spec #273) adds the ledger half of `sc job` subagents. The
-`sc job agent` verb, its supervisor path, the wake body and the GUI rows are
-not shipped yet; until they are, nothing registers an `agent` run.
+Feature #96 (spec #273) adds `sc job` subagents. `sc job agent` registers an
+`agent` run and detaches the job supervisor, which creates the worktree, runs
+the harness, and ends the run (see Running a subagent). The GUI rows are not
+shipped yet.
 
 Every run may record `timeout_seconds`, its time limit, fixed at registration;
 `sc job start` sends its `--timeout`. Rows registered before this column
@@ -92,8 +94,10 @@ exist carry none.
 An `agent` run is one headless harness run. Its registration carries
 `commit` (the base commit, a full object id) and an `agent` object:
 `harness`, `requested_model`, `requested_effort`, `effective_effort`, `branch`,
-`adapter_version`, `brief_bytes`, `launched_from_run`. The engine assigns its
-`cwd`, the worktree `.sc-worktrees/agent-<run_id>`. The facts live in
+`adapter_version`, `brief_bytes`, `launched_from_run`, `continues_run_id`. The
+engine assigns its `cwd`, the worktree `.sc-worktrees/agent-<run_id>`; a
+continue is given the worktree, base commit and branch of the run it
+continues. The facts live in
 `run_agents`, keyed by `run_id`, and appear as `agent` on the run row in
 `GET /_sc/runs`, `GET /_sc/runs/<id>` and the operator routes; a run of any
 other kind has no `agent` key. The result route reads `result.md` beside the
@@ -114,15 +118,19 @@ Registration holds the limits, inside its write transaction:
 | Harness, model, effort shape | harness is a shipped harness name; model and effort carry no leading dash, quote, backslash or control character | 400 |
 
 A slot is held by a run in state `registered` or `running` that can still be
-running. A finished, stopped or lost run frees its slot. So does an unfinished
-run with no process: one whose reconciliation was blocked (`wake_state`
-`blocked`, left for operator recovery) and one whose supervisor is proven gone.
+running. A finished, stopped or lost run frees its slot. An unfinished run
+holds its slot while its supervisor or its harness process is proven alive
+(pid, start ticks and boot id all match). Otherwise it frees the slot when its
+supervisor is proven gone, or when its reconciliation was blocked (`wake_state`
+`blocked`, left for operator recovery) and its supervisor is not proven alive.
 `sc job kill` stops only a run whose process is running.
 
-The run is registered before its worktree exists. If the worktree cannot be
-created, for example because `.sc-worktrees/agent-<run_id>` was left behind by
-an earlier run of that number, the run ends `failed` with exit code 127 and the
-reason, and the launching shell is told as for any finished run.
+The run is registered before its worktree exists. The supervisor checks in
+first and then creates the worktree, so a slow creation is a running run and
+never a registered row with no process. If the worktree cannot be created, for
+example because `.sc-worktrees/agent-<run_id>` was left behind by an earlier
+run of that number, the run ends `failed` with exit code 127 and the reason,
+and the launching shell is told as for any finished run.
 
 A subagent runs in its own worktree so that it is not counted as its launching
 shell's live session and does not read that shell's boot file. Shell shortnames
@@ -131,6 +139,97 @@ shell's, with `SC_SEAT` cleared and `SC_JOB_AGENT_RUN` set: it acts under the
 launching shell's identity with exactly that shell's authority, and the engine
 adds no refusal for what it writes. `SC_JOB_AGENT_RUN` marks that one process
 tree only: a shell session launch and the API server both clear it at start.
+
+## Running a subagent
+
+```bash
+sc job agent --harness <name> --model <selector> [--effort <level>] \
+  (--brief-file <path> | --brief "<text>") \
+  [--base <ref>] [--branch <name>] [--label <text>] [--timeout <seconds>]
+sc job result <id> [--json]
+sc job continue <id> (--brief-file <path> | --brief "<text>") [--label <text>] [--timeout <seconds>]
+sc job clean <id> [--discard]
+sc job list [--kind agent|probe|job] [--all]
+```
+
+- **Launch.** Every refusal comes before registration; a refusal registers
+  nothing, creates no worktree and starts no process. The brief is copied to
+  `brief.md` in the run's evidence directory. The run's `meta.json` carries the
+  recorded command and, beside it, the positions of the engine's `{brief}` and
+  `{run_dir}` tokens; the supervisor fills those positions and no others.
+- **Supervisor.** It attaches the brief (standard input, or the argument the
+  adapter names) before the process starts, and runs the harness in the
+  worktree as the leader of its own process group. Standard output is the
+  harness's report and is the run's log; standard error is appended to the log
+  when the run ends. Exit, the run-time limit, `sc job kill`, and a signal to
+  the supervisor itself all end with a signal to the whole group, so no harness
+  process outlives its run. A supervisor stopped by a signal records `failed`
+  with that reason.
+- **A supervisor that is killed** cannot do that. The runtime pulse then finds
+  the run without a supervisor, stops the harness's process group, and records
+  `lost`. The pid, start ticks and boot id of a run are written by its owner, so
+  they are not enough to signal anything. The group is signalled only when the
+  kernel also says the process is this run's harness: it leads its own process
+  group, and its working directory is the worktree the engine assigned to the
+  run. Pid 1, the server and the server's own process group are never
+  signalled. A process that is running but cannot be tied to the run is left
+  alone, and the `lost` result says so (`spawn_error`). A harness whose leader
+  has already exited is not signalled. A row whose reconciliation was blocked
+  gets the same stop, on the same evidence, once its supervisor is proven gone;
+  it stays blocked, with what was done added to `last_error`.
+- **Result and facts.** Before the terminal result is submitted the supervisor
+  writes `result.md` (the final message, or a line saying there was none) and
+  `facts.json` (`session_ref`, `result_bytes`, `worktree_removed_at`), and
+  posts the facts. The terminal route reads `facts.json` if the post did not
+  arrive, so the wake written in the terminal transaction states them either
+  way. A `session_ref` that could not be an argument of a later resume (a
+  leading dash, a quote, a control character) is refused when written.
+- **Wake.** An agent's wake states the state and exit, harness, model and
+  effort, time run against its limit, the worktree (or that it was removed
+  unchanged), branch, HEAD, whether uncommitted changes exist, the result size,
+  and the result, tail, continue and clean commands. It carries no part of the
+  final message.
+- **Worktree.** When a run ends with no uncommitted change and HEAD still at
+  the base commit, the supervisor removes the worktree and records
+  `worktree_removed_at`; a branch the run created is kept. Untracked files
+  count as a change whatever git is configured to show
+  (`status.showUntrackedFiles`, submodule ignore settings and a global
+  excludes file are overridden). Files the repository itself ignores do not
+  count and are removed with the worktree; the wake says so. Otherwise the
+  worktree is kept until `sc job clean`, which refuses while a run is live in
+  it, and refuses uncommitted changes or commits on no remote branch unless
+  `--discard` is given. A discard is recorded (`worktree_discarded_at`).
+- **Continue** registers a new run (`continues_run_id`) with its own slot and
+  time limit, on the earlier run's harness and model, resuming its
+  `session_ref` in its worktree. A removed worktree is recreated at the same
+  path, on its branch when that exists, else detached at the base. It is
+  refused while a run is live in that worktree, when no session reference was
+  captured, for another harness or model, for an adapter with no resume form,
+  and after a discard.
+- **Usage.** `sc analytics sweep` gives a session whose working directory is
+  `.sc-worktrees/agent-<run_id>` the launching shell's id and that run id
+  (`session_token_usage.run_id`), and writes the totals to the run row's
+  `usage_json`. A continued subagent works in the first run's worktree, so its
+  usage is counted on that first run.
+
+## Watchers
+
+Every `probe` run is a watcher: `sc job start --until`, and two named forms on
+the same supervisor. One shell may have 10 live at once; the eleventh
+registration is refused (429) naming the runs that hold the slots.
+
+- `sc job watch pr --pr <n> [--repository owner/name] [--every <s>] [--timeout <s>]`
+  reads the PR every 60 seconds for at most 3,600 seconds, through the PR
+  watcher's reader and state normalization, and ends when the state is green,
+  red, merged or closed. Green means proven green at the head commit. A PR that
+  cannot be read when the verb runs starts no watch. It creates no
+  subscription and changes nothing in the PR watcher.
+- `sc job watch timer --after <s>` ends `done` when the delay has passed. The
+  delay is at most 86,400 seconds (24 hours); more is refused (400).
+
+Their ledger `argv` is `sc job watch <form> ...`, which is how the condition is
+read back. The wake names the condition, the final state and, for a PR, the
+head commit, and grants no merge authority.
 
 ## Dev-kit receipts
 

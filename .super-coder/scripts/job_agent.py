@@ -11,7 +11,9 @@ known. Arguments that depend on the run's evidence directory carry the
 so the ledger records the command without the brief's text. `materialize`
 replaces both once the run exists, and only at the positions the engine placed
 them: a model, effort, session or branch that happens to spell a token is
-passed through as the caller wrote it.
+passed through as the caller wrote it. The supervisor is another process, so
+those positions travel to it in the run's `meta.json` as the spawn plan
+(`spawn_plan`, `materialize_argv`); it never searches the argv for a token.
 
 The worktree and the child environment are mechanics, not containment
 (decision #427): a subagent acts under its launching shell's identity with
@@ -31,7 +33,14 @@ from typing import NamedTuple
 
 import project_root
 import run as run_mod
-from runs import AGENT_BRIEF_MAX, AGENT_WORKTREE_PREFIX, harness_name, route_value
+from runs import (
+    AGENT_BRIEF_MAX,
+    AGENT_FACTS_FILE,
+    AGENT_RESULT_FILE,
+    AGENT_WORKTREE_PREFIX,
+    harness_name,
+    route_value,
+)
 
 RUN_DIR = "{run_dir}"
 BRIEF = "{brief}"
@@ -40,6 +49,10 @@ BRIEF = "{brief}"
 _MARK = "\x1f"
 BRIEF_FILE = "brief.md"
 LAST_MESSAGE_FILE = "last-message.md"
+STDERR_FILE = "stderr.log"
+STDERR_TAIL = 65536
+WHOLE_REPORT_MAX = 16 * 1024 * 1024
+NO_RESULT = "This run ended without a final message.\n"
 RUN_VARIABLE = "SC_JOB_AGENT_RUN"
 SEAT_VARIABLE = "SC_SEAT"
 DEFAULT_EFFORT = run_mod.route_transport.route_bindings.DEFAULT_EFFORT
@@ -74,12 +87,49 @@ class AgentCommand(NamedTuple):
         Only the positions recorded at build time are replaced; every other
         argument is passed exactly as recorded.
         """
-        argv = list(self.argv)
-        for index in self.run_dir_indexes:
-            argv[index] = argv[index].replace(RUN_DIR, str(run_dir), 1)
-        if self.brief_index is not None:
-            argv[self.brief_index] = (run_dir / BRIEF_FILE).read_text()
-        return argv, (run_dir / BRIEF_FILE if self.stdin else None)
+        return materialize_argv(self.argv, run_dir, spawn_plan(self))
+
+
+def spawn_plan(command: AgentCommand) -> dict:
+    """What the supervisor needs to start this command, as plain data.
+
+    It is written to the run's `meta.json`, beside the recorded argv. The
+    token positions are the ones recorded when the command was built.
+    """
+    return {
+        "harness": command.harness,
+        "stdin": command.stdin is not None,
+        "brief_index": command.brief_index,
+        "run_dir_indexes": list(command.run_dir_indexes),
+        "env": dict(command.env),
+        "env_unset": list(command.env_unset),
+        "result": dict(command.result),
+        "session": dict(command.session),
+        "session_ref": command.session_ref,
+    }
+
+
+def materialize_argv(argv: list[str], run_dir: Path, plan: dict) -> tuple[list[str], Path | None]:
+    """Fill the engine's tokens at their recorded positions, and nowhere else.
+
+    A plan that does not fit the argv is refused: a position outside it, or a
+    position that does not hold the token the engine placed there.
+    """
+    argv = list(argv)
+    brief_index = plan.get("brief_index")
+    run_dir_indexes = plan.get("run_dir_indexes") or []
+    positions = [*run_dir_indexes, *([] if brief_index is None else [brief_index])]
+    if any(type(i) is not int or not 0 <= i < len(argv) for i in positions):
+        raise ValueError("spawn plan names a position outside the recorded command")
+    for index in run_dir_indexes:
+        if not argv[index].startswith(RUN_DIR):
+            raise ValueError("spawn plan and recorded command disagree on the run directory")
+        argv[index] = argv[index].replace(RUN_DIR, str(run_dir), 1)
+    if brief_index is not None:
+        if argv[brief_index] != BRIEF:
+            raise ValueError("spawn plan and recorded command disagree on the brief")
+        argv[brief_index] = (run_dir / BRIEF_FILE).read_text()
+    return argv, (run_dir / BRIEF_FILE if plan.get("stdin") else None)
 
 
 def _disabled(env: Mapping[str, str]) -> frozenset[str]:
@@ -336,6 +386,49 @@ def read_result(spec: dict, stdout: str, run_dir: Path | None = None) -> str | N
     return value if isinstance(value, str) and value.strip() else None
 
 
+def read_report(
+    result: dict, session: dict, log: Path, run_dir: Path, pinned: str | None = None
+) -> tuple[str | None, str | None]:
+    """The final message and the session reference, from one pass over the log.
+
+    The log of a long run is its whole event stream, so it is read a line at a
+    time and only the last message and the first session reference are kept.
+    A harness that reports one JSON document over several lines is read whole,
+    up to `WHOLE_REPORT_MAX`.
+    """
+    message = read_result(result, "", run_dir) if result["source"] == "file" else None
+    found = pinned if session["source"] == "pinned" else None
+    from_stream = result["source"] != "file"
+    with log.open(errors="replace") as handle:
+        for line in handle:
+            wants_session = session["source"] == "event" and found is None
+            if not from_stream and not wants_session:
+                break
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if wants_session and _matching([record], session):
+                value = _field(record, session["field"])
+                if isinstance(value, str) and value.strip():
+                    found = value
+            if from_stream and _matching([record], result):
+                value = _field(record, result["field"])
+                if isinstance(value, str) and value.strip():
+                    message = value
+    if (
+        message is None and result["source"] == "stdout_json"
+        and log.stat().st_size <= WHOLE_REPORT_MAX
+    ):
+        message = read_result(result, log.read_text(errors="replace"), run_dir)
+    return message, found
+
+
 def read_session(spec: dict, stdout: str, pinned: str | None = None) -> str | None:
     """The harness session reference: the pinned one, or the first one reported."""
     if spec["source"] == "pinned":
@@ -382,15 +475,25 @@ def validate_branch(name: str, root: Path) -> str:
 
 
 def create_worktree(
-    run_id: int, base_commit: str, branch: str | None = None, *, root: Path | None = None
+    run_id: int,
+    base_commit: str,
+    branch: str | None = None,
+    *,
+    root: Path | None = None,
+    path: Path | None = None,
+    reuse_branch: bool = False,
 ) -> Path:
     """Create `.sc-worktrees/agent-<run_id>` at the base: detached, or on a new branch.
 
     The boot files are ignored by git, so the worktree carries none: a harness
     started there is a plain harness, never the launching shell.
+
+    A continue recreates a removed worktree at the earlier run's `path`, and
+    with `reuse_branch` checks out the branch that run created when it still
+    exists.
     """
     root = root or project_root.ENGINE.parent
-    path = worktree_path(run_id, root)
+    path = path or worktree_path(run_id, root)
     if path.exists():
         raise RuntimeError(
             f"{path} already exists, left by an earlier run of this number; "
@@ -398,8 +501,14 @@ def create_worktree(
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     command = ["worktree", "add"]
-    command += ["-b", branch] if branch else ["--detach"]
-    made = _git(root, *command, str(path), base_commit)
+    target = base_commit
+    if branch and reuse_branch and _git(
+        root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"
+    ).returncode == 0:
+        target = branch
+    else:
+        command += ["-b", branch] if branch else ["--detach"]
+    made = _git(root, *command, str(path), target)
     if made.returncode != 0:
         raise RuntimeError(
             f"could not create subagent worktree {path}: {made.stderr.strip()}"
@@ -414,6 +523,8 @@ def create_worktree_or_fail(
     *,
     submit,
     root: Path | None = None,
+    path: Path | None = None,
+    reuse_branch: bool = False,
 ) -> Path | None:
     """Create the worktree, or end the registered run as failed with the reason.
 
@@ -423,7 +534,9 @@ def create_worktree_or_fail(
     the run was ended.
     """
     try:
-        return create_worktree(run_id, base_commit, branch, root=root)
+        return create_worktree(
+            run_id, base_commit, branch, root=root, path=path, reuse_branch=reuse_branch
+        )
     except (RuntimeError, OSError) as exc:
         submit({
             "state": "failed",
@@ -434,12 +547,84 @@ def create_worktree_or_fail(
         return None
 
 
+def worktree_state(path: Path, base_commit: str) -> dict:
+    """What a subagent left in its worktree: HEAD, and whether anything changed.
+
+    `unchanged` is the removal rule: no uncommitted change (untracked files
+    count; ignored ones do not) and HEAD still the base commit. A worktree
+    that cannot be read is never reported unchanged.
+    """
+    if not path.is_dir():
+        return {"exists": False, "head_commit": None, "uncommitted": None, "unchanged": False}
+    head = _git(path, "rev-parse", "--verify", "--quiet", "HEAD")
+    # The answer decides whether a worktree is deleted, so it does not depend
+    # on configuration: untracked files are always listed
+    # (`status.showUntrackedFiles`), submodule changes always count
+    # (`diff.ignoreSubmodules`, `submodule.<name>.ignore`), and a user's
+    # global excludes file hides nothing. Only the repository's own ignore
+    # rules decide what is ignored, and an ignored file is not work.
+    status = _git(
+        path, "-c", "core.excludesFile=/dev/null", "status", "--porcelain",
+        "--untracked-files=all", "--ignore-submodules=none", "--no-renames",
+    )
+    head_commit = head.stdout.strip() if head.returncode == 0 else None
+    uncommitted = bool(status.stdout.strip()) if status.returncode == 0 else None
+    return {
+        "exists": True,
+        "head_commit": head_commit,
+        "uncommitted": uncommitted,
+        "unchanged": uncommitted is False and head_commit == base_commit,
+    }
+
+
+def unpushed_commits(path: Path, base_commit: str) -> int | None:
+    """Commits made since the base that no remote branch holds; None when unreadable."""
+    found = _git(path, "rev-list", "--count", f"{base_commit}..HEAD", "--not", "--remotes")
+    try:
+        return int(found.stdout.strip()) if found.returncode == 0 else None
+    except ValueError:
+        return None
+
+
+def remove_worktree(path: Path, root: Path | None = None) -> None:
+    """Remove a subagent worktree the caller has already judged safe to remove."""
+    root = root or path.parents[1]
+    done = _git(root, "worktree", "remove", "--force", str(path))
+    if done.returncode != 0 and path.exists():
+        raise RuntimeError(f"could not remove subagent worktree {path}: {done.stderr.strip()}")
+    _git(root, "worktree", "prune")
+
+
+def write_result(run_dir: Path, message: str | None) -> int:
+    """Write `result.md`; the size reported is the final message's, 0 when none."""
+    (run_dir / AGENT_RESULT_FILE).write_text(message if message else NO_RESULT)
+    return len(message.encode()) if message else 0
+
+
+def write_facts(run_dir: Path, facts: dict) -> None:
+    """Persist the run's facts beside its evidence, for recovery at terminal."""
+    path = run_dir / AGENT_FACTS_FILE
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(facts, sort_keys=True))
+    os.replace(tmp, path)
+
+
+def usable_session(value: object) -> str | None:
+    """A session reference that can be an argument of a later resume, or None."""
+    try:
+        return route_value(value, "session_ref")
+    except ValueError:
+        return None
+
+
 # ── child environment ────────────────────────────────────────────────────────
 
 def child_environment(
     run_id: int,
     command: AgentCommand | None = None,
     environ: Mapping[str, str] | None = None,
+    *,
+    plan: dict | None = None,
 ) -> dict[str, str]:
     """The launching shell's environment, as the subagent receives it.
 
@@ -455,9 +640,11 @@ def child_environment(
     env.pop("SC_DEVKIT_RUN_ID", None)
     env[RUN_VARIABLE] = str(int(run_id))
     if command is not None:
-        for name in command.env_unset:
+        plan = spawn_plan(command)
+    if plan is not None:
+        for name in plan.get("env_unset") or ():
             env.pop(name, None)
-        env.update(command.env)
+        env.update(plan.get("env") or {})
     return env
 
 

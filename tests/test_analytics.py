@@ -514,6 +514,77 @@ class CollectorTest(unittest.TestCase):
             "SELECT shell_id FROM session_token_usage "
             "WHERE harness_session_ref='h4'").fetchone()[0], 1)
 
+    def test_subagent_session_is_attributed_to_its_launching_shell_and_run(self):
+        """Feature #96, spec #273 AC 16: a sweep over a session whose cwd is
+        `.sc-worktrees/agent-<run_id>` gives the usage row the launching
+        shell's id and the run id, and shows the tokens on the run row."""
+        con = self.con()
+        con.execute(
+            "INSERT INTO runs (run_id, owner_shell_id, registration_key, kind, label, argv, "
+            "cwd, evidence_path) VALUES (41, 2, 'k', 'agent', 'review', '[\"claude\"]', ?, '/e')",
+            (str(analytics.REPO_ROOT / ".sc-worktrees/agent-41"),))
+        con.execute(
+            "INSERT INTO run_agents (run_id, harness, requested_model, worktree, base_commit) "
+            "VALUES (41, 'claude', 'haiku', ?, ?)",
+            (str(analytics.REPO_ROOT / ".sc-worktrees/agent-41"), "a" * 40))
+        # A command job of the same number as a second worktree is not a subagent.
+        con.execute(
+            "INSERT INTO runs (run_id, owner_shell_id, registration_key, kind, label, argv, "
+            "cwd, evidence_path) VALUES (42, 2, 'j', 'job', 'x', '[\"true\"]', '/r', '/e')")
+        # The launching shell (dev1, a Codex session) was live at the time.
+        con.execute("INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, "
+                    "date, started_at, harness) VALUES (30, 2, '0001', '2026-07-19', "
+                    "'2026-07-19T09:00:00Z', 'codex')")
+        con.commit()
+        con.close()
+
+        data = self.tmp / "claude-data"
+        original = p_claude.DATA_DIR
+        p_claude.DATA_DIR = data
+        self.addCleanup(setattr, p_claude, "DATA_DIR", original)
+        for run_id in (41, 42):
+            cwd = str(analytics.REPO_ROOT / f".sc-worktrees/agent-{run_id}")
+            project = data / p_claude._encode(cwd)
+            project.mkdir(parents=True)
+            (project / f"session-{run_id}.jsonl").write_text("\n".join([
+                user_line("check the spec", cwd=cwd),
+                usage_line(f"m{run_id}a", model="claude-haiku-5-5", cwd=cwd, inp=100),
+                usage_line(f"m{run_id}b", model="claude-haiku-5-5", cwd=cwd, inp=40,
+                           ts="2026-07-19T10:05:00Z"),
+            ]) + "\n")
+
+        summary = analytics.sweep(only="claude", quiet=True)
+        self.assertEqual(summary["inserted"], 2)
+        con = self.con()
+        got = {r["harness_session_ref"].rsplit("/", 1)[-1]: dict(r) for r in con.execute(
+            "SELECT * FROM session_token_usage")}
+        tagged = next(v for k, v in got.items() if "session-41" in k)
+        self.assertEqual((tagged["shell_id"], tagged["run_id"]), (2, 41))
+        # Not unattributed: it sits in the launching shell's session, whatever
+        # harness the subagent ran on.
+        self.assertEqual(tagged["archive_id"], 30)
+        other = next(v for k, v in got.items() if "session-42" in k)
+        self.assertEqual((other["shell_id"], other["run_id"], other["archive_id"]),
+                         (None, None, None))
+        # The run row shows the tokens once a sweep has read them.
+        usage = json.loads(con.execute(
+            "SELECT usage_json FROM run_agents WHERE run_id=41").fetchone()[0])
+        self.assertEqual(usage["input_tokens"], 140)
+        self.assertEqual(usage["output_tokens"], 20)
+        self.assertEqual(usage["cache_read_tokens"], 40)
+        self.assertEqual(usage["models"], ["claude-haiku-5-5"])
+        self.assertTrue(usage["swept_at"])
+        import runs as runs_module
+        row = runs_module.RunStore(con, self.tmp / "engine").get(41)
+        self.assertEqual(row["agent"]["usage_json"]["input_tokens"], 140)
+        # A second sweep is idempotent.
+        analytics.sweep(only="claude", quiet=True, full=True)
+        self.assertEqual(con.execute(
+            "SELECT count(*) FROM session_token_usage").fetchone()[0], 2)
+        self.assertEqual(json.loads(con.execute(
+            "SELECT usage_json FROM run_agents WHERE run_id=41").fetchone()[0])["input_tokens"],
+            140)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
