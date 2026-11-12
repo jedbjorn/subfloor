@@ -24,7 +24,16 @@ from pathlib import Path
 from typing import NoReturn
 
 import project_root
-from runs import PROBE_EXCERPT, boot_id, terminal_payload
+from runs import (
+    AGENT_DEFAULT_TIMEOUT,
+    AGENT_MAX_TIMEOUT,
+    PROBE_EXCERPT,
+    TERMINAL,
+    WATCH_ARGV,
+    boot_id,
+    terminal_payload,
+    watch_form,
+)
 
 ENGINE = Path(__file__).resolve().parents[1]
 JOBS = ENGINE / "run" / "jobs"
@@ -39,6 +48,9 @@ WAIT_CAP = 550              # hard cap — under harness foreground-timeout limi
 KILL_GRACE = 10             # SIGTERM → SIGKILL grace (seconds)
 POLL = 2                    # supervisor/wait poll interval (seconds)
 PROBE_TIMEOUT = 3600        # probes always have a finite overall deadline
+WATCH_PR_EVERY = 60         # `watch pr` default delay between reads (seconds)
+AGENT_START_WAIT = 60       # how long `agent` waits for its harness to start
+SETTLED_PR_STATES = frozenset({"green", "red", "merged", "closed"})
 
 
 def die(msg: str) -> NoReturn:
@@ -260,7 +272,11 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
     if meta.get('kind') == 'probe':
         meta['probe_ready'] = True
         write_meta(jobdir, meta)
+        if meta.get('watch') == 'timer':
+            return supervise_timer(jobdir, meta, notify)
         return supervise_probe(jobdir, meta, notify)
+    if meta.get('kind') == 'agent':
+        return supervise_agent(jobdir, meta, notify)
 
     log = open(jobdir / "log", "ab", buffering=0)
     child_environment = project_root.scrubbed()
@@ -319,6 +335,159 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
     log.close()
     notify(meta)
     return rc
+
+
+def supervise_agent(jobdir: Path, meta: dict, notify) -> int:
+    """Run one subagent: worktree, brief, harness, result, facts, terminal.
+
+    The worktree is created here, under a supervisor that has already checked
+    in, so a slow creation is a running run and never a registered row with no
+    process. Ending the run, by exit, time limit, stop or a signal to this
+    supervisor, signals the harness's whole process group, so no harness
+    process outlives its run.
+    """
+    import job_agent as agent
+
+    plan = meta['agent']
+    run_id = meta['run_id']
+    worktree = Path(meta['cwd'])
+    root = worktree.parents[1]
+    base = plan['base_commit']
+    continues = plan.get('continues_run_id') is not None
+
+    def not_started(payload: dict) -> None:
+        meta.update(finished_at=_now(), exit_code=payload['exit_code'],
+                    spawn_error=payload['spawn_error'])
+        write_meta(jobdir, meta)
+        notify(meta)
+
+    # A continue works in the earlier run's worktree; one removed as unchanged
+    # is recreated at the same path, where the harness session was first run.
+    if not (continues and worktree.is_dir()):
+        created = agent.create_worktree_or_fail(
+            run_id, base, plan.get('branch'), submit=not_started,
+            root=root, path=worktree, reuse_branch=continues)
+        if created is None:
+            return 127
+
+    stopped_by: list[int] = []
+    previous = {}
+    for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        try:
+            previous[number] = signal.signal(
+                number, lambda received, _frame: stopped_by.append(received))
+        except ValueError:
+            pass  # not the main thread: the caller keeps its own handlers
+    child = None
+    rc = 127
+    timed_out = False
+    spawn_error = None
+    log = open(jobdir / 'log', 'ab', buffering=0)
+    errors = open(jobdir / agent.STDERR_FILE, 'ab', buffering=0)
+    try:
+        try:
+            argv, brief = agent.materialize_argv(meta['cmd'], jobdir, plan)
+            with (open(brief, 'rb') if brief else open(os.devnull, 'rb')) as stdin:
+                # The brief is attached before the process starts. Standard
+                # output is the harness's report and goes to the log alone, so
+                # it can be parsed; standard error is appended when the run ends.
+                child = subprocess.Popen(
+                    argv, cwd=str(worktree),
+                    env=agent.child_environment(run_id, plan=plan),
+                    stdout=log, stderr=errors, stdin=stdin, start_new_session=True)
+        except (OSError, ValueError) as exc:
+            spawn_error = f'subagent not started: {exc}'[:256]
+        if child is not None:
+            meta['pid'] = child.pid
+            meta['start_ticks'] = _start_ticks(child.pid)
+            write_meta(jobdir, meta)
+            try:
+                _api('POST', f"/_sc/runs/{run_id}/running", {
+                    k: meta.get(k) for k in ('pid', 'start_ticks', 'supervisor_pid',
+                                            'supervisor_start_ticks', 'boot_id', 'started_at')})
+            except (urllib.error.URLError, OSError):
+                pass  # local identity is durable; the runtime pulse recovers it
+            timeout = meta.get('timeout')
+            deadline = time.monotonic() + timeout if timeout else None
+            while True:
+                try:
+                    rc = child.wait(timeout=POLL)
+                    break
+                except subprocess.TimeoutExpired:
+                    timed_out = bool(deadline and time.monotonic() >= deadline)
+                    if timed_out or stopped_by or (jobdir / 'kill_requested').exists():
+                        _kill_group(child.pid, child)
+                        rc = child.wait()
+                        break
+            # The leader is gone; whatever it left in its group goes with it.
+            _kill_group(child.pid)
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+        errors.close()
+
+    stdout = (jobdir / 'log').read_text(errors='replace')
+    message = agent.read_result(plan['result'], stdout, jobdir)
+    session = agent.usable_session(
+        agent.read_session(plan['session'], stdout, plan.get('session_ref'))
+        or plan.get('session_ref'))
+    result_bytes = agent.write_result(jobdir, message)
+    stderr_path = jobdir / agent.STDERR_FILE
+    if stderr_path.stat().st_size:
+        with stderr_path.open('rb') as handle:
+            handle.seek(max(0, stderr_path.stat().st_size - agent.STDERR_TAIL))
+            log.write(b'\n--- harness standard error ---\n' + handle.read())
+    log.close()
+
+    state = agent.worktree_state(worktree, base)
+    removed_at = None
+    if state['unchanged']:
+        try:
+            agent.remove_worktree(worktree, root)
+            removed_at = _now()
+        except RuntimeError:
+            pass  # kept; `sc job clean` removes it
+    facts = {k: v for k, v in {
+        'session_ref': session, 'result_bytes': result_bytes,
+        'worktree_removed_at': removed_at}.items() if v is not None}
+    # Persisted first: the terminal route recovers them if this post is lost.
+    agent.write_facts(jobdir, facts)
+    try:
+        _api('POST', f"/_sc/runs/{run_id}/facts", facts)
+    except (urllib.error.URLError, OSError):
+        pass
+    outcome = {k: v for k, v in {
+        'head_commit': state['head_commit'], 'uncommitted': state['uncommitted'],
+    }.items() if v is not None}
+
+    # Re-read before the final write, as for every job: never clobber a marker.
+    meta = read_meta(jobdir) or meta
+    meta.update(finished_at=_now(), exit_code=rc, timed_out=timed_out,
+                agent_outcome=outcome)
+    if (jobdir / 'kill_requested').exists():
+        meta['killed'] = True
+    if spawn_error:
+        meta['spawn_error'] = spawn_error
+    elif stopped_by:
+        meta['spawn_error'] = (f'supervisor stopped by signal {stopped_by[0]}; '
+                               'the subagent was stopped with it')
+    write_meta(jobdir, meta)
+    notify(meta)
+    return rc
+
+
+def supervise_timer(jobdir: Path, meta: dict, notify) -> int:
+    """`watch timer`: end `done` when the delay has passed, `killed` when stopped."""
+    deadline = time.monotonic() + meta['after']
+    stopped = False
+    while not stopped and time.monotonic() < deadline:
+        time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+        stopped = (jobdir / 'kill_requested').exists()
+    meta.update(finished_at=_now(), exit_code=None if stopped else 0,
+                timed_out=False, killed=stopped)
+    write_meta(jobdir, meta)
+    notify(meta)
+    return 1 if stopped else 0
 
 
 def probe_stop(jobdir: Path, deadline: float) -> str | None:
@@ -457,6 +626,8 @@ def cmd_start(args) -> int:
             'argv': cmd, 'cwd': cwd, 'commit': commit.stdout.strip() or None,
             'timeout_seconds': args.timeout})
     except (urllib.error.URLError, OSError, ValueError) as exc:
+        if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
+            die(f'refused ({_refused(exc)}); no command launched')
         die(f'registration failed ({type(exc).__name__}); no command launched')
     job_id = str(registered['run_id'])
     jobdir = Path(registered['evidence_path']).parent
@@ -469,12 +640,7 @@ def cmd_start(args) -> int:
         'every': every,
         'timeout': args.timeout, 'started_at': _now(), 'log': str(jobdir / 'log'),
     })
-    # Detach: the supervisor gets its own session so it survives this process,
-    # the harness turn, and the harness session itself.
-    sup = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "_supervise", str(jobdir)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL, start_new_session=True)
+    sup = _detach_supervisor(jobdir)
     # Only the supervisor writes meta after this point (no lost-update races);
     # wait for its first write so an immediate `status`/`wait` never reads a
     # pre-supervisor meta and mis-calls the job 'lost'.
@@ -492,6 +658,320 @@ def cmd_start(args) -> int:
           f"end your turn; completion wakes you "
           f"(TUI delivery waits for the CLI slot). `sc job status {job_id}`")
     return 0
+
+
+def _refused(exc: Exception) -> str:
+    """The engine's own words for a refusal, when it sent any."""
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            reason = json.loads(exc.read()).get('error')
+        except (OSError, ValueError, AttributeError):
+            reason = None
+        return f'HTTP {exc.code}: {reason}' if reason else f'HTTP {exc.code}'
+    return type(exc).__name__
+
+
+def _detach_supervisor(jobdir: Path) -> subprocess.Popen:
+    # Detach: the supervisor gets its own session so it survives this process,
+    # the harness turn, and the harness session itself.
+    return subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "_supervise", str(jobdir)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def _brief_text(args) -> str:
+    if args.brief is not None:
+        return args.brief
+    try:
+        return project_root.read_text(args.brief_file)
+    except (OSError, UnicodeDecodeError) as exc:
+        die(f'cannot read the brief file: {exc}; nothing was registered or started')
+
+
+def _version_notice(harness: str) -> str | None:
+    """One line when the installed harness is outside its adapter's tested range."""
+    try:
+        import harness_versions
+        status = harness_versions.compatibility_status((harness,)).get(harness) or {}
+    except Exception:  # noqa: BLE001 - a notice never blocks a launch
+        return None
+    found = status.get('compatibility')
+    if not found or found == 'verified':
+        return None
+    return (f"note: {harness} {status.get('observed_version') or '?'} is outside the "
+            f"version its adapter was tested with ({found}); launching anyway")
+
+
+def _launch_agent(args, *, harness, model, effort, base_commit, branch, label,
+                  continues=None, resume_session=None) -> int:
+    """Register, then detach the supervisor that creates the worktree and runs the harness."""
+    import job_agent as agent
+
+    if not (SC_API_TOKEN and SC_API_BASE):
+        die('authenticated shell API is required; nothing was registered or started')
+    if args.timeout is not None and args.timeout <= 0:
+        die('--timeout must be positive seconds; nothing was registered or started')
+    try:
+        brief = agent.validate_brief(_brief_text(args))
+        command = agent.build_command(harness, model, effort, resume_session=resume_session)
+    except agent.AgentRefusal as exc:
+        die(f'refused: {exc}; nothing was registered or started')
+    try:
+        registered = _api('POST', '/_sc/runs', {
+            'registration_key': uuid.uuid4().hex, 'kind': 'agent', 'label': label,
+            'argv': command.argv, 'commit': base_commit, 'timeout_seconds': args.timeout,
+            'agent': {
+                'harness': harness, 'requested_model': model, 'requested_effort': effort,
+                'effective_effort': command.effective_effort, 'branch': branch,
+                'adapter_version': (command.cli_version or '')[:128] or None,
+                'brief_bytes': len(brief),
+                'launched_from_run': agent.launched_from_run(),
+                'continues_run_id': continues,
+            }})
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        die(f'refused ({_refused(exc)}); nothing was registered or started')
+    job_id = str(registered['run_id'])
+    facts = registered['agent']
+    jobdir = Path(registered['evidence_path']).parent
+    jobdir.mkdir(parents=True, exist_ok=False)
+    (jobdir / 'log').touch()
+    (jobdir / agent.BRIEF_FILE).write_bytes(brief)
+    write_meta(jobdir, {
+        'run_id': registered['run_id'], 'job_id': job_id, 'kind': 'agent',
+        'label': registered['label'], 'cmd': command.argv, 'cwd': registered['cwd'],
+        'timeout': registered['timeout_seconds'], 'started_at': _now(),
+        'log': str(jobdir / 'log'),
+        # The supervisor is another process: the positions of the engine's
+        # tokens travel with the command, so it never searches argv for them.
+        'agent': {**agent.spawn_plan(command), 'base_commit': facts['base_commit'],
+                  'branch': facts['branch'], 'continues_run_id': continues},
+    })
+    _detach_supervisor(jobdir)
+    end = time.monotonic() + AGENT_START_WAIT
+    started: dict = {}
+    while time.monotonic() < end:
+        started = read_meta(jobdir)
+        if started.get('pid') or started.get('finished_at'):
+            break
+        time.sleep(0.05)
+    else:
+        die(f'subagent startup unconfirmed after {AGENT_START_WAIT}s; registered run {job_id} '
+            f'will reconcile; inspect `sc job status {job_id}` before starting dependent work')
+    if started.get('finished_at') and started.get('spawn_error'):
+        die(f"run {job_id} ended before the subagent started: {started['spawn_error']}. "
+            f"Its wake states the same; `sc job status {job_id}`")
+    notice = _version_notice(harness)
+    if notice:
+        print(f'job: {notice}')
+    where = facts['branch'] or f"detached at {facts['base_commit'][:12]}"
+    print(f"job: {job_id} started — subagent {harness} · {facts['requested_model']} · "
+          f"effort {facts['effective_effort'] or 'default'}; time limit "
+          f"{registered['timeout_seconds']}s\n"
+          f"  worktree: {registered['cwd']} ({where})"
+          + (f"\n  continues run {continues}, same harness session" if continues else '')
+          + f"\n  end your turn; completion wakes you. `sc job status {job_id}` · "
+          f"`sc job result {job_id}`")
+    return 0
+
+
+def cmd_agent(args) -> int:
+    import job_agent as agent
+
+    cwd = project_root.invocation_cwd()
+    try:
+        base = agent.resolve_base(args.base or 'HEAD', cwd)
+        branch = agent.validate_branch(args.branch, cwd) if args.branch else None
+    except agent.AgentRefusal as exc:
+        die(f'refused: {exc}; nothing was registered or started')
+    return _launch_agent(args, harness=args.harness, model=args.model, effort=args.effort,
+                         base_commit=base, branch=branch, label=args.label)
+
+
+def _agent_row(job_id: str) -> dict:
+    if not job_id.isdecimal():
+        die(f"'{job_id}' is not a run id")
+    row = ledger_run(job_id)
+    if row is None:
+        die(f"no run '{job_id}' in the ledger (see `sc job list --kind agent --all`)")
+    if row['kind'] != 'agent' or not row.get('agent'):
+        die(f"run {job_id} is a {row['kind']} run, not a subagent")
+    return row
+
+
+def cmd_continue(args) -> int:
+    row = _agent_row(args.id)
+    facts = row['agent']
+    if row['state'] not in TERMINAL:
+        die(f"refused: run {args.id} is still live ({row['state']}); wait for it to end or "
+            f"stop it with `sc job kill {args.id}`; nothing was registered or started")
+    if not facts['session_ref']:
+        die(f'refused: run {args.id} captured no session reference, so there is no harness '
+            'session to resume; launch a fresh subagent. Nothing was registered or started')
+    return _launch_agent(
+        args, harness=facts['harness'], model=facts['requested_model'],
+        effort=facts['requested_effort'], base_commit=facts['base_commit'], branch=None,
+        label=args.label or row['label'], continues=row['run_id'],
+        resume_session=facts['session_ref'])
+
+
+def cmd_result(args) -> int:
+    _agent_row(args.id)
+    try:
+        result = _api('GET', f'/_sc/runs/{args.id}/result')
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        die(f'result unavailable ({_refused(exc)})')
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0 if result['available'] else 1
+    facts = result['agent'] or {}
+    print(f"run {result['run_id']}: {result['state']} exit={result['exit_code']} — "
+          f"{facts.get('harness')} · {facts.get('requested_model')} · "
+          f"{facts.get('effective_effort') or 'default'}")
+    for name in ('session_ref', 'worktree', 'worktree_removed_at', 'worktree_discarded_at',
+                 'base_commit', 'branch', 'continues_run_id', 'usage_json'):
+        if facts.get(name) is not None:
+            print(f"  {name}: {json.dumps(facts[name]) if name == 'usage_json' else facts[name]}")
+    if not result['available']:
+        print('  no result is recorded yet')
+        return 1
+    print(f"  result_bytes: {result['result_bytes']}")
+    print('---')
+    print(result['text'])
+    if result['truncated']:
+        print("--- truncated: the first 256 KiB are shown; the full text is result.md "
+              "beside the run's log (`sc job status` names the path)")
+    return 0
+
+
+def cmd_clean(args) -> int:
+    import job_agent as agent
+
+    row = _agent_row(args.id)
+    facts = row['agent']
+    path = Path(facts['worktree'])
+    state = agent.worktree_state(path, facts['base_commit'])
+    discarding = False
+    if state['exists']:
+        unpushed = agent.unpushed_commits(path, facts['base_commit'])
+        discarding = state['uncommitted'] is not False or unpushed is None or unpushed > 0
+        if discarding and not args.discard:
+            die(f"refused: {path} holds work that exists nowhere else — uncommitted changes: "
+                f"{'unknown' if state['uncommitted'] is None else 'yes' if state['uncommitted'] else 'no'}; "
+                f"commits on no remote branch: {'unknown' if unpushed is None else unpushed}. "
+                f"Push or copy what you need, or remove it with `sc job clean {args.id} --discard`")
+    try:
+        _api('POST', f'/_sc/runs/{args.id}/clean', {'discard': discarding})
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        die(f'refused ({_refused(exc)}); nothing was removed')
+    if not state['exists']:
+        print(f'job: {args.id} worktree {path} is already removed')
+        return 0
+    try:
+        agent.remove_worktree(path)
+    except RuntimeError as exc:
+        die(f'{exc}; the ledger records the removal — remove the directory by hand')
+    print(f'job: {args.id} worktree {path} removed'
+          + (' with its uncommitted or unpushed work (--discard); it cannot be continued'
+             if discarding else '')
+          + (f". Branch {facts['branch']} is kept" if facts['branch'] else ''))
+    return 0
+
+
+def _register_watch(args, *, argv, cmd, every, timeout, label, extra) -> int:
+    if not (SC_API_TOKEN and SC_API_BASE):
+        die('authenticated shell API is required; no watch started')
+    cwd = str(project_root.invocation_cwd())
+    try:
+        registered = _api('POST', '/_sc/runs', {
+            'registration_key': uuid.uuid4().hex, 'kind': 'probe', 'label': label,
+            'argv': argv, 'cwd': cwd, 'commit': None, 'timeout_seconds': timeout})
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        die(f'refused ({_refused(exc)}); no watch started')
+    job_id = str(registered['run_id'])
+    jobdir = Path(registered['evidence_path']).parent
+    jobdir.mkdir(parents=True, exist_ok=False)
+    (jobdir / 'log').touch()
+    write_meta(jobdir, {
+        'run_id': registered['run_id'], 'job_id': job_id, 'kind': 'probe',
+        'label': label, 'cmd': cmd, 'cwd': cwd, 'every': every, 'timeout': timeout,
+        'started_at': _now(), 'log': str(jobdir / 'log'), **extra})
+    _detach_supervisor(jobdir)
+    end = time.monotonic() + 5
+    while time.monotonic() < end:
+        started = read_meta(jobdir)
+        if started.get('probe_ready') or started.get('finished_at'):
+            break
+        time.sleep(0.05)
+    else:
+        die(f'supervisor startup unconfirmed; registered run {job_id} will reconcile; '
+            f'inspect `sc job status {job_id}`')
+    print(f"job: {job_id} watching — {watch_form(registered)[1]}; ends within {timeout}s. "
+          f"End your turn; it wakes you once. This watch grants no merge authority. "
+          f"`sc job status {job_id}`")
+    return 0
+
+
+def cmd_watch(args) -> int:
+    script = [sys.executable, str(Path(__file__).resolve()), '_watch']
+    if args.form == 'timer':
+        if not 0 < args.after <= sys.maxsize:
+            die('--after must be positive seconds')
+        options = ['timer', '--after', str(args.after)]
+        return _register_watch(
+            args, argv=[*WATCH_ARGV, *options], cmd=[*script, *options], every=None,
+            timeout=args.after, label=args.label or f'timer {args.after}s',
+            extra={'watch': 'timer', 'after': args.after})
+    if args.pr < 1:
+        die('--pr must be a pull request number')
+    every = WATCH_PR_EVERY if args.every is None else args.every
+    timeout = PROBE_TIMEOUT if args.timeout is None else args.timeout
+    if not 5 <= every <= sys.maxsize:
+        die(f'--every must be between 5 and {sys.maxsize} seconds')
+    if not 0 < timeout <= sys.maxsize:
+        die(f'--timeout must be positive seconds (maximum {sys.maxsize})')
+    options = ['pr', '--pr', str(args.pr)]
+    if args.repository:
+        options += ['--repository', args.repository]
+    # One read in the foreground: a PR that cannot be read is refused now,
+    # not reported an hour later as a timeout.
+    state, line = read_pr_state(args.pr, args.repository)
+    if state is None:
+        die(f'cannot read PR #{args.pr}: {line}; no watch started')
+    return _register_watch(
+        args, argv=[*WATCH_ARGV, *options], cmd=[*script, *options], every=every,
+        timeout=timeout, label=args.label or f'PR #{args.pr}', extra={'watch': 'pr'})
+
+
+def read_pr_state(number: int, repository: str | None) -> tuple[str | None, str]:
+    """One read of a PR through the PR watcher's reader and normalization.
+
+    Returns the state and the line a watch attempt reports, or (None, reason)
+    when GitHub could not be read.
+    """
+    from github_pull_requests import GitHubPullRequestReader, GitHubReadError, normalize_state
+
+    try:
+        pull_request = GitHubPullRequestReader(
+            project_root.invocation_cwd(), repository=repository).get(number)
+    except (GitHubReadError, ValueError) as exc:
+        return None, str(exc)[:120]
+    state = normalize_state(pull_request)
+    shown = 'no checks reported' if state == 'created' else state
+    return state, f"{shown} at head {pull_request.head_sha or 'unknown'}"
+
+
+def cmd_watch_attempt(args) -> int:
+    """One attempt of a watch, run by the probe supervisor: exit 0 = settled."""
+    if args.form == 'timer':
+        time.sleep(args.after)
+        return 0
+    state, line = read_pr_state(args.pr, args.repository)
+    if state is None:
+        print(f'read failed: {line}')
+        return 2
+    print(line)
+    return 0 if state in SETTLED_PR_STATES else 1
 
 
 def read_api(path: str) -> dict | None:
@@ -513,21 +993,65 @@ def local_notice():
     print('job: local evidence (unauthoritative; wake delivery unconfirmed)', file=sys.stderr)
 
 
+def _seconds_since(stamp: str | None) -> float | None:
+    try:
+        parsed = datetime.fromisoformat(str(stamp).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - parsed).total_seconds()
+
+
+def _span(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def _remaining(row: dict) -> str:
+    """Time left against the run's recorded limit, for a live run."""
+    elapsed = _seconds_since(row.get('started_at') or row.get('created_at'))
+    limit = row.get('timeout_seconds')
+    if row['state'] in TERMINAL or elapsed is None or not limit:
+        return f"limit {_span(limit)}" if limit else 'no limit'
+    return f"{_span(limit - elapsed)} left of {_span(limit)}"
+
+
+def _row_detail(row: dict, kind: str | None) -> str:
+    """What `list` adds for a subagent, and for a watcher under `--kind probe`."""
+    agent = row.get('agent')
+    if agent:
+        usage = agent.get('usage_json') or {}
+        tokens = (f" · {usage.get('input_tokens', 0) + usage.get('output_tokens', 0)} tokens"
+                  if usage else '')
+        return (f" [{agent['harness']} · {agent['requested_model']} · "
+                f"{agent['effective_effort'] or 'default'} · {_remaining(row)}{tokens}]")
+    if kind == 'probe':
+        form, condition = watch_form(row)
+        return f" [{form}: {condition[:80]} · {_remaining(row)}]"
+    return ''
+
+
 def cmd_list(args) -> int:
     emitted = False
-    result = read_api('/_sc/runs')
+    kind = getattr(args, 'kind', None)
+    result = read_api('/_sc/runs' + (f'?kind={kind}' if kind else ''))
     if result is not None:
         for row in result['runs']:
             if args.all or row['state'] in {'registered', 'running'} or row['wake_state'] == 'blocked':
                 emitted = True
-                print(f"  {row['run_id']:<20} {row['state']:<10} wake={row['wake_state']} {row['label']}")
-    roots = [JOBS] if result is not None else [RUNS, JOBS]
+                print(f"  {row['run_id']:<20} {row['state']:<10} wake={row['wake_state']} "
+                      f"{row['label']}{_row_detail(row, kind)}")
+    # Legacy job directories predate kinds: they are listed only without a filter.
+    roots = ([] if kind else [JOBS]) if result is not None else [RUNS, JOBS]
     for root in roots:
         if not root.is_dir():
             continue
         for directory in sorted(root.iterdir(), key=lambda p: p.name):
             meta = read_meta(directory)
-            if not meta:
+            if not meta or (kind and meta.get('kind', 'job') != kind):
                 continue
             st = state_of(meta)
             if not args.all and st not in ('running', 'lost') and not meta.get('submission_error'):
@@ -666,7 +1190,8 @@ def cmd_attach(args) -> int:
 
 # ── arg parsing ───────────────────────────────────────────────────────────────
 
-PUBLIC_VERBS = ("start", "list", "status", "tail", "wait", "kill", "attach")
+PUBLIC_VERBS = ("start", "agent", "continue", "result", "clean", "watch",
+                "list", "status", "tail", "wait", "kill", "attach")
 
 HELP_EPILOG = """\
 forms:
@@ -676,9 +1201,35 @@ forms:
       repeat a quoted /bin/sh probe until it exits 0, then wake you; --every
       is the delay between attempts (default 30, minimum 5) and needs --until;
       probes time out after 3600s unless --timeout says otherwise
+  sc job agent --harness H --model M [--effort E] (--brief-file P | --brief "T")
+               [--base REF] [--branch NAME] [--label L] [--timeout S]
+      run one subagent: a headless harness run in its own worktree
+      (.sc-worktrees/agent-<id>), acting as you under your brief; its
+      completion wakes you. Model is required. Effort is optional: omitted,
+      no effort setting is sent and the harness's own default for that model
+      applies (`sc run` instead falls back to a flavor effort, then high).
+      Time limit 7200s by default, 28800s at most. At most 3 live subagents
+      for one shell and 6 on the install; a subagent cannot launch one.
+  sc job result <id> [--json]
+      a subagent's final message (at most 256 KiB) and its recorded facts
+  sc job continue <id> (--brief-file P | --brief "T") [--label L] [--timeout S]
+      a new run that resumes the same harness session in the same worktree
+  sc job clean <id> [--discard]
+      remove a kept subagent worktree; --discard removes one that holds
+      uncommitted changes or commits on no remote branch
+  sc job watch pr --pr N [--repository owner/name] [--every S] [--timeout S]
+      wake you once when that PR's checks settle (green or red) or it is
+      merged or closed; read every 60s, for at most 3600s, unless told otherwise
+  sc job watch timer --after S
+      wake you once after S seconds
   sc job attach <id> (--pr N [--repository owner/name] | --work-unit N)
       link a finished run to a PR or a Sprint work unit as supporting evidence
-  sc job list [--all] · status <id> · tail <id> [-n N] · wait <id> [--for S] · kill <id>
+  sc job list [--kind agent|probe|job] [--all] · status <id> · tail <id> [-n N]
+  sc job wait <id> [--for S] · kill <id>
+
+A watch is the engine reading on your behalf, bounded, with one outcome; it
+grants no merge authority. At most 10 live watchers (--until included) for
+one shell.
 
 Service teardown/reboot may interrupt computation; recovery records lost when
 no exit evidence survives. Interrupted runs are never automatically restarted.
@@ -707,8 +1258,62 @@ def build_parser() -> argparse.ArgumentParser:
                     help="-- <command and args>")
     sp.set_defaults(fn=cmd_start)
 
+    def brief_arguments(parser) -> None:
+        brief = parser.add_mutually_exclusive_group(required=True)
+        brief.add_argument("--brief-file", metavar="PATH",
+                           help="file holding the brief (at most 64 KiB); - reads stdin")
+        brief.add_argument("--brief", metavar="TEXT", help="the brief as text")
+        parser.add_argument("--label", help="display label")
+        parser.add_argument("--timeout", type=int,
+                            help=f"run-time limit in seconds (default {AGENT_DEFAULT_TIMEOUT}, "
+                                 f"maximum {AGENT_MAX_TIMEOUT})")
+
+    sp = sub.add_parser("agent", help="run one subagent in its own worktree; completion wakes you")
+    sp.add_argument("--harness", help="harness to run it on (required)")
+    sp.add_argument("--model", help="model selector for that harness (required)")
+    sp.add_argument("--effort", help="effort level; omitted, the harness's default for the "
+                                     "model applies and no effort setting is sent")
+    sp.add_argument("--base", metavar="REF", help="commit to start from (default: your HEAD)")
+    sp.add_argument("--branch", metavar="NAME",
+                    help="create this branch at the base; omitted, the worktree is detached")
+    brief_arguments(sp)
+    sp.set_defaults(fn=cmd_agent)
+
+    sp = sub.add_parser("continue", help="resume a subagent's session in its worktree, as a new run")
+    sp.add_argument("id")
+    brief_arguments(sp)
+    sp.set_defaults(fn=cmd_continue)
+
+    sp = sub.add_parser("result", help="a subagent's final message and recorded facts")
+    sp.add_argument("id")
+    sp.add_argument("--json", action="store_true", help="the structured form")
+    sp.set_defaults(fn=cmd_result)
+
+    sp = sub.add_parser("clean", help="remove a kept subagent worktree")
+    sp.add_argument("id")
+    sp.add_argument("--discard", action="store_true",
+                    help="remove it even with uncommitted changes or unpushed commits")
+    sp.set_defaults(fn=cmd_clean)
+
+    sp = sub.add_parser("watch", help="one bounded watch that wakes you once")
+    forms = sp.add_subparsers(dest="form", required=True)
+    wp = forms.add_parser("pr", help="a PR's checks settle, or it is merged or closed")
+    wp.add_argument("--pr", type=int, required=True)
+    wp.add_argument("--repository", help="owner/name; default: this checkout's repository")
+    wp.add_argument("--every", type=int, metavar="SECONDS",
+                    help=f"delay between reads (default {WATCH_PR_EVERY}, minimum 5)")
+    wp.add_argument("--timeout", type=int, help=f"overall seconds (default {PROBE_TIMEOUT})")
+    wp.add_argument("--label", help="display label")
+    wp = forms.add_parser("timer", help="a number of seconds passes")
+    wp.add_argument("--after", type=int, required=True, metavar="SECONDS")
+    wp.add_argument("--label", help="display label")
+    sp.set_defaults(fn=cmd_watch)
+
     sp = sub.add_parser("list", help="live jobs (--all includes finished)")
     sp.add_argument("--all", action="store_true")
+    sp.add_argument("--kind", choices=("agent", "probe", "job"),
+                    help="only runs of this kind; agents show harness, model, effort "
+                         "and time remaining")
     sp.set_defaults(fn=cmd_list)
 
     sp = sub.add_parser("status", help="state, exit, paths; local evidence when API unreachable")
@@ -751,10 +1356,26 @@ def supervisor_parser() -> argparse.ArgumentParser:
     return p
 
 
+def watch_attempt_parser() -> argparse.ArgumentParser:
+    """One attempt of a named watch (`job.py _watch <form>`), run by the probe
+    supervisor. Internal, like `_supervise`."""
+    p = argparse.ArgumentParser(prog="sc job _watch")
+    forms = p.add_subparsers(dest="form", required=True)
+    wp = forms.add_parser("pr")
+    wp.add_argument("--pr", type=int, required=True)
+    wp.add_argument("--repository")
+    wp = forms.add_parser("timer")
+    wp.add_argument("--after", type=int, required=True)
+    p.set_defaults(fn=cmd_watch_attempt)
+    return p
+
+
 def main(argv: list[str]) -> int:
     # Early-closed stdout is handled at the entrypoint (cli_entry.run_cli, #384).
     if argv[:1] == ["_supervise"]:
         args = supervisor_parser().parse_args(argv[1:])
+    elif argv[:1] == ["_watch"]:
+        args = watch_attempt_parser().parse_args(argv[1:])
     else:
         args = build_parser().parse_args(argv)
     return args.fn(args)

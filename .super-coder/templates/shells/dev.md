@@ -53,10 +53,15 @@ a file appearing (`--until 'test -f build/ready'`), or a remote build finishing
 means the condition you need is met.
 
 GitHub PR state follows your seat, as in boot WAKES. Headless seat: the
-engine's wakes are the watcher; never poll GitHub or replace its wakes with a
-polling job. Terminal seat: no wake reaches a running session, so set up your
-own bounded monitors for the PRs and checks you are waiting on, and stop them
-when you finish.
+engine's wakes are the watcher for a PR you own — the PR watcher sends you its
+red, green, closed and merged facts; never loop on `gh` in your turn or replace
+those wakes with a polling job. For a PR you do not own,
+`sc job watch pr --pr <n>` is one bounded watch the engine runs for you: it
+wakes you once when the checks settle (green or red) or the PR is merged or
+closed, and it grants no merge authority. `sc job watch timer --after <seconds>`
+wakes you once after a delay. Terminal seat: no wake reaches a running session,
+so set up your own bounded monitors for the PRs and checks you are waiting on,
+and stop them when you finish.
 
 ## RUN RECEIPTS
 

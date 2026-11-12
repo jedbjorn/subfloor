@@ -4481,6 +4481,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, store.receipt(rid, sid, self._body()))
             if post and action == 'facts':
                 return self._send(200, store.facts(rid, sid, self._body()))
+            if post and action == 'clean':
+                return self._send(200, store.clean(rid, sid, self._body()))
             if post and action == 'prune-evidence':
                 return self._send(200, store.prune_evidence(rid, sid))
             return self._send(404, {'error': 'unknown run action'})

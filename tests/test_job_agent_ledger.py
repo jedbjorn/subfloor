@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -139,7 +140,8 @@ class UpgradeTest(unittest.TestCase):
     def test_populated_ledger_upgrades_with_rows_ids_and_guards_intact(self):
         self._populate()
         before = self._snapshot()
-        self.assertEqual([path.name for path in migrate.pending(self.con)], [MIGRATION])
+        # Still first in line; later migrations wait behind it.
+        self.assertEqual(migrate.pending(self.con)[0].name, MIGRATION)
 
         migrate.apply(self.con, ENGINE / "migrations" / MIGRATION)
 
@@ -223,7 +225,7 @@ class UpgradeTest(unittest.TestCase):
 
     def test_empty_ledger_upgrades_and_accepts_every_kind(self):
         migrate.apply(self.con, ENGINE / "migrations" / MIGRATION)
-        self.assertEqual(migrate.pending(self.con), [])
+        self.assertNotIn(MIGRATION, [path.name for path in migrate.pending(self.con)])
         for kind in ("job", "devkit", "probe", "native", "agent"):
             self.con.execute(
                 "INSERT INTO runs(owner_shell_id,registration_key,kind,label,argv,cwd,evidence_path) "
@@ -248,7 +250,8 @@ class UpgradeTest(unittest.TestCase):
             [{k: v for k, v in row.items() if k != "timeout_seconds"} for row in self._snapshot()],
             before,
         )
-        self.assertEqual([path.name for path in migrate.pending(self.con)], [MIGRATION])
+        # Still first in line; later migrations wait behind it.
+        self.assertEqual(migrate.pending(self.con)[0].name, MIGRATION)
 
 
 class AgentLedgerCase(ApiFixture, unittest.TestCase):
@@ -298,6 +301,7 @@ class RegistrationTest(AgentLedgerCase):
                 "worktree": worktree, "base_commit": COMMIT, "branch": "feat/x",
                 "continues_run_id": None, "result_bytes": None, "usage_json": None,
                 "adapter_version": "codex-cli 0.0.0", "worktree_removed_at": None,
+                "worktree_discarded_at": None,
             },
         )
         # Registration is idempotent on its key and refuses a changed request.
@@ -325,7 +329,7 @@ class RegistrationTest(AgentLedgerCase):
     def test_malformed_agent_requests_register_nothing(self):
         cases = {
             "an agent object": {"agent": None},
-            "unknown agent field": {"agent": {"continues_run_id": 4}},
+            "unknown agent field": {"agent": {"owner_shell_id": 4}},
             "engine-assigned worktree": {"cwd": str(self.root)},
             "base commit": {"commit": "main"},
             "harness must be": {"agent": {"harness": ""}},
@@ -618,15 +622,34 @@ class RunTimeTest(AgentLedgerCase):
             self.con.execute("SELECT count(*) FROM runs WHERE kind='agent'").fetchone()[0], 2)
 
     def test_a_run_past_its_limit_ends_timeout_and_wakes(self):
-        row = job._api("POST", "/_sc/runs", agent_payload("short", timeout_seconds=1))
+        def git(*args):
+            return subprocess.run(
+                ["git", "-C", str(self.root), *args],
+                capture_output=True, text=True, check=True).stdout.strip()
+
+        git("init", "-q", "-b", "main")
+        (self.root / "tracked.txt").write_text("one\n")
+        git("add", "tracked.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@subfloor.local",
+            "commit", "-q", "-m", "first")
+        base = git("rev-parse", "HEAD")
+        row = job._api(
+            "POST", "/_sc/runs", agent_payload("short", timeout_seconds=1, commit=base))
         jobdir = Path(row["evidence_path"]).parent
         jobdir.mkdir(parents=True)
         (jobdir / "log").touch()
         job.write_meta(jobdir, {
             "run_id": row["run_id"], "job_id": str(row["run_id"]), "kind": "agent",
-            "label": row["label"], "cmd": ["sleep", "60"], "cwd": str(self.root),
+            "label": row["label"], "cmd": ["sleep", "60"], "cwd": row["cwd"],
             "timeout": row["timeout_seconds"], "started_at": job._now(),
             "log": str(jobdir / "log"),
+            "agent": {
+                "harness": "codex", "stdin": False, "brief_index": None,
+                "run_dir_indexes": [], "env": {}, "env_unset": [],
+                "result": {"source": "stdout_json", "field": "result"},
+                "session": {"source": "pinned"}, "session_ref": None,
+                "base_commit": base, "branch": None, "continues_run_id": None,
+            },
         })
         job.supervise(jobdir)
         final = job._api("GET", f"/_sc/runs/{row['run_id']}")

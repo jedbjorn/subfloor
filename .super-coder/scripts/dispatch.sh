@@ -2119,6 +2119,13 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc job start --until "<probe>" [--every <s>]
                            repeat a quoted /bin/sh probe until it exits 0, then wake you (--every: delay
                              between attempts, default 30, minimum 5; probes time out after 3600s by default)
+  ./sc job agent --harness <h> --model <m> [--effort <e>] (--brief-file <path> | --brief "<text>")
+                           run one subagent on any headless harness in its own worktree, acting as you
+                             under your brief; completion wakes you. result <id> reads its final message,
+                             continue <id> resumes its session, clean <id> removes a kept worktree
+                             (./sc job --help lists every option and limit)
+  ./sc job watch pr --pr <n> [--repository <owner/name>] · watch timer --after <s>
+                           one bounded watch that wakes you once; it grants no merge authority
   ./sc job attach <id> (--pr <n> [--repository <owner/name>] | --work-unit <n>)
                            link a finished run to a PR or work unit as supporting evidence
   ./sc job wait <id>       bounded foreground wait — exit 0 done · 2 still running; --for <s> sets the

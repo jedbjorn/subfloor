@@ -29,6 +29,7 @@ from github_pull_requests import (
     GitHubReadError,
     PullRequest,
     newest_by_branch,
+    normalize_state,
 )
 from sprint_domain import (
     LifecycleActor,
@@ -410,25 +411,6 @@ class PRSubscriptionStore:
             ).lastrowid
         )
         return SubscriptionReceipt(subscription_id, True)
-
-
-def normalize_state(pull_request: PullRequest) -> str:
-    """Project one GitHub response onto the durable PR state vocabulary."""
-    if (
-        pull_request.state == "MERGED"
-        or pull_request.merged_at is not None
-        or pull_request.merge_sha is not None
-    ):
-        return "merged"
-    if pull_request.state == "CLOSED":
-        return "closed"
-    if pull_request.checks_failed:
-        return "red"
-    if pull_request.checks == "SUCCESS":
-        return "green"
-    if pull_request.checks == "PENDING":
-        return "pending"
-    return "created"
 
 
 class SprintPRRegistrationStore:

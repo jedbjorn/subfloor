@@ -289,6 +289,11 @@ first reply. The `--json` stream is `thread.started` (with `thread_id`),
 `turn.completed`; the `-o` file holds the final message alone; the resumed run
 reports the same `thread_id`, and the `-c sandbox_mode=…` form was accepted.
 Both runs were made outside a repository and so also carried
-`--skip-git-repo-check`, which a subagent's worktree does not need. Observed
+`--skip-git-repo-check`, which a subagent's worktree does not need: on the same
+date and version, `sc job agent` and `sc job continue` ran the built commands
+(without that flag) in a subagent worktree of a scratch repository, two
+requests on `gpt-6-luna` at `low`. The launch ended `done`; the worktree was
+removed as unchanged and recreated at the same path; the resume ran from that
+directory, reported the same `thread_id`, and recalled the first reply. Observed
 without a request: SIGTERM while `codex exec -` waits on standard input ends
 the process by the signal (status -15).
