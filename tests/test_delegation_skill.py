@@ -235,7 +235,10 @@ class RefusalTextTest(unittest.TestCase):
         event = {"tool_name": "Agent", "tool_input": {"prompt": "x", "run_in_background": True}}
         reason = self.reason(event, "deny-only")
         self.assertEqual(reason, seat_convert.AGENT_REFUSAL)
-        self.assertTrue(reason.startswith("Run Agent in the foreground."))
+        # Decision #428: the confusion it prevents comes first.
+        self.assertTrue(reason.startswith(
+            "A background Agent dies when your turn ends, and its work with it. "
+            "Run Agent in the foreground."))
         self.assertIn("`sc job agent`", reason)
         self.assertIn("`delegation` skill", reason)
         self.assertIn("Big multi-shell work is a Sprint", reason)
@@ -262,8 +265,7 @@ class RefusalTextTest(unittest.TestCase):
         self.assertEqual(run_seat.boot_block("admin", "gui"), "")
 
     def test_the_registration_refusals_name_what_they_prevent(self):
-        # Decision #428: each names the confusion it prevents. The guard ledger
-        # (control-plane document #268) lists these four with their limits.
+        # Decision #428: each refusal names the confusion it prevents, first.
         self.assertEqual(
             runs.NESTING_CONFUSION, "delegated work whose owner can no longer be traced")
         self.assertEqual(

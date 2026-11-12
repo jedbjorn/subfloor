@@ -29,6 +29,7 @@ sys.path.insert(0, str(ENGINE / "api"))
 
 import job_agent  # noqa: E402
 import run as run_mod  # noqa: E402
+import runs  # noqa: E402
 import shell_factory  # noqa: E402
 import shell_liveness  # noqa: E402
 from conversation_launch import (  # noqa: E402
@@ -518,11 +519,24 @@ class WorktreeTest(unittest.TestCase):
 
 class ReservedPrefixTest(unittest.TestCase):
     def test_a_shell_cannot_take_an_agent_worktree_name(self):
-        for shortname in ("agent-7", "Agent-x", " AGENT-12 "):
+        for shortname in ("agent-7", "agent-12", " AGENT-12 "):
             with self.subTest(shortname=shortname), self.assertRaises(ValueError) as caught:
                 shell_factory.create_shell(
                     mock.Mock(), flavor=None, name="Imposter", shortname=shortname)
-            self.assertIn("cannot start with 'agent-'", str(caught.exception))
+            # Decision #428: the confusion it prevents comes first, in the
+            # words subagent admission uses.
+            self.assertTrue(str(caught.exception).startswith(
+                f"refused — {runs.RESERVED_NAME_CONFUSION}: "))
+
+    def test_only_the_run_number_form_is_reserved(self):
+        # The refusal is for agent-<number> alone, the form a run's worktree
+        # takes; other names that begin with agent- are a shell's to take.
+        con = mock.Mock()
+        con.execute.side_effect = RuntimeError("reached the insert")
+        for shortname in ("agent-foo", "Agent-x", "agent-", "agent-12a", "agents-1"):
+            with self.subTest(shortname=shortname), self.assertRaises(RuntimeError):
+                shell_factory.create_shell(
+                    con, flavor=None, name="Allowed", shortname=shortname)
 
 
 class ChildEnvironmentTest(unittest.TestCase):

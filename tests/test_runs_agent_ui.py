@@ -128,6 +128,25 @@ class RunLimitsTest(DelegationCase, unittest.TestCase):
         for entry in worktrees[2:]:
             self.assertNotIn("agent", entry)
 
+    def test_a_stray_directory_named_for_a_continue_is_not_that_runs_worktree(self):
+        # Run N is a continue: it works in agent-M, the worktree of its first
+        # run M. A directory agent-N, left by anything else, carries N's number
+        # but is not where N works, and is not labelled as N's.
+        first = self.agent("m")
+        job._api("POST", f"/_sc/runs/{first['run_id']}/facts", {"session_ref": "s-1"})
+        job._api("POST", f"/_sc/runs/{first['run_id']}/terminal", {
+            "state": "done", "exit_code": 0, "finished_at": "2026-11-12T10:00:00Z"})
+        again = job._api("POST", "/_sc/runs", {
+            "registration_key": "n", "kind": "agent", "argv": ["x"], "commit": self.base,
+            "agent": {"harness": "codex", "requested_model": "m", "brief_bytes": 1,
+                      "continues_run_id": first["run_id"]}})
+        self.assertNotEqual(again["run_id"], first["run_id"])
+        stray = Path(first["cwd"]).with_name(f"agent-{again['run_id']}")
+        self.assertNotEqual(str(stray), again["cwd"])
+        worktrees = [{"abs": str(stray), "path": f".sc-worktrees/{stray.name}"}]
+        self.store.label_worktrees(worktrees)
+        self.assertEqual(worktrees[0]["agent"], {"run_id": again["run_id"], "known": False})
+
     def test_the_worktrees_route_labels_what_it_lists(self):
         route = SERVER[SERVER.index('== "/api/git-state":'):]
         route = route[:route.index("# Rolling webapp event log")]

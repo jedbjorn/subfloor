@@ -25,9 +25,10 @@ SCHEDULER_REFUSAL = (
     "<seconds>` for a delay. Sprint and PR wakes already deliver their outcomes."
 )
 AGENT_REFUSAL = (
-    "Run Agent in the foreground. For small delegated work that should outlive "
-    "this turn, launch a subagent with `sc job agent` (see the `delegation` "
-    "skill); it wakes you when it finishes. Big multi-shell work is a Sprint."
+    "A background Agent dies when your turn ends, and its work with it. Run Agent "
+    "in the foreground. For small delegated work that should outlive this turn, "
+    "launch a subagent with `sc job agent` (see the `delegation` skill); it wakes "
+    "you when it finishes. Big multi-shell work is a Sprint."
 )
 
 
