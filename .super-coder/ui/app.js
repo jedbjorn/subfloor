@@ -5028,9 +5028,16 @@ function chatContextPercent(value, windowTokens) {
   return `${Math.round((size / total) * 100)}%`;
 }
 
-function chatContextTokenTitle(value, windowTokens = null) {
+// `measured` is true only for a figure an adapter reported as the input side
+// of one model request. Any other figure (a reply recorded before that
+// existed, or a harness that reports a turn total) is a token count of
+// another meaning: it gets no percentage and its tooltip says what it is.
+function chatContextTokenTitle(value, windowTokens = null, measured = false) {
   const size = chatTokenCount(value);
   if (size === null) return "";
+  if (!measured)
+    return `${fmt(size)} tokens reported for this reply; `
+      + "not a measured context size";
   const total = chatTokenCount(windowTokens);
   return total
     ? `${fmt(size)} of ${fmt(total)} tokens in context on this reply's last model request`
@@ -5038,7 +5045,10 @@ function chatContextTokenTitle(value, windowTokens = null) {
       + "the harness has not reported this model's window";
 }
 
-function chatUpdateContextTokens(node, value, windowTokens = null) {
+function chatUpdateContextTokens(
+  node, value, windowTokens = null, measured = false,
+) {
+  if (!measured) windowTokens = null;
   const text = chatContextTokenLabel(value, windowTokens);
   let label = node.querySelector(".chat-context-tokens");
   if (!text) {
@@ -5050,7 +5060,17 @@ function chatUpdateContextTokens(node, value, windowTokens = null) {
     node.append(label);
   }
   label.textContent = text;
-  label.title = chatContextTokenTitle(value, windowTokens);
+  label.title = chatContextTokenTitle(value, windowTokens, measured);
+}
+
+// "Auto-compacts at 120k", when the engine applies a window to this chat.
+// Claude's figure is the window it compacts within, so it fires below it.
+function chatCompactWindowNote(context, harness) {
+  const applied = chatTokenCount(context?.compact_window);
+  if (!applied) return "";
+  return harness === "claude"
+    ? `Auto-compacts within a ${chatShortTokens(applied)} window (fires somewhat below it).`
+    : `Auto-compacts at ${chatShortTokens(applied)}.`;
 }
 
 // The chat-level meter beside the composer: the latest size, and the share
@@ -5065,17 +5085,19 @@ function chatContextMeterText(context) {
     : `Context ${chatShortTokens(size)}`;
 }
 
-function chatPaintContextMeter(node, context) {
+function chatPaintContextMeter(node, context, harness = null) {
   const text = chatContextMeterText(context);
   node.hidden = !text;
   node.textContent = text;
   const size = chatTokenCount(context?.context_tokens);
   const total = chatTokenCount(context?.context_window);
-  node.title = !text ? ""
+  const reading = !text ? ""
     : total
-      ? `${fmt(size)} of ${fmt(total)} tokens in context on the latest model request`
+      ? `${fmt(size)} of ${fmt(total)} tokens in context on the latest model request.`
       : `${fmt(size)} tokens in context on the latest model request; `
-        + "the harness has not reported this model's window, so no percentage is shown";
+        + "the harness has not reported this model's window, so no percentage is shown.";
+  const note = chatCompactWindowNote(context, harness);
+  node.title = reading && note ? `${reading} ${note}` : reading;
   const share = total ? size / total : 0;
   node.classList.toggle("chat-context-high", share >= 0.8);
 }
@@ -5120,6 +5142,8 @@ function chatApplyContextEvent(context, event) {
   const total = chatTokenCount(payload.context_window);
   if (!total || total === context.context_window) return false;
   context.context_window = total;
+  // A model window below the setting keeps the harness default.
+  if (chatTokenCount(context.compact_window) > total) context.compact_window = null;
   return true;
 }
 
@@ -5206,7 +5230,7 @@ function chatWireLocalFileLinks(content, conversation) {
 
 function chatBubble(
   kind, body, meta = "", conversation = null, createdAt = "", contextTokens = null,
-  segment = "answer",
+  segment = "answer", contextMeasured = false,
 ) {
   const bubble = el("article", { className: `chat-bubble chat-${kind}` });
   const isReasoning = kind === "assistant" && segment === "reasoning";
@@ -5241,12 +5265,14 @@ function chatBubble(
   }
   if (meta) bubble.append(el("div", { className: "chat-meta" }, meta));
   if (kind === "assistant") {
-    const windowTokens = conversation?.context?.context_window;
+    const windowTokens = contextMeasured
+      ? conversation?.context?.context_window : null;
     const tokenLabel = chatContextTokenLabel(contextTokens, windowTokens);
     if (tokenLabel)
       bubble.append(el("div", {
         className: "chat-context-tokens",
-        title: chatContextTokenTitle(contextTokens, windowTokens),
+        title: chatContextTokenTitle(
+          contextTokens, windowTokens, contextMeasured),
       }, tokenLabel));
   }
   return bubble;
@@ -6478,6 +6504,7 @@ function chatTranscriptItemNode(item, conversation, retry) {
     item.created_at,
     item.context_tokens,
     item.segment,
+    Boolean(item.context_measured),
   );
   if (item.kind === "user" && item.state === "failed") {
     const button = el("button", {
@@ -6498,7 +6525,8 @@ function chatUpdateTranscriptNode(node, item, retry, conversation) {
     body.replaceChildren(...rendered.childNodes);
     chatWireLocalFileLinks(body, conversation);
     chatUpdateContextTokens(
-      node, item.context_tokens, conversation?.context?.context_window);
+      node, item.context_tokens, conversation?.context?.context_window,
+      Boolean(item.context_measured));
     return;
   }
   if (item.kind !== "user") return;
@@ -7009,7 +7037,8 @@ async function chatRenderOpen(
     const queued = chatQueuedCount(messages);
     queueState.hidden = queued === 0;
     queueState.textContent = `${queued} queued`;
-    chatPaintContextMeter(contextMeter, conversation.context);
+    chatPaintContextMeter(
+      contextMeter, conversation.context, conversation.route?.harness);
     updateStreamStatus();
     const closed = conversation.state === "closed";
     const closing = !closed && Boolean(conversation.close_requested_at);
@@ -7396,6 +7425,7 @@ async function chatRenderOpen(
       const contextTokens = event.payload?.context_tokens;
       if (assistant && Number.isSafeInteger(contextTokens) && contextTokens >= 0) {
         assistant.context_tokens = contextTokens;
+        assistant.context_measured = event.payload?.scope === "request";
         transcriptState.dirty.add(assistant.item_id);
       }
     } else if ([

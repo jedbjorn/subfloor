@@ -161,7 +161,12 @@ harness's own compaction earlier and visible.
   compaction left behind, with a percentage only when a window is known. The
   transcript projection returns it as `context`
   (`context_tokens`, `context_window`, `measured_at`, `sequence`), each `null`
-  when unknown. Nothing is estimated.
+  when unknown. Nothing is estimated. `context.compact_window` is the
+  auto-compact window the engine applies to that chat (`null` when the
+  harness has none, the setting is `off`, or the model's window is smaller);
+  the meter's tooltip states it. Each assistant item carries
+  `context_measured`: true only when its figure is a `request` reading, so a
+  figure of another meaning gets no percentage and a tooltip that says so.
 - **`message.reground`** records that the engine appended the re-ground line
   to the text it dispatched for that message. The broker adds the line to the
   first message sent to a resumed session after a compaction (operator

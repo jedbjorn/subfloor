@@ -621,6 +621,12 @@ class ClaudeAdapter(ConversationAdapter):
             if not isinstance(raw, dict):
                 continue
             entry_events, entry_text = self._transcript_events(raw)
+            if any(event.type == "context.compacted" for event in entry_events):
+                # Readings from before this boundary are stale. On a replay
+                # the boundary itself may already be recorded and be dropped
+                # by the store; re-recording the older readings after it
+                # would leave the meter on a pre-compaction figure.
+                events = [event for event in events if event.type != "usage"]
             events.extend(entry_events)
             if entry_text is not None:
                 text = entry_text

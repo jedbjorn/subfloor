@@ -2717,6 +2717,7 @@ def _transcript_projection(
         }
         segments_by_run: dict[int, dict[int, list[dict]]] = {}
         context_tokens_by_run: dict[int, dict[int, int]] = {}
+        context_measured: set[tuple[int, int]] = set()
         latest_assistant_anchor_by_run: dict[int, int] = {}
         latest_assistant_segment_by_run: dict[int, tuple[int, int, str]] = {}
         evidence_count_by_run: dict[int, int] = {}
@@ -2785,6 +2786,14 @@ def _transcript_projection(
                     context_tokens_by_run.setdefault(int(run_id), {})[
                         assistant_anchor
                     ] = context_tokens
+                    # Only a ``request`` reading is a context size. Anything
+                    # else is a token figure of another meaning (a turn
+                    # total from an unscoped event) and is labelled as such.
+                    measured = (int(run_id), assistant_anchor)
+                    if event["payload"].get("scope") == "request":
+                        context_measured.add(measured)
+                    else:
+                        context_measured.discard(measured)
             elif event["event_type"] in activity_types:
                 activities.append(event)
 
@@ -2855,6 +2864,7 @@ def _transcript_projection(
                             run_id,
                             {},
                         ).get(anchor),
+                        "context_measured": (run_id, anchor) in context_measured,
                         "text_truncated": False,
                     })
 
@@ -2980,9 +2990,21 @@ def _transcript_projection(
             # reported, read from the events this page already loaded (the
             # projection's read budget is fixed). Either is None when it was
             # not reported; the page shows nothing rather than a guess.
-            projection["context"] = conversation_compaction.meter_reading(
-                reversed(events)
+            meter = conversation_compaction.meter_reading(reversed(events))
+            # The auto-compact window the engine applies to this chat's next
+            # turn: the harness setting, or None when there is none, it is
+            # off, or the model's reported window is smaller.
+            applied = conversation_compaction.compact_window(
+                conversation["harness"]
             )
+            if (
+                applied is not None
+                and meter["context_window"] is not None
+                and meter["context_window"] < applied
+            ):
+                applied = None
+            meter["compact_window"] = applied
+            projection["context"] = meter
         if warnings:
             projection["warnings"] = warnings
         _bound_transcript_response(

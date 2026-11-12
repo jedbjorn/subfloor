@@ -227,11 +227,16 @@ Checked on `codex-cli 0.167.1`, 2026-11-12, with one small model request.
   deprecated `thread/compacted` notification is ignored. The item carries no
   trigger and no counts: the trigger is `auto` unless the engine asked for the
   compaction (`CodexAdapter.compaction_requested`), and the counts are read
-  from the `thread/tokenUsage/updated` values on either side of the item.
-  Right after a compaction Codex reports `inputTokens: 0` and puts its
-  estimate of the new context in `totalTokens`; that figure is the size after.
-  This ordering is read from this host's Codex session store, not from a
-  recorded app-server stream.
+  from the `thread/tokenUsage/updated` values around the item. The app-server
+  order, from 308 engine-captured compactions, is: the last request's usage
+  (for example input 215,900, total 216,150), `item/started`, a usage update
+  with `inputTokens: 0` whose `totalTokens` is the reduced context (for
+  example 18,692; sometimes sent twice), then `item/completed`. The size
+  before is the last reading at `item/started`; the size after is that
+  zero-input update's total. A repeat of it adds no second marker. Item ids
+  were distinct across all 308, so a replayed item is recorded once.
 - **Meter.** `tokenUsage.last.inputTokens` (which already counts the cached
   part) is the context size of the latest request, and `modelContextWindow`
-  is kept as the window.
+  is kept as the window, exactly as Codex reports it (258,400 for a 272,000
+  model: Codex states 95%). The zero-input update after a compaction reads as
+  its total, never as 0.

@@ -273,11 +273,11 @@ class ClaudeTranscriptRecoveryTest(AdapterCase):
                                    "output_tokens": 40}}},
         ]
 
-    def attach(self, adapter: ClaudeAdapter) -> list[NormalizedEvent]:
+    def attach(self, adapter: ClaudeAdapter, rows=None) -> list[NormalizedEvent]:
         path = adapter._session_path(SESSION, self.worktree)
         path.parent.mkdir(parents=True)
         path.write_text(
-            "".join(json.dumps(row) + "\n" for row in self.transcript_rows())
+            "".join(json.dumps(row) + "\n" for row in (rows or self.transcript_rows()))
         )
         turn = NativeTurn(
             harness="claude", session_ref=SESSION, run_ref="claude-recovered",
@@ -306,6 +306,63 @@ class ClaudeTranscriptRecoveryTest(AdapterCase):
         self.assertEqual(
             of_type(events, "usage")[-1].payload["context_tokens"], 13903
         )
+
+    def test_replay_never_ends_the_meter_on_a_pre_compaction_reading(self) -> None:
+        def reply(text: str, cache_read: int) -> dict[str, Any]:
+            return {"type": "assistant", "sessionId": SESSION,
+                    "message": {"role": "assistant",
+                                "content": [{"type": "text", "text": text}],
+                                "usage": {"input_tokens": 5,
+                                          "cache_read_input_tokens": cache_read,
+                                          "cache_creation_input_tokens": 0,
+                                          "output_tokens": 30}}}
+
+        boundary = self.transcript_rows()[1]
+        adapter, _runner = self.claude()
+        # The turn compacted and has not made its next request yet.
+        events = self.attach(adapter, [reply("one", 110000), reply("two", 118000), boundary])
+        self.assertEqual(len(of_type(events, "context.compacted")), 1)
+        self.assertEqual(of_type(events, "usage"), [])
+        # The last event that moves the meter is the compaction itself.
+        rows = [
+            {"sequence": i, "event_type": e.type, "payload": dict(e.payload),
+             "created_at": "t"}
+            for i, e in enumerate(events, 1)
+        ]
+        self.assertEqual(
+            conversation_compaction.meter_reading(reversed(rows))["context_tokens"],
+            13638,
+        )
+
+    def test_boundary_without_post_tokens_has_no_after_figure(self) -> None:
+        import conversation_routes
+
+        [event] = ClaudeAdapter._compaction(
+            {"type": "system", "subtype": "compact_boundary", "uuid": "u-1",
+             "compactMetadata": {"trigger": "auto", "preTokens": 172300,
+                                 "durationMs": 39000}},
+            "transcript.compact_boundary",
+        )
+        self.assertEqual(
+            event.payload,
+            {"trigger": "auto", "tokens_before": 172300, "compaction_ref": "u-1"},
+        )
+        self.assertEqual(
+            conversation_routes._compaction_label(dict(event.payload)),
+            "Context compacted · from 172k · automatic",
+        )
+
+    def test_meter_moves_from_post_tokens_to_the_next_requests_usage(self) -> None:
+        """postTokens is the summary alone; the next request is far larger."""
+        boundary = {"sequence": 1, "event_type": "context.compacted",
+                    "payload": {"trigger": "auto", "tokens_before": 172300,
+                                "tokens_after": 12878}, "created_at": "t1"}
+        request = {"sequence": 2, "event_type": "usage",
+                   "payload": {"scope": "request", "context_tokens": 43835},
+                   "created_at": "t2"}
+        read = conversation_compaction.meter_reading
+        self.assertEqual(read([boundary])["context_tokens"], 12878)
+        self.assertEqual(read([request, boundary])["context_tokens"], 43835)
 
 
 class RecoveryDedupeTest(ConversationBrokerCase):
@@ -515,6 +572,67 @@ class CodexCompactionEventTest(AdapterCase):
                 for e in of_type(events, "context.compacted")
             ],
             [(201000, 30194), (30194, 12000)],
+        )
+
+    def test_recorded_app_server_sequence_with_the_duplicated_update(self) -> None:
+        """The order and figures of an engine-captured Codex compaction: the
+        last request, the item start, the zero-input update (sent twice),
+        the item end, then the next real request."""
+        reduced = codex_usage(input_tokens=0, total=18692)
+        events = self.run_turn([
+            TURN_STARTED,
+            codex_usage(input_tokens=215900, total=216150),
+            codex_note("item/started", item=COMPACTION_ITEM),
+            reduced,
+            reduced,
+            codex_note("item/completed", item=COMPACTION_ITEM),
+            codex_usage(input_tokens=21480, total=21700),
+            TURN_COMPLETED,
+        ])
+
+        # One marker, 216k -> 19k: never 216k -> 216k, never -> 0.
+        [compacted] = of_type(events, "context.compacted")
+        self.assertEqual(
+            compacted.payload,
+            {"trigger": "auto", "tokens_before": 216150, "tokens_after": 18692,
+             "compaction_ref": "item-compact-1"},
+        )
+        import conversation_routes
+
+        self.assertEqual(
+            conversation_routes._compaction_label(dict(compacted.payload)),
+            "Context compacted · 216k → 19k · automatic",
+        )
+        # Four usage updates in, four usage events out: the duplicate is an
+        # ordinary usage row and nothing more.
+        usage = of_type(events, "usage")
+        self.assertEqual(
+            [e.payload["context_tokens"] for e in usage],
+            # The zero-input update reads as its total, never as 0.
+            [215900, 18692, 18692, 21480],
+        )
+        self.assertNotIn(0, [e.payload["context_tokens"] for e in usage])
+        # The window is the figure Codex reports, unchanged.
+        self.assertEqual({e.payload["context_window"] for e in usage}, {258400})
+        self.assertEqual(of_type(events, "tool.started"), [])
+        self.assertEqual(of_type(events, "tool.completed"), [])
+        # The meter follows the stream: 216k, 19k after the compaction, then
+        # the next request.
+        rows = [
+            {"sequence": i, "event_type": e.type, "payload": dict(e.payload),
+             "created_at": "t"}
+            for i, e in enumerate(events, 1)
+        ]
+        through_marker = rows[: [r["event_type"] for r in rows].index(
+            "context.compacted") + 1]
+        self.assertEqual(
+            conversation_compaction.meter_reading(reversed(through_marker))[
+                "context_tokens"],
+            18692,
+        )
+        self.assertEqual(
+            conversation_compaction.meter_reading(reversed(rows))["context_tokens"],
+            21480,
         )
 
     def test_engine_requested_compaction_is_manual_once(self) -> None:
@@ -1128,6 +1246,7 @@ class TranscriptMarkerAndMeterTest(ConversationApiCase):
                 "context_window": 200000,
                 "measured_at": transcript["context"]["measured_at"],
                 "sequence": transcript["context"]["sequence"],
+                "compact_window": 120000,
             },
         )
 
@@ -1142,8 +1261,39 @@ class TranscriptMarkerAndMeterTest(ConversationApiCase):
         )
         assistant = next(i for i in transcript["items"] if i["kind"] == "assistant")
         self.assertEqual(assistant["context_tokens"], 12345)
-        # But a figure of unknown meaning never drives the meter.
+        # It is not a measured context size, and the reply says so.
+        self.assertFalse(assistant["context_measured"])
+        # And a figure of unknown meaning never drives the meter.
         self.assertIsNone(transcript["context"]["context_tokens"])
+
+    def test_applied_compact_window_is_reported_with_the_meter(self) -> None:
+        events = (
+            ("assistant.delta", {"text": "answer"}),
+            ("usage", {"tokens": {"inputTokens": 84000}, "scope": "request",
+                       "context_tokens": 84000, "context_window": 258400}),
+        )
+        cleared = {"SC_CHAT_COMPACT_WINDOW_CODEX": ""}
+        with mock.patch.dict(os.environ, cleared):
+            transcript = self.transcript(events, number=805)
+        self.assertEqual(transcript["context"]["compact_window"], 120000)
+        assistant = next(i for i in transcript["items"] if i["kind"] == "assistant")
+        self.assertTrue(assistant["context_measured"])
+
+        with mock.patch.dict(os.environ, {"SC_CHAT_COMPACT_WINDOW_CODEX": "off"}):
+            transcript = self.transcript(events, number=806)
+        self.assertIsNone(transcript["context"]["compact_window"])
+
+        # A model whose reported window is below the setting gets none.
+        with mock.patch.dict(os.environ, cleared):
+            transcript = self.transcript(
+                (
+                    ("assistant.delta", {"text": "answer"}),
+                    ("usage", {"tokens": {"inputTokens": 9000}, "scope": "request",
+                               "context_tokens": 9000, "context_window": 96000}),
+                ),
+                number=807,
+            )
+        self.assertIsNone(transcript["context"]["compact_window"])
 
 
 CONTEXT_HELPERS = APP[
@@ -1198,6 +1348,19 @@ console.log(JSON.stringify({
     chatCompactionLabel({}),
   ],
   steps,
+  tips: (() => {
+    const tip = (context, harness) => { chatPaintContextMeter(node, context, harness); return node.title; };
+    return [
+      tip({context_tokens: 84000, context_window: 258400, compact_window: 120000}, "codex"),
+      tip({context_tokens: 84000, context_window: 1000000, compact_window: 120000}, "claude"),
+      tip({context_tokens: 84000, context_window: 258400, compact_window: null}, "codex"),
+      tip({context_tokens: null, context_window: 258400, compact_window: 120000}, "codex"),
+      chatContextTokenTitle(84000, 258400, true),
+      chatContextTokenTitle(84000, null, true),
+      chatContextTokenTitle(12345, 258400, false),
+      chatContextTokenTitle(null, 258400, true),
+    ];
+  })(),
 }));
 """
     )
@@ -1228,12 +1391,28 @@ console.log(JSON.stringify({
         (False, 28100, 258400),     # the meter drops with the compaction
         (False, None, 258400),      # no size stated: unknown, not the old one
     ]
+    assert result["tips"] == [
+        "84,000 of 258,400 tokens in context on the latest model request. "
+        "Auto-compacts at 120k.",
+        "84,000 of 1,000,000 tokens in context on the latest model request. "
+        "Auto-compacts within a 120k window (fires somewhat below it).",
+        # No window applied to this chat: nothing is said about one.
+        "84,000 of 258,400 tokens in context on the latest model request.",
+        # No reading: the meter is hidden and has no tooltip.
+        "",
+        "84,000 of 258,400 tokens in context on this reply's last model request",
+        "84,000 tokens in context on this reply's last model request; "
+        "the harness has not reported this model's window",
+        # A figure that is not a measured context size says so.
+        "12,345 tokens reported for this reply; not a measured context size",
+        "",
+    ]
 
 
 def test_chat_view_wires_the_marker_meter_and_listeners() -> None:
     assert '"context.compacted", "message.reground"' in APP
     assert 'activity.classList.add("chat-compaction-marker")' in APP
-    assert "chatPaintContextMeter(contextMeter, conversation.context);" in APP
+    assert "contextMeter, conversation.context, conversation.route?.harness);" in APP
     # The meter sits in the left group of the composer's bottom row.
     assert 'className: "chat-compose-left" }, contextMeter)' in APP
     assert "composeLeft, pending, send, stop" in APP

@@ -249,7 +249,6 @@ class CodexAdapter(ConversationAdapter):
         # is the meter reading, ``total`` adds that request's output, and
         # ``estimate`` marks Codex's post-compaction figure (no input side).
         self._reading: tuple[int, int, bool] | None = None
-        self._previous_reading: tuple[int, int, bool] | None = None
         self._compaction: dict[str, Any] | None = None
 
     @staticmethod
@@ -263,7 +262,6 @@ class CodexAdapter(ConversationAdapter):
         """Start from the chat's last recorded size, when one is recorded."""
         size = token_count(context.context_tokens)
         self._reading = (size, size, False) if size else None
-        self._previous_reading = None
         self._compaction = None
 
     def _transport(self, context: ConversationContext) -> RpcTransport:
@@ -386,7 +384,7 @@ class CodexAdapter(ConversationAdapter):
     def start(self, context: ConversationContext, message: str) -> NativeTurn:
         message = ensure_nonempty_message(message)
         rpc = self._transport(context)
-        self._reading = self._previous_reading = self._compaction = None
+        self._reading = self._compaction = None
         started = rpc.request("thread/start", self._thread_params(context))
         thread = started.get("thread") if isinstance(started, dict) else None
         session_ref = thread.get("id") if isinstance(thread, dict) else None
@@ -504,17 +502,19 @@ class CodexAdapter(ConversationAdapter):
     def _open_compaction(self, ref: str | None) -> dict[str, Any]:
         """Begin tracking one ``contextCompaction`` item.
 
-        The item carries no counts. They are read from the token-usage
-        updates on either side of it: the update that follows the compaction
-        is the size after, and the one before that is the size before.
-        ``measured`` records whether that following update has arrived; it
-        is already true when Codex's post-compaction estimate came in ahead
-        of the item.
+        The item carries no counts; they are read from the token-usage
+        updates around it. The app-server order is: the last request's
+        usage, ``item/started``, a usage update with no input side whose
+        total is the reduced context (sometimes sent twice), then
+        ``item/completed``. So the size before is the last reading at
+        ``item/started``, fixed here, and the size after is the zero-input
+        update that arrives while the item is open.
         """
-        latest, previous = self._reading, self._previous_reading
+        latest = self._reading
         self._compaction = {
             "ref": ref,
-            "measured": bool(latest and latest[2] and previous),
+            "before": latest[1] if latest else None,
+            "after": None,
             "completed": False,
         }
         return self._compaction
@@ -525,20 +525,11 @@ class CodexAdapter(ConversationAdapter):
             return []
         trigger = "manual" if self.compaction_requested else "auto"
         self.compaction_requested = False
-        if compaction["measured"]:
-            before = self._previous_reading
-            after = self._reading[0] if self._reading else None
-            if self._reading is not None:
-                # This estimate is spent: a later compaction must not read
-                # it as its own size after.
-                self._reading = (self._reading[0], self._reading[1], False)
-        else:
-            before, after = self._reading, None
         return [
             compaction_event(
                 trigger=trigger,
-                tokens_before=before[1] if before else None,
-                tokens_after=after,
+                tokens_before=compaction["before"],
+                tokens_after=compaction["after"],
                 compaction_ref=compaction["ref"],
                 native_type=native_type,
             )
@@ -612,8 +603,9 @@ class CodexAdapter(ConversationAdapter):
                 else:
                     flushed = []
                 compaction["completed"] = True
-                if not compaction["measured"]:
-                    # The size after is the next token-usage update.
+                if compaction["after"] is None:
+                    # No size arrived while the item was open; the next
+                    # token-usage update is the first reading after it.
                     return flushed
                 return [*flushed, *self._emit_compaction(method)]
             item = params.get("item")
@@ -682,12 +674,15 @@ class CodexAdapter(ConversationAdapter):
             reading = self._usage_reading(source)
             events: list[NormalizedEvent] = []
             if reading is not None:
-                self._previous_reading, self._reading = self._reading, reading
+                self._reading = reading
                 compaction = self._compaction
-                if compaction is not None:
-                    compaction["measured"] = True
-                    if compaction["completed"]:
-                        events.extend(self._emit_compaction(method))
+                if compaction is not None and compaction["completed"]:
+                    compaction["after"] = reading[0]
+                    events.extend(self._emit_compaction(method))
+                elif compaction is not None and reading[2]:
+                    # The zero-input update inside the item. A repeat of it
+                    # only restates the same figure: one marker, no more.
+                    compaction["after"] = reading[0]
             events.append(
                 usage_event(
                     usage,
