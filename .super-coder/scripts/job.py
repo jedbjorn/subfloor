@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import selectors
 import signal
 import subprocess
@@ -51,6 +52,7 @@ PROBE_TIMEOUT = 3600        # probes always have a finite overall deadline
 WATCH_PR_EVERY = 60         # `watch pr` default delay between reads (seconds)
 AGENT_START_WAIT = 60       # how long `agent` waits for its harness to start
 SETTLED_PR_STATES = frozenset({"green", "red", "merged", "closed"})
+REPOSITORY = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_.][A-Za-z0-9_.-]*")
 
 
 def die(msg: str) -> NoReturn:
@@ -262,7 +264,17 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
             _api('POST', f"/_sc/runs/{meta['run_id']}/running", {
                 k: meta.get(k) for k in ('pid', 'start_ticks', 'supervisor_pid', 'supervisor_start_ticks',
                                         'boot_id', 'started_at')})
-        except (urllib.error.URLError, OSError):
+        except (urllib.error.URLError, OSError) as exc:
+            if isinstance(exc, urllib.error.HTTPError) and exc.code == 409 \
+                    and 'terminal result' in _refused(exc):
+                # The run ended before this supervisor arrived (for example it
+                # was recorded lost). Nothing is launched and nothing is
+                # submitted: the ledger already holds the outcome.
+                meta.update(finished_at=_now(), exit_code=127, not_launched=True,
+                            spawn_error='the run had already ended when its supervisor '
+                                        'checked in; nothing launched')
+                write_meta(jobdir, meta)
+                return 127
             meta.update(finished_at=_now(), exit_code=127,
                         spawn_error='registration check-in unavailable; command not launched')
             write_meta(jobdir, meta)
@@ -426,11 +438,11 @@ def supervise_agent(jobdir: Path, meta: dict, notify) -> int:
             signal.signal(number, handler)
         errors.close()
 
-    stdout = (jobdir / 'log').read_text(errors='replace')
-    message = agent.read_result(plan['result'], stdout, jobdir)
-    session = agent.usable_session(
-        agent.read_session(plan['session'], stdout, plan.get('session_ref'))
-        or plan.get('session_ref'))
+    message, reported = agent.read_report(
+        plan['result'], plan['session'], jobdir / 'log', jobdir, plan.get('session_ref'))
+    # A reference that could not be an argument of a later resume is not
+    # reported; the run then has none, and a continue is refused.
+    session = agent.usable_session(reported or plan.get('session_ref'))
     result_bytes = agent.write_result(jobdir, message)
     stderr_path = jobdir / agent.STDERR_FILE
     if stderr_path.stat().st_size:
@@ -856,10 +868,13 @@ def cmd_clean(args) -> int:
         unpushed = agent.unpushed_commits(path, facts['base_commit'])
         discarding = state['uncommitted'] is not False or unpushed is None or unpushed > 0
         if discarding and not args.discard:
-            die(f"refused: {path} holds work that exists nowhere else — uncommitted changes: "
+            kept = (f" (local branch {facts['branch']} is kept and still holds its commits)"
+                    if facts['branch'] and unpushed else '')
+            die(f"refused: {path} holds work that is on no remote branch — uncommitted changes: "
                 f"{'unknown' if state['uncommitted'] is None else 'yes' if state['uncommitted'] else 'no'}; "
-                f"commits on no remote branch: {'unknown' if unpushed is None else unpushed}. "
-                f"Push or copy what you need, or remove it with `sc job clean {args.id} --discard`")
+                f"commits on no remote branch: {'unknown' if unpushed is None else unpushed}{kept}. "
+                f"Push or copy what you need, or remove the worktree with "
+                f"`sc job clean {args.id} --discard`")
     try:
         _api('POST', f'/_sc/runs/{args.id}/clean', {'discard': discarding})
     except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -924,6 +939,8 @@ def cmd_watch(args) -> int:
             extra={'watch': 'timer', 'after': args.after})
     if args.pr < 1:
         die('--pr must be a pull request number')
+    if args.repository is not None and not REPOSITORY.fullmatch(args.repository):
+        die('--repository must be owner/name')
     every = WATCH_PR_EVERY if args.every is None else args.every
     timeout = PROBE_TIMEOUT if args.timeout is None else args.timeout
     if not 5 <= every <= sys.maxsize:
@@ -1221,7 +1238,7 @@ forms:
       wake you once when that PR's checks settle (green or red) or it is
       merged or closed; read every 60s, for at most 3600s, unless told otherwise
   sc job watch timer --after S
-      wake you once after S seconds
+      wake you once after S seconds (at most 86400, 24 hours)
   sc job attach <id> (--pr N [--repository owner/name] | --work-unit N)
       link a finished run to a PR or a Sprint work unit as supporting evidence
   sc job list [--kind agent|probe|job] [--all] · status <id> · tail <id> [-n N]

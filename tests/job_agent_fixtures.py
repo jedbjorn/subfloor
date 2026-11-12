@@ -68,7 +68,11 @@ class DelegationCase(ApiFixture):
             "GH_STUB_MAP": str(self.gh_map),
             "GH_STUB_CALLS": str(self.gh_calls),
             "SC_SEAT": "gui",
+            # The user's own git configuration never decides a test's outcome.
+            "GIT_CONFIG_GLOBAL": str(Path(self.temp.name) / "gitconfig"),
+            "GIT_CONFIG_NOSYSTEM": "1",
         }
+        (Path(self.temp.name) / "gitconfig").write_text("")
         self.addCleanup(self.stop_everything)
 
     @staticmethod

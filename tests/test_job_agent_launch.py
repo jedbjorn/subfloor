@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -82,7 +83,8 @@ class LaunchTest(DelegationCase, unittest.TestCase):
             r"ran \d+s of 2h00m\.$")
         self.assertEqual(
             lines[1],
-            f"Worktree removed, unchanged; detached at {self.base[:12]}; "
+            f"Worktree removed, unchanged (ignored files were not kept); "
+            f"detached at {self.base[:12]}; "
             f"HEAD {self.base[:12]}; uncommitted changes: no.")
         self.assertEqual(
             lines[2],
@@ -208,6 +210,45 @@ class LaunchTest(DelegationCase, unittest.TestCase):
         self.assertEqual(result["result_bytes"], 0)
 
 
+class GroupEndTest(DelegationCase, unittest.TestCase):
+    def test_children_left_by_a_harness_that_exits_on_its_own_are_stopped(self):
+        row = self.finished(self.launch("SPAWN:1\nRESULT:finished normally"))
+        start = self.starts()[0]
+        self.assertEqual((row["state"], row["exit_code"]), ("done", 0))
+        # The leader exited by itself; what it left in its group went with it.
+        self.assert_gone(start["pid"], start["spawned"])
+
+
+class ReportReadTest(unittest.TestCase):
+    """The log is read a line at a time; the answers match the whole-text readers."""
+
+    def test_one_pass_gives_the_last_message_and_the_first_session(self):
+        for harness, recorded in RECORDED.items():
+            adapter = json.loads((ENGINE / f"adapters/{harness}/adapter.json").read_text())
+            keys = adapter["headless"]["agent"]
+            run = recorded["dash_briefs"]["runs"][0] if harness == "kimi" else recorded["launch"]
+            with self.subTest(harness=harness), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp)
+                (run_dir / "log").write_text("not json\n" + run["stdout"])
+                if "last_message_file" in run:
+                    (run_dir / "last-message.md").write_text(run["last_message_file"])
+                message, session = job_agent.read_report(
+                    keys["result"], keys["session"], run_dir / "log", run_dir, "pinned-id")
+                self.assertEqual(message.strip(), "NONCE-7f3a")
+                self.assertEqual(session, "pinned-id" if harness == "claude" else run["session_ref"])
+                self.assertEqual(
+                    message, job_agent.read_result(keys["result"], run["stdout"], run_dir))
+
+    def test_a_document_spread_over_several_lines_is_still_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "log").write_text(json.dumps({"result": "spread"}, indent=2))
+            message, session = job_agent.read_report(
+                {"source": "stdout_json", "field": "result"}, {"source": "pinned"},
+                run_dir / "log", run_dir, None)
+            self.assertEqual((message, session), ("spread", None))
+
+
 class BoundedResultTest(DelegationCase, unittest.TestCase):
     """AC 10: at most 256 KiB is returned, flagged; the file holds everything."""
 
@@ -305,6 +346,256 @@ class TruthfulEndTest(DelegationCase, unittest.TestCase):
         self.assertIn("supervisor stopped by signal 15",
                       json.loads(final["terminal_json"])["spawn_error"])
         self.assert_gone(start["pid"], start["spawned"])
+
+
+class OrphanStopTest(DelegationCase, unittest.TestCase):
+    """A harness is signalled only on evidence that it belongs to the run."""
+
+    def orphan(self, key: str, pid: int, **changes) -> dict:
+        """A registered agent run whose owner reports `pid` as its harness and a
+        supervisor that is proven gone (pid 1 with start ticks it never had)."""
+        row = job._api("POST", "/_sc/runs", {
+            "registration_key": key, "kind": "agent", "argv": ["x"], "commit": self.base,
+            "agent": {"harness": "codex", "requested_model": "m", "brief_bytes": 1}})
+        ticks = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        job._api("POST", f"/_sc/runs/{row['run_id']}/running", {
+            "pid": pid, "start_ticks": ticks, "supervisor_pid": 1,
+            "supervisor_start_ticks": 1, "boot_id": runs.boot_id(), **changes})
+        return row
+
+    def bystander(self, cwd=None) -> subprocess.Popen:
+        process = subprocess.Popen(["sleep", "300"], start_new_session=True, cwd=cwd)
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        return process
+
+    def test_a_process_the_owner_merely_names_is_not_signalled(self):
+        # An unrelated process in its own session: alive, the recorded
+        # incarnation, a group leader, but not in the run's worktree.
+        other = self.bystander()
+        row = self.orphan("names-a-stranger", other.pid)
+        self.store.reconcile()
+        final = job._api("GET", f"/_sc/runs/{row['run_id']}")
+        self.assertEqual(final["state"], "lost")
+        self.assertIsNone(other.poll())
+        self.assertTrue(self.alive(other.pid))
+        # The outcome says what is still true.
+        self.assertIn(
+            f"harness process {other.pid} is still running and was not stopped",
+            json.loads(final["terminal_json"])["spawn_error"])
+        self.assertIn(") lost; exit=unknown;", self.wake(final))
+
+    def test_pid_one_and_the_server_itself_are_never_the_answer(self):
+        row = self.orphan("names-the-server", os.getpid())
+        stored = dict(self.con.execute(
+            "SELECT * FROM runs WHERE run_id=?", (row["run_id"],)).fetchone())
+        self.assertIs(runs.process_alive(stored["pid"], stored["start_ticks"],
+                                         stored["boot_id"]), True)
+        self.assertFalse(self.store._tied_to_run(stored))
+        self.assertEqual(self.store._stop_orphan(stored), "unverified")
+        for pid in (1, os.getpgrp()):
+            self.assertFalse(self.store._tied_to_run({**stored, "pid": pid}))
+        # Even from inside the worktree: this process leads no group of its own
+        # that is not the server's.
+        worktree = Path(stored["cwd"])
+        worktree.mkdir(parents=True)
+        here = os.getcwd()
+        os.chdir(worktree)
+        try:
+            self.assertFalse(self.store._tied_to_run(stored))
+        finally:
+            os.chdir(here)
+        # A row whose cwd is not an engine-assigned worktree proves nothing.
+        self.assertFalse(self.store._tied_to_run({**stored, "cwd": str(self.root)}))
+
+    def test_a_group_leader_in_the_runs_worktree_is_stopped(self):
+        row = job._api("POST", "/_sc/runs", {
+            "registration_key": "legitimate", "kind": "agent", "argv": ["x"],
+            "commit": self.base,
+            "agent": {"harness": "codex", "requested_model": "m", "brief_bytes": 1}})
+        Path(row["cwd"]).mkdir(parents=True)
+        harness = self.bystander(cwd=row["cwd"])
+        ticks = int(Path(f"/proc/{harness.pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        job._api("POST", f"/_sc/runs/{row['run_id']}/running", {
+            "pid": harness.pid, "start_ticks": ticks, "supervisor_pid": 1,
+            "supervisor_start_ticks": 1, "boot_id": runs.boot_id()})
+        self.store.reconcile()
+        final = job._api("GET", f"/_sc/runs/{row['run_id']}")
+        self.assertEqual(final["state"], "lost")
+        self.assertEqual(harness.wait(timeout=10), -signal.SIGKILL)
+        self.assertNotIn("spawn_error", json.loads(final["terminal_json"]))
+
+    def test_a_blocked_row_with_a_dead_supervisor_has_its_harness_stopped(self):
+        row = self.launch("SLEEP:120")
+        start = self.wait_started()[0]
+        running = wait_for(lambda: (
+            r if (r := job._api("GET", f"/_sc/runs/{row['run_id']}"))["pid"] else None))
+        self.con.execute(
+            "UPDATE runs SET wake_state='blocked', last_error='reconciliation blocked' "
+            "WHERE run_id=?", (row["run_id"],))
+        self.con.commit()
+        # With its supervisor alive the row is left alone.
+        self.store.reconcile()
+        self.assertTrue(self.alive(start["pid"]))
+        os.kill(running["supervisor_pid"], signal.SIGKILL)
+        wait_for(lambda: not self.alive(running["supervisor_pid"]))
+        self.assertTrue(self.alive(start["pid"]))
+        self.store.reconcile()
+        self.assert_gone(start["pid"])
+        after = job._api("GET", f"/_sc/runs/{row['run_id']}")
+        # Still blocked for operator recovery, and it says what was done, once.
+        self.assertEqual((after["state"], after["wake_state"]), ("running", "blocked"))
+        self.assertEqual(
+            after["last_error"],
+            "reconciliation blocked; harness stopped: its supervisor is gone")
+        self.store.reconcile()
+        self.assertEqual(
+            job._api("GET", f"/_sc/runs/{row['run_id']}")["last_error"], after["last_error"])
+        # It holds no slot any more.
+        self.assertIn(row["run_id"], self.store._agents_without_a_process())
+
+    def test_a_blocked_row_naming_a_stranger_leaves_it_running(self):
+        other = self.bystander()
+        row = self.orphan("blocked-stranger", other.pid)
+        self.con.execute(
+            "UPDATE runs SET wake_state='blocked', last_error='reconciliation blocked' "
+            "WHERE run_id=?", (row["run_id"],))
+        self.con.commit()
+        self.store.reconcile()
+        self.assertTrue(self.alive(other.pid))
+        self.assertIn("not stopped: it could not be tied to this run's worktree",
+                      job._api("GET", f"/_sc/runs/{row['run_id']}")["last_error"])
+
+
+class LateSupervisorTest(DelegationCase, unittest.TestCase):
+    """A supervisor that arrives after its run ended starts nothing."""
+
+    def lost_run(self, payload: dict) -> dict:
+        row = job._api("POST", "/_sc/runs", payload)
+        # No supervisor ever checked in: after the grace the run is lost.
+        self.store.reconcile()
+        self.assertEqual(job._api("GET", f"/_sc/runs/{row['run_id']}")["state"], "registered")
+        self.con.execute(
+            "UPDATE runs SET created_at=datetime('now','-60 seconds') WHERE run_id=?",
+            (row["run_id"],))
+        self.con.commit()
+        self.store.reconcile()
+        final = job._api("GET", f"/_sc/runs/{row['run_id']}")
+        self.assertEqual((final["state"], final["exit_code"]), ("lost", None))
+        return final
+
+    def supervise(self, row: dict, **meta) -> tuple[int, list]:
+        jobdir = Path(row["evidence_path"]).parent
+        jobdir.mkdir(parents=True)
+        (jobdir / "log").touch()
+        job.write_meta(jobdir, {
+            "run_id": row["run_id"], "job_id": str(row["run_id"]), "kind": row["kind"],
+            "label": row["label"], "cwd": row["cwd"], "timeout": 30,
+            "started_at": job._now(), "log": str(jobdir / "log"), **meta})
+        notified: list = []
+        return job.supervise(jobdir, notify=notified.append), notified
+
+    def test_a_registered_agent_row_with_no_supervisor_is_lost_after_the_grace(self):
+        final = self.lost_run({
+            "registration_key": "never-supervised", "kind": "agent", "argv": ["x"],
+            "commit": self.base,
+            "agent": {"harness": "codex", "requested_model": "m", "brief_bytes": 1}})
+        self.assertIn(f"Run {final['run_id']} (agent: codex:m) lost; exit=unknown;",
+                      self.wake(final))
+        self.assertEqual(self.store._agents_without_a_process(), frozenset())
+        self.assertEqual(
+            self.con.execute("SELECT count(*) FROM runs WHERE state IN ('registered','running')"
+                             ).fetchone()[0], 0)
+
+    def test_the_running_route_refuses_a_terminal_row_and_nothing_is_launched(self):
+        marker = Path(self.temp.name) / "launched"
+        agent = self.lost_run({
+            "registration_key": "late-agent", "kind": "agent", "argv": ["touch", str(marker)],
+            "commit": self.base,
+            "agent": {"harness": "codex", "requested_model": "m", "brief_bytes": 1}})
+        command = self.lost_run({
+            "registration_key": "late-command", "kind": "job",
+            "argv": ["touch", str(marker)], "cwd": str(self.root)})
+        for row in (agent, command):
+            with self.subTest(kind=row["kind"]):
+                code, error = self.api_error("POST", f"/_sc/runs/{row['run_id']}/running", {
+                    "supervisor_pid": os.getpid(), "supervisor_start_ticks": 1,
+                    "boot_id": runs.boot_id()})
+                self.assertEqual(code, 409)
+                self.assertIn("already has a terminal result (lost)", error)
+                returned, notified = self.supervise(
+                    row, cmd=row["argv"],
+                    agent={"harness": "codex", "stdin": False, "brief_index": None,
+                           "run_dir_indexes": [], "env": {}, "env_unset": [],
+                           "result": {"source": "stdout_json", "field": "result"},
+                           "session": {"source": "pinned"}, "session_ref": None,
+                           "base_commit": self.base, "branch": None,
+                           "continues_run_id": None})
+                self.assertEqual(returned, 127)
+                # Not launched, not submitted, and the ledger keeps its outcome.
+                self.assertEqual(notified, [])
+                self.assertFalse(marker.exists())
+                meta = job.read_meta(Path(row["evidence_path"]).parent)
+                self.assertTrue(meta["not_launched"])
+                self.assertIsNone(meta.get("pid"))
+                self.assertEqual(
+                    job._api("GET", f"/_sc/runs/{row['run_id']}")["state"], "lost")
+        self.assertFalse((self.root / ".sc-worktrees").exists())
+        self.assertEqual(self.starts(), [])
+
+
+class UnchangedMeansUnchangedTest(DelegationCase, unittest.TestCase):
+    """H1: git configuration never makes a changed worktree look unchanged."""
+
+    def setUp(self):
+        super().setUp()
+        excludes = Path(self.temp.name) / "global-excludes"
+        excludes.write_text("notes.txt\n")
+        Path(self.env["GIT_CONFIG_GLOBAL"]).write_text(
+            f"[core]\n\texcludesFile = {excludes}\n"
+            "[status]\n\tshowUntrackedFiles = no\n\tbranch = true\n"
+            "[diff]\n\tignoreSubmodules = all\n")
+        # And in the repository's own configuration, which every worktree shares.
+        self.git("config", "status.showUntrackedFiles", "no")
+        self.git("config", "status.branch", "true")
+
+    def test_an_untracked_file_keeps_the_worktree_whatever_git_is_told_to_hide(self):
+        for name in ("draft.md", "notes.txt"):  # the second is in the global excludes file
+            with self.subTest(name=name):
+                row = self.finished(self.launch(f"WRITE:{name}"))
+                worktree = Path(row["cwd"])
+                self.assertTrue((worktree / name).exists())
+                self.assertIsNone(row["agent"]["worktree_removed_at"])
+                body = self.wake(row)
+                self.assertIn(f"Worktree {worktree}; ", body)
+                self.assertIn("uncommitted changes: yes.", body)
+                self.assertNotIn("removed, unchanged", body)
+                # Git, asked the plain way under this configuration, shows nothing.
+                plain = subprocess.run(
+                    ["git", "-C", str(worktree), "status", "--porcelain"],
+                    env=self.env, capture_output=True, text=True, check=True).stdout
+                self.assertNotIn(name, plain)
+                refused = self.cli("clean", str(row["run_id"]))
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("uncommitted changes: yes", refused.stderr)
+                self.assertTrue((worktree / name).exists())
+                self.assertEqual(self.cli("clean", str(row["run_id"]), "--discard").returncode, 0)
+
+    def test_a_read_only_run_is_still_removed_under_that_configuration(self):
+        row = self.finished(self.launch("RESULT:read only"))
+        self.assertIsNotNone(row["agent"]["worktree_removed_at"])
+        self.assertFalse(Path(row["cwd"]).exists())
+
+    def test_a_file_the_repository_ignores_is_not_work(self):
+        # Planner ruling: ignored files do not count; the wake says they were not kept.
+        (self.root / ".gitignore").write_text("engine/\n.sc-worktrees/\n*.cache\n")
+        self.git("add", ".gitignore")
+        self.git("-c", "user.name=Test", "-c", "user.email=test@subfloor.local",
+                 "commit", "-q", "-m", "ignore caches")
+        row = self.finished(self.launch("WRITE:build.cache"))
+        self.assertFalse(Path(row["cwd"]).exists())
+        self.assertIn("Worktree removed, unchanged (ignored files were not kept);",
+                      self.wake(row))
 
 
 class ContinueTest(DelegationCase, unittest.TestCase):
@@ -463,6 +754,33 @@ class ContinueTest(DelegationCase, unittest.TestCase):
             },
         }
 
+    def test_a_continue_is_refused_when_the_slots_are_full(self):
+        done = self.finished(self.launch("RESULT:one"))
+        held = [self.launch("SLEEP:60") for _ in range(3)]
+        refused = self.cli("continue", str(done["run_id"]), "--brief", "x")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("HTTP 429", refused.stderr)
+        self.assertIn("live subagent limit for one shell reached: 3 of 3 live", refused.stderr)
+        self.assertEqual(self.newest_id(), held[-1]["run_id"])
+        self.assertEqual(len(self.wait_started(4)), 4)
+        for row in held:
+            self.assertEqual(self.cli("kill", str(row["run_id"])).returncode, 0)
+            self.finished(row)
+
+    def test_the_supervisor_does_not_report_an_unusable_session_reference(self):
+        for value in ("--dangerously-skip-permissions", 'ses"quoted'):
+            with self.subTest(value=value):
+                row = self.finished(self.launch(f"SESSION:{value}", harness="opencode"))
+                self.assertEqual(row["state"], "done")
+                self.assertIsNone(row["agent"]["session_ref"])
+                recorded = json.loads(
+                    (Path(row["evidence_path"]).parent / "facts.json").read_text())
+                self.assertNotIn("session_ref", recorded)
+                self.assertNotIn(value, json.dumps(row["agent"]))
+                refused = self.cli("continue", str(row["run_id"]), "--brief", "x")
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("captured no session reference", refused.stderr)
+
     def test_a_malformed_session_reference_is_refused_when_it_is_written(self):
         row = self.launch("SLEEP:60")
         self.wait_started()
@@ -525,7 +843,9 @@ class WorktreeLifeTest(DelegationCase, unittest.TestCase):
         worktree = Path(first["cwd"])
         self.assertFalse(worktree.exists())
         self.assertIsNotNone(first["agent"]["worktree_removed_at"])
-        self.assertIn("Worktree removed, unchanged; agent/review;", self.wake(first))
+        self.assertIn(
+            "Worktree removed, unchanged (ignored files were not kept); agent/review;",
+            self.wake(first))
         self.assertNotIn(str(worktree), self.git("worktree", "list"))
 
         second = self.finished(self.continue_run(first, "WRITE:notes.txt"))
@@ -564,6 +884,7 @@ class WorktreeLifeTest(DelegationCase, unittest.TestCase):
         refused = self.cli("clean", str(kept["run_id"]))
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("uncommitted changes: yes; commits on no remote branch: 1", refused.stderr)
+        self.assertIn("holds work that is on no remote branch", refused.stderr)
         self.assertTrue((worktree / "draft.txt").exists())
         self.assertIsNone(
             job._api("GET", f"/_sc/runs/{kept['run_id']}")["agent"]["worktree_discarded_at"])
@@ -591,7 +912,12 @@ class WorktreeLifeTest(DelegationCase, unittest.TestCase):
         kept = self.finished(self.launch("COMMIT:work.txt", "--branch", "agent/pushed"))
         worktree = Path(kept["cwd"])
         self.assertTrue(worktree.exists())
-        self.assertNotEqual(self.cli("clean", str(kept["run_id"])).returncode, 0)
+        refused = self.cli("clean", str(kept["run_id"]))
+        self.assertNotEqual(refused.returncode, 0)
+        # True to what clean does: the commits stay on the local branch it keeps.
+        self.assertIn("commits on no remote branch: 1 (local branch agent/pushed is kept "
+                      "and still holds its commits)", refused.stderr)
+        self.assertNotIn("nowhere else", refused.stderr)
         self.git("push", "-q", "origin", "agent/pushed", cwd=worktree)
         done = self.cli("clean", str(kept["run_id"]))
         self.assertEqual(done.returncode, 0, done.stderr)

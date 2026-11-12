@@ -64,7 +64,7 @@ submit execution outcomes. Cancellation verifies boot id, pid and start ticks.
 | `POST /_sc/runs` | `{registration_key,kind,label,argv,cwd,commit,foreground?,timeout_seconds?}`; returns registered run with engine-allocated evidence path; retries require identical input. An `agent` run adds an `agent` object and omits `cwd` (see Subagent ledger) |
 | `GET /_sc/runs` | Owner's runs, newest first |
 | `GET /_sc/runs/<id>` | Owner's authoritative state and wake receipt |
-| `POST /_sc/runs/<id>/running` | Supervisor/child pid, start ticks, boot id, started timestamp |
+| `POST /_sc/runs/<id>/running` | Supervisor/child pid, start ticks, boot id, started timestamp. Refused (409) once the run has a terminal result; a supervisor that receives that launches nothing and submits nothing |
 | `POST /_sc/runs/<id>/terminal` | `{state,exit_code,finished_at,spawn_error?}`; one immutable terminal payload. An `agent` run may add `agent: {head_commit?, uncommitted?}`, what the supervisor found in the worktree |
 | `GET /_sc/runs/<id>/tail` | Bounded log text; absent evidence is identified |
 | `POST /_sc/runs/<id>/receipt` | Owner-only immutable dev-kit receipt; duplicate identical submissions are idempotent |
@@ -166,9 +166,17 @@ sc job list [--kind agent|probe|job] [--all]
   process outlives its run. A supervisor stopped by a signal records `failed`
   with that reason.
 - **A supervisor that is killed** cannot do that. The runtime pulse then finds
-  the run without a supervisor, kills the harness's process group if its leader
-  is still the recorded incarnation, and records `lost`. A harness whose leader
-  has already exited is not signalled.
+  the run without a supervisor, stops the harness's process group, and records
+  `lost`. The pid, start ticks and boot id of a run are written by its owner, so
+  they are not enough to signal anything. The group is signalled only when the
+  kernel also says the process is this run's harness: it leads its own process
+  group, and its working directory is the worktree the engine assigned to the
+  run. Pid 1, the server and the server's own process group are never
+  signalled. A process that is running but cannot be tied to the run is left
+  alone, and the `lost` result says so (`spawn_error`). A harness whose leader
+  has already exited is not signalled. A row whose reconciliation was blocked
+  gets the same stop, on the same evidence, once its supervisor is proven gone;
+  it stays blocked, with what was done added to `last_error`.
 - **Result and facts.** Before the terminal result is submitted the supervisor
   writes `result.md` (the final message, or a line saying there was none) and
   `facts.json` (`session_ref`, `result_bytes`, `worktree_removed_at`), and
@@ -183,7 +191,11 @@ sc job list [--kind agent|probe|job] [--all]
   final message.
 - **Worktree.** When a run ends with no uncommitted change and HEAD still at
   the base commit, the supervisor removes the worktree and records
-  `worktree_removed_at`; a branch the run created is kept. Otherwise the
+  `worktree_removed_at`; a branch the run created is kept. Untracked files
+  count as a change whatever git is configured to show
+  (`status.showUntrackedFiles`, submodule ignore settings and a global
+  excludes file are overridden). Files the repository itself ignores do not
+  count and are removed with the worktree; the wake says so. Otherwise the
   worktree is kept until `sc job clean`, which refuses while a run is live in
   it, and refuses uncommitted changes or commits on no remote branch unless
   `--discard` is given. A discard is recorded (`worktree_discarded_at`).
@@ -212,7 +224,8 @@ registration is refused (429) naming the runs that hold the slots.
   red, merged or closed. Green means proven green at the head commit. A PR that
   cannot be read when the verb runs starts no watch. It creates no
   subscription and changes nothing in the PR watcher.
-- `sc job watch timer --after <s>` ends `done` when the delay has passed.
+- `sc job watch timer --after <s>` ends `done` when the delay has passed. The
+  delay is at most 86,400 seconds (24 hours); more is refused (400).
 
 Their ledger `argv` is `sc job watch <form> ...`, which is how the condition is
 read back. The wake names the condition, the final state and, for a PR, the

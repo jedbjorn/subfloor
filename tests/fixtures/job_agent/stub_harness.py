@@ -11,7 +11,7 @@ Instructions are brief lines of the form `NAME:value`:
   SLEEP:<s>       wait before reporting      EXIT:<code>  exit status
   WRITE:<name>    leave an uncommitted file  COMMIT:<name> commit a new file
   SPAWN:1         leave a child in the process group
-  STDERR:<text>   a line on standard error
+  STDERR:<text>   a line on standard error  SESSION:<ref> report this session reference
   REPLAY:1        print the output recorded for this harness in harness_controls.json
 """
 import json
@@ -81,6 +81,7 @@ def main() -> int:
     if "NORESULT" in instructions:
         text = None
     session = None if "NOSESSION" in instructions else SESSION.get(name)
+    session = instructions.get("SESSION", session)
     if name == "claude":
         print(json.dumps({"type": "result", "result": text} if text else {"type": "result"}))
     elif name == "codex":

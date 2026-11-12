@@ -51,6 +51,7 @@ BRIEF_FILE = "brief.md"
 LAST_MESSAGE_FILE = "last-message.md"
 STDERR_FILE = "stderr.log"
 STDERR_TAIL = 65536
+WHOLE_REPORT_MAX = 16 * 1024 * 1024
 NO_RESULT = "This run ended without a final message.\n"
 RUN_VARIABLE = "SC_JOB_AGENT_RUN"
 SEAT_VARIABLE = "SC_SEAT"
@@ -385,6 +386,49 @@ def read_result(spec: dict, stdout: str, run_dir: Path | None = None) -> str | N
     return value if isinstance(value, str) and value.strip() else None
 
 
+def read_report(
+    result: dict, session: dict, log: Path, run_dir: Path, pinned: str | None = None
+) -> tuple[str | None, str | None]:
+    """The final message and the session reference, from one pass over the log.
+
+    The log of a long run is its whole event stream, so it is read a line at a
+    time and only the last message and the first session reference are kept.
+    A harness that reports one JSON document over several lines is read whole,
+    up to `WHOLE_REPORT_MAX`.
+    """
+    message = read_result(result, "", run_dir) if result["source"] == "file" else None
+    found = pinned if session["source"] == "pinned" else None
+    from_stream = result["source"] != "file"
+    with log.open(errors="replace") as handle:
+        for line in handle:
+            wants_session = session["source"] == "event" and found is None
+            if not from_stream and not wants_session:
+                break
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if wants_session and _matching([record], session):
+                value = _field(record, session["field"])
+                if isinstance(value, str) and value.strip():
+                    found = value
+            if from_stream and _matching([record], result):
+                value = _field(record, result["field"])
+                if isinstance(value, str) and value.strip():
+                    message = value
+    if (
+        message is None and result["source"] == "stdout_json"
+        and log.stat().st_size <= WHOLE_REPORT_MAX
+    ):
+        message = read_result(result, log.read_text(errors="replace"), run_dir)
+    return message, found
+
+
 def read_session(spec: dict, stdout: str, pinned: str | None = None) -> str | None:
     """The harness session reference: the pinned one, or the first one reported."""
     if spec["source"] == "pinned":
@@ -513,7 +557,16 @@ def worktree_state(path: Path, base_commit: str) -> dict:
     if not path.is_dir():
         return {"exists": False, "head_commit": None, "uncommitted": None, "unchanged": False}
     head = _git(path, "rev-parse", "--verify", "--quiet", "HEAD")
-    status = _git(path, "status", "--porcelain")
+    # The answer decides whether a worktree is deleted, so it does not depend
+    # on configuration: untracked files are always listed
+    # (`status.showUntrackedFiles`), submodule changes always count
+    # (`diff.ignoreSubmodules`, `submodule.<name>.ignore`), and a user's
+    # global excludes file hides nothing. Only the repository's own ignore
+    # rules decide what is ignored, and an ignored file is not work.
+    status = _git(
+        path, "-c", "core.excludesFile=/dev/null", "status", "--porcelain",
+        "--untracked-files=all", "--ignore-submodules=none", "--no-renames",
+    )
     head_commit = head.stdout.strip() if head.returncode == 0 else None
     uncommitted = bool(status.stdout.strip()) if status.returncode == 0 else None
     return {

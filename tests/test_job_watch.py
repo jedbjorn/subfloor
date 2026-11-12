@@ -124,6 +124,33 @@ class WatchPullRequestTest(WatchCase, unittest.TestCase):
         self.assertEqual(
             lines[2], f"Final state: timeout; last read: pending at head {HEADS[PENDING]}.")
 
+    def test_the_default_interval_is_sixty_seconds_for_an_hour(self):
+        self.assertEqual((job.WATCH_PR_EVERY, job.PROBE_TIMEOUT), (60, 3600))
+        self.answer(PENDING)
+        row = self.watch("pr", "--pr", str(WATCHED))
+        meta = job.read_meta(Path(row["evidence_path"]).parent)
+        self.assertEqual((meta["every"], meta["timeout"]), (60, 3600))
+        self.assertEqual(row["timeout_seconds"], 3600)
+        wait_for(lambda: self.attempts(row))
+        # No second read arrives within the next seconds: the delay is not the
+        # five-second minimum.
+        reads = len(self.attempts(row))
+        time.sleep(6)
+        self.assertEqual(len(self.attempts(row)), reads)
+        self.assertEqual(self.cli("kill", str(row["run_id"])).returncode, 0)
+        self.assertEqual(self.finished(row)["state"], "killed")
+
+    def test_a_repository_must_be_owner_slash_name(self):
+        self.answer(GREEN)
+        for value in ("name-only", "-owner/name", "owner/name/extra", "owner /name",
+                      "https://github.com/owner/name", "owner/"):
+            with self.subTest(value=value):
+                refused = self.cli("watch", "pr", "--pr", str(WATCHED), f"--repository={value}")
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("--repository must be owner/name", refused.stderr)
+        self.assertEqual(self.newest_id(), 0)
+        self.assertFalse(self.gh_calls.exists())
+
     def test_a_pr_that_cannot_be_read_starts_no_watch(self):
         self.answer(None)
         done = self.cli("watch", "pr", "--pr", str(WATCHED))
@@ -172,6 +199,18 @@ class WatchTimerTest(WatchCase, unittest.TestCase):
         self.assertEqual(lines[0], f"Run {row['run_id']} (watch timer: nudge) killed; exit=unknown.")
         self.assertEqual(lines[2], "Final state: killed.")
         self.assertNotEqual(self.cli("watch", "timer", "--after", "0").returncode, 0)
+
+    def test_a_timer_is_limited_to_twenty_four_hours(self):
+        refused = self.cli("watch", "timer", "--after", "86401")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("HTTP 400", refused.stderr)
+        self.assertIn("a timer is limited to 86400 seconds (24 hours); 86401 was requested",
+                      refused.stderr)
+        self.assertEqual(self.newest_id(), 0)
+        row = self.watch("timer", "--after", "86400")
+        self.assertEqual(row["timeout_seconds"], 86400)
+        self.assertEqual(self.cli("kill", str(row["run_id"])).returncode, 0)
+        self.finished(row)
 
 
 class WatcherLimitTest(WatchCase, unittest.TestCase):

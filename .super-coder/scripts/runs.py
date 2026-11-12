@@ -34,6 +34,7 @@ AGENT_RESULT_FILE = "result.md"
 WATCH_LIVE_PER_SHELL = 10
 WATCH_ARGV = ("sc", "job", "watch")
 WATCH_FORMS = ("pr", "timer")
+WATCH_TIMER_MAX = 86400
 # Decision #428: each refusal names the confusion it prevents, first.
 NESTING_CONFUSION = "delegated work whose owner can no longer be traced"
 REVIEWER_CONFUSION = "a review verdict that rests on a reader nobody assigned"
@@ -211,7 +212,10 @@ def agent_wake_body(row: dict, payload: dict) -> str:
     ran = _span((end - start).total_seconds()) if start and end else "unknown"
     base = agent.get("base_commit") or ""
     removed = bool(agent.get("worktree_removed_at"))
-    where = "removed, unchanged" if removed else agent.get("worktree") or row["cwd"]
+    where = (
+        "removed, unchanged (ignored files were not kept)" if removed
+        else agent.get("worktree") or row["cwd"]
+    )
     head = outcome.get("head_commit") or (base if removed else None)
     dirty = outcome.get("uncommitted")
     if dirty is None and removed:
@@ -586,6 +590,13 @@ class RunStore:
                 f"a subagent run is limited to {AGENT_MAX_TIMEOUT} seconds (8 hours); "
                 f"{timeout} was requested"
             )
+        if kind == "probe":
+            form = watch_form({"kind": kind, "argv": argv})
+            if form[0] == "timer" and (timeout is None or timeout > WATCH_TIMER_MAX):
+                raise ValueError(
+                    f"a timer is limited to {WATCH_TIMER_MAX} seconds (24 hours); "
+                    f"{timeout} was requested"
+                )
         foreground = data.get("foreground", False)
         if type(foreground) is not bool or (foreground and kind != "devkit"):
             raise ValueError("foreground must be a boolean and requires a devkit run")
@@ -766,6 +777,13 @@ class RunStore:
         )
         if not isinstance(data.get("boot_id"), str) or not data["boot_id"]:
             raise ValueError("boot_id is required")
+        if existing["state"] in TERMINAL:
+            # "conflict" makes this a 409: the run ended (for example it was
+            # recorded lost) before this check-in, and nothing may start under it.
+            raise ValueError(
+                f"conflict: run {run_id} already has a terminal result "
+                f"({existing['state']}); nothing may start under it"
+            )
         for key in keys[:4]:
             if data.get(key) is not None and (
                 type(data[key]) is not int or data[key] <= 0
@@ -1007,23 +1025,103 @@ class RunStore:
             )
         return self.get(run_id, owner)
 
-    @staticmethod
-    def _stop_orphan(row: dict) -> None:
+    def _tied_to_run(self, row: dict) -> bool:
+        """Whether the recorded process is this run's harness, by what the kernel says.
+
+        The pid, start ticks and boot id of a run are written by its owner
+        (the running route, `meta.json`), so they identify a process but do
+        not prove it belongs to the run. The proof is read from /proc: the
+        process leads its own process group, and its working directory is the
+        worktree the engine assigned to this run, `.sc-worktrees/agent-<n>`,
+        which no caller can set. Pid 1, this server and this server's process
+        group are never the answer.
+        """
+        try:
+            pid = int(row["pid"])
+            worktree = Path(row["cwd"])
+            if pid <= 1 or pid in (os.getpid(), os.getpgrp()):
+                return False
+            if worktree.parent != self.worktrees or not _RESERVED_SHELL_NAME.fullmatch(
+                worktree.name
+            ):
+                return False
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            group = int(fields[2])
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except (OSError, ValueError, IndexError, KeyError, TypeError):
+            return False
+        if group != pid or group == os.getpgrp():
+            return False
+        home = os.path.realpath(worktree)
+        return cwd == home or cwd.startswith(home + os.sep)
+
+    def _stop_orphan(self, row: dict) -> str:
         """Stop a subagent's harness when its supervisor is gone.
 
         The harness runs as the leader of its own process group, so it outlives
         a supervisor that was killed. Nothing would then stop it at its time
-        limit, and it would go on working under a run recorded as lost. The
-        group is signalled only while its leader is the recorded incarnation
-        (pid, start ticks and boot id all match); anything else is left alone.
+        limit, and it would go on working under a run recorded as lost.
+
+        Returns `gone` when the recorded process is not running, `stopped`
+        when its group was signalled, and `unverified` when it is running but
+        could not be tied to this run (`_tied_to_run`); that one is left alone.
         """
-        if process_alive(row.get("pid"), row.get("start_ticks"), row.get("boot_id")) is True:
+        if process_alive(row.get("pid"), row.get("start_ticks"), row.get("boot_id")) is not True:
+            return "gone"
+        if not self._tied_to_run(row):
+            return "unverified"
+        try:
+            os.killpg(int(row["pid"]), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            return "gone"
+        return "stopped"
+
+    def _stop_blocked_orphans(self) -> None:
+        """A blocked subagent row is skipped by reconciliation, not by its limits.
+
+        Its supervisor is what enforces the time limit. When that supervisor is
+        proven gone, a harness still running under the row is stopped, on the
+        same evidence as for any other row. The row stays blocked for operator
+        recovery; what was done is added to its error text once.
+        """
+        rows = self.con.execute(
+            "SELECT * FROM runs WHERE kind='agent' AND state IN ('registered','running') "
+            "AND wake_state='blocked'"
+        ).fetchall()
+        for raw in rows:
+            row = dict(raw)
             try:
-                os.killpg(int(row["pid"]), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+                meta = json.loads(Path(row["evidence_path"]).with_name("meta.json").read_text())
+            except (OSError, ValueError):
+                meta = {}
+            if isinstance(meta, dict) and meta.get("run_id") == row["run_id"]:
+                for key in ("pid", "start_ticks", "supervisor_pid",
+                            "supervisor_start_ticks", "boot_id"):
+                    if row.get(key) is None and meta.get(key) is not None:
+                        row[key] = meta[key]
+            if process_alive(
+                row.get("supervisor_pid"), row.get("supervisor_start_ticks"), row.get("boot_id")
+            ) is not False:
+                continue
+            outcome = self._stop_orphan(row)
+            note = {
+                "stopped": "; harness stopped: its supervisor is gone",
+                "unverified": "; harness process still running and not stopped: "
+                              "it could not be tied to this run's worktree",
+            }.get(outcome)
+            if note and note not in (row["last_error"] or ""):
+                with db_driver.write_transaction(self.con, "runs.blocked_orphan"):
+                    self.con.execute(
+                        "UPDATE runs SET last_error=? WHERE run_id=? "
+                        "AND state IN ('registered','running')",
+                        (((row["last_error"] or "") + note)[:1024], row["run_id"]),
+                    )
 
     def reconcile(self) -> None:
+        try:
+            self._stop_blocked_orphans()
+        except Exception:  # noqa: BLE001 - must not halt reconciliation of other rows
+            pass
         rows = self.con.execute(
             "SELECT * FROM runs WHERE state IN ('registered','running') "
             "AND wake_state<>'blocked'"
@@ -1082,13 +1180,11 @@ class RunStore:
         if final.get("run_id") == row["run_id"] and final.get("finished_at"):
             self.terminal(row["run_id"], row["owner_shell_id"], terminal_payload(final))
             return
-        if row["kind"] == "agent":
-            self._stop_orphan(row)
-        self.terminal(
-            row["run_id"],
-            row["owner_shell_id"],
-            {
-                "state": "lost",
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-            },
-        )
+        lost = {"state": "lost", "finished_at": datetime.now(timezone.utc).isoformat()}
+        if row["kind"] == "agent" and self._stop_orphan(row) == "unverified":
+            # Truthful: the run is lost and something is still running under it.
+            lost["spawn_error"] = (
+                f"harness process {row.get('pid')} is still running and was not stopped: "
+                "it could not be tied to this run's worktree"
+            )
+        self.terminal(row["run_id"], row["owner_shell_id"], lost)

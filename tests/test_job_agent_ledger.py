@@ -254,6 +254,81 @@ class UpgradeTest(unittest.TestCase):
         self.assertEqual(migrate.pending(self.con)[0].name, MIGRATION)
 
 
+class DiscardAndUsageUpgradeTest(unittest.TestCase):
+    """Migration 0286 on a populated database: rows carried, new columns empty."""
+
+    LATER = "0286_agent_worktree_discard_and_usage_run.sql"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        con = sqlite3.connect(Path(self.temp.name) / "prior.db")
+        con.executescript((ENGINE / "schema.sql").read_text())
+        for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+            if migration.name >= self.LATER:
+                break
+            con.executescript(migration.read_text())
+            con.execute(
+                "INSERT OR IGNORE INTO schema_migrations(filename) VALUES(?)", (migration.name,))
+        con.execute("INSERT INTO users (user_id, username, is_active) VALUES (1, 'T', 1)")
+        con.execute(
+            "INSERT INTO shells (shell_id, display_name, shortname, system_prompt, user_id, api_key) "
+            "VALUES (1, 'Dev One', 'dev1', 'x', 1, ?)", (TOKEN,))
+        con.execute(
+            "INSERT INTO runs(run_id,owner_shell_id,registration_key,kind,label,argv,cwd,"
+            "evidence_path,timeout_seconds) VALUES(5,1,'k','agent','a','[\"codex\"]',"
+            "'/repo/.sc-worktrees/agent-5','/e/5/log',7200)")
+        con.execute(
+            "INSERT INTO run_agents(run_id,harness,requested_model,effective_effort,session_ref,"
+            "worktree,base_commit,branch,result_bytes,usage_json,worktree_removed_at) "
+            "VALUES(5,'codex','model-x','default','thread-1','/repo/.sc-worktrees/agent-5',?,"
+            "'feat/x',12,'{\"input_tokens\":3}','2026-11-12T10:00:00Z')", (COMMIT,))
+        con.execute(
+            "INSERT INTO session_token_usage(usage_id,shell_id,harness,harness_session_ref,model,"
+            "input_tokens,output_tokens,status) VALUES(9,1,'codex','rollout-1','model-x',10,2,'ok')")
+        con.execute(
+            "INSERT INTO session_token_usage(usage_id,harness,harness_session_ref,status) "
+            "VALUES(10,'claude','transcript-1','no_usage')")
+        con.commit()
+        con.row_factory = sqlite3.Row
+        self.con = con
+        self.addCleanup(con.close)
+
+    def _rows(self, table: str, key: str) -> list[dict]:
+        return [dict(row) for row in self.con.execute(f"SELECT * FROM {table} ORDER BY {key}")]
+
+    def test_populated_tables_upgrade_with_rows_intact_and_new_columns_empty(self):
+        agents = self._rows("run_agents", "run_id")
+        usage = self._rows("session_token_usage", "usage_id")
+        self.assertEqual(migrate.pending(self.con)[0].name, self.LATER)
+
+        migrate.apply(self.con, ENGINE / "migrations" / self.LATER)
+
+        self.assertNotIn(self.LATER, [path.name for path in migrate.pending(self.con)])
+        self.assertEqual(
+            self._rows("run_agents", "run_id"),
+            [{**row, "worktree_discarded_at": None} for row in agents])
+        self.assertEqual(
+            self._rows("session_token_usage", "usage_id"),
+            [{**row, "run_id": None} for row in usage])
+        self.assertEqual(self.con.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(self.con.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        self.assertIn("idx_stu_run", {row[1] for row in self.con.execute(
+            "PRAGMA index_list(session_token_usage)")})
+        # The request stays immutable; the new columns accept their writes.
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.con.execute("UPDATE run_agents SET worktree='/elsewhere' WHERE run_id=5")
+        self.con.rollback()
+        self.con.execute(
+            "UPDATE run_agents SET worktree_discarded_at='2026-11-12T11:00:00Z' WHERE run_id=5")
+        self.con.execute("UPDATE session_token_usage SET run_id=5 WHERE usage_id=9")
+        self.con.commit()
+        store = runs.RunStore(self.con, Path(self.temp.name) / "engine")
+        self.assertEqual(
+            store.get(5)["agent"]["worktree_discarded_at"], "2026-11-12T11:00:00Z")
+        self.assertEqual(store.get(5)["agent"]["usage_json"], {"input_tokens": 3})
+
+
 class AgentLedgerCase(ApiFixture, unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
