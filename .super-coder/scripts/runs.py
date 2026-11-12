@@ -411,11 +411,16 @@ class RunStore:
             for key, value in data.items():
                 if stored[key] is not None and stored[key] != value:
                     raise ValueError(f"conflicting agent fact: {key}")
+            # One fixed statement: no column name is ever taken from the request.
             self.con.execute(
-                "UPDATE run_agents SET "
-                + ",".join(f"{key}=?" for key in data)
-                + " WHERE run_id=?",
-                (*data.values(), run_id),
+                "UPDATE run_agents SET session_ref=COALESCE(?,session_ref),"
+                "provider_model=COALESCE(?,provider_model),"
+                "result_bytes=COALESCE(?,result_bytes),"
+                "worktree_removed_at=COALESCE(?,worktree_removed_at) WHERE run_id=?",
+                (
+                    data.get("session_ref"), data.get("provider_model"),
+                    data.get("result_bytes"), data.get("worktree_removed_at"), run_id,
+                ),
             )
         return self.get(run_id, owner)
 
