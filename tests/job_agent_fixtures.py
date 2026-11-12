@@ -87,7 +87,8 @@ class DelegationCase(ApiFixture):
         for row in self.con.execute(
                 "SELECT pid,supervisor_pid FROM runs WHERE state IN ('registered','running')"):
             for pid in (row["supervisor_pid"], row["pid"]):
-                if pid:
+                # A slot test records this process, or pid 1, as a run's process.
+                if pid and pid > 1 and pid != os.getpid():
                     try:
                         os.kill(pid, 9)
                     except (ProcessLookupError, PermissionError):
