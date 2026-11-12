@@ -2900,6 +2900,200 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertEqual(inspection.state, "unknown")
         self.assertIsNone(inspection.metadata["terminal"])
 
+    def claude_transcript(self, adapter, session_ref: str, *rows: dict) -> Path:
+        path = adapter._session_path(session_ref, self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(
+                json.dumps({"sessionId": session_ref, **row}) + "\n"
+                for row in rows
+            )
+        )
+        return path
+
+    def test_claude_inspect_is_not_idle_when_a_user_entry_follows_the_reply(
+        self,
+    ) -> None:
+        adapter, _runner = self.build("claude")
+        reply = {
+            "type": "assistant",
+            "cwd": str(self.root),
+            "message": {"content": [{"type": "text", "text": "done"}]},
+        }
+        bookkeeping = (
+            {"type": "last-prompt", "lastPrompt": "hello"},
+            {"type": "cost-state", "totalCostUSD": 0.01},
+        )
+        cases = {
+            # A later prompt supersedes the earlier reply.
+            "next prompt pending": (
+                reply,
+                *bookkeeping,
+                {"type": "queue-operation", "operation": "enqueue"},
+                {
+                    "type": "user",
+                    "cwd": str(self.root),
+                    "message": {"role": "user", "content": "again"},
+                },
+                {"type": "attachment", "attachment": {"type": "skill_listing"}},
+                {"type": "last-prompt", "lastPrompt": "again"},
+            ),
+            # The tail 2.1.322 leaves after SIGINT: a partial assistant
+            # entry, then the interrupt marker as a user entry.
+            "interrupted": (
+                reply,
+                *bookkeeping,
+                {
+                    "type": "user",
+                    "cwd": str(self.root),
+                    "message": {"role": "user", "content": "count to 300"},
+                },
+                {"type": "last-prompt", "lastPrompt": "count to 300"},
+                {"type": "mode", "mode": "normal"},
+                {"type": "cost-state", "totalCostUSD": 0.02},
+                {
+                    "type": "assistant",
+                    "cwd": str(self.root),
+                    "message": {
+                        "stop_reason": None,
+                        "content": [{"type": "text", "text": "1\n2\n3\n4"}],
+                    },
+                },
+                {
+                    "type": "user",
+                    "cwd": str(self.root),
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "[Request interrupted by user]",
+                            }
+                        ],
+                    },
+                },
+                {"type": "queue-operation", "operation": "enqueue"},
+            ),
+        }
+        for index, (label, rows) in enumerate(cases.items(), 1):
+            with self.subTest(transcript=label):
+                session_ref = f"66666666-6666-4666-8666-{index:012d}"
+                self.claude_transcript(adapter, session_ref, *rows)
+
+                inspection = adapter.inspect(session_ref, self.context)
+
+                self.assertTrue(inspection.exists)
+                self.assertEqual(inspection.state, "unknown")
+                self.assertIsNone(inspection.metadata["terminal"])
+
+    def test_claude_api_error_entry_is_not_a_completed_reply(self) -> None:
+        adapter, _runner = self.build("claude")
+        session_ref = "66666666-6666-4666-8666-000000000010"
+        path = self.claude_transcript(
+            adapter,
+            session_ref,
+            {
+                "type": "user",
+                "cwd": str(self.root),
+                "message": {"role": "user", "content": "hello"},
+            },
+            {
+                "type": "assistant",
+                "cwd": str(self.root),
+                "isApiErrorMessage": True,
+                "message": {
+                    "content": [{"type": "text", "text": "API Error: 529"}]
+                },
+            },
+            {"type": "last-prompt", "lastPrompt": "hello"},
+            {"type": "cost-state", "totalCostUSD": 0.0},
+        )
+
+        inspection = adapter.inspect(session_ref, self.context)
+        self.assertEqual(inspection.state, "unknown")
+        self.assertIsNone(inspection.metadata["terminal"])
+
+        turn = NativeTurn(
+            harness="claude",
+            session_ref=session_ref,
+            run_ref="claude-run",
+            worktree=self.root,
+            metadata={"transcript_path": str(path), "transcript_offset": 0},
+        )
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual((result.outcome, result.proven), ("unknown", False))
+
+    def test_claude_reconcile_needs_a_reply_written_after_the_run_began(
+        self,
+    ) -> None:
+        adapter, _runner = self.build("claude")
+        session_ref = "66666666-6666-4666-8666-000000000020"
+        earlier = (
+            {
+                "type": "user",
+                "cwd": str(self.root),
+                "message": {"role": "user", "content": "first"},
+            },
+            {
+                "type": "assistant",
+                "cwd": str(self.root),
+                "message": {"content": [{"type": "text", "text": "first reply"}]},
+            },
+            {"type": "last-prompt", "lastPrompt": "first"},
+            {"type": "cost-state", "totalCostUSD": 0.01},
+        )
+        path = self.claude_transcript(adapter, session_ref, *earlier)
+        offset = path.stat().st_size
+        turn = NativeTurn(
+            harness="claude",
+            session_ref=session_ref,
+            run_ref="claude-run",
+            worktree=self.root,
+            metadata={"transcript_path": str(path), "transcript_offset": offset},
+        )
+
+        # The process died before it wrote anything for this run: the
+        # previous turn's reply is the last message and proves nothing.
+        self.assertEqual(adapter.inspect(session_ref, self.context).state, "idle")
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual((result.outcome, result.proven), ("unknown", False))
+
+        # Bookkeeping alone after the launch is still not a reply.
+        with path.open("a") as stream:
+            stream.write(
+                json.dumps({"type": "last-prompt", "sessionId": session_ref})
+                + "\n"
+            )
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual((result.outcome, result.proven), ("unknown", False))
+
+        with path.open("a") as stream:
+            for row in (
+                {
+                    "type": "user",
+                    "cwd": str(self.root),
+                    "message": {"role": "user", "content": "second"},
+                },
+                {
+                    "type": "assistant",
+                    "cwd": str(self.root),
+                    "message": {
+                        "content": [{"type": "text", "text": "second reply"}]
+                    },
+                },
+                {"type": "cost-state", "totalCostUSD": 0.02},
+            ):
+                stream.write(
+                    json.dumps({"sessionId": session_ref, **row}) + "\n"
+                )
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual((result.outcome, result.proven), ("succeeded", True))
+
+        # A turn with no recorded offset reads the whole transcript.
+        turn.metadata.pop("transcript_offset")
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual((result.outcome, result.proven), ("succeeded", True))
+
     def test_claude_interrupt_falls_back_to_the_recorded_process_group(
         self,
     ) -> None:

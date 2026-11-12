@@ -736,15 +736,34 @@ class ClaudeAdapter(ConversationAdapter):
         session_ref: str,
         context: ConversationContext,
     ) -> SessionInspection:
+        return self._inspect_since(session_ref, context, 0)
+
+    def _inspect_since(
+        self,
+        session_ref: str,
+        context: ConversationContext,
+        since: int,
+    ) -> SessionInspection:
+        """Inspect a session, reading its final state from byte ``since`` on.
+
+        The whole file is still checked for session and worktree identity.
+        Only an entry that starts at or after ``since`` can be the final
+        conversation entry, so a reply written before a run's launch cannot
+        stand in for that run's own reply.
+        """
         worktree = context.checked_worktree()
         path = self._session_path(session_ref, worktree)
         if not path.is_file():
             return SessionInspection(session_ref, False, "missing")
         last: Mapping[str, Any] | None = None
         seen_session = False
+        position = 0
         try:
-            with path.open() as stream:
-                for line in stream:
+            with path.open("rb") as stream:
+                for data in stream:
+                    start = position
+                    position += len(data)
+                    line = data.decode("utf-8", "replace")
                     try:
                         raw = json.loads(line)
                     except json.JSONDecodeError:
@@ -763,7 +782,7 @@ class ClaudeAdapter(ConversationAdapter):
                             "HARNESS_WORKTREE_MISMATCH",
                             "Claude session belongs to a different worktree",
                         )
-                    if self._is_conversation_entry(raw):
+                    if start >= since and self._is_conversation_entry(raw):
                         last = raw
         except OSError as exc:
             raise AdapterError(
@@ -774,9 +793,10 @@ class ClaudeAdapter(ConversationAdapter):
         # A Claude session file never contains a ``result`` entry; the reply
         # that ends a turn is the last assistant text block with no tool call
         # after it. ``last`` is the last conversation entry, not the last
-        # line: 2.1.322 writes bookkeeping after the reply.
+        # line: 2.1.322 writes bookkeeping after the reply. A synthetic
+        # API-error entry is assistant text too, and is not a reply.
         terminal: str | None = None
-        if last is not None:
+        if last is not None and not last.get("isApiErrorMessage"):
             events, text = self._transcript_events(last)
             if text is not None and not any(
                 event.type == "tool.started" for event in events
@@ -819,7 +839,15 @@ class ClaudeAdapter(ConversationAdapter):
                 True,
                 "Claude process is still running",
             )
-        inspection = self.inspect(turn.session_ref, context)
+        # Only what this run appended can prove it completed: after a broker
+        # restart the previous turn's reply is still the file's last message
+        # if the process died before writing anything.
+        offset = turn.metadata.get("transcript_offset")
+        inspection = self._inspect_since(
+            turn.session_ref,
+            context,
+            offset if isinstance(offset, int) and offset > 0 else 0,
+        )
         transcript_terminal = inspection.metadata.get("terminal")
         if transcript_terminal in TERMINAL_EVENTS:
             outcome = terminal_outcome(str(transcript_terminal))

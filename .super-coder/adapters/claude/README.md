@@ -181,9 +181,12 @@ code, not run on an older build:
   refuses only on a probe error or a missing version, not on an old one
   (`route_bindings._require_runtime`, `_runtime_support_state`).
 - The adapter's own `probe()` raises `HARNESS_VERSION_UNSUPPORTED`. Its only
-  callers are the Sprint preflights, which ignore that code.
+  callers are the arm and reroute preflights in `sprint_domain.py`. With the
+  route-binding schema they ignore that code. The legacy arm preflight, taken
+  only when that schema is absent, turns any adapter error into a preflight
+  failure, so there an older Claude cannot arm a run.
 
-Nothing therefore stops the launch, and an older Claude fails every
+Nothing stops a browser-chat launch, and an older Claude fails every
 browser-chat launch on the unknown `--autocompact` flag. The fix is to update
 Claude Code to 2.1.304 or later. `SC_CHAT_COMPACT_WINDOW_CLAUDE=off` stops
 the engine passing the flag and is a stopgap only.
