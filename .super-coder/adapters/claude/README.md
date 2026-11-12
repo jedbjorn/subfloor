@@ -117,6 +117,16 @@ job-start bridges, background Agent calls become foreground, and native
 scheduling tools are refused with the engine equivalent. TUI and Admin return
 before reading hook input or evidence.
 
+The two refusal texts name the engine route for what was asked:
+
+- A scheduling tool (`Monitor`, `CronCreate`, `ScheduleWakeup`) is refused with
+  the bounded watches: `sc job start --until "<command>"`,
+  `sc job watch pr --pr <n>` and `sc job watch timer --after <seconds>`.
+- A background Agent call is rewritten to the foreground. Where the hook can
+  only refuse (the `deny-only` tier), the refusal says to run Agent in the
+  foreground, to use `sc job agent` for small delegated work that should
+  outlive the turn, and names the separate route for big multi-shell work.
+
 The bridge transports the original Bash program and cwd as encoded data,
 then starts `sc job` through argv with `shell=False`. The original program is
 one unchanged argument to Bash `-c`. Positive native millisecond timeouts round

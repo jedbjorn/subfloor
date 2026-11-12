@@ -25,6 +25,7 @@ RATIFIED_OPT_INS = {
     },
     "planner": {
         "cli_orchestration",
+        "delegation",
         "dev_kit",
         "flag_sweep",
         "fork_skill_design",
@@ -37,6 +38,7 @@ RATIFIED_OPT_INS = {
         "themed_markdown",
     },
     "dev": {
+        "delegation",
         "git",
         "harness_readiness",
         "redline_review",
@@ -44,9 +46,9 @@ RATIFIED_OPT_INS = {
         "sprint_dev",
         "sprint_protocol",
     },
-    "reviewer": {"git", "redline_review", "sprint_protocol", "sprint_rev"},
-    "devops": {"git", "themed_markdown"},
-    "cartographer": {"git"},
+    "reviewer": {"delegation", "git", "redline_review", "sprint_protocol", "sprint_rev"},
+    "devops": {"delegation", "git", "themed_markdown"},
+    "cartographer": {"delegation", "git"},
 }
 # The pack matrix 0241 established, proven in isolation by the 0241 fixture
 # below; F72 (0257) retired twelve of these names and added two.

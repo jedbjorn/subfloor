@@ -14,9 +14,13 @@ questions. Agents do the work. Keep your context window for the FnB and you.
 
 ## Seat gate
 
-This loop needs a terminal seat: boot `## SEAT` says "You hold a terminal".
-On the GUI seat your background agents and commands die when your turn ends.
-Tell the FnB that this work needs a terminal session and stop.
+The launch and monitor commands below need a terminal seat: boot `## SEAT`
+says "You hold a terminal". On the GUI seat your native background agents and
+commands die when your turn ends, so do not use them there. Load the
+`delegation` skill instead: `sc job agent` launches each agent on any harness
+and wakes you when it ends, and `sc job watch pr` replaces the PR monitors.
+Your lane, the kickoff contract, the lane order, the brief and the close in
+this skill still apply.
 
 ## Your lane
 
@@ -127,8 +131,9 @@ KIMI_MODEL_THINKING_EFFORT=<level> kimi -m <alias> -p "$(cat brief.md)" > lane.l
 ```
 
 To continue a child, resume its session: `claude -p --resume <session_id>`
-(the id is in the JSON result) or `codex exec resume <thread_id> "<follow-up>"`.
-For Kimi, start a fresh child and include the earlier report in the brief.
+(the id is in the JSON result), `codex exec resume <thread_id> "<follow-up>"`,
+or `kimi -m <alias> -S <session_id> -p "<follow-up>"`. Kimi's session id has
+the form `session_<uuid>`; `kimi session list --cwd <worktree> --json` lists it.
 
 Rules for CLI children:
 
