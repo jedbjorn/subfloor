@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -1290,7 +1291,12 @@ console.log(JSON.stringify({
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
 def test_cold_return_rule_in_the_chat_view() -> None:
     """AC11: the same thresholds, read against the page's own clock."""
-    script = JS_PRELUDE + HELPERS + r"""
+    # The conversation field that marks a chat the engine manages for a
+    # participant, as the rule itself reads it.
+    managed_flag = re.search(
+        r"conversation\?\.(\w+_managed)\b", HELPERS[HELPERS.index(
+            "function chatColdReturnDue"):]).group(1)
+    script = JS_PRELUDE + f"const MANAGED_FLAG = {json.dumps(managed_flag)};\n" + HELPERS + r"""
 const now = Date.parse("2026-11-12T12:00:00Z");
 const ago = (minutes) => new Date(now - minutes * 60000).toISOString()
   .slice(0, 19).replace("T", " ");
@@ -1311,7 +1317,7 @@ console.log(JSON.stringify({
   queued: due(90000, 120, {state: "queued"}),
   closed: due(90000, 120, {state: "closed"}),
   closing: due(90000, 120, {close_requested_at: "t"}),
-  managed: due(90000, 120, {sprint_managed: true}),
+  managed: due(90000, 120, {[MANAGED_FLAG]: true}),
   compacting: due(90000, 120, {compaction: {pending: true}}),
   unknownSize: due(null, 120),
   unknownTime: chatColdReturnDue({...chat(90000, 120), last_activity_at: null}, now),
@@ -1533,7 +1539,7 @@ const open = async (overrides = {}) => {
   const conversation = {conversation_id: "cv_fixture", scope: "normal",
     route: {harness: "codex"}, shell: {shortname: "dev", display_name: "Dev",
       shell_id: 1},
-    last_activity_at: ago(overrides.minutes ?? 120), sprint_managed: false};
+    last_activity_at: ago(overrides.minutes ?? 120)};
   const snapshot = {conversation_id: "cv_fixture", projection_version: 3,
     through_sequence: 10,
     controls: {conversation_state: overrides.state ?? "idle",
