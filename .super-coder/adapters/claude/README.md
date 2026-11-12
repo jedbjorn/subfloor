@@ -167,6 +167,9 @@ Checked on `2.1.322 (Claude Code)`, 2026-11-12, with three small requests.
   by a delegated agent (`parent_tool_use_id` set) is not the chat's context
   either. The window is `result.modelUsage[<model>].contextWindow` for the
   chat's own model, so it is known only after a chat's first completed turn.
+  The meter's percentage is of the compact window, not of this window
+  (decision #451); the model window decides only whether the compact window
+  applies, and the tooltip states it.
 - **Manual compaction.** A resumed headless run whose whole prompt is
   `/compact` (`claude -p /compact … --resume <session>`). Run once on
   2.1.322, 2026-11-12, on a two-message scratch session with Haiku (two small

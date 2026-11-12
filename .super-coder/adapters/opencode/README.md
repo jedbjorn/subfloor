@@ -168,7 +168,8 @@ was not repeated; an installed 1.19.5 reports `supported`. CI still installs
   shared server (the check used a private one), and a large session.
 - The meter reads the assistant message's `tokens`
   (`input` + `cache.read` + `cache.write`). OpenCode states no window there,
-  so the chat shows the size with no percentage.
+  and the engine applies no compact window to it, so the chat shows the size
+  with no percentage (the meter's percentage is of the compact window).
 - OpenCode gets no compact-window setting in this delivery: its control is an
   on/off switch, not a token count.
 
