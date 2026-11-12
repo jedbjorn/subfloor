@@ -243,12 +243,15 @@ class HostRuntimeFixture:
             "systemd-run",
             """\
             #!/usr/bin/env python3
+            import json
             import os
             import subprocess
             import sys
 
             with open(os.environ["SC_TEST_LOG"], "a") as log:
                 log.write("systemd-run " + " ".join(sys.argv[1:]) + "\\n")
+                # The arguments one by one, for tests of the launcher's quoting.
+                log.write("systemd-run-argv " + json.dumps(sys.argv[1:]) + "\\n")
             # systemd unescapes doubled dollars before executing the command.
             argv = [arg.replace("$$", "$") for arg in sys.argv[sys.argv.index("--") + 1:]]
             subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -364,6 +367,29 @@ class HostRuntimeLifecycleTest(unittest.TestCase):
         options = self._systemd_run_line().split(" -- ", 1)[0]
         for name, value in values.items():
             self.assertIn(f"--setenv={name}={value}", options)
+
+    def test_each_chat_setting_reaches_the_unit_as_one_argument(self):
+        # A value with a space, shaped like another option: it must stay one
+        # argument, never split into a second --setenv of its own.
+        values = {name: f"{index} --setenv=X={index}"
+                  for index, name in enumerate(self.CHAT_SETTINGS, start=1)}
+        self.fx.env.update(values)
+        result = self.fx.run("launch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [line] = [line for line in self.fx.calls()
+                  if line.startswith("systemd-run-argv ")]
+        argv = json.loads(line.split(" ", 1)[1])
+        options = argv[:argv.index("--")]
+        for name, value in values.items():
+            self.assertIn(f"--setenv={name}={value}", options)
+        self.assertEqual(
+            [option for option in options if option.startswith("--setenv=X=")],
+            [],
+        )
+        self.assertEqual(
+            len([option for option in options if option.startswith("--setenv=")]),
+            len(values),
+        )
 
     def test_launch_carries_only_the_chat_settings_that_are_set(self):
         for name in self.CHAT_SETTINGS:

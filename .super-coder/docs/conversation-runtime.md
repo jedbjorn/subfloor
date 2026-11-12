@@ -158,6 +158,23 @@ with, so a change needs `./sc restart`.
 - **Foreground** (`./sc serve`): the server inherits the shell's
   environment directly.
 
+Three cases where exporting and restarting does not change the value:
+
+- **A restart from the review GUI.** The engine-ops service runs
+  `./sc restart` with its own environment, which is that of the launch that
+  started the service, not of any shell you exported in since. Run the
+  restart from a terminal.
+- **A sandbox restart that keeps the container.** When nothing the container
+  is built from changed and it is healthy, `./sc restart` reports
+  `restart preserved healthy sandbox` and leaves it running with the values
+  it was created with. Run `./sc down`, then `./sc launch`.
+- **Host runtime, a variable set in the systemd user manager.** The server
+  unit inherits the user manager's environment
+  (`systemctl --user show-environment`), and the launcher only adds the
+  variables set in its shell. Unsetting one in the shell therefore does not
+  restore the default while the manager still holds it: remove it there too
+  (`systemctl --user unset-environment NAME`).
+
 ## Compaction, the context meter and the re-ground line
 
 Feature #95, spec #272. The engine summarises nothing; it makes each
