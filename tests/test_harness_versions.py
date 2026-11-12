@@ -39,19 +39,19 @@ def test_runtime_binary_version_is_checked_against_adapter_range() -> None:
         mock.patch.object(
             harness_versions,
             "probe",
-            return_value="2.1.223 (Claude Code)",
+            return_value="2.1.322 (Claude Code)",
         ),
     ):
         assert harness_versions.compatibility_status() == {
             "claude": {
                 "harness": "claude",
                 **harness_versions.runtime_scope(),
-                "version": "2.1.223",
-                "observed_version": "2.1.223 (Claude Code)",
+                "version": "2.1.322",
+                "observed_version": "2.1.322 (Claude Code)",
                 "compatibility": "verified",
-                "minimum_version": "2.1.220",
+                "minimum_version": "2.1.304",
                 "maximum_version_exclusive": "2.2.0",
-                "verified_version": "2.1.223",
+                "verified_version": "2.1.322",
                 "error": None,
             }
         }
@@ -107,7 +107,7 @@ def test_older_runtime_is_reported_as_best_effort_not_an_error() -> None:
 
 def test_spec_current_harness_versions_all_report_tested() -> None:
     observed = {
-        "claude": "2.1.223 (Claude Code)",
+        "claude": "2.1.322 (Claude Code)",
         "codex": "codex-cli 0.155.1",
         "opencode": "1.18.9",
         "vibe": "vibe 2.22.0",

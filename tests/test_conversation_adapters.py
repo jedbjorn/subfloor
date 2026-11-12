@@ -970,13 +970,13 @@ class ConversationAdapterTest(unittest.TestCase):
 
     def test_declared_compatibility_ranges_enforce_floor_and_flag_newer(self) -> None:
         cases = {
-            "claude": ("2.1.219", "2.1.220", "2.1.223", "2.2.0"),
+            "claude": ("2.1.303", "2.1.304", "2.1.322", "2.2.0"),
             "codex": ("0.144.999", "0.145.0", "0.155.1", "0.168.0"),
             "opencode": ("1.18.8", "1.18.9", "1.18.13", "1.20.0"),
             "kimi": ("0.29.999", "0.30.0", "0.33.0", "2.6.0"),
         }
         current_observed = {
-            "claude": "2.1.223 (Claude Code)",
+            "claude": "2.1.322 (Claude Code)",
             "codex": "codex-cli 0.155.1",
             "opencode": "1.18.13",
             "kimi": "0.33.0",
@@ -1036,9 +1036,9 @@ class ConversationAdapterTest(unittest.TestCase):
 
     def test_verified_probe_result_names_missing_manifest_keys(self) -> None:
         adapter, _native = self.build("claude")
-        result = adapter._probe_result("2.1.223 (Claude Code)")
+        result = adapter._probe_result("2.1.322 (Claude Code)")
         self.assertEqual(result.compatibility, "verified")
-        self.assertEqual(result.verified_version, "2.1.223")
+        self.assertEqual(result.verified_version, "2.1.322")
         self.assertEqual(result.maximum_version_exclusive, "2.2.0")
 
         manifest = json.loads(
@@ -1212,6 +1212,71 @@ class ConversationAdapterTest(unittest.TestCase):
 
         self.assertEqual(events[-1].type, "run.completed")
         self.assertEqual(events[-1].payload["status"], "completed")
+
+    def test_claude_interruption_is_read_from_subtype_or_terminal_reason(
+        self,
+    ) -> None:
+        adapter, _runner = self.build("claude")
+        cases = {
+            # Older builds name the interruption in the subtype.
+            "subtype": (
+                {"subtype": "error_during_execution_aborted", "is_error": True},
+                "run.interrupted",
+            ),
+            "subtype interrupted": (
+                {"subtype": "interrupted"},
+                "run.interrupted",
+            ),
+            # 2.1.322 after SIGINT, as recorded by the contract probe.
+            "terminal_reason": (
+                {
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "stop_reason": None,
+                    "terminal_reason": "aborted_streaming",
+                    "num_turns": 2,
+                },
+                "run.interrupted",
+            ),
+            "execution error": (
+                {
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "terminal_reason": "model_error",
+                },
+                "run.failed",
+            ),
+            "execution error without a reason": (
+                {"subtype": "error_during_execution", "is_error": True},
+                "run.failed",
+            ),
+            "turn limit": (
+                {
+                    "subtype": "error_max_turns",
+                    "is_error": True,
+                    "terminal_reason": "max_turns",
+                },
+                "run.failed",
+            ),
+            "completed": (
+                {
+                    "subtype": "success",
+                    "is_error": False,
+                    "terminal_reason": "completed",
+                    "num_turns": 1,
+                },
+                "run.completed",
+            ),
+        }
+        for label, (fields, expected) in cases.items():
+            with self.subTest(result=label):
+                events = adapter._normalize({"type": "result", **fields})
+
+                self.assertEqual(events[-1].type, expected)
+                self.assertEqual(
+                    events[-1].interrupt_evidence,
+                    "native" if expected == "run.interrupted" else None,
+                )
 
     def test_claude_resume_preamble_result_is_not_terminal(self) -> None:
         """#1497: on ``--resume`` Claude first flushes a pending background-task
@@ -2765,6 +2830,345 @@ class ConversationAdapterTest(unittest.TestCase):
 
                 self.assertTrue(inspection.exists)
                 self.assertEqual(inspection.state, state)
+
+    def test_claude_inspect_skips_trailing_bookkeeping_entries(self) -> None:
+        adapter, _runner = self.build("claude")
+        reply = [{"type": "text", "text": "done"}]
+        tool_call = [{"type": "tool_use", "id": "tool-1", "name": "Bash"}]
+
+        def bookkeeping(session_ref: str, kind: str, **fields: Any) -> str:
+            return json.dumps({"type": kind, "sessionId": session_ref, **fields})
+
+        # The tail 2.1.322 writes after a completed turn.
+        current = (
+            ("last-prompt", {"lastPrompt": "hello", "leafUuid": "leaf-1"}),
+            ("mode", {"mode": "normal"}),
+            ("cost-state", {"totalCostUSD": 0.01, "modelUsage": {}}),
+        )
+        # Entries that carry a ``message`` or assistant-shaped content but
+        # are not the conversation, and a type no build has written yet.
+        unfamiliar = (
+            ("attachment", {"attachment": {"type": "skill_listing"}}),
+            (
+                "api-request-blob",
+                {"hash": "abc", "message": {"content": [{"type": "text", "text": "x"}]}},
+            ),
+            ("some-future-entry", {"payload": [1, 2, 3]}),
+        )
+        cases = {
+            "old shape, reply last": (reply, (), "idle", "run.completed"),
+            "2.1.322 tail after a reply": (reply, current, "idle", "run.completed"),
+            "unknown tail after a reply": (
+                reply, current + unfamiliar, "idle", "run.completed",
+            ),
+            "2.1.322 tail after a tool call": (tool_call, current, "unknown", None),
+            "unknown tail after a tool call": (
+                tool_call, unfamiliar, "unknown", None,
+            ),
+        }
+        for index, (label, (blocks, tail, state, terminal)) in enumerate(
+            cases.items(), 1
+        ):
+            with self.subTest(transcript=label):
+                session_ref = f"55555555-5555-4555-8555-{index:012d}"
+                path = adapter._session_path(session_ref, self.root)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                lines = [self.claude_entry(session_ref, *blocks)] + [
+                    bookkeeping(session_ref, kind, **fields)
+                    for kind, fields in tail
+                ]
+                path.write_text("\n".join(lines) + "\n")
+
+                inspection = adapter.inspect(session_ref, self.context)
+
+                self.assertTrue(inspection.exists)
+                self.assertEqual(inspection.state, state)
+                self.assertEqual(inspection.metadata["terminal"], terminal)
+
+    def test_claude_inspect_of_bookkeeping_alone_is_not_idle(self) -> None:
+        adapter, _runner = self.build("claude")
+        session_ref = "55555555-5555-4555-8555-000000000099"
+        path = adapter._session_path(session_ref, self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"type": "last-prompt", "sessionId": session_ref}) + "\n"
+        )
+
+        inspection = adapter.inspect(session_ref, self.context)
+
+        self.assertTrue(inspection.exists)
+        self.assertEqual(inspection.state, "unknown")
+        self.assertIsNone(inspection.metadata["terminal"])
+
+    def claude_transcript(self, adapter, session_ref: str, *rows: dict) -> Path:
+        path = adapter._session_path(session_ref, self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(
+                json.dumps({"sessionId": session_ref, **row}) + "\n"
+                for row in rows
+            )
+        )
+        return path
+
+    def test_claude_inspect_is_not_idle_when_a_user_entry_follows_the_reply(
+        self,
+    ) -> None:
+        adapter, _runner = self.build("claude")
+        reply = {
+            "type": "assistant",
+            "cwd": str(self.root),
+            "message": {"content": [{"type": "text", "text": "done"}]},
+        }
+        bookkeeping = (
+            {"type": "last-prompt", "lastPrompt": "hello"},
+            {"type": "cost-state", "totalCostUSD": 0.01},
+        )
+        cases = {
+            # A later prompt supersedes the earlier reply.
+            "next prompt pending": (
+                reply,
+                *bookkeeping,
+                {"type": "queue-operation", "operation": "enqueue"},
+                {
+                    "type": "user",
+                    "cwd": str(self.root),
+                    "message": {"role": "user", "content": "again"},
+                },
+                {"type": "attachment", "attachment": {"type": "skill_listing"}},
+                {"type": "last-prompt", "lastPrompt": "again"},
+            ),
+            # The tail 2.1.322 leaves after SIGINT: a partial assistant
+            # entry, then the interrupt marker as a user entry.
+            "interrupted": (
+                reply,
+                *bookkeeping,
+                {
+                    "type": "user",
+                    "cwd": str(self.root),
+                    "message": {"role": "user", "content": "count to 300"},
+                },
+                {"type": "last-prompt", "lastPrompt": "count to 300"},
+                {"type": "mode", "mode": "normal"},
+                {"type": "cost-state", "totalCostUSD": 0.02},
+                {
+                    "type": "assistant",
+                    "cwd": str(self.root),
+                    "message": {
+                        "stop_reason": None,
+                        "content": [{"type": "text", "text": "1\n2\n3\n4"}],
+                    },
+                },
+                {
+                    "type": "user",
+                    "cwd": str(self.root),
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "[Request interrupted by user]",
+                            }
+                        ],
+                    },
+                },
+                {"type": "queue-operation", "operation": "enqueue"},
+            ),
+        }
+        for index, (label, rows) in enumerate(cases.items(), 1):
+            with self.subTest(transcript=label):
+                session_ref = f"66666666-6666-4666-8666-{index:012d}"
+                self.claude_transcript(adapter, session_ref, *rows)
+
+                inspection = adapter.inspect(session_ref, self.context)
+
+                self.assertTrue(inspection.exists)
+                self.assertEqual(inspection.state, "unknown")
+                self.assertIsNone(inspection.metadata["terminal"])
+
+    def test_claude_api_error_entry_is_not_a_completed_reply(self) -> None:
+        adapter, _runner = self.build("claude")
+        session_ref = "66666666-6666-4666-8666-000000000010"
+        path = self.claude_transcript(
+            adapter,
+            session_ref,
+            {
+                "type": "user",
+                "cwd": str(self.root),
+                "message": {"role": "user", "content": "hello"},
+            },
+            {
+                "type": "assistant",
+                "cwd": str(self.root),
+                "isApiErrorMessage": True,
+                "message": {
+                    "content": [{"type": "text", "text": "API Error: 529"}]
+                },
+            },
+            {"type": "last-prompt", "lastPrompt": "hello"},
+            {"type": "cost-state", "totalCostUSD": 0.0},
+        )
+
+        inspection = adapter.inspect(session_ref, self.context)
+        self.assertEqual(inspection.state, "unknown")
+        self.assertIsNone(inspection.metadata["terminal"])
+
+        turn = NativeTurn(
+            harness="claude",
+            session_ref=session_ref,
+            run_ref="claude-run",
+            worktree=self.root,
+            metadata={"transcript_path": str(path), "transcript_offset": 0},
+        )
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual((result.outcome, result.proven), ("unknown", False))
+
+    def test_claude_reconcile_needs_a_reply_written_after_the_run_began(
+        self,
+    ) -> None:
+        adapter, _runner = self.build("claude")
+        session_ref = "66666666-6666-4666-8666-000000000020"
+        earlier = (
+            {
+                "type": "user",
+                "cwd": str(self.root),
+                "message": {"role": "user", "content": "first"},
+            },
+            {
+                "type": "assistant",
+                "cwd": str(self.root),
+                "message": {"content": [{"type": "text", "text": "first reply"}]},
+            },
+            {"type": "last-prompt", "lastPrompt": "first"},
+            {"type": "cost-state", "totalCostUSD": 0.01},
+        )
+        path = self.claude_transcript(adapter, session_ref, *earlier)
+        offset = path.stat().st_size
+        turn = NativeTurn(
+            harness="claude",
+            session_ref=session_ref,
+            run_ref="claude-run",
+            worktree=self.root,
+            metadata={"transcript_path": str(path), "transcript_offset": offset},
+        )
+
+        # The process died before it wrote anything for this run: the
+        # previous turn's reply is the last message and proves nothing.
+        self.assertEqual(adapter.inspect(session_ref, self.context).state, "idle")
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual((result.outcome, result.proven), ("unknown", False))
+
+        # Bookkeeping alone after the launch is still not a reply.
+        with path.open("a") as stream:
+            stream.write(
+                json.dumps({"type": "last-prompt", "sessionId": session_ref})
+                + "\n"
+            )
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual((result.outcome, result.proven), ("unknown", False))
+
+        with path.open("a") as stream:
+            for row in (
+                {
+                    "type": "user",
+                    "cwd": str(self.root),
+                    "message": {"role": "user", "content": "second"},
+                },
+                {
+                    "type": "assistant",
+                    "cwd": str(self.root),
+                    "message": {
+                        "content": [{"type": "text", "text": "second reply"}]
+                    },
+                },
+                {"type": "cost-state", "totalCostUSD": 0.02},
+            ):
+                stream.write(
+                    json.dumps({"sessionId": session_ref, **row}) + "\n"
+                )
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual((result.outcome, result.proven), ("succeeded", True))
+
+        # A turn with no recorded offset reads the whole transcript.
+        turn.metadata.pop("transcript_offset")
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual((result.outcome, result.proven), ("succeeded", True))
+
+    def test_claude_reconcile_offset_is_a_byte_position_at_a_line_start(
+        self,
+    ) -> None:
+        adapter, _runner = self.build("claude")
+
+        def reply(text: str) -> dict:
+            return {
+                "type": "assistant",
+                "cwd": str(self.root),
+                "message": {"content": [{"type": "text", "text": text}]},
+            }
+
+        def prompt(text: str) -> dict:
+            return {
+                "type": "user",
+                "cwd": str(self.root),
+                "message": {"role": "user", "content": text},
+            }
+
+        cases = {
+            # The stale reply is the last line before the offset, so its
+            # newline ends exactly there.
+            "reply ends at the offset": (prompt("first"), reply("stale")),
+            # Multi-byte text makes the byte offset larger than the
+            # character count; counting characters would read the stale
+            # reply as written after the launch.
+            "non-ASCII before the offset": (
+                prompt("pr\u00e9c\u00e9dent \u2014 \u65e5\u672c\u8a9e \U0001f600" * 60),
+                reply("r\u00e9ponse p\u00e9rim\u00e9e \u2014 \u53e4\u3044"),
+            ),
+        }
+        for index, (label, earlier) in enumerate(cases.items(), 1):
+            with self.subTest(transcript=label):
+                session_ref = f"88888888-8888-4888-8888-{index:012d}"
+                path = adapter._session_path(session_ref, self.root)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    "".join(
+                        json.dumps(
+                            {"sessionId": session_ref, **row},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                        for row in earlier
+                    ),
+                    encoding="utf-8",
+                )
+                offset = path.stat().st_size
+                self.assertGreaterEqual(offset, len(path.read_text("utf-8")))
+                turn = NativeTurn(
+                    harness="claude",
+                    session_ref=session_ref,
+                    run_ref="claude-run",
+                    worktree=self.root,
+                    metadata={
+                        "transcript_path": str(path),
+                        "transcript_offset": offset,
+                    },
+                )
+
+                result = adapter.reconcile(turn, self.context)
+                self.assertEqual(
+                    (result.outcome, result.proven), ("unknown", False)
+                )
+
+                with path.open("a", encoding="utf-8") as stream:
+                    for row in (prompt("second"), reply("own reply")):
+                        stream.write(
+                            json.dumps({"sessionId": session_ref, **row})
+                            + "\n"
+                        )
+                result = adapter.reconcile(turn, self.context)
+                self.assertEqual(
+                    (result.outcome, result.proven), ("succeeded", True)
+                )
 
     def test_claude_interrupt_falls_back_to_the_recorded_process_group(
         self,

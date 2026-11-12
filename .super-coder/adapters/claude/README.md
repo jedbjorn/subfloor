@@ -88,6 +88,27 @@ interrupted prompt. Browser-mediated permission responses remain unproven, so
 the manifest advertises that capability as false until the adapter has a typed
 permission bridge.
 
+**Current pin.** Minimum `2.1.304`, verified `2.1.322`, below `2.2.0`. The six
+proofs (two-turn exact resume, same-worktree isolation, structured streaming,
+interruption, resume after compute exit, session inspection) were re-run
+through the adapter on `2.1.322 (Claude Code)`, 2026-11-12, with five small
+requests, and all passed. Two shapes differ from the earlier builds and the
+adapter reads both:
+
+- **Interrupt result.** After `SIGINT` the result is `subtype:
+  error_during_execution`, `is_error: true`, `terminal_reason:
+  aborted_streaming`. An interruption is read from `subtype` or
+  `terminal_reason`; an execution error naming an abort in neither is a
+  failure.
+- **Transcript tail.** The stored session ends with bookkeeping entries
+  (`last-prompt`, `mode`, `cost-state`) after the reply. Inspection reads the
+  last `user` or `assistant` message entry and ignores every other entry type,
+  known or not.
+
+The minimum is the first build known to accept `--autocompact` (see the
+compatibility caution below). What happens below it is under "Below the
+minimum".
+
 ## GUI background conversion
 
 Non-Admin launches carry `SC_SEAT=gui|tui`. Only the GUI seat uses
@@ -149,7 +170,23 @@ Checked on `2.1.322 (Claude Code)`, 2026-11-12, with three small requests.
 
 **Compatibility caution.** `--autocompact` is present in the 2.1.319, 2.1.321
 and 2.1.322 binaries and named in the changelog at 2.1.304; nothing earlier is
-established, and the manifest's floor is still 2.1.220. A build below the
-manifest minimum is warn-only (status shows `older-unverified · best-effort`;
-nothing refuses the launch), so an older Claude fails every browser-chat
-launch on `--autocompact` unless `SC_CHAT_COMPACT_WINDOW_CLAUDE=off`.
+established, so the manifest's minimum is 2.1.304.
+
+**Below the minimum.** The minimum is reported, not enforced. Read from the
+code, not run on an older build:
+
+- Harness status shows `older-unverified · best-effort` with no error
+  (`harness_versions.compatibility_status`).
+- Route resolution still resolves the route and marks it `best-effort`; it
+  refuses only on a probe error or a missing version, not on an old one
+  (`route_bindings._require_runtime`, `_runtime_support_state`).
+- The adapter's own `probe()` raises `HARNESS_VERSION_UNSUPPORTED`. Its only
+  callers are the arm and reroute preflights in `sprint_domain.py`. With the
+  route-binding schema they ignore that code. The legacy arm preflight, taken
+  only when that schema is absent, turns any adapter error into a preflight
+  failure, so there an older Claude cannot arm a run.
+
+Nothing stops a browser-chat launch, and an older Claude fails every
+browser-chat launch on the unknown `--autocompact` flag. The fix is to update
+Claude Code to 2.1.304 or later. `SC_CHAT_COMPACT_WINDOW_CLAUDE=off` stops
+the engine passing the flag and is a stopgap only.

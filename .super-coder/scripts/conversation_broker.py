@@ -1740,6 +1740,21 @@ class ConversationBroker(threading.Thread):
             "transcript_offset": run.transcript_offset or 0,
         }
 
+    @staticmethod
+    def _transcript_metadata(run: BrokerRun) -> dict[str, Any]:
+        """Where the run's own transcript entries begin, live process or not.
+
+        Reconcile needs this most when the process is gone: without the
+        offset a transcript-reading adapter cannot tell this run's reply from
+        the previous turn's.
+        """
+        if run.transcript_path is None:
+            return {}
+        return {
+            "transcript_path": run.transcript_path,
+            "transcript_offset": run.transcript_offset or 0,
+        }
+
     def _open_continuation(self, active: _ActiveRun) -> int | None:
         persisted, continuation_id = self._retry_busy(
             partial(self.store.open_continuation, active.run_id, self.owner),
@@ -2223,7 +2238,11 @@ class ConversationBroker(threading.Thread):
                 run_ref=run.runner_ref,
                 worktree=run.worktree.resolve(),
                 process_ref=str(run.process_pid) if attach else None,
-                metadata={"recovered": True, **attach},
+                metadata={
+                    "recovered": True,
+                    **self._transcript_metadata(run),
+                    **attach,
+                },
             )
             self._deliver_interrupt(active)
             recovery = getattr(self.launch_preparer, "recovery", None)

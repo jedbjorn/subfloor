@@ -24,16 +24,24 @@
       }
     },
     "claude": {
-      "probe_date": "2026-08-05",
-      "verified_cli_version": "2.1.223",
+      "probe_date": "2026-11-12",
+      "verified_cli_version": "2.1.322",
       "maximum_cli_version_exclusive": "2.2.0",
       "driver": "claude-print",
       "native_ref_shape": "uuid",
       "observed_events": [
         "system.init",
+        "system.status",
+        "stream_event.message_start",
+        "stream_event.content_block_start",
         "stream_event.content_block_delta",
         "assistant",
-        "result"
+        "stream_event.content_block_stop",
+        "stream_event.message_delta",
+        "stream_event.message_stop",
+        "rate_limit_event",
+        "result",
+        "user"
       ],
       "proof": {
         "two_turn_exact_resume": true,

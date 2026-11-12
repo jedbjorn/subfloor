@@ -56,7 +56,7 @@ SEMVER_TOKEN = re.compile(
     r"(?:\+[0-9A-Za-z.-]+)?)(?=$|\s|\()"
 )
 MAINTAINED_OBSERVED_VERSIONS = {
-    "claude": "2.1.223 (Claude Code)",
+    "claude": "2.1.322 (Claude Code)",
     "codex": "codex-cli 0.155.1",
     "opencode": "1.18.9",
     "vibe": "vibe 2.22.0",

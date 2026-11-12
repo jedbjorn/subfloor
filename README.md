@@ -58,6 +58,8 @@ Python 3.14.x with `sqlite3`, and a reachable Docker daemon for the default sand
 Select `./sc install --runtime host` for the systemd-supervised host runtime
 without Docker. On macOS or Windows, create a Linux VM; keep the checkout on guest storage.
 Set `SC_PYTHON` to an absolute interpreter path if needed.
+Claude Code 2.1.304 or later is the supported minimum; older versions are not
+supported (and are not blocked).
 
 Run these commands from your own host terminal:
 
