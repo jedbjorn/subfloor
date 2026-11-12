@@ -98,31 +98,101 @@ def test_every_nav_entry_is_a_view_and_every_view_has_a_nav_entry_and_section():
         assert INDEX.count(f'data-tab="{key}"') == 1
 
 
-def test_flat_nav_marks_the_active_tab_routes_by_hash_and_scrolls_when_narrow():
+def test_flat_nav_marks_the_active_tab_and_routes_every_button_by_hash():
     show = APP[APP.index("function show(tab)"):APP.index("// Hash routing:")]
     assert 'for (const b of document.querySelectorAll("nav button")) {' in show
     assert 'const on = b.dataset.tab === tab;\n    b.classList.toggle("active", on);' in show
+    # A scrolled nav keeps the active tab in view.
+    assert 'if (on) b.scrollIntoView?.({ block: "nearest", inline: "nearest" });' in show
     # Every nav button is a route: one handler, no trigger to special-case.
     assert ('document.querySelectorAll("nav button").forEach((b) => '
             '(b.onclick = () => { location.hash = b.dataset.tab; }));') in APP
+
+
+def rules_outside_media(selector: str) -> list[str]:
+    """Declarations of every top-level (not @media-nested) rule for selector."""
+    return re.findall(r"^" + re.escape(selector) + r" \{\s*([^}]*?)\s*\}", STYLE, re.MULTILINE)
+
+
+def test_header_gives_way_in_the_nav_at_every_width_not_at_one_breakpoint():
+    # The rules that keep the header to one row hold at every width: the nav
+    # scrolls within itself, and the tools zone's children neither wrap nor
+    # shrink, so its automatic minimum is its whole content on one line.
+    nav = " ".join(rules_outside_media("nav"))
+    for declaration in ("flex: 0 1 auto;", "min-width: 0;", "overflow-x: auto;",
+                        "overflow-y: hidden;", "scrollbar-width: none;"):
+        assert declaration in nav
+    assert rules_outside_media("nav > *") == ["flex: none; white-space: nowrap;"]
+    assert rules_outside_media(".tools > *") == ["flex: none; white-space: nowrap;"]
+    tools = " ".join(rules_outside_media(".tools"))
+    assert "flex: 1 1 0;" in tools and "min-width" not in tools and "overflow" not in tools
+    status = " ".join(rules_outside_media(".status"))
+    assert "max-width: 22rem;" in status and "text-overflow: ellipsis;" in status
+    # No width breakpoint carries the header between the phone layout and full width.
+    assert re.findall(r"@media \(max-width: (\d+)px\) \{\n(?:[^@]*?\n)?  (?:header|nav)\b", STYLE) == ["760"]
+    # The scrolling nav clips what sits outside it: underline and ring stay inside.
+    assert "bottom: 0; height: 2px;" in " ".join(rules_outside_media("nav button.active::after"))
+    assert rules_outside_media("nav button:focus-visible") == ["box-shadow: inset var(--focus-ring);"]
     narrow = STYLE[STYLE.index("@media (max-width: 760px) {"):]
     narrow = narrow[:narrow.index("\n}\n")]
-    # Narrow widths scroll the nav sideways, so no tab is clipped out of reach.
-    assert "nav { flex: 1 1 0; min-width: 35%; overflow-x: auto;" in narrow
-    assert "nav > * { flex: none; white-space: nowrap; }" in narrow
-    # Ten tabs outgrow the header well above phone width: from 1320px down the
-    # nav is the part that scrolls, and the tools zone never shrinks or wraps.
-    mid = STYLE[STYLE.index("@media (max-width: 1320px) {"):]
-    mid = mid[:mid.index("\n}\n")]
-    assert STYLE.index("@media (max-width: 1320px) {") < STYLE.index("@media (max-width: 760px) {")
-    assert "nav { flex: 1 1 0; min-width: 0; gap: .8rem; overflow-x: auto;" in mid
-    assert "nav > * { flex: none; white-space: nowrap; }" in mid
-    assert ".tools { flex: 0 0 auto; }" in mid
-    assert "#snapshot { flex: none; white-space: nowrap; }" in mid
-    # A scrolled nav keeps the active tab in view and answers a plain wheel.
-    assert 'if (on) b.scrollIntoView?.({ block: "nearest", inline: "nearest" });' in show
-    assert 'document.querySelector("nav").addEventListener("wheel", (e) => {' in APP
-    assert "if (nav.scrollWidth <= nav.clientWidth || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;" in APP
+    assert "nav { flex: 1 1 0; min-width: 35%; }" in narrow
+
+
+def test_brand_truncation_is_scoped_to_the_header_and_never_reaches_document_headings():
+    # A bare h1 rule with nowrap/ellipsis would cut every rendered document
+    # and chat heading to one line.
+    for match in re.finditer(r"(?:^|[\n,{}])\s*([^{}\n]*\bh1\b[^{}\n]*)\{([^}]*)\}", STYLE):
+        selectors, body = match.group(1), match.group(2)
+        if not any(word in body for word in ("nowrap", "ellipsis", "overflow")):
+            continue
+        for selector in selectors.split(","):
+            if re.search(r"\bh1\b", selector):
+                assert selector.strip().startswith("header h1"), selector
+    assert rules_outside_media("header h1") == [
+        "min-width: 6rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"]
+    narrow = STYLE[STYLE.index("@media (max-width: 760px) {"):]
+    narrow = narrow[:narrow.index("\n}\n")]
+    assert "  header h1 { flex: 0 1 auto; min-width: 0; }" in narrow
+    assert not re.search(r"^  h1\b", narrow, re.MULTILINE)
+
+
+NAV_WHEEL = APP[APP.index("function navWheel(e) {"):APP.index("// Header chrome (spec #270)")]
+
+
+@needs_node
+def test_nav_wheel_scrolls_sideways_only_when_that_is_the_only_thing_to_do():
+    script = r"""
+const listeners = [];
+const document = {querySelector: (selector) => ({
+  addEventListener: (type, fn, options) => listeners.push([selector, type, fn.name, options])})};
+""" + NAV_WHEEL + r"""
+const run = (nav, event) => {
+  let prevented = 0;
+  const state = {scrollWidth: 1000, clientWidth: 400, scrollLeft: 0, ...nav};
+  navWheel({deltaX: 0, deltaY: 0, ctrlKey: false, ...event, currentTarget: state,
+    preventDefault() { prevented += 1; }});
+  return [state.scrollLeft, prevented];
+};
+console.log(JSON.stringify({
+  listeners,
+  down: run({}, {deltaY: 120}),
+  up: run({scrollLeft: 300}, {deltaY: -120}),
+  zoom: run({}, {deltaY: 120, ctrlKey: true}),
+  sideways: run({}, {deltaY: 10, deltaX: 40}),
+  fits: run({scrollWidth: 400}, {deltaY: 120}),
+  atStart: run({scrollLeft: 0}, {deltaY: -120}),
+  atEnd: run({scrollLeft: 600}, {deltaY: 120}),
+  nearEnd: run({scrollLeft: 599.5}, {deltaY: 120}),
+}));
+"""
+    assert run_js(script) == {
+        "listeners": [["nav", "wheel", "navWheel", {"passive": False}]],
+        "down": [120, 1], "up": [180, 1],
+        # Left to the browser: zoom, a sideways gesture, a nav that fits, and
+        # a nav already at the end the wheel is heading for (the page scrolls).
+        "zoom": [0, 0], "sideways": [0, 0], "fits": [0, 0],
+        "atStart": [0, 0], "atEnd": [600, 0], "nearEnd": [599.5, 0],
+    }
 
 
 def test_header_keeps_status_and_snapshot_and_gains_one_drawer_button():

@@ -143,8 +143,10 @@ def test_token_section_reads_the_stored_quota_and_never_probes_or_sweeps():
 
 
 def test_drawer_thresholds_are_its_own_and_the_full_view_keeps_80_and_95():
-    assert ('const drawerQuotaClass = (pct) => pct == null ? "" '
-            ': pct >= 90 ? " red" : pct >= 75 ? " amber" : "";') in TOKENS
+    assert 'return shown >= 90 ? " red" : shown >= 75 ? " amber" : "";' in TOKENS
+    # The figure classified is the figure displayed: both round to one decimal.
+    assert "const shown = Math.round(pct * 10) / 10;" in TOKENS
+    assert 'const anPct = (pct) => pct == null ? "n/a" : Math.round(pct * 10) / 10 + "%";' in APP
     assert ('const anQuotaClass = (pct) => pct == null ? "" '
             ': pct >= 95 ? " red" : pct >= 80 ? " amber" : "";') in APP
     assert "anQuotaClass(" not in TOKENS
@@ -218,19 +220,27 @@ def test_lane_css_block_closes_the_stylesheet_and_uses_tokens_only():
 
 # ── Behaviour under node ──────────────────────────────────────────────────────
 
+# A fixed clock: reset countdowns and reading ages are exact, not near a
+# rounding boundary that the wall clock can cross between two statements.
+FIXED_CLOCK = r"""
+const NOW = Date.parse("2026-03-04T12:00:00Z");
+Date.now = () => NOW;
+const at = (ms) => new Date(NOW + ms).toISOString();
+"""
+
+
 @needs_node
 def test_token_section_renders_weekly_percent_used_per_provider_from_one_get():
-    script = FAKE_DOM + API + QUOTA_HELPERS + TOKENS + r"""
+    script = FAKE_DOM + FIXED_CLOCK + API + QUOTA_HELPERS + TOKENS + r"""
 const calls = [];
-const soon = new Date(Date.now() + 3 * 3600e3 + 10 * 60e3 + 20e3).toISOString();
 const win = (window_kind, used_percent, extra = {}) => ({window_kind, used_percent, ...extra});
 const providers = [
   // Two weekly windows, listed out of order, beside non-weekly ones.
-  {provider: "anthropic", status: "ok", captured_at: new Date(Date.now() - 5 * 60e3).toISOString(),
+  {provider: "anthropic", status: "ok", captured_at: at(-5 * 60e3),
    windows: [win("weekly_scoped", 91.26, {scope: "opus"}), win("five_hour", 99),
-             win("weekly", 74.94, {resets_at: soon}), win("session", 100)]},
+             win("weekly", 74.94, {resets_at: at(3 * 3600e3 + 10 * 60e3)}), win("session", 100)]},
   // A weekly window whose percent the provider did not report.
-  {provider: "openai", status: "ok", captured_at: new Date(Date.now() - 2 * 3600e3 - 20e3).toISOString(),
+  {provider: "openai", status: "ok", captured_at: at(-2 * 3600e3),
    windows: [win("weekly", null), win("five_hour", 97)]},
   // Kimi: percent USED here, not the full view's "% left".
   {provider: "moonshot", status: "ok", captured_at: null, windows: [win("weekly", 28)]},
@@ -254,10 +264,9 @@ globalThis.fetch = async (url, init) => {
     .slice(1).map((n) => n.className);
   const link = mount.children[mount.children.length - 1];
   link.onclick();
-  const classes = [null, undefined, 0, 74.9, 75, 89.9, 90, 100, 140].map(drawerQuotaClass);
   console.log(JSON.stringify({calls, loading, tableClass: table.className, cells, pctClasses,
     note: text(mount.children[1]), sections: mount.children.length,
-    href: link.href, linkText: text(link), closed, classes}));
+    href: link.href, linkText: text(link), closed}));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
     assert run_js(script) == {
@@ -276,8 +285,23 @@ globalThis.fetch = async (url, init) => {
         # The oldest reading's age stands for the whole section.
         "note": "as of 2h ago", "sections": 3,
         "href": "#analytics-quota", "linkText": "Open full analytics →", "closed": 1,
-        "classes": ["", "", "", "", " amber", " amber", " red", " red", " red"],
     }
+
+
+@needs_node
+def test_drawer_colour_follows_the_displayed_figure_at_both_thresholds():
+    script = QUOTA_HELPERS + TOKENS + r"""
+const cases = [null, undefined, 0, 74.94, 74.96, 75, 89.94, 89.96, 90, 100, 140];
+console.log(JSON.stringify(cases.map((pct) => [anPct(pct), drawerQuotaClass(pct)])));
+"""
+    assert run_js(script) == [
+        ["n/a", ""], ["n/a", ""], ["0%", ""],
+        # 74.94 reads 74.9% and stays plain; 74.96 reads 75% and is amber.
+        ["74.9%", ""], ["75%", " amber"], ["75%", " amber"],
+        # 89.94 reads 89.9% and stays amber; 89.96 reads 90% and is red.
+        ["89.9%", " amber"], ["90%", " red"], ["90%", " red"],
+        ["100%", " red"], ["140%", " red"],
+    ]
 
 
 @needs_node
@@ -306,25 +330,67 @@ console.log(JSON.stringify({rows, none: drawerWeeklyRows(undefined)}));
 
 @needs_node
 def test_token_section_reports_no_reading_and_a_failed_read():
-    script = FAKE_DOM + API + QUOTA_HELPERS + TOKENS + r"""
+    # What the server returns before any probe has read anything: every
+    # provider it knows, with no reading time and no windows.
+    script = FAKE_DOM + FIXED_CLOCK + API + QUOTA_HELPERS + TOKENS + r"""
 let fail = false;
+const providers = ["anthropic", "openai", "moonshot"].map((provider) => (
+  {provider, status: null, detail: null, captured_at: null, windows: []}));
 globalThis.fetch = async () => fail
   ? {ok: false, statusText: "boom", json: async () => ({error: "db locked"})}
-  : {ok: true, json: async () => ({providers: []})};
+  : {ok: true, json: async () => ({providers, ttl_seconds: 60, probed: false, notes: []})};
 (async () => {
-  const empty = el("div");
-  renderDrawerTokens(empty, {close() {}});
+  const unread = el("div");
+  renderDrawerTokens(unread, {close() {}});
   await tick(); await tick();
   fail = true;
   const failed = el("div");
   renderDrawerTokens(failed, {close() {}});
   await tick(); await tick();
-  console.log(JSON.stringify({empty: empty.children.map(text), failed: failed.children.map(text)}));
+  console.log(JSON.stringify({
+    unread: unread.children.map((node) => node.className),
+    cells: unread.children[0].children.map(text),
+    coloured: unread.children[0].children.map((n) => n.className).filter((c) => /amber|red/.test(c)),
+    failed: failed.children.map(text)}));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
     assert run_js(script) == {
-        "empty": ["No probe has run yet.", "Open full analytics →"],
+        # Rows and the link only: with no reading there is no "as of" line.
+        "unread": ["drawer-quota", "drawer-link"],
+        "cells": ["Weekly limit", "Resets", "Used",
+                  "Claude", "—", "n/a", "Codex", "—", "n/a", "Kimi", "—", "n/a"],
+        "coloured": [],
         "failed": ["quota error: db locked", "Open full analytics →"],
+    }
+    assert "No probe has run yet." not in TOKENS
+
+
+@needs_node
+def test_token_section_paints_nothing_once_closed_whether_the_read_lands_or_fails():
+    script = FAKE_DOM + FIXED_CLOCK + API + QUOTA_HELPERS + TOKENS + r"""
+const pending = [];
+globalThis.fetch = () => new Promise((resolve) => pending.push(resolve));
+const providers = [{provider: "anthropic", status: "ok", captured_at: at(-60e3),
+  windows: [{window_kind: "weekly", used_percent: 95}]}];
+(async () => {
+  const landed = el("div"), failed = el("div"), open = el("div");
+  const closeLanded = renderDrawerTokens(landed, {close() {}});
+  const closeFailed = renderDrawerTokens(failed, {close() {}});
+  renderDrawerTokens(open, {close() {}});
+  closeLanded(); closeFailed();
+  pending[0]({ok: true, json: async () => ({providers})});
+  pending[1]({ok: false, statusText: "boom", json: async () => ({error: "db locked"})});
+  pending[2]({ok: false, statusText: "boom", json: async () => ({error: "db locked"})});
+  await tick(); await tick(); await tick();
+  console.log(JSON.stringify({landed: landed.children.map(text),
+    failed: failed.children.map(text), open: open.children.map(text)}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    assert run_js(script) == {
+        "landed": ["Loading…", "Open full analytics →"],
+        "failed": ["Loading…", "Open full analytics →"],
+        # The same failure on a section still open does paint.
+        "open": ["quota error: db locked", "Open full analytics →"],
     }
 
 

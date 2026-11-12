@@ -3191,14 +3191,22 @@ async function renderWorktrees(root, opts = {}) {
 // order and labels stay with the drawer and only the bodies live here.
 
 // Tokens: how close each provider is to its WEEKLY limit, as percent used.
-// One read of the stored provider-quota reading the Analytics → Provider Quota
-// view uses (60s TTL on the server); the drawer never forces a probe — that
-// control lives in the full view, which the link opens.
+// One GET of the same route the Analytics → Provider Quota view reads. The
+// server answers from the stored reading, first re-probing the providers
+// itself when its last attempt is older than its 60s TTL — so opening the
+// drawer can cost one probe a minute at most. The drawer never calls the
+// forced route; that control lives in the full view, which the link opens.
 //
 // below 75 normal · 75+ amber · 90+ red. These are the drawer's own, earlier
 // than the full view's 80/95 (anQuotaClass): this is the early-warning glance.
+// The colour is chosen from the figure as DISPLAYED (anPct rounds to one
+// decimal), so a row reading "75%" is amber and one reading "74.9%" is not.
 // NULL has no class: an absent number is not a low one.
-const drawerQuotaClass = (pct) => pct == null ? "" : pct >= 90 ? " red" : pct >= 75 ? " amber" : "";
+const drawerQuotaClass = (pct) => {
+  if (pct == null) return "";
+  const shown = Math.round(pct * 10) / 10;
+  return shown >= 90 ? " red" : shown >= 75 ? " amber" : "";
+};
 const DRAWER_WEEKLY_KINDS = ["weekly", "weekly_scoped"];
 // One row per weekly window, and every provider gets at least one row: a
 // provider with no weekly window reads "n/a", never 0% and never a missing
@@ -3233,8 +3241,9 @@ function renderDrawerTokens(mount, { close }) {
   let closed = false;
   api("/analytics/quota").then((data) => {
     if (closed) return;
+    // The server lists every provider it knows, read or not, so there is no
+    // empty state: a provider never read is a row reading "n/a".
     const providers = data.providers || [];
-    if (!providers.length) { body.textContent = "No probe has run yet."; return; }
     const table = el("div", { className: "drawer-quota" });
     table.append(
       el("span", { className: "drawer-quota-head" }, "Weekly limit"),
@@ -9137,13 +9146,18 @@ $("#snapshot").onclick = async () => {
 };
 // In a window too narrow for all ten tabs the nav scrolls sideways with no
 // scrollbar; a plain mouse wheel has no sideways axis, so turn it into one
-// there. A nav that fits, or a gesture that is already sideways, is left alone.
-document.querySelector("nav").addEventListener("wheel", (e) => {
+// there. Everything else is left to the browser: ctrl+wheel and trackpad pinch
+// (zoom), a gesture that is already sideways, a nav that fits, and a nav
+// already at the end the wheel is heading for — so the page still scrolls.
+function navWheel(e) {
   const nav = e.currentTarget;
-  if (nav.scrollWidth <= nav.clientWidth || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+  const room = nav.scrollWidth - nav.clientWidth;
+  if (e.ctrlKey || room <= 0 || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+  if (e.deltaY < 0 ? nav.scrollLeft <= 0 : nav.scrollLeft >= room - 1) return;
   nav.scrollLeft += e.deltaY;
   e.preventDefault();
-}, { passive: false });
+}
+document.querySelector("nav").addEventListener("wheel", navWheel, { passive: false });
 // Header chrome (spec #270): the settings drawer button.
 $("#drawer-open").onclick = openSettingsDrawer;
 (async () => {
