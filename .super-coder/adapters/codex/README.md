@@ -282,11 +282,13 @@ and is unaffected otherwise.
 | `session` | `event`, `thread.started`, field `thread_id` | the session reference is read from the event stream |
 | `resume` | subcommand `resume`, `-c sandbox_mode="danger-full-access"` | `codex exec resume <id> -`; that subcommand has no `--sandbox` or `-C` option, so the policy travels as config |
 
-From `codex exec --help` and `codex exec resume --help` on codex-cli 0.167.1,
-2026-11-12. **No model request was made**: the model named for this check
-matched two catalogue ids, so the live run is pending. The event names
-`thread.started` and `thread_id` are present in the installed binary; the
-`--json` stream, the `-o` file and the resume form have not been observed in a
-run, and continue is unproven until they are. Observed without a request:
-SIGTERM while `codex exec -` waits on standard input ends the process by the
-signal (status -15).
+Checked on codex-cli 0.167.1, 2026-11-12, model `gpt-6-luna` at effort `low`,
+two requests: one launch and one `codex exec resume <id> -` that recalled the
+first reply. The `--json` stream is `thread.started` (with `thread_id`),
+`turn.started`, `item.completed` (an `agent_message` item) and
+`turn.completed`; the `-o` file holds the final message alone; the resumed run
+reports the same `thread_id`, and the `-c sandbox_mode=…` form was accepted.
+Both runs were made outside a repository and so also carried
+`--skip-git-repo-check`, which a subagent's worktree does not need. Observed
+without a request: SIGTERM while `codex exec -` waits on standard input ends
+the process by the signal (status -15).

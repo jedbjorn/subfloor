@@ -294,27 +294,34 @@ class RecordedRunTest(unittest.TestCase):
                         command.session, resumed["stdout"], command.session_ref),
                     resumed["session_ref"])
 
-    def test_codex_is_built_from_help_and_awaits_its_live_run(self):
+    def test_codex_launch_and_resume_match_the_recorded_runs(self):
+        # The recordings were made outside a repository, so they carry one flag
+        # a subagent's worktree never needs; everything else must be identical,
+        # in order.
         record = HARNESSES["codex"]
-        self.assertFalse(record["live"])
-        self.assertIsNone(record["continue_works"])
-        command = build("codex", "model-x")
-        self.assertEqual(
-            job_agent.read_session(command.session, record["expected_stdout"]),
-            record["expected_session_ref"])
-        with tempfile.TemporaryDirectory() as tmp:
-            self.assertIsNone(job_agent.read_result(command.result, "", Path(tmp)))
-            (Path(tmp) / "last-message.md").write_text(NONCE)
-            self.assertEqual(job_agent.read_result(command.result, "", Path(tmp)), NONCE)
+        self.assertTrue(record["live"])
+        self.assertTrue(record["continue_works"])
+        scratch = set(record["scratch_only_flags"])
+        for step, session in (("launch", None), ("resume", record["resume"]["session_ref"])):
+            with self.subTest(step=step):
+                run = record[step]
+                command = build(
+                    "codex", record["model"], record["effort"], resume_session=session)
+                self.assertEqual(command.argv, [a for a in run["argv"] if a not in scratch])
+                self.assertEqual(command.stdin, "{run_dir}/brief.md")
+                self.assertEqual(
+                    job_agent.read_session(command.session, run["stdout"]), run["session_ref"])
+                with tempfile.TemporaryDirectory() as tmp:
+                    self.assertIsNone(job_agent.read_result(command.result, "", Path(tmp)))
+                    (Path(tmp) / "last-message.md").write_text(run["last_message_file"])
+                    self.assertEqual(
+                        job_agent.read_result(command.result, run["stdout"], Path(tmp)), NONCE)
+        # The resumed run reports the session it continued.
+        self.assertEqual(record["resume"]["session_ref"], record["launch"]["session_ref"])
         # `codex exec resume` has no --sandbox option; the policy travels as config.
         self.assertFalse(record["from_help"]["resume_has_sandbox_flag"])
-        resumed = build("codex", "model-x", "low", resume_session="thread-1")
-        self.assertEqual(
-            resumed.argv,
-            ["codex", "exec", "resume", "-m", "model-x", "-c", 'model_reasoning_effort="low"',
-             "-c", 'sandbox_mode="danger-full-access"', "--json",
-             "-o", "{run_dir}/last-message.md", "thread-1", "-"],
-        )
+        self.assertIn('sandbox_mode="danger-full-access"', record["resume"]["argv"])
+        self.assertNotIn("--sandbox", record["resume"]["argv"])
 
     def test_a_run_without_a_final_message_has_none(self):
         for harness in ("claude", "kimi", "opencode"):

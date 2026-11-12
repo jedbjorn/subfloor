@@ -55,25 +55,67 @@
     },
     "codex": {
       "cli_version": "codex-cli 0.167.1",
-      "live": false,
-      "pending": "no live run: the model named for Codex matched two catalogue ids",
-      "requests": 0,
+      "live": true,
+      "model": "gpt-6-luna",
+      "effort": "low",
+      "requests": 2,
       "brief": "stdin",
+      "scratch_only_flags": [
+        "--skip-git-repo-check"
+      ],
+      "launch": {
+        "argv": [
+          "codex",
+          "exec",
+          "-m",
+          "gpt-6-luna",
+          "-c",
+          "model_reasoning_effort=\"low\"",
+          "--sandbox",
+          "danger-full-access",
+          "--json",
+          "-o",
+          "{run_dir}/last-message.md",
+          "--skip-git-repo-check",
+          "-"
+        ],
+        "exit_code": 0,
+        "stdout": "{\"type\":\"thread.started\",\"thread_id\":\"00000000-0000-7000-8000-0000000000d1\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"<str>\",\"type\":\"agent_message\",\"text\":\"NONCE-7f3a\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":0,\"reasoning_output_tokens\":0}}\n",
+        "last_message_file": "NONCE-7f3a",
+        "session_ref": "00000000-0000-7000-8000-0000000000d1"
+      },
+      "resume": {
+        "argv": [
+          "codex",
+          "exec",
+          "resume",
+          "-m",
+          "gpt-6-luna",
+          "-c",
+          "model_reasoning_effort=\"low\"",
+          "-c",
+          "sandbox_mode=\"danger-full-access\"",
+          "--json",
+          "-o",
+          "{run_dir}/last-message.md",
+          "--skip-git-repo-check",
+          "00000000-0000-7000-8000-0000000000d1",
+          "-"
+        ],
+        "exit_code": 0,
+        "stdout": "{\"type\":\"thread.started\",\"thread_id\":\"00000000-0000-7000-8000-0000000000d1\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"<str>\",\"type\":\"agent_message\",\"text\":\"NONCE-7f3a\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":0,\"reasoning_output_tokens\":0}}\n",
+        "last_message_file": "NONCE-7f3a",
+        "session_ref": "00000000-0000-7000-8000-0000000000d1",
+        "recalled_nonce": true
+      },
       "from_help": {
-        "launch": "codex exec [OPTIONS] [PROMPT]; `-` reads the prompt from stdin",
-        "final_message": "-o, --output-last-message <FILE>",
-        "events": "--json prints events to stdout as JSONL",
-        "resume": "codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]; `-` reads stdin",
         "resume_has_sandbox_flag": false,
         "resume_has_cd_flag": false
       },
-      "expected_stdout": "{\"type\":\"thread.started\",\"thread_id\":\"00000000-0000-4000-8000-0000000000d1\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"<str>\",\"type\":\"agent_message\",\"text\":\"NONCE-7f3a\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}\n",
-      "expected_stdout_basis": "event names present in the installed binary; shape not observed in a run",
-      "expected_session_ref": "00000000-0000-4000-8000-0000000000d1",
       "observed": {
         "sigterm_before_brief_exit_code": -15
       },
-      "continue_works": null
+      "continue_works": true
     },
     "kimi": {
       "cli_version": "2.5.3",
