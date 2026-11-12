@@ -5202,7 +5202,10 @@ async function chatCloseForSwitch(conversation) {
 // Feature #95 — the context meter and the compaction marker. Every figure
 // here is one the harness reported. A size or a window that was not
 // reported is null and renders as nothing: no figure is ever guessed.
-// A reply's label: "84k · 33%" with a known window, "84k tok" without one.
+// Every percentage is of the chat's auto-compact window (decision #451), not
+// of the model's full window: 100% is where the harness compacts. A chat
+// with no auto-compact window gets no percentage.
+// A reply's label: "84k · 70%" with a compact window, "84k tok" without one.
 function chatContextTokenLabel(value, windowTokens = null) {
   const size = chatTokenCount(value);
   if (size === null) return "";
@@ -5220,7 +5223,9 @@ function chatShortTokens(value) {
   return value >= 1000 ? `${Math.round(value / 1000)}k` : String(value);
 }
 
-// The share of the window in use, or "" when the window is unknown.
+// The share of the window in use, or "" when the window is unknown. Not
+// capped: a context past the compact window reads above 100%, which says
+// the harness has not compacted at the size the engine asked for.
 function chatContextPercent(value, windowTokens) {
   const size = chatTokenCount(value);
   const total = chatTokenCount(windowTokens);
@@ -5240,9 +5245,18 @@ function chatContextTokenTitle(value, windowTokens = null, measured = false) {
       + "not a measured context size";
   const total = chatTokenCount(windowTokens);
   return total
-    ? `${fmt(size)} of ${fmt(total)} tokens in context on this reply's last model request`
+    ? `${fmt(size)} tokens in context on this reply's last model request, `
+      + `${chatContextPercent(size, total)} of the ${fmt(total)}-token `
+      + "auto-compact window"
     : `${fmt(size)} tokens in context on this reply's last model request; `
-      + "the harness has not reported this model's window";
+      + "no auto-compact window applies to this chat";
+}
+
+// The window the percentages are of: the auto-compact window the engine
+// applies to this chat, or null when it applies none (Kimi, OpenCode, a
+// setting of off, or a model whose window is smaller than the setting).
+function chatContextBasis(context) {
+  return chatTokenCount(context?.compact_window) || null;
 }
 
 function chatUpdateContextTokens(
@@ -5263,25 +5277,24 @@ function chatUpdateContextTokens(
   label.title = chatContextTokenTitle(value, windowTokens, measured);
 }
 
-// "Auto-compacts at 120k", when the engine applies a window to this chat.
-// Claude's figure is the window it compacts within, so it fires below it.
+// When the harness compacts against the window. Claude's figure is the
+// window it compacts within, so it fires somewhat below 100%.
 function chatCompactWindowNote(context, harness) {
-  const applied = chatTokenCount(context?.compact_window);
-  if (!applied) return "";
+  if (!chatContextBasis(context)) return "";
   return harness === "claude"
-    ? `Auto-compacts within a ${chatShortTokens(applied)} window (fires somewhat below it).`
-    : `Auto-compacts at ${chatShortTokens(applied)}.`;
+    ? "Claude compacts within this window, so it fires somewhat below 100%."
+    : "The harness compacts when the context reaches 100%.";
 }
 
-// The chat-level meter beside the composer: the latest size, and the share
-// of the window when the harness has stated one.
+// The chat-level meter beside the composer: the latest size, and its share
+// of the chat's auto-compact window when the engine applies one.
 function chatContextMeterText(context) {
   const size = chatTokenCount(context?.context_tokens);
   if (size === null) return "";
-  const total = chatTokenCount(context?.context_window);
-  const percent = chatContextPercent(size, total);
+  const basis = chatContextBasis(context);
+  const percent = chatContextPercent(size, basis);
   return percent
-    ? `Context ${chatShortTokens(size)} · ${percent} of ${chatShortTokens(total)}`
+    ? `Context ${chatShortTokens(size)} · ${percent} of ${chatShortTokens(basis)} compact window`
     : `Context ${chatShortTokens(size)}`;
 }
 
@@ -5290,15 +5303,24 @@ function chatPaintContextMeter(node, context, harness = null) {
   node.hidden = !text;
   node.textContent = text;
   const size = chatTokenCount(context?.context_tokens);
-  const total = chatTokenCount(context?.context_window);
-  const reading = !text ? ""
-    : total
-      ? `${fmt(size)} of ${fmt(total)} tokens in context on the latest model request.`
-      : `${fmt(size)} tokens in context on the latest model request; `
-        + "the harness has not reported this model's window, so no percentage is shown.";
-  const note = chatCompactWindowNote(context, harness);
-  node.title = reading && note ? `${reading} ${note}` : reading;
-  const share = total ? size / total : 0;
+  const basis = chatContextBasis(context);
+  const model = chatTokenCount(context?.context_window);
+  const parts = [];
+  if (text && basis) {
+    parts.push(`${fmt(size)} tokens in context on the latest model request, `
+      + `${chatContextPercent(size, basis)} of the ${fmt(basis)}-token `
+      + "auto-compact window the engine applies to this chat.");
+    parts.push(chatCompactWindowNote(context, harness));
+    if (size > basis)
+      parts.push("Above 100%: the context is past the window and has not "
+        + "been compacted yet.");
+  } else if (text) {
+    parts.push(`${fmt(size)} tokens in context on the latest model request. `
+      + "No auto-compact window applies to this chat, so no percentage is shown.");
+  }
+  if (text && model) parts.push(`The model's full window is ${fmt(model)} tokens.`);
+  node.title = parts.join(" ");
+  const share = basis ? size / basis : 0;
   node.classList.toggle("chat-context-high", share >= 0.8);
 }
 
@@ -5613,7 +5635,7 @@ function chatBubble(
   if (meta) bubble.append(el("div", { className: "chat-meta" }, meta));
   if (kind === "assistant") {
     const windowTokens = contextMeasured
-      ? conversation?.context?.context_window : null;
+      ? chatContextBasis(conversation?.context) : null;
     const tokenLabel = chatContextTokenLabel(contextTokens, windowTokens);
     if (tokenLabel)
       bubble.append(el("div", {
@@ -6881,7 +6903,7 @@ function chatUpdateTranscriptNode(node, item, retry, conversation) {
     body.replaceChildren(...rendered.childNodes);
     chatWireLocalFileLinks(body, conversation);
     chatUpdateContextTokens(
-      node, item.context_tokens, conversation?.context?.context_window,
+      node, item.context_tokens, chatContextBasis(conversation?.context),
       Boolean(item.context_measured));
     return;
   }
@@ -7984,7 +8006,8 @@ async function chatRenderOpen(
       conversation.context ||= {
         context_tokens: null, context_window: null, measured_at: null,
       };
-      // A window learned mid-chat gives every loaded reply its percentage.
+      // A model window learned mid-chat can rule out the compact window
+      // (a smaller model keeps the harness default): repaint every reply.
       if (chatApplyContextEvent(conversation.context, event))
         for (const item of transcriptState.items.values())
           if (item.kind === "assistant") transcriptState.dirty.add(item.item_id);

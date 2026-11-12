@@ -206,20 +206,40 @@ harness's own compaction earlier and visible.
   scope (recorded earlier, or from Kimi) still labels its reply as before but
   never drives the meter.
 - **The meter** is the latest `request` reading, or the size a newer
-  compaction left behind, with a percentage only when a window is known. The
-  transcript projection returns it as `context`
+  compaction left behind. The transcript projection returns it as `context`
   (`context_tokens`, `context_window`, `measured_at`, `sequence`), each `null`
   when unknown. Nothing is estimated. `context.compact_window` is the
   auto-compact window the engine applies to that chat (`null` when the
-  harness has none, the setting is `off`, or the model's window is smaller);
-  the meter's tooltip states it. Each assistant item carries
-  `context_measured`: true only when its figure is a `request` reading, so a
-  figure of another meaning gets no percentage and a tooltip that says so.
+  harness has none, the setting is `off`, or the model's window is smaller).
+- **The percentage is of the compact window**, not of the model's window
+  (decision #451), so 100% is where the harness compacts:
+  `Context 95k · 79% of 120k compact window` on a Claude Haiku chat with a
+  1,000,000-token model window, `Context 84k · 70% of 120k compact window`
+  on a Codex chat with a 258,400-token one. It is shown only when
+  `compact_window` is set; a Kimi or OpenCode chat, a setting of `off`, or a
+  model whose window is smaller than the setting shows the size alone, and
+  the tooltip says no auto-compact window applies. The percentage is not
+  capped: a context past the window reads above 100% (for example `125%`),
+  which says the harness has not compacted at the size the engine asked for,
+  and the tooltip says so. Claude compacts within its window, so it fires
+  somewhat below 100%; the tooltip says that too. The tooltip also states the
+  model's full window when the harness reported one. The meter turns to its
+  high style at 80% of the compact window. The per-reply label (`84k · 70%`)
+  uses the same basis. The page computes the percentage (rounded to a whole
+  number); the server sends only the token counts. Each assistant item
+  carries `context_measured`: true only when its figure is a `request`
+  reading, so a figure of another meaning gets no percentage and a tooltip
+  that says so.
 - **`message.reground`** records that the engine appended the re-ground line
   to the text it dispatched for that message. The broker adds the line to the
   first message sent to a resumed session after a compaction (operator
   messages and engine wakes alike), once per compaction. The stored message,
-  the boot file and the system prompt are never changed.
+  the boot file and the system prompt are never changed. The line is the
+  same for every harness and is a direct instruction (decision #451):
+
+  > Your context was compacted. Your first action this turn, before you
+  > reply: run `sc mem get state`. If you carry a task or work unit, also run
+  > `sc context --task <id>` or `sc context --work-unit <id>`.
 - **Claude's marker says "summary".** Claude's figure after is the summary
   alone; the next request also carries the system prompt and tools and is
   several times larger. Its marker reads

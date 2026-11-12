@@ -24,10 +24,12 @@ LOG = logging.getLogger(__name__)
 # The engine-added line. It is appended to the dispatched text only: the
 # stored message, the boot file and the system prompt are never touched, so
 # the cached prefix of the chat is unchanged.
+# Worded as a direct instruction with the exact commands (decision #451): in
+# live tests an advisory line was read and not acted on.
 REGROUND_LINE = (
-    "Your context was compacted since your last turn. Before continuing, "
-    "re-read your durable state: `sc mem get state`, and the projection for "
-    "any task or work unit you are carrying."
+    "Your context was compacted. Your first action this turn, before you "
+    "reply: run `sc mem get state`. If you carry a task or work unit, also "
+    "run `sc context --task <id>` or `sc context --work-unit <id>`."
 )
 
 # One engine setting per harness, read from the server process environment

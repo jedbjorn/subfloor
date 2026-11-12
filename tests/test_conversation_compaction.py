@@ -1329,16 +1329,28 @@ apply("context.compacted", {trigger: "auto", tokens_before: 123400, tokens_after
 apply("context.compacted", {trigger: "unknown"});
 console.log(JSON.stringify({
   reply: [
-    chatContextTokenLabel(84000, 258400), chatContextTokenLabel(84000, null),
-    chatContextTokenLabel(850, null), chatContextTokenLabel(null, 258400),
-    chatContextTokenLabel(84000, 0),
+    chatContextTokenLabel(84000, 120000), chatContextTokenLabel(84000, null),
+    chatContextTokenLabel(850, null), chatContextTokenLabel(null, 120000),
+    chatContextTokenLabel(84000, 0), chatContextTokenLabel(150000, 120000),
+  ],
+  basis: [
+    chatContextBasis({compact_window: 120000, context_window: 1000000}),
+    chatContextBasis({compact_window: null, context_window: 258400}),
+    chatContextBasis({context_window: 258400}),
+    chatContextBasis(undefined),
   ],
   meter: [
-    meter({context_tokens: 84000, context_window: 258400}),
-    meter({context_tokens: 84000, context_window: null}),
-    meter({context_tokens: null, context_window: 258400}),
+    meter({context_tokens: 84000, context_window: 258400, compact_window: 120000}),
+    meter({context_tokens: 84000, context_window: null, compact_window: null}),
+    meter({context_tokens: null, context_window: 258400, compact_window: 120000}),
     meter(undefined),
-    meter({context_tokens: 230000, context_window: 258400}),
+    meter({context_tokens: 100000, context_window: 258400, compact_window: 120000}),
+    // Haiku: a 1M model window, the default 120k compact window.
+    meter({context_tokens: 95000, context_window: 1000000, compact_window: 120000}),
+    // Past the window: not capped.
+    meter({context_tokens: 150000, context_window: 258400, compact_window: 120000}),
+    // No compact window (off, Kimi, OpenCode): the model window gives no %.
+    meter({context_tokens: 230000, context_window: 258400, compact_window: null}),
   ],
   marker: [
     chatCompactionLabel({trigger: "auto", tokens_before: 123400, tokens_after: 28100}),
@@ -1352,27 +1364,40 @@ console.log(JSON.stringify({
     const tip = (context, harness) => { chatPaintContextMeter(node, context, harness); return node.title; };
     return [
       tip({context_tokens: 84000, context_window: 258400, compact_window: 120000}, "codex"),
-      tip({context_tokens: 84000, context_window: 1000000, compact_window: 120000}, "claude"),
+      tip({context_tokens: 95000, context_window: 1000000, compact_window: 120000}, "claude"),
       tip({context_tokens: 84000, context_window: 258400, compact_window: null}, "codex"),
       tip({context_tokens: null, context_window: 258400, compact_window: 120000}, "codex"),
-      chatContextTokenTitle(84000, 258400, true),
+      tip({context_tokens: 150000, context_window: null, compact_window: 120000}, "codex"),
+      tip({context_tokens: 84000, context_window: null, compact_window: null}, "opencode"),
+      chatContextTokenTitle(84000, 120000, true),
       chatContextTokenTitle(84000, null, true),
-      chatContextTokenTitle(12345, 258400, false),
-      chatContextTokenTitle(null, 258400, true),
+      chatContextTokenTitle(12345, 120000, false),
+      chatContextTokenTitle(null, 120000, true),
     ];
   })(),
 }));
 """
     )
     result = run_js(script)
-    assert result["reply"] == ["84k · 33%", "84k tok", "850 tok", "", "84k tok"]
+    # Every percentage is of the auto-compact window (decision #451).
+    assert result["reply"] == [
+        "84k · 70%", "84k tok", "850 tok", "", "84k tok", "150k · 125%",
+    ]
+    assert result["basis"] == [120000, None, None, None]
     assert result["meter"] == [
-        {"hidden": False, "text": "Context 84k · 33% of 258k", "high": False},
+        {"hidden": False, "text": "Context 84k · 70% of 120k compact window",
+         "high": False},
         {"hidden": False, "text": "Context 84k", "high": False},
         # A window with no size, and no reading at all, show nothing.
         {"hidden": True, "text": "", "high": False},
         {"hidden": True, "text": "", "high": False},
-        {"hidden": False, "text": "Context 230k · 89% of 258k", "high": True},
+        {"hidden": False, "text": "Context 100k · 83% of 120k compact window",
+         "high": True},
+        {"hidden": False, "text": "Context 95k · 79% of 120k compact window",
+         "high": False},
+        {"hidden": False, "text": "Context 150k · 125% of 120k compact window",
+         "high": True},
+        {"hidden": False, "text": "Context 230k", "high": False},
     ]
     assert result["marker"] == [
         "Context compacted · 123k → 28k · automatic",
@@ -1392,21 +1417,107 @@ console.log(JSON.stringify({
         (False, None, 258400),      # no size stated: unknown, not the old one
     ]
     assert result["tips"] == [
-        "84,000 of 258,400 tokens in context on the latest model request. "
-        "Auto-compacts at 120k.",
-        "84,000 of 1,000,000 tokens in context on the latest model request. "
-        "Auto-compacts within a 120k window (fires somewhat below it).",
-        # No window applied to this chat: nothing is said about one.
-        "84,000 of 258,400 tokens in context on the latest model request.",
+        "84,000 tokens in context on the latest model request, 70% of the "
+        "120,000-token auto-compact window the engine applies to this chat. "
+        "The harness compacts when the context reaches 100%. "
+        "The model's full window is 258,400 tokens.",
+        "95,000 tokens in context on the latest model request, 79% of the "
+        "120,000-token auto-compact window the engine applies to this chat. "
+        "Claude compacts within this window, so it fires somewhat below 100%. "
+        "The model's full window is 1,000,000 tokens.",
+        # No window applied to this chat: no percentage, and it says why.
+        "84,000 tokens in context on the latest model request. No auto-compact "
+        "window applies to this chat, so no percentage is shown. "
+        "The model's full window is 258,400 tokens.",
         # No reading: the meter is hidden and has no tooltip.
         "",
-        "84,000 of 258,400 tokens in context on this reply's last model request",
+        "150,000 tokens in context on the latest model request, 125% of the "
+        "120,000-token auto-compact window the engine applies to this chat. "
+        "The harness compacts when the context reaches 100%. "
+        "Above 100%: the context is past the window and has not been "
+        "compacted yet.",
+        "84,000 tokens in context on the latest model request. No auto-compact "
+        "window applies to this chat, so no percentage is shown.",
+        "84,000 tokens in context on this reply's last model request, 70% of "
+        "the 120,000-token auto-compact window",
         "84,000 tokens in context on this reply's last model request; "
-        "the harness has not reported this model's window",
+        "no auto-compact window applies to this chat",
         # A figure that is not a measured context size says so.
         "12,345 tokens reported for this reply; not a measured context size",
         "",
     ]
+
+
+
+def test_reply_labels_use_the_compact_window_not_the_model_window() -> None:
+    # Both reply-label paths (the bubble and its live repaint) take their
+    # percentage from the compact window, like the meter (decision #451).
+    assert APP.count("chatContextBasis(conversation?.context)") == 2
+    assert "conversation?.context?.context_window" not in APP
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_a_smaller_model_window_learned_live_drops_the_percentage() -> None:
+    script = (
+        "const fmt = (n) => n.toLocaleString('en-US');\n"
+        "const el = (tag, props = {}) => ({tag, ...props});\n"
+        + CONTEXT_HELPERS
+        + r"""
+const node = {hidden: false, textContent: "", title: "",
+  classList: {flags: {}, toggle(name, on) { this.flags[name] = on; }}};
+const context = {context_tokens: 60000, context_window: null, compact_window: 120000};
+chatPaintContextMeter(node, context, "codex");
+const before = node.textContent;
+const repaint = chatApplyContextEvent(context, {event_type: "usage", created_at: "t",
+  payload: {scope: "request", context_tokens: 60000, context_window: 96000}});
+chatPaintContextMeter(node, context, "codex");
+console.log(JSON.stringify({before, repaint, after: node.textContent,
+  basis: chatContextBasis(context)}));
+"""
+    )
+    result = run_js(script)
+    assert result == {
+        "before": "Context 60k · 50% of 120k compact window",
+        "repaint": True,
+        # The harness default applies, which the engine does not know.
+        "after": "Context 60k",
+        "basis": None,
+    }
+
+
+class RegroundLineWordingTest(unittest.TestCase):
+    """Decision #451: a direct instruction naming the exact commands."""
+
+    def test_line_is_an_instruction_with_the_exact_commands(self) -> None:
+        self.assertEqual(
+            LINE,
+            "Your context was compacted. Your first action this turn, before "
+            "you reply: run `sc mem get state`. If you carry a task or work "
+            "unit, also run `sc context --task <id>` or "
+            "`sc context --work-unit <id>`.",
+        )
+        self.assertNotIn("\n", LINE)
+        self.assertLessEqual(len(LINE), 200)
+
+    def test_the_named_commands_exist(self) -> None:
+        # `sc context` dispatches to task_context.py, whose selector takes
+        # exactly --task and --work-unit; `sc mem get` takes `state`.
+        dispatch = (SCRIPTS / "dispatch.sh").read_text(encoding="utf-8")
+        self.assertIn('context)      sc_project_env; exec "$PY" "$S/task_context.py"',
+                      dispatch)
+        source = (SCRIPTS / "task_context.py").read_text(encoding="utf-8")
+        self.assertIn('sel.add_argument("--task"', source)
+        self.assertIn('sel.add_argument("--work-unit"', source)
+        mem = (SCRIPTS / "mem.py").read_text(encoding="utf-8")
+        self.assertIn("./sc mem get <surface>", mem)
+        self.assertIn("# state|", mem)
+
+    def test_every_harness_gets_the_same_line(self) -> None:
+        # One definition: the broker appends it for every harness.
+        self.assertEqual(
+            conversation_compaction.with_reground("carry on"),
+            f"carry on\n\n{LINE}",
+        )
 
 
 def test_chat_view_wires_the_marker_meter_and_listeners() -> None:

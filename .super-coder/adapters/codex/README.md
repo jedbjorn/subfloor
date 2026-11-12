@@ -239,7 +239,9 @@ Checked on `codex-cli 0.167.1`, 2026-11-12, with one small model request.
   part) is the context size of the latest request, and `modelContextWindow`
   is kept as the window, exactly as Codex reports it (258,400 for a 272,000
   model: Codex states 95%). The zero-input update after a compaction reads as
-  its total, never as 0.
+  its total, never as 0. The meter's percentage is of the compact window, not
+  of `modelContextWindow` (decision #451); the model window decides only
+  whether the compact window applies, and the tooltip states it.
 - **Manual compaction.** `thread/compact/start` with `{"threadId": …}`, sent
   after `thread/resume` in a new app-server (the engine's process-per-message
   shape). Run once on 0.167.1, 2026-11-12, on a one-turn scratch thread with
