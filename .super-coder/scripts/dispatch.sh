@@ -305,9 +305,15 @@ sc_host_server_up() {
   # The transient unit starts from the user manager's environment, not this
   # one. A non-default XDG_STATE_HOME selects where this install's private
   # engine state lives, so carry it across or the server resolves a different
-  # (or missing) instance than the launcher that started it.
+  # (or missing) instance than the launcher that started it. The browser-chat
+  # compaction settings are read by that server, so each one that is set here
+  # is carried across the same way; an unset one is left to its default.
   if ! systemd-run --user --quiet --collect --unit "$HOST_SERVER_UNIT" \
-      ${XDG_STATE_HOME:+"--setenv=XDG_STATE_HOME=$XDG_STATE_HOME"} -- \
+      ${XDG_STATE_HOME:+"--setenv=XDG_STATE_HOME=$XDG_STATE_HOME"} \
+      ${SC_CHAT_COMPACT_WINDOW_CLAUDE:+"--setenv=SC_CHAT_COMPACT_WINDOW_CLAUDE=$SC_CHAT_COMPACT_WINDOW_CLAUDE"} \
+      ${SC_CHAT_COMPACT_WINDOW_CODEX:+"--setenv=SC_CHAT_COMPACT_WINDOW_CODEX=$SC_CHAT_COMPACT_WINDOW_CODEX"} \
+      ${SC_CHAT_COLD_RETURN_TOKENS:+"--setenv=SC_CHAT_COLD_RETURN_TOKENS=$SC_CHAT_COLD_RETURN_TOKENS"} \
+      ${SC_CHAT_COLD_RETURN_MINUTES:+"--setenv=SC_CHAT_COLD_RETURN_MINUTES=$SC_CHAT_COLD_RETURN_MINUTES"} -- \
       /bin/sh -c 'printf "%s\n" "$$$$" > "$1"; exec env SC_BIND=127.0.0.1 PYTHONUNBUFFERED=1 "$2" "$3" --port "$4" >> "$5" 2>&1' \
       sc-host-server "$HOST_SERVER_PID" "$PY" "$ENGINE/api/server.py" "$host_port" "$HOST_SERVER_LOG"; then
     echo "✗ host-runtime: systemd could not start $HOST_SERVER_UNIT" >&2
@@ -1667,6 +1673,15 @@ case "$cmd" in
     [ -n "${MISTRAL_API_KEY:-}" ] && mistral_env="-e MISTRAL_API_KEY=${MISTRAL_API_KEY}"
     disabled_harnesses_env=""
     [ -n "${SC_DISABLED_HARNESSES:-}" ] && disabled_harnesses_env="-e SC_DISABLED_HARNESSES"
+    # The browser-chat compaction settings are read by the review server, which
+    # runs inside the container: forward each one that is set, by name, so the
+    # value comes from the launch environment like SC_DISABLED_HARNESSES. An
+    # unset one is left out and the server uses its default.
+    chat_settings_env=""
+    [ -n "${SC_CHAT_COMPACT_WINDOW_CLAUDE:-}" ] && chat_settings_env="$chat_settings_env -e SC_CHAT_COMPACT_WINDOW_CLAUDE"
+    [ -n "${SC_CHAT_COMPACT_WINDOW_CODEX:-}" ] && chat_settings_env="$chat_settings_env -e SC_CHAT_COMPACT_WINDOW_CODEX"
+    [ -n "${SC_CHAT_COLD_RETURN_TOKENS:-}" ] && chat_settings_env="$chat_settings_env -e SC_CHAT_COLD_RETURN_TOKENS"
+    [ -n "${SC_CHAT_COLD_RETURN_MINUTES:-}" ] && chat_settings_env="$chat_settings_env -e SC_CHAT_COLD_RETURN_MINUTES"
     # Forward DATABASE_URL into the sandbox when a pg sidecar is configured, so
     # the fork's APP can connect to it. Default tracks the sidecar's container
     # name + baked sc/sc/sc creds (one source of truth); SC_DATABASE_URL overrides
@@ -1761,7 +1776,7 @@ case "$cmd" in
         SC_GITHUB_AUTH_ARGS \
         -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
         -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
-        $mistral_env $disabled_harnesses_env $pg_env \
+        $mistral_env $disabled_harnesses_env $chat_settings_env $pg_env \
         -w "$here" \
         -v "$here:$here" \
         $state_namespace_mounts \

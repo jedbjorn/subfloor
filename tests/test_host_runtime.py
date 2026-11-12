@@ -243,12 +243,15 @@ class HostRuntimeFixture:
             "systemd-run",
             """\
             #!/usr/bin/env python3
+            import json
             import os
             import subprocess
             import sys
 
             with open(os.environ["SC_TEST_LOG"], "a") as log:
                 log.write("systemd-run " + " ".join(sys.argv[1:]) + "\\n")
+                # The arguments one by one, for tests of the launcher's quoting.
+                log.write("systemd-run-argv " + json.dumps(sys.argv[1:]) + "\\n")
             # systemd unescapes doubled dollars before executing the command.
             argv = [arg.replace("$$", "$") for arg in sys.argv[sys.argv.index("--") + 1:]]
             subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -348,6 +351,56 @@ class HostRuntimeLifecycleTest(unittest.TestCase):
         line = self._systemd_run_line()
         options = line.split(" -- ", 1)[0]
         self.assertIn(f"--setenv=XDG_STATE_HOME={state_home}", options)
+
+    CHAT_SETTINGS = (
+        "SC_CHAT_COMPACT_WINDOW_CLAUDE",
+        "SC_CHAT_COMPACT_WINDOW_CODEX",
+        "SC_CHAT_COLD_RETURN_TOKENS",
+        "SC_CHAT_COLD_RETURN_MINUTES",
+    )
+
+    def test_launch_carries_the_chat_settings_into_the_server_unit(self):
+        values = dict(zip(self.CHAT_SETTINGS, ("off", "90000", "20000", "5")))
+        self.fx.env.update(values)
+        result = self.fx.run("launch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        options = self._systemd_run_line().split(" -- ", 1)[0]
+        for name, value in values.items():
+            self.assertIn(f"--setenv={name}={value}", options)
+
+    def test_each_chat_setting_reaches_the_unit_as_one_argument(self):
+        # A value with a space, shaped like another option: it must stay one
+        # argument, never split into a second --setenv of its own.
+        values = {name: f"{index} --setenv=X={index}"
+                  for index, name in enumerate(self.CHAT_SETTINGS, start=1)}
+        self.fx.env.update(values)
+        result = self.fx.run("launch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [line] = [line for line in self.fx.calls()
+                  if line.startswith("systemd-run-argv ")]
+        argv = json.loads(line.split(" ", 1)[1])
+        options = argv[:argv.index("--")]
+        for name, value in values.items():
+            self.assertIn(f"--setenv={name}={value}", options)
+        self.assertEqual(
+            [option for option in options if option.startswith("--setenv=X=")],
+            [],
+        )
+        self.assertEqual(
+            len([option for option in options if option.startswith("--setenv=")]),
+            len(values),
+        )
+
+    def test_launch_carries_only_the_chat_settings_that_are_set(self):
+        for name in self.CHAT_SETTINGS:
+            self.fx.env.pop(name, None)
+        self.fx.env["SC_CHAT_COLD_RETURN_MINUTES"] = "5"
+        self.fx.env["SC_CHAT_COLD_RETURN_TOKENS"] = ""
+        result = self.fx.run("launch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        options = self._systemd_run_line().split(" -- ", 1)[0]
+        self.assertIn("--setenv=SC_CHAT_COLD_RETURN_MINUTES=5", options)
+        self.assertEqual(options.count("--setenv=SC_CHAT_"), 1)
 
     def test_launch_sets_no_state_home_when_the_launcher_has_none(self):
         for value in (None, ""):

@@ -142,6 +142,43 @@ warning and uses the default. Kimi and OpenCode have no window setting. The
 two cold-return settings are read whenever a chat is projected; a value that
 is not a positive whole number logs a warning and uses the default.
 
+### Setting the four chat-compaction variables
+
+The server process reads them. On both runtimes, export the variable in the
+shell that runs `./sc launch` or `./sc restart`; the launcher carries each of
+the four that is set across to the server, and an unset or empty one is left
+out so the default applies. A running server keeps the values it was started
+with, so a change needs `./sc restart`.
+
+- **Docker sandbox** (`./sc runtime sandbox`): forwarded into the container
+  by name (`docker run -e NAME`).
+- **Host runtime** (`./sc runtime host`): the review server is a transient
+  systemd user unit, which does not inherit the launching shell; the launcher
+  passes each set variable to it (`systemd-run --setenv`).
+- **Foreground** (`./sc serve`): the server inherits the shell's
+  environment directly.
+
+Three cases where exporting and restarting does not change the value:
+
+- **A restart from the review GUI.** The engine-ops service runs
+  `./sc restart` with its own environment, which is that of the launch that
+  started the service, not of any shell you exported in since. Run the
+  restart from a terminal.
+- **A sandbox restart that keeps the container.** An ordinary
+  `./sc restart` recreates the container and applies the exports. The
+  exception is a fork that declares native packages whose image could not be
+  built or verified: the running container is then kept, `./sc restart`
+  reports `restart preserved healthy sandbox`, and it goes on with the values
+  it was created with. Run `./sc down`, then `./sc launch`.
+- **Host runtime, a variable set in the systemd user manager.** The server
+  unit inherits the user manager's environment
+  (`systemctl --user show-environment`), and the launcher only adds the
+  variables set in its shell. Unsetting one in the shell therefore does not
+  restore the default while the manager still holds it: remove it there too
+  (`systemctl --user unset-environment NAME`). A value that comes from a
+  file under `~/.config/environment.d/` returns at the next login unless it
+  is removed from that file as well.
+
 ## Compaction, the context meter and the re-ground line
 
 Feature #95, spec #272. The engine summarises nothing; it makes each
@@ -152,7 +189,14 @@ harness's own compaction earlier and visible.
   or the adapter can read them, and never any summary text. One event per
   compaction. The chat shows it as a marker, for example
   `Context compacted · 123k → 28k · automatic`; a figure that was not reported
-  is left out. Claude, Codex and OpenCode are mapped; Kimi is not (see each
+  is left out. When the figure after is not lower than the figure before, the
+  marker does not show a reduction: it reads
+  `Context compacted · 21k, nothing to drop · manual`. That happens on a
+  small Codex chat, where the figure after is Codex's own estimate of the
+  rebuilt context (its instructions plus the summary) and exceeds the few
+  thousand tokens the chat held. The event keeps both figures as stated, the
+  rule is the same for every harness, and the meter moves to the next
+  request's own figure as soon as that request reports. Claude, Codex and OpenCode are mapped; Kimi is not (see each
   adapter's README).
 - **`usage`** now says what it measures. `scope: request` is one model request
   of the chat and carries `context_tokens` (uncached input, cache read and
@@ -262,8 +306,10 @@ composer, one line above the composer says so, with the size.
   participant. On a closed chat there is no live session to compact, so it
   offers no compaction there.
 - **Data.** The transcript projection returns `cold_return`
-  (`context_tokens`, `idle_minutes`, `last_model_activity_at`, `server_time`,
-  and `due` as of that read); the single-chat read returns the two settings.
+  (`threshold_tokens`, `threshold_minutes`, `last_model_activity_at`,
+  `server_time`, and `due` as of that read); the single-chat read returns
+  the two thresholds under the same names. Both are the settings, not the
+  chat's own size or idle time: the size is `context.context_tokens`.
   The page re-checks the rule while it stays open, so a tab left open is
   covered without a reload. It does so on the server's clock: it records how
   far its own clock is from `server_time` and corrects for it, so a browser

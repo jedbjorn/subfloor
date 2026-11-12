@@ -2498,12 +2498,20 @@ def _compaction_label(payload: dict, harness: str | None = None) -> str:
     request also carries the system prompt and tools and is several times
     larger. Its marker says "summary" so the figure is not read as the new
     context size. The stored event is the same for every harness.
+
+    A figure after that is not lower than the figure before is not shown as
+    a reduction: the compaction ran and freed nothing (a small chat, whose
+    rebuilt context is no smaller than the old one), so the marker reads
+    "Context compacted · 21k, nothing to drop · manual". Both figures stay
+    in the event as the harness stated them.
     """
     marker = _compaction_projection(payload)
     before, after = marker["tokens_before"], marker["tokens_after"]
     summary = " summary" if harness == "claude" else ""
     parts = ["Context compacted"]
-    if before is not None and after is not None:
+    if before is not None and after is not None and after >= before:
+        parts.append(f"{_short_tokens(before)}, nothing to drop")
+    elif before is not None and after is not None:
         parts.append(
             f"{_short_tokens(before)} → {_short_tokens(after)}{summary}"
         )
