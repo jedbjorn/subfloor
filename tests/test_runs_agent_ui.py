@@ -241,11 +241,11 @@ def test_a_subagent_row_shows_its_route_its_time_and_a_result_action():
     assert live["lines"] == [
         "codex · gpt-6-luna · effort low",
         "elapsed 12m00s · 1h48m left of 2h00m",
-        "Tokens: not read yet (they arrive with a usage sweep)",
+        "Input + output tokens: not read yet (they arrive with a usage sweep)",
     ]
     assert live["buttons"] == ["Tail", "Result", "Copy status command", "Kill"]
     assert done["lines"] == [
-        "codex · gpt-6-luna · effort default", "ran 10m00s of 1h00m limit", "Tokens: 1000"]
+        "codex · gpt-6-luna · effort default", "ran 10m00s of 1h00m limit", "Input + output tokens: 1000"]
     assert done["buttons"] == ["Tail", "Result", "Copy status command", "Attach receipt"]
     # A command job has the time line and no Result action.
     assert plain["lines"] == ["ran 10m00s"]
@@ -286,6 +286,7 @@ def test_a_continued_subagent_is_one_thread_with_its_tokens_on_the_newest_row():
     folded: byClass(thread, "run-row").map((n) => n.ariaLabel + "|" + n.className),
     head: lines(host.children[0]),
     foldedTokens: byClass(thread, "run-tokens").map(text),
+    basis: byClass(host, "run-tokens").map((n) => n.title),
     otherTokens: byClass(host.children[2], "run-tokens").map(text),
     threads: runThreads([third, other, run(13), second, first]).map((t) => [t.head.run_id, t.earlier.map((r) => r.run_id)]),
     before, after: byClass(cut, "run-tokens").map(text), calls,
@@ -299,13 +300,20 @@ def test_a_continued_subagent_is_one_thread_with_its_tokens_on_the_newest_row():
     assert out["summary"] == "2 earlier runs of this subagent"
     assert out["folded"] == ["Run 12|run-row run-row-earlier", "Run 10|run-row run-row-earlier"]
     assert out["head"][0] == "codex · gpt-6-luna · effort default · continues run #12"
-    assert out["head"][-1] == "Tokens: 750 for this thread, counted on run #10"
-    # The first run still shows its own figure inside the fold; the middle run has none.
-    assert out["foldedTokens"] == ["Tokens: 750"]
-    assert out["otherTokens"] == ["Tokens: not read yet (they arrive with a usage sweep)"]
+    # The basis is input + output, said on the row and in its tooltip.
+    assert out["head"][-1] == "Input + output tokens: 750 for this thread, counted on run #10"
+    assert set(out["basis"]) == {
+        "Input plus output tokens, as the usage sweep read them. Cache reads and cache "
+        "writes are not included here; the Analytics tab counts them as well."}
+    # The folded first run shows the same figure, labelled as the thread's; the
+    # middle run has none.
+    assert out["foldedTokens"] == [
+        "Input + output tokens: 750 for this thread, counted on run #10"]
+    assert out["otherTokens"] == [
+        "Input + output tokens: not read yet (they arrive with a usage sweep)"]
     # Beyond the loaded rows the first run is read once, and the thread shows its tokens.
-    assert out["before"] == ["Tokens: not read yet (they arrive with a usage sweep)"]
-    assert out["after"] == ["Tokens: 750 for this thread, counted on run #10"]
+    assert out["before"] == ["Input + output tokens: not read yet (they arrive with a usage sweep)"]
+    assert out["after"] == ["Input + output tokens: 750 for this thread, counted on run #10"]
     assert out["calls"] == [["GET", "/runs/10"]]
 
 
@@ -445,3 +453,16 @@ def test_the_worktrees_tab_labels_a_subagent_worktree():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_sc_job_list_names_the_token_basis():
+    # The same basis as the run row: input + output, never cache tokens.
+    row = {"state": "done", "started_at": "2026-11-12T11:00:00+00:00",
+           "timeout_seconds": 7200,
+           "agent": {"harness": "codex", "requested_model": "m", "effective_effort": None,
+                     "usage_json": {"input_tokens": 700, "output_tokens": 50,
+                                    "cache_read_tokens": 90000, "cache_write_tokens": 4000}}}
+    assert job._row_detail(row, "agent") == (
+        " [codex · m · default · limit 2h00m · 750 input + output tokens]")
+    row["agent"]["usage_json"] = None
+    assert job._row_detail(row, "agent") == " [codex · m · default · limit 2h00m]"

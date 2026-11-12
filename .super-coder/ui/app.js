@@ -813,6 +813,8 @@ async function runLastAttempt(run, node) {
   } catch { node.textContent = "Last attempt not readable."; }
 }
 const runTokens = (usage) => (usage ? (usage.input_tokens || 0) + (usage.output_tokens || 0) : null);
+const RUN_TOKEN_BASIS = "Input plus output tokens, as the usage sweep read them. Cache reads and "
+  + "cache writes are not included here; the Analytics tab counts them as well.";
 // A continued subagent is one thread: every run of it works in the first run's
 // worktree, so that path groups them. The list is newest first, so the first
 // run met is the latest and the rest fold beneath it.
@@ -869,8 +871,9 @@ async function showRunResult(run) {
     close.onclick = dismiss;
   } catch (error) { toast(error.message); }
 }
-// `thread` is given for the row at the head of a thread; a folded earlier run has none.
-function runRow(run, shells, refresh, thread = null) {
+// `thread` is given for the row at the head of a thread; a folded earlier run has
+// none and is marked `folded`.
+function runRow(run, shells, refresh, thread = null, folded = false) {
   const owner = shells.find((s) => s.shell_id === run.owner_shell_id);
   const live = RUN_LIVE.includes(run.state);
   const terminal = runTerminal(run);
@@ -896,15 +899,18 @@ function runRow(run, shells, refresh, thread = null) {
     body.append(attempt);
   }
   // Tokens arrive with a usage sweep, not with the wake. A continued thread's
-  // tokens are counted on its first run, so the thread's latest row shows them.
+  // tokens are counted on its first run, so the thread's latest row shows them,
+  // and the folded first run says its figure is the thread's. The basis is
+  // input + output only; the Analytics tab also counts cache reads and writes.
   if (agent && (thread || agent.usage_json)) {
     const root = Number(/agent-(\d+)$/.exec(agent.worktree || "")?.[1]);
-    const threaded = Boolean(thread && (thread.earlier.length || agent.continues_run_id));
-    const tokens = el("div", { className: "run-detail run-tokens" });
+    const threaded = folded || Boolean(thread && (thread.earlier.length || agent.continues_run_id));
+    const tokens = el("div", { className: "run-detail run-tokens", title: RUN_TOKEN_BASIS });
     const paint = (usage) => {
       const total = runTokens(usage);
-      tokens.textContent = total == null ? "Tokens: not read yet (they arrive with a usage sweep)"
-        : threaded ? `Tokens: ${total} for this thread, counted on run #${root}` : `Tokens: ${total}`;
+      tokens.textContent = total == null ? "Input + output tokens: not read yet (they arrive with a usage sweep)"
+        : threaded ? `Input + output tokens: ${total} for this thread, counted on run #${root}`
+          : `Input + output tokens: ${total}`;
     };
     const first = thread ? [run, ...thread.earlier].find((r) => r.run_id === root) : run;
     paint(first?.agent?.usage_json);
@@ -969,7 +975,7 @@ function renderRunRows(host, runs, shells, refresh, { limits = null, shell = nul
     const count = thread.earlier.length;
     host.append(el("details", { className: "run-thread" },
       el("summary", {}, `${count} earlier run${count === 1 ? "" : "s"} of this subagent`),
-      ...thread.earlier.map((run) => runRow(run, shells, refresh))));
+      ...thread.earlier.map((run) => runRow(run, shells, refresh, null, true))));
   }
 }
 function renderProcessTile(host, snapshot) {

@@ -321,7 +321,8 @@ def test_subagents_watches_limits_and_worktree_labels(broker_case, monkeypatch):
             assert f"codex · gpt-6-luna · effort low · continues run #{first['run_id']}" in drawer
             assert 'left of 2h00m' in drawer and 'left of 1h00m' in drawer
             assert 'claude · haiku · effort default' in drawer
-            assert f"Tokens: 43000 for this thread, counted on run #{first['run_id']}" in drawer
+            assert (f"Input + output tokens: 43000 for this thread, counted on run #{first['run_id']}"
+                    in drawer)
             assert 'watch pr · PR #1786: checks settle (green or red), or it is merged or closed' in drawer
             assert 'watch until · test -f ready' in drawer and 'Last attempt 4: exit 0 · ready' in drawer
             assert 'Lost reader' not in drawer    # another shell's run
