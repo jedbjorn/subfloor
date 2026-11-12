@@ -427,8 +427,15 @@ class ClaudeAdapter(ConversationAdapter):
                 return []
             subtype = str(raw.get("subtype") or "")
             detail = str(raw.get("result") or raw.get("error") or "")
+            # Older builds name the interruption in ``subtype``. 2.1.322
+            # reports ``subtype: error_during_execution`` and names the abort
+            # in ``terminal_reason`` (``aborted_streaming``) instead. Both are
+            # structured fields; an execution error naming neither stays
+            # failed.
+            terminal_reason = str(raw.get("terminal_reason") or "")
             interrupted = any(
-                token in subtype.lower()
+                token in field.lower()
+                for field in (subtype, terminal_reason)
                 for token in ("interrupt", "aborted")
             )
             failed = bool(raw.get("is_error")) or subtype.startswith("error")
@@ -711,6 +718,19 @@ class ClaudeAdapter(ConversationAdapter):
         project = re.sub(r"[^A-Za-z0-9]", "-", str(worktree))
         return root / "projects" / project / f"{session_ref}.jsonl"
 
+    @staticmethod
+    def _is_conversation_entry(raw: Mapping[str, Any]) -> bool:
+        """Whether a transcript entry is a user or assistant message.
+
+        Claude appends bookkeeping entries after a turn's reply (2.1.322:
+        ``last-prompt``, ``mode``, ``cost-state``; also attachments and
+        request records). The test is positive, so an entry type this code
+        has never seen is bookkeeping too and cannot hide the reply.
+        """
+        return raw.get("type") in ("user", "assistant") and isinstance(
+            raw.get("message"), dict
+        )
+
     def inspect(
         self,
         session_ref: str,
@@ -743,7 +763,8 @@ class ClaudeAdapter(ConversationAdapter):
                             "HARNESS_WORKTREE_MISMATCH",
                             "Claude session belongs to a different worktree",
                         )
-                    last = raw
+                    if self._is_conversation_entry(raw):
+                        last = raw
         except OSError as exc:
             raise AdapterError(
                 "HARNESS_SESSION_INSPECTION_FAILED",
@@ -752,7 +773,8 @@ class ClaudeAdapter(ConversationAdapter):
             ) from exc
         # A Claude session file never contains a ``result`` entry; the reply
         # that ends a turn is the last assistant text block with no tool call
-        # after it.
+        # after it. ``last`` is the last conversation entry, not the last
+        # line: 2.1.322 writes bookkeeping after the reply.
         terminal: str | None = None
         if last is not None:
             events, text = self._transcript_events(last)

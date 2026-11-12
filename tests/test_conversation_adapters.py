@@ -1213,6 +1213,71 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertEqual(events[-1].type, "run.completed")
         self.assertEqual(events[-1].payload["status"], "completed")
 
+    def test_claude_interruption_is_read_from_subtype_or_terminal_reason(
+        self,
+    ) -> None:
+        adapter, _runner = self.build("claude")
+        cases = {
+            # Older builds name the interruption in the subtype.
+            "subtype": (
+                {"subtype": "error_during_execution_aborted", "is_error": True},
+                "run.interrupted",
+            ),
+            "subtype interrupted": (
+                {"subtype": "interrupted"},
+                "run.interrupted",
+            ),
+            # 2.1.322 after SIGINT, as recorded by the contract probe.
+            "terminal_reason": (
+                {
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "stop_reason": None,
+                    "terminal_reason": "aborted_streaming",
+                    "num_turns": 2,
+                },
+                "run.interrupted",
+            ),
+            "execution error": (
+                {
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "terminal_reason": "model_error",
+                },
+                "run.failed",
+            ),
+            "execution error without a reason": (
+                {"subtype": "error_during_execution", "is_error": True},
+                "run.failed",
+            ),
+            "turn limit": (
+                {
+                    "subtype": "error_max_turns",
+                    "is_error": True,
+                    "terminal_reason": "max_turns",
+                },
+                "run.failed",
+            ),
+            "completed": (
+                {
+                    "subtype": "success",
+                    "is_error": False,
+                    "terminal_reason": "completed",
+                    "num_turns": 1,
+                },
+                "run.completed",
+            ),
+        }
+        for label, (fields, expected) in cases.items():
+            with self.subTest(result=label):
+                events = adapter._normalize({"type": "result", **fields})
+
+                self.assertEqual(events[-1].type, expected)
+                self.assertEqual(
+                    events[-1].interrupt_evidence,
+                    "native" if expected == "run.interrupted" else None,
+                )
+
     def test_claude_resume_preamble_result_is_not_terminal(self) -> None:
         """#1497: on ``--resume`` Claude first flushes a pending background-task
         notification as its own turn and emits a zero-turn ``result`` for it
@@ -2765,6 +2830,75 @@ class ConversationAdapterTest(unittest.TestCase):
 
                 self.assertTrue(inspection.exists)
                 self.assertEqual(inspection.state, state)
+
+    def test_claude_inspect_skips_trailing_bookkeeping_entries(self) -> None:
+        adapter, _runner = self.build("claude")
+        reply = [{"type": "text", "text": "done"}]
+        tool_call = [{"type": "tool_use", "id": "tool-1", "name": "Bash"}]
+
+        def bookkeeping(session_ref: str, kind: str, **fields: Any) -> str:
+            return json.dumps({"type": kind, "sessionId": session_ref, **fields})
+
+        # The tail 2.1.322 writes after a completed turn.
+        current = (
+            ("last-prompt", {"lastPrompt": "hello", "leafUuid": "leaf-1"}),
+            ("mode", {"mode": "normal"}),
+            ("cost-state", {"totalCostUSD": 0.01, "modelUsage": {}}),
+        )
+        # Entries that carry a ``message`` or assistant-shaped content but
+        # are not the conversation, and a type no build has written yet.
+        unfamiliar = (
+            ("attachment", {"attachment": {"type": "skill_listing"}}),
+            (
+                "api-request-blob",
+                {"hash": "abc", "message": {"content": [{"type": "text", "text": "x"}]}},
+            ),
+            ("some-future-entry", {"payload": [1, 2, 3]}),
+        )
+        cases = {
+            "old shape, reply last": (reply, (), "idle", "run.completed"),
+            "2.1.322 tail after a reply": (reply, current, "idle", "run.completed"),
+            "unknown tail after a reply": (
+                reply, current + unfamiliar, "idle", "run.completed",
+            ),
+            "2.1.322 tail after a tool call": (tool_call, current, "unknown", None),
+            "unknown tail after a tool call": (
+                tool_call, unfamiliar, "unknown", None,
+            ),
+        }
+        for index, (label, (blocks, tail, state, terminal)) in enumerate(
+            cases.items(), 1
+        ):
+            with self.subTest(transcript=label):
+                session_ref = f"55555555-5555-4555-8555-{index:012d}"
+                path = adapter._session_path(session_ref, self.root)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                lines = [self.claude_entry(session_ref, *blocks)] + [
+                    bookkeeping(session_ref, kind, **fields)
+                    for kind, fields in tail
+                ]
+                path.write_text("\n".join(lines) + "\n")
+
+                inspection = adapter.inspect(session_ref, self.context)
+
+                self.assertTrue(inspection.exists)
+                self.assertEqual(inspection.state, state)
+                self.assertEqual(inspection.metadata["terminal"], terminal)
+
+    def test_claude_inspect_of_bookkeeping_alone_is_not_idle(self) -> None:
+        adapter, _runner = self.build("claude")
+        session_ref = "55555555-5555-4555-8555-000000000099"
+        path = adapter._session_path(session_ref, self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"type": "last-prompt", "sessionId": session_ref}) + "\n"
+        )
+
+        inspection = adapter.inspect(session_ref, self.context)
+
+        self.assertTrue(inspection.exists)
+        self.assertEqual(inspection.state, "unknown")
+        self.assertIsNone(inspection.metadata["terminal"])
 
     def test_claude_interrupt_falls_back_to_the_recorded_process_group(
         self,
