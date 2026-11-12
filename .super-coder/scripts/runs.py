@@ -344,6 +344,69 @@ class RunStore:
             (owner, owner, kind, kind, state, state),
         ).fetchone()[0]
 
+    def limits(self, owner: int | None = None, *, fleet: bool = False) -> dict:
+        """Live subagents and watchers against their limits, for a list's head.
+
+        A run is counted as registration counts it: unfinished, and not
+        proven to have no process. `shell_live` is the owner's count, absent
+        without an owner; `by_shell` is given to the operator's fleet view only.
+        """
+        out = {}
+        for name, kind, per_shell in (
+            ("agents", "agent", AGENT_LIVE_PER_SHELL),
+            ("watchers", "probe", WATCH_LIVE_PER_SHELL),
+        ):
+            gone = self._runs_without_a_process(kind)
+            owners = [
+                row["owner_shell_id"] for row in self.con.execute(
+                    "SELECT run_id,owner_shell_id FROM runs WHERE kind=? "
+                    "AND state IN ('registered','running')", (kind,),
+                )
+                if row["run_id"] not in gone
+            ]
+            entry = {"per_shell": per_shell, "install_live": len(owners)}
+            if owner is not None:
+                entry["shell_live"] = owners.count(owner)
+            if fleet:
+                entry["by_shell"] = {
+                    str(shell): owners.count(shell) for shell in sorted(set(owners))
+                }
+            out[name] = entry
+        out["agents"]["per_install"] = AGENT_LIVE_PER_INSTALL
+        return out
+
+    def label_worktrees(self, worktrees: list[dict]) -> None:
+        """Name the run and launching shell of each `agent-<run_id>` worktree.
+
+        Adds an `agent` object to the entries of a worktree listing whose
+        directory is a subagent's. The directory name carries the first run
+        of its thread; `latest_run_id` is the newest run that worked there.
+        """
+        for entry in worktrees:
+            path = Path(str(entry.get("abs") or ""))
+            if path.parent != self.worktrees or not _RESERVED_SHELL_NAME.fullmatch(path.name):
+                continue
+            run_id = int(path.name[len(AGENT_WORKTREE_PREFIX):])
+            row = self.con.execute(
+                "SELECT r.label,r.owner_shell_id,s.shortname,a.harness,"
+                "a.requested_model,a.worktree FROM runs r JOIN run_agents a USING(run_id) "
+                "LEFT JOIN shells s ON s.shell_id=r.owner_shell_id WHERE r.run_id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None or Path(row["worktree"]).name != path.name:
+                entry["agent"] = {"run_id": run_id, "known": False}
+                continue
+            latest = self.con.execute(
+                "SELECT r.run_id,r.state FROM runs r JOIN run_agents a USING(run_id) "
+                "WHERE a.worktree=? ORDER BY r.run_id DESC LIMIT 1", (row["worktree"],),
+            ).fetchone()
+            entry["agent"] = {
+                "run_id": run_id, "known": True, "label": row["label"],
+                "owner_shell_id": row["owner_shell_id"], "owner": row["shortname"],
+                "harness": row["harness"], "requested_model": row["requested_model"],
+                "latest_run_id": latest["run_id"], "state": latest["state"],
+            }
+
     def _agent(self, run_id: int) -> dict | None:
         row = self.con.execute(
             "SELECT * FROM run_agents WHERE run_id=?", (run_id,)

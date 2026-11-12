@@ -700,8 +700,10 @@ function openNewShellModal(templates, root) {
 }
 
 // Runs use the same rows in the shell drawer and operator fleet view.
+const runStamp = (value) =>
+  Date.parse(String(value || "").replace(" ", "T") + (/Z$|[+-]\d\d:\d\d$/.test(value || "") ? "" : "Z"));
 const runAge = (value) => {
-  const stamp = Date.parse(String(value || "").replace(" ", "T") + (/Z$|[+-]\d\d:\d\d$/.test(value || "") ? "" : "Z"));
+  const stamp = runStamp(value);
   if (!Number.isFinite(stamp)) return "—";
   const seconds = Math.max(0, Math.floor((Date.now() - stamp) / 1000));
   return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h`;
@@ -739,51 +741,235 @@ async function attachRun(run, refresh) {
     };
   } catch (error) { toast(error.message); }
 }
-function renderRunRows(host, runs, shells, refresh) {
-  host.replaceChildren();
-  if (!runs.length) { host.append(el("div", { className: "muted" }, "No runs.")); return; }
+const RUN_LIVE = ["registered", "running"];
+const runSpan = (value) => {
+  const seconds = Math.max(0, Math.floor(value));
+  if (seconds < 60) return `${seconds}s`;
+  const pad = (n) => String(n).padStart(2, "0");
+  return seconds < 3600 ? `${Math.floor(seconds / 60)}m${pad(seconds % 60)}s`
+    : `${Math.floor(seconds / 3600)}h${pad(Math.floor((seconds % 3600) / 60))}m`;
+};
+// Elapsed and remaining time, from the ledger's start time and time limit. A
+// finished run states how long it ran and its limit.
+function runClock(run, now = Date.now()) {
+  const start = runStamp(run.started_at || run.created_at);
+  const limit = Number(run.timeout_seconds) > 0 ? Number(run.timeout_seconds) : null;
+  if (!Number.isFinite(start)) return limit ? `limit ${runSpan(limit)}` : "no time limit";
+  if (RUN_LIVE.includes(run.state)) {
+    const elapsed = Math.max(0, (now - start) / 1000);
+    if (!limit) return `elapsed ${runSpan(elapsed)} · no time limit`;
+    return elapsed >= limit ? `elapsed ${runSpan(elapsed)} · past its limit of ${runSpan(limit)}`
+      : `elapsed ${runSpan(elapsed)} · ${runSpan(limit - elapsed)} left of ${runSpan(limit)}`;
+  }
+  const end = runStamp(run.finished_at);
+  if (!Number.isFinite(end)) return "run time not recorded" + (limit ? ` · limit ${runSpan(limit)}` : "");
+  const ran = `ran ${runSpan((end - start) / 1000)}`;
+  return limit ? `${ran} of ${runSpan(limit)} limit` : ran;
+}
+// One timer keeps the clocks of live rows current between refreshes.
+const runClocks = new Set();
+let runClockTimer = null;
+function runClockNode(run) {
+  const node = el("span", { className: "run-clock" }, runClock(run));
+  if (!RUN_LIVE.includes(run.state)) return node;
+  runClocks.add({ node, run });
+  runClockTimer ??= setInterval(() => {
+    for (const clock of runClocks) {
+      if (clock.node.isConnected) clock.node.textContent = runClock(clock.run);
+      else runClocks.delete(clock);
+    }
+    if (!runClocks.size) { clearInterval(runClockTimer); runClockTimer = null; }
+  }, 1000);
+  return node;
+}
+const runTerminal = (run) => {
+  try { return JSON.parse(run.terminal_json || "null") || {}; } catch { return {}; }
+};
+// A probe run is a watcher. Its form and condition are read from the ledger's
+// argv, as `sc job list --kind probe` reads them.
+function runWatch(run) {
+  if (run.kind !== "probe") return null;
+  const argv = Array.isArray(run.argv) ? run.argv : [];
+  if (argv[0] === "sc" && argv[1] === "job" && argv[2] === "watch" && ["pr", "timer"].includes(argv[3])) {
+    const options = {};
+    for (let i = 4; i + 1 < argv.length; i += 2) options[argv[i]] = argv[i + 1];
+    if (argv[3] === "timer") return { form: "timer", condition: `${options["--after"] ?? "?"} seconds pass` };
+    return { form: "pr", condition: `PR #${options["--pr"] ?? "?"}`
+      + (options["--repository"] ? ` in ${options["--repository"]}` : "")
+      + ": checks settle (green or red), or it is merged or closed" };
+  }
+  return { form: "until", condition: argv[argv.length - 1] || "" };
+}
+const runAttemptText = (attempt) => (attempt && Number.isInteger(attempt.number)
+  ? `Last attempt ${attempt.number}: exit ${attempt.exit_code}`
+    + (String(attempt.excerpt || "").trim() ? ` · ${String(attempt.excerpt).trim()}` : "")
+  : "");
+// A live watcher's attempts are the lines of its log; the ledger holds only the final one.
+async function runLastAttempt(run, node) {
+  try {
+    const { text } = await api(`/runs/${run.run_id}/tail`);
+    const last = String(text || "").trim().split("\n").pop();
+    node.textContent = runAttemptText(JSON.parse(last || "null")) || "No attempt yet.";
+  } catch { node.textContent = "Last attempt not readable."; }
+}
+const runTokens = (usage) => (usage ? (usage.input_tokens || 0) + (usage.output_tokens || 0) : null);
+// A continued subagent is one thread: every run of it works in the first run's
+// worktree, so that path groups them. The list is newest first, so the first
+// run met is the latest and the rest fold beneath it.
+function runThreads(runs) {
+  const threads = [], byWorktree = new Map();
   for (const run of runs) {
-    const owner = shells.find((s) => s.shell_id === run.owner_shell_id);
-    const row = el("article", { className: "run-row", ariaLabel: `Run ${run.run_id}` });
-    row.append(el("div", { className: "run-heading" },
-      el("strong", {}, `#${run.run_id} ${run.label}`),
-      el("span", { className: `run-state run-state-${run.state}` }, run.state)));
-    row.append(el("div", { className: "run-facts" },
-      `${owner?.shortname || run.owner_shell_id} · ${run.kind} · ${runAge(run.started_at || run.created_at)} · exit ${run.exit_code ?? "—"}`,
-      el("span", { className: `run-wake run-wake-${run.wake_state}`, title: run.delivery_error || run.last_error || "" }, `Wake: ${run.wake_state}`)));
-    const actions = el("div", { className: "run-actions" });
-    const tail = el("button", { className: "act", type: "button" }, "Tail");
-    tail.onclick = async () => {
-      try {
-        const evidence = await api(`/runs/${run.run_id}/tail`);
-        const close = el("button", { className: "act", type: "button" }, "Close");
-        const dismiss = openModal({ title: `Run #${run.run_id} · ${run.label}`,
-          bodyNode: el("pre", { className: "run-log" }, evidence.evidence_pruned ? "Evidence was pruned." : evidence.text || "No output yet."), footerEnd: close });
-        close.onclick = dismiss;
-      } catch (error) { toast(error.message); }
+    const key = run.kind === "agent" && run.agent?.worktree;
+    const thread = key && byWorktree.get(key);
+    if (thread) { thread.earlier.push(run); continue; }
+    const made = { head: run, earlier: [] };
+    if (key) byWorktree.set(key, made);
+    threads.push(made);
+  }
+  return threads;
+}
+// The limits are stated once at the head of a list. A list at a limit says so in words.
+function runLimitsLine(limits, shell, shells = []) {
+  if (!limits?.agents || !limits?.watchers) return null;
+  const { agents, watchers } = limits;
+  const name = (id) => shells.find((s) => String(s.shell_id) === String(id))?.shortname || `shell ${id}`;
+  const who = shell ? (shell.shortname || `shell ${shell.shell_id}`) : null;
+  const facts = [], full = [];
+  if (who && agents.shell_live != null) {
+    facts.push(`Subagents: ${agents.shell_live} of ${agents.per_shell} live for ${who} · ${agents.install_live} of ${agents.per_install} on this install.`);
+    if (agents.shell_live >= agents.per_shell) full.push(`${who} is at its limit of ${agents.per_shell} live subagents.`);
+    facts.push(`Watchers: ${watchers.shell_live} of ${watchers.per_shell} live for ${who}.`);
+    if (watchers.shell_live >= watchers.per_shell) full.push(`${who} is at its limit of ${watchers.per_shell} live watchers.`);
+  } else {
+    facts.push(`Subagents: ${agents.install_live} of ${agents.per_install} live on this install; one shell may run ${agents.per_shell}.`);
+    facts.push(`Watchers: ${watchers.install_live} live on this install; one shell may run ${watchers.per_shell}.`);
+    for (const [id, count] of Object.entries(agents.by_shell || {}))
+      if (count >= agents.per_shell) full.push(`${name(id)} is at its limit of ${agents.per_shell} live subagents.`);
+    for (const [id, count] of Object.entries(watchers.by_shell || {}))
+      if (count >= watchers.per_shell) full.push(`${name(id)} is at its limit of ${watchers.per_shell} live watchers.`);
+  }
+  if (agents.install_live >= agents.per_install) full.push(`This install is at its limit of ${agents.per_install} live subagents.`);
+  const line = el("div", { className: "run-limits" + (full.length ? " run-limits-full" : "") }, facts.join(" "));
+  if (full.length) line.append(el("strong", {}, ` ${full.join(" ")} A further launch is refused until one ends.`));
+  return line;
+}
+async function showRunResult(run) {
+  try {
+    const found = await api(`/runs/${run.run_id}/result`);
+    const facts = found.agent || {};
+    const body = el("div", { className: "run-result" },
+      el("div", { className: "muted" }, [`${found.state} · exit ${found.exit_code ?? "—"}`,
+        facts.harness, facts.requested_model, `effort ${facts.effective_effort || "default"}`,
+        found.result_bytes != null ? `${found.result_bytes} bytes` : null].filter(Boolean).join(" · ")),
+      el("pre", { className: "run-log" }, found.available ? found.text : "No result is recorded yet."));
+    if (found.truncated) body.append(el("div", { className: "warning" },
+      "Truncated: the first 256 KiB are shown. The full text is result.md beside the run's log."));
+    const close = el("button", { className: "act", type: "button" }, "Close");
+    const dismiss = openModal({ title: `Result of run #${run.run_id} · ${run.label}`, bodyNode: body, footerEnd: close });
+    close.onclick = dismiss;
+  } catch (error) { toast(error.message); }
+}
+// `thread` is given for the row at the head of a thread; a folded earlier run has none.
+function runRow(run, shells, refresh, thread = null) {
+  const owner = shells.find((s) => s.shell_id === run.owner_shell_id);
+  const live = RUN_LIVE.includes(run.state);
+  const terminal = runTerminal(run);
+  const agent = run.kind === "agent" ? run.agent : null;
+  const watch = runWatch(run);
+  const row = el("article", { className: "run-row" + (thread ? "" : " run-row-earlier"), ariaLabel: `Run ${run.run_id}` });
+  row.append(el("div", { className: "run-heading" },
+    el("strong", {}, `#${run.run_id} ${run.label}`),
+    el("span", { className: `run-state run-state-${run.state}` }, run.state)));
+  const body = el("div", { className: "run-body" });
+  body.append(el("div", { className: "run-facts" },
+    `${owner?.shortname || run.owner_shell_id} · ${run.kind} · ${runAge(run.started_at || run.created_at)} · exit ${run.exit_code ?? "—"}`,
+    el("span", { className: `run-wake run-wake-${run.wake_state}`, title: run.delivery_error || run.last_error || "" }, `Wake: ${run.wake_state}`)));
+  if (agent) body.append(el("div", { className: "run-detail" },
+    `${agent.harness} · ${agent.requested_model} · effort ${agent.effective_effort || "default"}`
+    + (agent.continues_run_id ? ` · continues run #${agent.continues_run_id}` : "")));
+  if (watch) body.append(el("div", { className: "run-detail" }, `watch ${watch.form} · ${watch.condition}`));
+  body.append(el("div", { className: "run-detail" }, runClockNode(run)));
+  if (watch && watch.form !== "timer") {
+    const attempt = el("div", { className: "run-detail run-attempt" },
+      runAttemptText(terminal.probe_attempt) || (live ? "Reading the last attempt…" : "No attempt was recorded."));
+    if (live) runLastAttempt(run, attempt);
+    body.append(attempt);
+  }
+  // Tokens arrive with a usage sweep, not with the wake. A continued thread's
+  // tokens are counted on its first run, so the thread's latest row shows them.
+  if (agent && (thread || agent.usage_json)) {
+    const root = Number(/agent-(\d+)$/.exec(agent.worktree || "")?.[1]);
+    const threaded = Boolean(thread && (thread.earlier.length || agent.continues_run_id));
+    const tokens = el("div", { className: "run-detail run-tokens" });
+    const paint = (usage) => {
+      const total = runTokens(usage);
+      tokens.textContent = total == null ? "Tokens: not read yet (they arrive with a usage sweep)"
+        : threaded ? `Tokens: ${total} for this thread, counted on run #${root}` : `Tokens: ${total}`;
     };
-    const copy = el("button", { className: "act", type: "button" }, "Copy status command");
-    copy.onclick = () => Promise.resolve().then(() => navigator.clipboard.writeText(`sc job status ${run.run_id}`))
-      .then(() => toast("copied"), () => toast("copy failed"));
-    actions.append(tail, copy);
-    if (["registered", "running"].includes(run.state)) {
-      const kill = el("button", { className: "act danger", type: "button" }, "Kill");
-      kill.onclick = async () => {
-        if (!confirm(`Kill run #${run.run_id} (${run.label})?`)) return;
-        kill.disabled = true;
-        try { await api(`/runs/${run.run_id}/kill`, "POST", {}); await refresh(); }
-        catch (error) { toast(error.message); }
-        finally { kill.disabled = false; }
-      };
-      actions.append(kill);
-    }
-    if (["done", "failed", "timeout", "killed", "lost"].includes(run.state)) {
-      const attach = el("button", { className: "act", type: "button" }, "Attach receipt");
-      attach.onclick = () => attachRun(run, refresh);
-      actions.append(attach);
-    }
-    row.append(actions);
-    host.append(row);
+    const first = thread ? [run, ...thread.earlier].find((r) => r.run_id === root) : run;
+    paint(first?.agent?.usage_json);
+    // The thread's first run may lie beyond the rows this list loaded.
+    if (!first && Number.isInteger(root))
+      api(`/runs/${root}`).then((found) => paint(found.agent?.usage_json), () => {});
+    body.append(tokens);
+  }
+  // The engine's own note on how the run ended. For a lost subagent it says
+  // that the harness process was left running.
+  if (terminal.spawn_error) body.append(el("div", { className: "run-note" },
+    `${run.state === "lost" ? "Still running" : "Reason"}: ${terminal.spawn_error}`));
+  if (run.wake_state === "blocked" && run.last_error) body.append(el("div", { className: "run-note" }, run.last_error));
+  row.append(body);
+  const actions = el("div", { className: "run-actions" });
+  const tail = el("button", { className: "act", type: "button" }, "Tail");
+  tail.onclick = async () => {
+    try {
+      const evidence = await api(`/runs/${run.run_id}/tail`);
+      const close = el("button", { className: "act", type: "button" }, "Close");
+      const dismiss = openModal({ title: `Run #${run.run_id} · ${run.label}`,
+        bodyNode: el("pre", { className: "run-log" }, evidence.evidence_pruned ? "Evidence was pruned." : evidence.text || "No output yet."), footerEnd: close });
+      close.onclick = dismiss;
+    } catch (error) { toast(error.message); }
+  };
+  actions.append(tail);
+  if (agent) {
+    const result = el("button", { className: "act", type: "button" }, "Result");
+    result.onclick = () => showRunResult(run);
+    actions.append(result);
+  }
+  const copy = el("button", { className: "act", type: "button" }, "Copy status command");
+  copy.onclick = () => Promise.resolve().then(() => navigator.clipboard.writeText(`sc job status ${run.run_id}`))
+    .then(() => toast("copied"), () => toast("copy failed"));
+  actions.append(copy);
+  if (live) {
+    const kill = el("button", { className: "act danger", type: "button" }, "Kill");
+    kill.onclick = async () => {
+      if (!confirm(`Kill run #${run.run_id} (${run.label})?`)) return;
+      kill.disabled = true;
+      try { await api(`/runs/${run.run_id}/kill`, "POST", {}); await refresh(); }
+      catch (error) { toast(error.message); }
+      finally { kill.disabled = false; }
+    };
+    actions.append(kill);
+  } else {
+    const attach = el("button", { className: "act", type: "button" }, "Attach receipt");
+    attach.onclick = () => attachRun(run, refresh);
+    actions.append(attach);
+  }
+  row.append(actions);
+  return row;
+}
+function renderRunRows(host, runs, shells, refresh, { limits = null, shell = null } = {}) {
+  host.replaceChildren();
+  const line = runLimitsLine(limits, shell, shells);
+  if (line) host.append(line);
+  if (!runs.length) { host.append(el("div", { className: "muted" }, "No runs.")); return; }
+  for (const thread of runThreads(runs)) {
+    host.append(runRow(thread.head, shells, refresh, thread));
+    if (!thread.earlier.length) continue;
+    const count = thread.earlier.length;
+    host.append(el("details", { className: "run-thread" },
+      el("summary", {}, `${count} earlier run${count === 1 ? "" : "s"} of this subagent`),
+      ...thread.earlier.map((run) => runRow(run, shells, refresh))));
   }
 }
 function renderProcessTile(host, snapshot) {
@@ -799,7 +985,7 @@ function renderProcessTile(host, snapshot) {
 async function renderRunsFleet(host, shells, badge) {
   const filters = el("div", { className: "run-filters" });
   const list = el("div", { className: "run-list" });
-  let runs = [];
+  let runs = [], limits = null;
   const select = (label, options) => {
     const node = el("select", { ariaLabel: label });
     node.append(el("option", { value: "" }, `All ${label.toLowerCase()}`));
@@ -809,10 +995,11 @@ async function renderRunsFleet(host, shells, badge) {
     return node;
   };
   const shell = select("Shells", shells.map((s) => [String(s.shell_id), s.shortname || s.display_name]));
-  const kind = select("Kinds", ["job", "devkit", "probe"].map((s) => [s, s]));
+  const kind = select("Kinds", ["job", "agent", "probe", "devkit"].map((s) => [s, s]));
   const state = select("States", ["registered", "running", "done", "failed", "timeout", "killed", "lost"].map((s) => [s, s]));
   const paint = () => renderRunRows(list, runs.filter((r) => (!shell.value || String(r.owner_shell_id) === shell.value)
-    && (!kind.value || r.kind === kind.value) && (!state.value || r.state === state.value)), shells, refresh);
+    && (!kind.value || r.kind === kind.value) && (!state.value || r.state === state.value)), shells, refresh,
+    { limits, shell: shells.find((s) => String(s.shell_id) === shell.value) || null });
   const caption = el("p", { className: "muted" });
   let refreshEpoch = 0;
   const refresh = async () => {
@@ -825,6 +1012,7 @@ async function renderRunsFleet(host, shells, badge) {
       const result = await api(`/runs?${query}`);
       if (!host.isConnected || epoch !== refreshEpoch) return;
       runs = result.runs;
+      limits = result.limits;
       caption.textContent = `Newest ${countLabel(runs.length, result.total)} matching runs.`;
       // The tab always counts the fleet, even when its rows are filtered.
       const count = shell.value ? await api("/runs?limit=1") : result;
@@ -3146,8 +3334,14 @@ async function renderWorktrees(root, opts = {}) {
     const top = el("div", { className: "wt-top" });
     top.append(el("span", { className: "wt-path" }, w.path === "." ? ".  (main)" : w.path));
     top.append(el("span", { className: "mono wt-branch" }, w.branch || "(detached)"));
+    // A subagent's worktree is named for its run, not for a shell: say whose it is.
+    if (w.agent) top.append(el("span", { className: "pill wt-agent" }, w.agent.known
+      ? `subagent run #${w.agent.run_id} · launched by ${w.agent.owner || `shell ${w.agent.owner_shell_id}`}`
+      : `subagent run #${w.agent.run_id} · not in the run ledger`));
     main.append(top);
     const bits = [dirty ? `✎ ${w.dirty} uncommitted` : "clean"];
+    if (w.agent?.known) bits.unshift(`${w.agent.harness} · ${w.agent.requested_model}`,
+      `latest run #${w.agent.latest_run_id} ${w.agent.state}`);
     if (w.behind) bits.push(`${w.behind} behind`);
     if (w.ahead) bits.push(`${w.ahead} ahead`);
     main.append(el("div", { className: "wt-meta muted" }, bits.join("  ·  ")));
@@ -3158,6 +3352,9 @@ async function renderWorktrees(root, opts = {}) {
       det.append(el("pre", {}, w.dirty_files.join("\n") + extra));
       main.append(det);
     }
+    if (w.agent?.known) main.append(el("div", { className: "wt-meta muted" },
+      ["registered", "running"].includes(w.agent.state) ? "A subagent run is live in it."
+        : `Kept after its run ended. Its launching shell removes it with \`sc job clean ${w.agent.latest_run_id}\`.`));
     wc.append(el("div", { className: "wt-row" },
       el("span", { className: "wt-dot " + (dirty ? "dirty" : "clean") }), main));
   }
@@ -8060,10 +8257,10 @@ async function renderInterface(root) {
     if (runsRefreshInFlight) return;
     runsRefreshInFlight = true;
     try {
-      const { runs, total } = await api(`/runs?shell_id=${shell.shell_id}&limit=${LIST_LIMIT}`);
+      const { runs, total, limits } = await api(`/runs?shell_id=${shell.shell_id}&limit=${LIST_LIMIT}`);
       if (generation !== chatRenderGeneration) return;
       runsSummary.textContent = `Runs (${countLabel(runs.length, total)})`;
-      renderRunRows(runsList, runs, shells, async () => { await refreshRuns(); await refreshPRs(); });
+      renderRunRows(runsList, runs, shells, async () => { await refreshRuns(); await refreshPRs(); }, { limits, shell });
       if (selectedConversation && (selectedConversation.state === "running" || selectedConversation.process?.alive)) {
         const snapshot = await api(`/runs/processes?conversation_id=${encodeURIComponent(selectedConversation.conversation_id)}`);
         if (generation === chatRenderGeneration) renderProcessTile(processTile, snapshot);

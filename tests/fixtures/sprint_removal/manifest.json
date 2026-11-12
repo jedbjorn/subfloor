@@ -191,7 +191,9 @@
     "tests/test_signin_gate.py",
     ".super-coder/migrations/0285_run_agents_and_time_limit.sql",
     "tests/test_job_agent_ledger.py",
-    "tests/test_job_watch.py"
+    "tests/test_job_watch.py",
+    "tests/test_runs_agent_ui.py",
+    "tests/test_runs_browser.py"
   ],
   "baseline_migration_ledger": {
     "count": 142,

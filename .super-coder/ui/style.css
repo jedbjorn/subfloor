@@ -1945,6 +1945,18 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .shell-pane .run-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(220px, 1fr) auto; align-items: center; gap: 12px; }
 .shell-pane .conversion-status .run-row { display: block; }
 @media (max-width: 1000px) { .shell-pane .run-row { display: block; } }
+/* Subagent and watcher facts, the limits line, and a continued subagent's earlier runs. */
+.run-body { min-width: 0; }
+.run-detail, .run-note, .run-limits { font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
+.run-detail { margin: 4px 0; }
+.run-note { margin: 4px 0; color: var(--danger); }
+.run-limits { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; }
+.run-limits-full { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+.run-limits-full strong { color: var(--warn); font-weight: 600; }
+.run-thread { margin: -4px 0 0 16px; padding-left: 10px; border-left: 2px solid var(--line); }
+.run-thread summary { cursor: pointer; font-size: 12px; color: var(--dim); }
+.run-thread .run-row { margin-top: 8px; }
+.wt-agent { color: var(--accent); }
 
 /* Receipt evidence stays beside, and distinct from, the observed GitHub check. */
 .run-receipts { display: grid; gap: .5rem; margin-top: .5rem; }
