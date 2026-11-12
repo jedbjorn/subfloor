@@ -502,6 +502,7 @@ const chatStartedLabel = () => "started";
 const chatHeaderLabel = () => "header";
 const chatConversationName = () => "fixture";
 const chatTranscriptAtBottom = () => true;
+const chatPaintContextMeter = () => {};
 const chatFlushTranscript = (node, state) => {
   node.textContent = [...state.items.values()].map((item) => item.text).join("\n");
 };
@@ -1662,7 +1663,7 @@ console.log(JSON.stringify({
         "activityHeaderItems": 1,
         "assistantToken": {
             "className": "chat-context-tokens",
-            "text": "12,345 tok",
+            "text": "12k tok",
         },
         "userHasToken": False,
         "assistantWithoutTokensHasToken": False,

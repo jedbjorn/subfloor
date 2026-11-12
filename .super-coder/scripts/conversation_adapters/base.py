@@ -36,11 +36,13 @@ NORMALIZED_EVENTS = frozenset(
         "permission.requested",
         "input.requested",
         "usage",
+        "context.compacted",
         "run.completed",
         "run.failed",
         "run.interrupted",
     }
 )
+COMPACTION_TRIGGERS = frozenset({"auto", "manual", "unknown"})
 TERMINAL_EVENTS = frozenset(
     {"run.completed", "run.failed", "run.interrupted"}
 )
@@ -194,6 +196,27 @@ class ConversationContext:
     conversation_id: str | None = None
     lifecycle_epoch: int = 1
     boot_content: str | None = None
+    # Feature #95. ``compact_window`` is the engine setting for this harness
+    # (None = leave the harness default). ``context_window`` and
+    # ``context_tokens`` are the chat's latest recorded readings; either may
+    # be None, and an adapter never substitutes a guess for a missing one.
+    compact_window: int | None = None
+    context_window: int | None = None
+    context_tokens: int | None = None
+
+    def effective_compact_window(self) -> int | None:
+        """The window to hand the harness, or None for its own default.
+
+        A model whose recorded window is smaller than the setting keeps the
+        harness default: the setting means "compact earlier", never "later".
+        """
+        window = self.compact_window
+        if window is None:
+            return None
+        known = self.context_window
+        if known is not None and known < window:
+            return None
+        return window
 
     def checked_worktree(self) -> Path:
         if self.permission_mode not in PERMISSION_MODES:
@@ -252,6 +275,70 @@ class NormalizedEvent:
             raise ValueError(
                 "interrupt evidence is valid only for run.interrupted"
             )
+
+
+def token_count(value: Any) -> int | None:
+    """A whole, non-negative token figure, or None for anything else."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    if value < 0 or int(value) != value:
+        return None
+    return int(value)
+
+
+def compaction_event(
+    *,
+    trigger: Any,
+    native_type: str,
+    tokens_before: Any = None,
+    tokens_after: Any = None,
+    compaction_ref: Any = None,
+) -> NormalizedEvent:
+    """One ``context.compacted`` event. No summary text is ever carried.
+
+    A count the harness did not state, and the engine could not read, is
+    left out of the payload; it is never estimated.
+    """
+    payload: dict[str, Any] = {
+        "trigger": trigger if trigger in COMPACTION_TRIGGERS else "unknown",
+    }
+    before = token_count(tokens_before)
+    after = token_count(tokens_after)
+    if before is not None:
+        payload["tokens_before"] = before
+    if after is not None:
+        payload["tokens_after"] = after
+    if isinstance(compaction_ref, str) and compaction_ref:
+        payload["compaction_ref"] = compaction_ref
+    return NormalizedEvent("context.compacted", payload, native_type)
+
+
+def usage_event(
+    tokens: Mapping[str, Any],
+    native_type: str,
+    *,
+    scope: str,
+    context_tokens: Any = None,
+    context_window: Any = None,
+) -> NormalizedEvent:
+    """One ``usage`` event carrying the context-meter fields (Feature #95).
+
+    ``scope`` says what ``tokens`` measures. ``request`` is one model request
+    of the chat itself, the only scope the context meter reads. ``turn`` is a
+    whole-turn total and ``subagent`` is a request made by a delegated agent;
+    neither is the size of the chat's context, so neither carries
+    ``context_tokens``.
+    """
+    payload: dict[str, Any] = {"tokens": dict(tokens), "scope": scope}
+    size = token_count(context_tokens)
+    window = token_count(context_window)
+    if scope == "request" and size is not None:
+        payload["context_tokens"] = size
+    if window:
+        payload["context_window"] = window
+    return NormalizedEvent("usage", payload, native_type)
 
 
 @dataclass(frozen=True)

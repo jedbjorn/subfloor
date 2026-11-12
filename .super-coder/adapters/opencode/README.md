@@ -110,3 +110,24 @@ different nonce values, and resuming the first by `sessionID` after the second
 ran returned only the first nonce. An asynchronous prompt emitted
 `session.status=busy`; `POST /session/:id/abort` returned `true`, emitted a
 `MessageAbortedError`, and returned the session to `idle`.
+
+`maximum_cli_version_exclusive` was raised from `1.19.0` to `1.20.0` on
+2026-11-12 to cover the installed `1.19.5`, by operator ruling (flag SC-1610,
+Feature #95 spec #272): build against the installed version and assume its
+behaviour holds. `verified_cli_version` stays `1.18.9` because the probe above
+was not repeated; an installed 1.19.5 reports `supported`. CI still installs
+`opencode-ai@1.18.9`.
+
+### Compaction and the context meter (Feature #95, spec #272)
+
+- `session.compacted` is mapped to one `context.compacted`. OpenCode names the
+  session and nothing else, so the trigger is `unknown`, the size before is
+  the last request this stream saw, and the size after stays empty until the
+  next request reports it. The event name is present in the installed 1.19.5
+  binary; **no run has shown it**, and whether OpenCode auto-compacts under
+  the engine is the open verification (spec #272 criterion 12).
+- The meter reads the assistant message's `tokens`
+  (`input` + `cache.read` + `cache.write`). OpenCode states no window there,
+  so the chat shows the size with no percentage.
+- OpenCode gets no compact-window setting in this delivery: its control is an
+  on/off switch, not a token count.

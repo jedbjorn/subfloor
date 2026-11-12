@@ -24,6 +24,10 @@ CONVERSATION_EVENT_TYPES = NORMALIZED_EVENTS | frozenset(
         "conversation.closed",
         "conversation.reopened",
         "message.accepted",
+        # Engine-added: the dispatched text of this message carried the
+        # re-ground line after a compaction (Feature #95). The stored
+        # message body is the operator's text, unchanged.
+        "message.reground",
         "run.resumed",
         "run.interrupt.requested",
         "run.unknown",

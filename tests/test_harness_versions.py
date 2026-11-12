@@ -26,7 +26,7 @@ STATUS = {
         "version": "0.155.1",
         "compatibility": "verified",
         "minimum_version": "0.145.0",
-        "maximum_version_exclusive": "0.156.0",
+        "maximum_version_exclusive": "0.168.0",
         "verified_version": "0.155.1",
         "error": None,
     }
@@ -63,18 +63,18 @@ def test_newer_runtime_is_reported_without_becoming_an_error() -> None:
         mock.patch.object(
             harness_versions,
             "probe",
-            return_value="codex-cli 0.156.0",
+            return_value="codex-cli 0.168.0",
         ),
     ):
         assert harness_versions.compatibility_status() == {
             "codex": {
                 "harness": "codex",
                 **harness_versions.runtime_scope(),
-                "version": "0.156.0",
-                "observed_version": "codex-cli 0.156.0",
+                "version": "0.168.0",
+                "observed_version": "codex-cli 0.168.0",
                 "compatibility": "newer-unverified",
                 "minimum_version": "0.145.0",
-                "maximum_version_exclusive": "0.156.0",
+                "maximum_version_exclusive": "0.168.0",
                 "verified_version": "0.155.1",
                 "error": None,
             }
@@ -98,7 +98,7 @@ def test_older_runtime_is_reported_as_best_effort_not_an_error() -> None:
                 "observed_version": "codex-cli 0.144.0",
                 "compatibility": "older-unverified",
                 "minimum_version": "0.145.0",
-                "maximum_version_exclusive": "0.156.0",
+                "maximum_version_exclusive": "0.168.0",
                 "verified_version": "0.155.1",
                 "error": None,
             }
@@ -267,7 +267,7 @@ def test_text_status_couples_host_provenance_and_compatibility() -> None:
 
     assert output.getvalue().splitlines() == [
         "  runtime:   host",
-        "  codex     0.155.1 · verified · tested [0.145.0, 0.156.0)",
+        "  codex     0.155.1 · verified · tested [0.145.0, 0.168.0)",
     ]
 
 
@@ -275,7 +275,7 @@ def test_text_status_marks_newer_runtime_as_unverified() -> None:
     status = {
         "codex": {
             **STATUS["codex"],
-            "version": "0.156.0",
+            "version": "0.168.0",
             "compatibility": "newer-unverified",
         }
     }
@@ -289,7 +289,7 @@ def test_text_status_marks_newer_runtime_as_unverified() -> None:
 
     assert output.getvalue().splitlines() == [
         "  runtime:   host",
-        "  codex     0.156.0 · newer-unverified · best-effort",
+        "  codex     0.168.0 · newer-unverified · best-effort",
     ]
 
 

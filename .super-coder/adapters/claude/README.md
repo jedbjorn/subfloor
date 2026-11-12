@@ -112,3 +112,44 @@ harness update and `sc harness-status` also observe new identities.
 The GUI status projection exposes the tier, version, timestamp and reason;
 its operator-only reverify endpoint is
 `POST /api/harnesses/claude/conversion/verify`.
+
+## Compaction and the context meter (Feature #95, spec #272)
+
+Checked on `2.1.322 (Claude Code)`, 2026-11-12, with three small requests.
+
+- **Earlier compact window.** A browser chat is launched with
+  `--autocompact <tokens>` (default 120,000; `SC_CHAT_COMPACT_WINDOW_CLAUDE`
+  sets it, `off` restores Claude's default). The value is the window Claude
+  compacts within, not the trigger: compaction fires somewhat below it. The
+  flag is accepted on a new session and on `--resume … -p` (both exit 0 and
+  complete the turn). **Not checked:** that a resumed run then compacts at
+  that window; forcing it costs at least 100,000 tokens. The engine passes the
+  value as set; Claude applies its own 100k minimum and clamps to the model's
+  window. A chat whose recorded window is smaller than the setting is launched
+  without the flag. Terminal seats are untouched.
+- **The environment variable wins, so the launch clears it.** In the installed
+  binary the window resolver returns `CLAUDE_CODE_AUTO_COMPACT_WINDOW` before
+  it reads the configured window. Whenever the engine passes `--autocompact`
+  it removes that variable from the browser chat's environment. With the
+  setting `off` the variable is left alone. This is read from the binary, not
+  observed in a compaction.
+- **Signal.** Stream line `type: system`, `subtype: compact_boundary`, with
+  `compact_metadata` (`trigger`, `pre_tokens`, optional `post_tokens`). The
+  stored transcript carries the same boundary in camelCase
+  (`compactMetadata`, `preTokens`, `postTokens`), which is what restart
+  recovery reads. Both become one `context.compacted`; the boundary's `uuid`
+  keeps a boundary seen on the pipe and again on replay to one marker.
+- **Meter.** The context size is the input side of one model request
+  (`input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens`
+  from `stream_event` → `message_delta.usage`). The `result` usage is the sum
+  of every request in the turn and is not shown as the context. A request made
+  by a delegated agent (`parent_tool_use_id` set) is not the chat's context
+  either. The window is `result.modelUsage[<model>].contextWindow` for the
+  chat's own model, so it is known only after a chat's first completed turn.
+
+**Compatibility caution.** `--autocompact` is present in the 2.1.319, 2.1.321
+and 2.1.322 binaries and named in the changelog at 2.1.304; nothing earlier is
+established, and the manifest's floor is still 2.1.220. A build below the
+manifest minimum is warn-only (status shows `older-unverified · best-effort`;
+nothing refuses the launch), so an older Claude fails every browser-chat
+launch on `--autocompact` unless `SC_CHAT_COMPACT_WINDOW_CLAUDE=off`.

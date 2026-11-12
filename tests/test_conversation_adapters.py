@@ -971,9 +971,9 @@ class ConversationAdapterTest(unittest.TestCase):
     def test_declared_compatibility_ranges_enforce_floor_and_flag_newer(self) -> None:
         cases = {
             "claude": ("2.1.219", "2.1.220", "2.1.223", "2.2.0"),
-            "codex": ("0.144.999", "0.145.0", "0.155.1", "0.156.0"),
-            "opencode": ("1.18.8", "1.18.9", "1.18.13", "1.19.0"),
-            "kimi": ("0.29.999", "0.30.0", "0.33.0", "0.34.0"),
+            "codex": ("0.144.999", "0.145.0", "0.155.1", "0.168.0"),
+            "opencode": ("1.18.8", "1.18.9", "1.18.13", "1.20.0"),
+            "kimi": ("0.29.999", "0.30.0", "0.33.0", "2.6.0"),
         }
         current_observed = {
             "claude": "2.1.223 (Claude Code)",
@@ -3857,7 +3857,12 @@ class ConversationAdapterTest(unittest.TestCase):
                     "outputTokens": 345,
                     "reasoningOutputTokens": 200,
                     "totalTokens": 12345,
-                }
+                },
+                # Feature #95: the last request's input side, and the window
+                # Codex states beside it (discarded before).
+                "scope": "request",
+                "context_tokens": 12000,
+                "context_window": 258400,
             },
         )
         self.assertNotIn("98765", repr(usage.payload))

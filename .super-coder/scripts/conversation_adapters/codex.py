@@ -25,13 +25,25 @@ from .base import (
     SessionInspection,
     cleanup_owned_process,
     command_version,
+    compaction_event,
     ensure_exact_session,
     ensure_nonempty_message,
     load_manifest,
     managed_mcp_launch_args,
     merged_env,
     terminal_outcome,
+    token_count,
+    usage_event,
 )
+
+# The Codex config key for the token count at which it compacts a thread.
+# The engine states it twice, and both were accepted by codex-cli 0.167.1:
+# as a ``-c`` override on the app-server launch (``config/read`` then reports
+# it with origin ``sessionFlags``) and in the ``config`` object of
+# ``thread/start`` / ``thread/resume`` (parsed as thread configuration: a
+# non-integer value is refused with "failed to load configuration").
+AUTO_COMPACT_KEY = "model_auto_compact_token_limit"
+COMPACTION_ITEM = "contextCompaction"
 
 
 class RpcTransport(Protocol):
@@ -229,6 +241,28 @@ class CodexAdapter(ConversationAdapter):
     ) -> None:
         super().__init__(manifest or load_manifest(self.harness))
         self._rpc = rpc
+        # Set by the caller that asked Codex to compact (the manual request);
+        # the next compaction recorded is then ``manual``. The item itself
+        # carries no trigger, so everything else is ``auto``.
+        self.compaction_requested = False
+        # (size, total, estimate) of the latest token-usage updates: ``size``
+        # is the meter reading, ``total`` adds that request's output, and
+        # ``estimate`` marks Codex's post-compaction figure (no input side).
+        self._reading: tuple[int, int, bool] | None = None
+        self._compaction: dict[str, Any] | None = None
+
+    @staticmethod
+    def _compact_launch_args(context: ConversationContext) -> list[str]:
+        window = context.effective_compact_window()
+        if window is None:
+            return []
+        return ["-c", f"{AUTO_COMPACT_KEY}={window}"]
+
+    def _seed_reading(self, context: ConversationContext) -> None:
+        """Start from the chat's last recorded size, when one is recorded."""
+        size = token_count(context.context_tokens)
+        self._reading = (size, size, False) if size else None
+        self._compaction = None
 
     def _transport(self, context: ConversationContext) -> RpcTransport:
         if self._rpc is None:
@@ -237,6 +271,7 @@ class CodexAdapter(ConversationAdapter):
                 argv=[
                     launch,
                     *managed_mcp_launch_args(self.manifest, context),
+                    *self._compact_launch_args(context),
                     "app-server",
                     "--stdio",
                 ],
@@ -277,6 +312,9 @@ class CodexAdapter(ConversationAdapter):
                     "sandbox": "danger-full-access",
                 }
             )
+        window = context.effective_compact_window()
+        if window is not None:
+            params["config"] = {AUTO_COMPACT_KEY: window}
         return params
 
     @staticmethod
@@ -346,6 +384,7 @@ class CodexAdapter(ConversationAdapter):
     def start(self, context: ConversationContext, message: str) -> NativeTurn:
         message = ensure_nonempty_message(message)
         rpc = self._transport(context)
+        self._reading = self._compaction = None
         started = rpc.request("thread/start", self._thread_params(context))
         thread = started.get("thread") if isinstance(started, dict) else None
         session_ref = thread.get("id") if isinstance(thread, dict) else None
@@ -370,6 +409,7 @@ class CodexAdapter(ConversationAdapter):
     ) -> NativeTurn:
         message = ensure_nonempty_message(message)
         rpc = self._transport(context)
+        self._seed_reading(context)
         params = self._thread_params(context)
         params["threadId"] = session_ref
         try:
@@ -435,6 +475,72 @@ class CodexAdapter(ConversationAdapter):
             ref if isinstance(ref, str) else None,
         )
 
+    @staticmethod
+    def _usage_reading(
+        source: Mapping[str, Any],
+    ) -> tuple[int, int, bool] | None:
+        """(size, total, estimate) of one token-usage breakdown.
+
+        ``inputTokens`` already counts the cached part, so it alone is the
+        input side of the request. Right after a compaction Codex reports no
+        input side at all and puts its estimate of the new context in
+        ``totalTokens``; that figure is then the reading.
+        """
+
+        def read(camel: str, snake: str) -> int | None:
+            value = token_count(source.get(camel))
+            return token_count(source.get(snake)) if value is None else value
+
+        input_side = read("inputTokens", "input_tokens")
+        total = read("totalTokens", "total_tokens")
+        if input_side:
+            return input_side, max(input_side, total or 0), False
+        if total:
+            return total, total, True
+        return None
+
+    def _open_compaction(self, ref: str | None) -> dict[str, Any]:
+        """Begin tracking one ``contextCompaction`` item.
+
+        The item carries no counts; they are read from the token-usage
+        updates around it. The app-server order is: the last request's
+        usage, ``item/started``, a usage update with no input side whose
+        total is the reduced context (sometimes sent twice), then
+        ``item/completed``. So the size before is the last reading at
+        ``item/started``, fixed here, and the size after is the zero-input
+        update that arrives while the item is open.
+        """
+        latest = self._reading
+        self._compaction = {
+            "ref": ref,
+            "before": latest[1] if latest else None,
+            "after": None,
+            "completed": False,
+        }
+        return self._compaction
+
+    def _emit_compaction(self, native_type: str) -> list[NormalizedEvent]:
+        compaction, self._compaction = self._compaction, None
+        if compaction is None:
+            return []
+        trigger = "manual" if self.compaction_requested else "auto"
+        self.compaction_requested = False
+        return [
+            compaction_event(
+                trigger=trigger,
+                tokens_before=compaction["before"],
+                tokens_after=compaction["after"],
+                compaction_ref=compaction["ref"],
+                native_type=native_type,
+            )
+        ]
+
+    def _flush_compaction(self, native_type: str) -> list[NormalizedEvent]:
+        """Record a finished compaction whose ``after`` never arrived."""
+        if self._compaction is None or not self._compaction["completed"]:
+            return []
+        return self._emit_compaction(native_type)
+
     def _normalize(
         self,
         raw: Mapping[str, Any],
@@ -444,6 +550,10 @@ class CodexAdapter(ConversationAdapter):
         if not isinstance(method, str) or not isinstance(params, dict):
             return []
         if method == "thread/started":
+            return []
+        if method == "thread/compacted":
+            # Deprecated in the installed protocol. The ``contextCompaction``
+            # item is the one signal; reading both would record it twice.
             return []
         if method == "turn/started":
             return [
@@ -468,17 +578,36 @@ class CodexAdapter(ConversationAdapter):
             kind, ref = self._item_kind(params)
             if kind in {None, "agentMessage", "reasoning"}:
                 return []
+            if kind == COMPACTION_ITEM:
+                # Not a tool: the compaction is recorded once, on completion.
+                flushed = self._flush_compaction(method)
+                self._open_compaction(ref)
+                return flushed
             return [
+                *self._flush_compaction(method),
                 NormalizedEvent(
                     "tool.started",
                     {"tool_ref": ref, "name": kind},
                     method,
-                )
+                ),
             ]
         if method == "item/completed":
             kind, ref = self._item_kind(params)
             if kind in {None, "agentMessage", "reasoning"}:
                 return []
+            if kind == COMPACTION_ITEM:
+                compaction = self._compaction
+                if compaction is None or compaction["completed"]:
+                    flushed = self._flush_compaction(method)
+                    compaction = self._open_compaction(ref)
+                else:
+                    flushed = []
+                compaction["completed"] = True
+                if compaction["after"] is None:
+                    # No size arrived while the item was open; the next
+                    # token-usage update is the first reading after it.
+                    return flushed
+                return [*flushed, *self._emit_compaction(method)]
             item = params.get("item")
             status = item.get("status") if isinstance(item, dict) else None
             return [
@@ -540,9 +669,34 @@ class CodexAdapter(ConversationAdapter):
                 for key, value in source.items()
                 if isinstance(value, (int, float)) and not isinstance(value, bool)
             }
-            return [
-                NormalizedEvent("usage", {"tokens": usage}, method)
-            ] if usage else []
+            if not usage:
+                return []
+            reading = self._usage_reading(source)
+            events: list[NormalizedEvent] = []
+            if reading is not None:
+                self._reading = reading
+                compaction = self._compaction
+                if compaction is not None and compaction["completed"]:
+                    compaction["after"] = reading[0]
+                    events.extend(self._emit_compaction(method))
+                elif compaction is not None and reading[2]:
+                    # The zero-input update inside the item. A repeat of it
+                    # only restates the same figure: one marker, no more.
+                    compaction["after"] = reading[0]
+            events.append(
+                usage_event(
+                    usage,
+                    method,
+                    scope="request",
+                    context_tokens=reading[0] if reading else None,
+                    context_window=(
+                        token_usage.get("modelContextWindow")
+                        if isinstance(token_usage, dict)
+                        else None
+                    ),
+                )
+            )
+            return events
         if method == "turn/completed":
             turn = params.get("turn")
             status = turn.get("status") if isinstance(turn, dict) else None
@@ -553,6 +707,7 @@ class CodexAdapter(ConversationAdapter):
             }.get(status, "run.failed")
             error = turn.get("error") if isinstance(turn, dict) else None
             return [
+                *self._flush_compaction(method),
                 NormalizedEvent(
                     event_type,
                     {"status": status or "failed", "error": error},

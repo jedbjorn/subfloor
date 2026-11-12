@@ -126,11 +126,22 @@ started a new server, resumed the exact thread, and recovered the original
 nonce. Permission policy is the requirement; `--sandbox` is not part of the
 shared contract. The app-server payload takes kebab-case `danger-full-access`.
 
-### Supported range (re-probed 2026-09-21 on 0.155.1)
+### Supported range (re-probed 2026-09-21 on 0.155.1; ceiling raised 2026-11-12)
 
 `conversation.verified_cli_version` is `0.155.1` and
-`maximum_cli_version_exclusive` is `0.156.0`. The window is authored from
-evidence, not from version arithmetic:
+`maximum_cli_version_exclusive` is `0.168.0`.
+
+**The ceiling and the probe are no longer the same statement.** On 2026-11-12
+the ceiling was raised from `0.156.0` to `0.168.0` to cover the installed
+`codex-cli 0.167.1`, by operator ruling (flag SC-1610, Feature #95 spec #272):
+build against the installed version and assume its behaviour holds; a later
+break is handled when it shows. `verified_cli_version` did not move, because
+the whole-contract probe below was not repeated on 0.167.1. So an installed
+0.167.1 reports `supported`, not `verified` and not `newer-unverified`. What
+was checked on 0.167.1 is narrower and is listed under "Compaction and the
+context meter" below.
+
+The original window was authored from evidence, not from version arithmetic:
 
 - **`0.155.1` is what was probed.** It is the installed host binary and, at the
   time of the probe, the newest stable `rust-v0.155.1` release — everything
@@ -193,3 +204,39 @@ was gone at CLI exit. This proves no durable detachment for that native exec
 session. Multi-agent lifetime and explicit OS detachment were not asserted.
 GUI long work therefore continues through `sc job`; no Codex conversion hook
 is introduced by this lane.
+
+## Compaction and the context meter (Feature #95, spec #272)
+
+Checked on `codex-cli 0.167.1`, 2026-11-12, with one small model request.
+
+- **Earlier compact window.** A browser chat is given
+  `model_auto_compact_token_limit` (default 120,000; `SC_CHAT_COMPACT_WINDOW_CODEX`
+  sets it, `off` restores Codex's default). It is stated twice, and both forms
+  were accepted: as `-c model_auto_compact_token_limit=<n>` on the
+  `codex … app-server --stdio` launch, where `config/read` then reports the
+  value with origin `sessionFlags`; and in the `config` object of
+  `thread/start` and `thread/resume`, where it is parsed as thread
+  configuration (a non-integer value is refused with
+  `failed to load configuration: invalid type … expected i64`). A resumed
+  thread therefore gets it by either route. **Not checked:** that Codex then
+  compacts at that figure, and the accepted range; that is the post-merge
+  live check (spec #272 criterion 10). It is skipped for a chat whose recorded
+  `modelContextWindow` is smaller than the setting. Terminal seats are untouched.
+- **Signal.** The `contextCompaction` item is the one signal. It is recorded
+  once as `context.compacted` and no longer surfaces as a tool event; the
+  deprecated `thread/compacted` notification is ignored. The item carries no
+  trigger and no counts: the trigger is `auto` unless the engine asked for the
+  compaction (`CodexAdapter.compaction_requested`), and the counts are read
+  from the `thread/tokenUsage/updated` values around the item. The app-server
+  order, from 308 engine-captured compactions, is: the last request's usage
+  (for example input 215,900, total 216,150), `item/started`, a usage update
+  with `inputTokens: 0` whose `totalTokens` is the reduced context (for
+  example 18,692; sometimes sent twice), then `item/completed`. The size
+  before is the last reading at `item/started`; the size after is that
+  zero-input update's total. A repeat of it adds no second marker. Item ids
+  were distinct across all 308, so a replayed item is recorded once.
+- **Meter.** `tokenUsage.last.inputTokens` (which already counts the cached
+  part) is the context size of the latest request, and `modelContextWindow`
+  is kept as the window, exactly as Codex reports it (258,400 for a 272,000
+  model: Codex states 95%). The zero-input update after a compaction reads as
+  its total, never as 0.
