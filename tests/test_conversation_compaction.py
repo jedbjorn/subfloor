@@ -802,13 +802,13 @@ class RegroundLineTest(DispatchCase):
         conversation_id = self.add_conversation()
         self.deliver(broker, conversation_id, "start")
         wake = self.deliver(
-            broker, conversation_id, "Sprint 12: work unit 3 is ready",
+            broker, conversation_id, "Wake: work unit 3 is ready",
             sender_kind="engine",
         )
         self.assertEqual(
-            adapter.dispatched[1], f"Sprint 12: work unit 3 is ready\n\n{LINE}"
+            adapter.dispatched[1], f"Wake: work unit 3 is ready\n\n{LINE}"
         )
-        self.assertEqual(self.stored_body(wake), "Sprint 12: work unit 3 is ready")
+        self.assertEqual(self.stored_body(wake), "Wake: work unit 3 is ready")
 
     def test_several_compactions_before_one_message_add_one_line(self) -> None:
         adapter = RecordingAdapter(compact_on={1, 2, 4})
