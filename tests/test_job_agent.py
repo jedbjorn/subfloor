@@ -174,8 +174,8 @@ class RefusalTest(unittest.TestCase):
         self.refuse(
             "does not support one-shot", "codex",
             adapter={**run_mod.load_adapter("codex"),
-                     "surfaces": {"terminal": True, "one_shot": False,
-                                  "browser": True, "sprint": True}})
+                     "surfaces": {**run_mod.load_adapter("codex")["surfaces"],
+                                  "one_shot": False}})
 
     def test_a_model_or_effort_the_harness_cannot_take_is_refused(self):
         adapter = run_mod.load_adapter("claude")

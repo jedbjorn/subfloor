@@ -160,7 +160,7 @@ class UpgradeTest(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.con.execute(
                 "INSERT INTO runs(owner_shell_id,registration_key,kind,label,argv,cwd,evidence_path) "
-                "VALUES(1,'bad','watcher','l','[]','/repo','/e')")
+                "VALUES(1,'bad','other','l','[]','/repo','/e')")
         with self.assertRaises(sqlite3.IntegrityError):
             self.con.execute("UPDATE runs SET timeout_seconds=0")
         self.con.rollback()
@@ -487,6 +487,25 @@ class FactsAndResultTest(AgentLedgerCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.con.execute("UPDATE run_agents SET harness='claude'")
         self.con.rollback()
+
+    def test_agent_facts_are_carried_by_the_instance_snapshot(self):
+        import snapshot
+
+        row = self.store.register(1, agent_payload("kept", timeout_seconds=600))
+        self.store.facts(row["run_id"], 1, {"session_ref": "thread-1"})
+        tables = snapshot.PER_INSTANCE_TABLES
+        self.assertLess(tables.index("runs"), tables.index("run_agents"))
+        script = "\n".join(
+            line for table in ("runs", "run_agents") for line in snapshot.dump_table(self.con, table)
+        )
+        rebuilt_path = self.root / "rebuilt.db"
+        build_db(str(rebuilt_path))
+        rebuilt = sqlite3.connect(rebuilt_path)
+        self.addCleanup(rebuilt.close)
+        rebuilt.executescript(script)
+        self.assertEqual(
+            runs.RunStore(rebuilt, self.root / "engine").get(row["run_id"]),
+            self.store.get(row["run_id"]))
 
     def test_result_is_read_from_the_registered_path_and_bounded(self):
         row = job._api("POST", "/_sc/runs", agent_payload("one"))

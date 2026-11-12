@@ -167,6 +167,9 @@ PER_INSTANCE_TABLES = [
     # survive update/rebuild together.
     *SPRINT_INSTANCE_TABLES,
     "runs",
+    # A subagent run's facts (harness, model, worktree, session) are part of
+    # the run; without them a rebuilt agent row would name no harness.
+    "run_agents",
     "engine_wake_receipts",
     "engine_wake_failures",
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
