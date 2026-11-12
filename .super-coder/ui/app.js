@@ -4571,6 +4571,9 @@ let chatHistoryPollTimer = null;
 let chatRenderGeneration = 0;
 let chatPendingSend = null;
 let chatModeController = null;
+// The history pane's "＋ Chat" action (close this chat, start a new one),
+// for the open chat's cold-return notice to offer.
+let chatNewChatAction = null;
 let chatReviewCleanup = null;
 let chatConfigurationPromise = null;
 
@@ -5105,21 +5108,127 @@ function chatPaintContextMeter(node, context, harness = null) {
 // The marker's wording, shared by the live event and the loaded transcript:
 // "Context compacted · 123k → 28k · automatic". A figure the harness did not
 // state is left out, and an unknown trigger is not named.
-function chatCompactionLabel(payload) {
+// Claude's figure after is the summary alone: the next request also carries
+// the system prompt and tools and is several times larger, so its marker
+// says "summary". The stored event is the same for every harness.
+function chatCompactionLabel(payload, harness = null) {
   const before = chatTokenCount(payload?.tokens_before);
   const after = chatTokenCount(payload?.tokens_after);
+  const summary = harness === "claude" ? " summary" : "";
   const parts = ["Context compacted"];
   if (before !== null && after !== null)
-    parts.push(`${chatShortTokens(before)} → ${chatShortTokens(after)}`);
+    parts.push(
+      `${chatShortTokens(before)} → ${chatShortTokens(after)}${summary}`);
   else if (before !== null) parts.push(`from ${chatShortTokens(before)}`);
-  else if (after !== null) parts.push(`now ${chatShortTokens(after)}`);
+  else if (after !== null)
+    parts.push(summary
+      ? `${chatShortTokens(after)} summary` : `now ${chatShortTokens(after)}`);
   if (payload?.trigger === "auto") parts.push("automatic");
   else if (payload?.trigger === "manual") parts.push("manual");
   return parts.join(" · ");
 }
 
+function chatCompactionMarkerTitle(harness = null) {
+  const base = "The harness compacted this chat's context here. "
+    + "The figures are the ones it reported.";
+  return harness === "claude"
+    ? `${base} For Claude the figure after is the summary alone; `
+      + "the next request is larger."
+    : base;
+}
+
 function chatRegroundLabel() {
   return "Re-ground line added to this message (context was compacted)";
+}
+
+// The manual compact button (spec #272). Every press ends in exactly one of
+// three lines in the chat: the marker above, this error, or this notice.
+function chatCompactionFailedLabel(payload) {
+  if (payload?.outcome === "cancelled")
+    return "Compaction stopped — the context was not compacted";
+  const raw = payload?.detail || payload?.error;
+  const reason = raw ? String(raw).split(/\s+/).filter(Boolean).join(" ") : "";
+  return reason
+    ? `Compaction failed — ${reason}`
+    : "Compaction failed — the context was not compacted";
+}
+
+function chatCompactionNotReportedLabel() {
+  return "Compaction not reported — the harness finished without reporting "
+    + "a compaction";
+}
+
+const CHAT_COMPACT_TOOLTIP = "Compact this chat's context now. "
+  + "The harness reads the whole context once to summarise it, "
+  + "which costs one model request.";
+
+// What the button shows. `compaction` is the server's reading (supported
+// harness, a stored session to compact, a request already in flight); the
+// chat's live state is laid over it. Hidden for a harness with no manual
+// trigger and for a chat with no session; greyed out and inert during a
+// turn and while a requested compaction is still running.
+function chatCompactButtonState(conversation, requesting = false) {
+  const controls = conversation?.compaction || {};
+  const closed = conversation?.state === "closed";
+  const visible = Boolean(controls.supported && controls.available) && !closed;
+  const pending = Boolean(controls.pending) || Boolean(requesting);
+  const working = ["queued", "running", "waiting"].includes(conversation?.state)
+    || conversation?.active_run_id != null;
+  const closing = Boolean(conversation?.close_requested_at);
+  const disabled = !visible || pending || working || closing;
+  return {
+    visible,
+    disabled,
+    pending,
+    label: pending ? "Compacting…" : "Compact",
+    title: !visible ? ""
+      : pending ? "A compaction is in progress."
+      : working ? "Available when the current turn has finished."
+      : closing ? "This chat is closing."
+      : CHAT_COMPACT_TOOLTIP,
+  };
+}
+
+// The cold-return notice (spec #272): a large chat that has sat idle long
+// enough to lose its provider cache re-reads its whole context, uncached, on
+// the next message. Both thresholds are engine settings the server reports.
+const CHAT_COLD_RETURN_TOKENS = 60000;
+const CHAT_COLD_RETURN_IDLE_MINUTES = 60;
+
+// Engine timestamps are UTC, written without an offset.
+function chatEngineTime(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const text = value.trim().replace(" ", "T");
+  const stamp = Date.parse(/(Z|[+-]\d\d:?\d\d)$/.test(text) ? text : `${text}Z`);
+  return Number.isFinite(stamp) ? stamp : null;
+}
+
+// True when the chat is at or above the token setting and its last activity
+// is more than the minute setting ago. Never during a turn or a pending
+// compaction, never for a closed chat, and never for a managed participant.
+function chatColdReturnDue(conversation, nowMs) {
+  const limits = conversation?.cold_return || {};
+  const tokens = chatTokenCount(limits.context_tokens) || CHAT_COLD_RETURN_TOKENS;
+  const minutes = chatTokenCount(limits.idle_minutes)
+    || CHAT_COLD_RETURN_IDLE_MINUTES;
+  if (!["idle", "error"].includes(conversation?.state)) return false;
+  if (conversation?.active_run_id != null) return false;
+  if (conversation?.close_requested_at) return false;
+  if (conversation?.sprint_managed) return false;
+  if (conversation?.compaction?.pending) return false;
+  const size = chatTokenCount(conversation?.context?.context_tokens);
+  const last = chatEngineTime(conversation?.last_activity_at);
+  if (size === null || last === null || !Number.isFinite(nowMs)) return false;
+  if (size < tokens) return false;
+  return nowMs - last > minutes * 60000;
+}
+
+function chatColdReturnText(conversation) {
+  const size = chatTokenCount(conversation?.context?.context_tokens);
+  const about = size === null ? "its whole context"
+    : `about ${chatShortTokens(size)} tokens`;
+  return "This chat is large and its cache has likely expired, "
+    + `so the next message re-reads ${about} at full price.`;
 }
 
 // What a live usage or compaction event does to the chat's meter. Returns
@@ -5324,6 +5433,7 @@ function chatOpenStream(
     "message.accepted", "session.started", "run.started",
     "assistant.delta", "tool.started", "tool.completed", "permission.requested",
     "input.requested", "usage", "context.compacted", "message.reground",
+    "compaction.requested", "compaction.failed", "compaction.not_reported",
     "run.completed", "run.resumed", "run.failed",
     "run.interrupt.requested", "run.interrupted", "run.unknown",
     "run.deferred", "run.reaped", "run.process.snapshot", "run.process.ended",
@@ -6487,8 +6597,16 @@ function chatTranscriptItemNode(item, conversation, retry) {
       // never mistaken for an ordinary activity line.
       activity.classList.add("chat-compaction-marker");
       activity.setAttribute("role", "separator");
-      activity.title = "The harness compacted this chat's context here. "
-        + "The figures are the ones it reported.";
+      activity.title = chatCompactionMarkerTitle(conversation?.route?.harness);
+    } else if (item.activity_type === "compaction.failed") {
+      activity.classList.add("chat-compaction-failed");
+      activity.title = "The manual compaction did not happen; "
+        + "the session is as it was.";
+    } else if (item.activity_type === "compaction.not_reported") {
+      activity.classList.add("chat-compaction-unreported");
+      activity.title = "The harness accepted the request and finished "
+        + "without reporting a compaction; the context meter shows "
+        + "whether anything changed.";
     } else if (item.activity_type === "message.reground") {
       activity.classList.add("chat-reground-note");
       activity.title = "Added by the engine to the text sent to the shell; "
@@ -6731,9 +6849,34 @@ async function chatRenderOpen(
     state: initialSnapshot.controls.conversation_state,
     close_requested_at: initialSnapshot.controls.close_requested_at,
     active_run_id: initialSnapshot.controls.active_run_id,
+    // The snapshot is the single-chat read: it carries the meter, the
+    // compact button's state and the cold-return settings, which a
+    // conversation taken from the history list does not.
+    context: initialSnapshot.context
+      ? { ...initialSnapshot.context } : conversation.context,
+    compaction: initialSnapshot.controls.compaction || conversation.compaction,
+    cold_return: initialSnapshot.cold_return || conversation.cold_return,
+  };
+  // The page keeps what only the transcript snapshot and the live stream
+  // report (the meter) when a conversation read replaces the object.
+  const adoptConversation = (next) => {
+    // The last compact request stays known after it finishes, so a late
+    // event of its run is still recognised as that run's.
+    const requestId = conversation.compaction?.message_id ?? null;
+    conversation = { ...next, context: conversation.context };
+    if (conversation.compaction && conversation.compaction.message_id == null
+        && requestId != null)
+      conversation.compaction = {
+        ...conversation.compaction, message_id: requestId,
+      };
   };
   let streamStatus = "connecting";
   let stopRequest = null;
+  let compactRequest = null;
+  // The cold-return notice is latched when the operator opens or returns to
+  // the chat, and dismissed by sending, compacting or "Continue here".
+  let coldReturnShown = false;
+  let coldReturnDismissedFor = null;
   let uploading = 0;
   let reconcilePromise = null;
   let reconcileFailures = 0;
@@ -6843,6 +6986,31 @@ async function chatRenderOpen(
     className: "chat-context-meter", hidden: true, role: "status",
   });
   const composeLeft = el("div", { className: "chat-compose-left" }, contextMeter);
+  // The manual compact button, beside the meter. Hidden until the chat has
+  // a session a supported harness can compact.
+  const compact = el("button", {
+    className: "act chat-compact", type: "button", textContent: "Compact",
+    hidden: true, disabled: true,
+  });
+  composeLeft.append(compact);
+  // The cold-return notice: one line above the composer, never in its way.
+  const coldReturnText = el("span", { className: "chat-cold-return-text" });
+  const coldCompact = el("button", {
+    className: "act", type: "button", textContent: "Compact now",
+    title: CHAT_COMPACT_TOOLTIP,
+  });
+  const coldContinue = el("button", {
+    className: "act", type: "button", textContent: "Continue here",
+    title: "Keep this chat and dismiss this notice.",
+  });
+  const coldNewChat = el("button", {
+    className: "act", type: "button", textContent: "New chat",
+    title: "Close this chat and start a new one. "
+      + "Only control-plane state carries over.",
+  });
+  const coldReturn = el("div", {
+    className: "chat-cold-return", hidden: true, role: "status",
+  }, coldReturnText, coldCompact, coldContinue, coldNewChat);
   const unavailable = el("div", {
     className: "chat-harness-unavailable",
     hidden: true,
@@ -6854,7 +7022,7 @@ async function chatRenderOpen(
     hidden: true,
   });
   const composerRow = el("div", { className: "chat-composer" },
-    unavailable, availabilityRetry,
+    unavailable, availabilityRetry, coldReturn,
     el("div", { className: "chat-composer-field" }, composer, attachmentChips),
     el("div", { className: "chat-compose-actions" },
       composeLeft, pending, send, stop));
@@ -6951,8 +7119,15 @@ async function chatRenderOpen(
     conversation.state = snapshot.controls.conversation_state;
     conversation.close_requested_at = snapshot.controls.close_requested_at;
     conversation.active_run_id = snapshot.controls.active_run_id;
+    if (snapshot.controls.compaction)
+      conversation.compaction = { ...snapshot.controls.compaction };
     // Only the newest page carries the meter; an older page leaves it be.
     if (snapshot.context) conversation.context = { ...snapshot.context };
+    if (snapshot.cold_return) {
+      conversation.cold_return = snapshot.cold_return;
+      conversation.last_activity_at = snapshot.cold_return.last_activity_at
+        || conversation.last_activity_at;
+    }
   };
   const reconcileTranscript = async (manual = false) => {
     if (manual) reconcileFailures = 0;
@@ -7015,10 +7190,24 @@ async function chatRenderOpen(
     const value = (prompt("Conversation title", conversation.title || "") || "").trim();
     if (!value) return;
     try {
-      conversation = await chatApi(`/conversations/${conversation.conversation_id}`,
-        "PATCH", { version: conversation.version, title: value });
+      adoptConversation(
+        await chatApi(`/conversations/${conversation.conversation_id}`,
+          "PATCH", { version: conversation.version, title: value }));
       paint();
     } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
+  };
+  // Latch the cold-return notice when the operator opens or returns to a
+  // large idle chat. It stays until it is dismissed; it never blocks a send.
+  const checkColdReturn = () => {
+    if (coldReturnShown || document.hidden) return;
+    if (coldReturnDismissedFor === conversation.last_activity_at) return;
+    if (!chatColdReturnDue(conversation, Date.now())) return;
+    coldReturnShown = true;
+    paint();
+  };
+  const dismissColdReturn = () => {
+    coldReturnShown = false;
+    coldReturnDismissedFor = conversation.last_activity_at;
   };
   const paint = () => {
     const rename = el("button", {
@@ -7039,10 +7228,29 @@ async function chatRenderOpen(
     queueState.textContent = `${queued} queued`;
     chatPaintContextMeter(
       contextMeter, conversation.context, conversation.route?.harness);
+    const compactState = chatCompactButtonState(
+      conversation, Boolean(compactRequest));
+    compact.hidden = !compactState.visible;
+    compact.disabled = compactState.disabled;
+    compact.textContent = compactState.label;
+    compact.title = compactState.title;
+    // The notice is a suggestion for an idle chat. Sending a message or
+    // requesting a compaction puts the chat to work, and that dismisses it.
+    if (coldReturnShown && (
+      !["idle", "error"].includes(conversation.state) || compactState.pending))
+      dismissColdReturn();
+    coldReturn.hidden = !coldReturnShown;
+    if (coldReturnShown) {
+      coldReturnText.textContent = chatColdReturnText(conversation);
+      coldCompact.hidden = !compactState.visible;
+      coldCompact.disabled = compactState.disabled;
+    }
     updateStreamStatus();
     const closed = conversation.state === "closed";
     const closing = !closed && Boolean(conversation.close_requested_at);
     const sprintScoped = conversation.scope === "sprint";
+    // An engine-managed chat is not the operator's to close and replace.
+    coldNewChat.hidden = sprintScoped || !chatNewChatAction;
     // Managed = the owning sprint is still armed/paused; close stays engine-
     // owned only for that window. Reopen is scope-blocked server-side forever.
     const sprintManaged = Boolean(conversation.sprint_managed);
@@ -7106,7 +7314,7 @@ async function chatRenderOpen(
     conversation.conversation_id,
     generation,
     (next, nextMessages) => {
-      conversation = next;
+      adoptConversation(next);
       messages = nextMessages;
       for (const message of nextMessages) {
         const item = transcriptState.items.get(
@@ -7227,6 +7435,52 @@ async function chatRenderOpen(
     }
   };
   headerStop.onclick = () => stop.click();
+  // The manual compact request. One press is one request: further clicks
+  // are ignored until the server answers, and the server refuses a second
+  // request while one is pending. The result arrives on the event stream as
+  // the marker, an error line or the not-reported notice; a refusal of the
+  // request itself is told at once.
+  const requestCompaction = async () => {
+    if (compactRequest
+        || chatCompactButtonState(conversation, false).disabled) return;
+    compactRequest = { key: requestKey() };
+    paint();
+    try {
+      const result = await chatApi(
+        `/conversations/${conversation.conversation_id}/compactions`,
+        "POST", {}, compactRequest.key);
+      conversation.compaction = {
+        ...(conversation.compaction || {}),
+        pending: true,
+        message_id: result.compaction?.message_id ?? null,
+      };
+      if (conversation.state !== "running") conversation.state = "queued";
+      refresh();
+      wakeSessionWatch();
+    } catch (error) {
+      toast(`${error.code}: ${error.message}`);
+      refresh();
+    } finally {
+      compactRequest = null;
+      paint();
+    }
+  };
+  compact.onclick = requestCompaction;
+  coldCompact.onclick = requestCompaction;
+  coldContinue.onclick = () => {
+    dismissColdReturn();
+    paint();
+    composer.focus();
+  };
+  coldNewChat.onclick = () => {
+    if (!chatNewChatAction) return;
+    if (!confirm("Close this chat and start a new one? "
+        + "Only control-plane state carries over: anything that exists "
+        + "only in this chat is left behind.")) return;
+    dismissColdReturn();
+    paint();
+    chatNewChatAction();
+  };
   // Dropped or pasted files upload to the engine host's shared/chat-uploads
   // and enter the sent message as a plain path, so every harness reads them alike
   // and the bytes ride whatever origin serves this page (tunnel included).
@@ -7308,7 +7562,11 @@ async function chatRenderOpen(
   const activityLabel = (event) => {
     const payload = event.payload || {};
     if (event.event_type === "context.compacted")
-      return chatCompactionLabel(payload);
+      return chatCompactionLabel(payload, conversation.route?.harness);
+    if (event.event_type === "compaction.failed")
+      return chatCompactionFailedLabel(payload);
+    if (event.event_type === "compaction.not_reported")
+      return chatCompactionNotReportedLabel();
     if (event.event_type === "message.reground") return chatRegroundLabel();
     if (event.event_type === "run.process.ended") return payload.label || "Turn process ended";
     if (event.event_type === "permission.requested")
@@ -7341,6 +7599,11 @@ async function chatRenderOpen(
       "permission.requested",
       "input.requested",
     ].includes(type);
+    // Events of the manual compact request's own run. It is not a turn: it
+    // drives the chat's state like one, but shows nothing of its own. Its
+    // result is the marker, the error line or the not-reported notice.
+    const compactionRun = event.message_id != null
+      && event.message_id === conversation.compaction?.message_id;
 
     if (boundary && event.run_id != null) {
       const previousAnchor = transcriptState.assistantAnchors.get(event.run_id)
@@ -7428,6 +7691,15 @@ async function chatRenderOpen(
         assistant.context_measured = event.payload?.scope === "request";
         transcriptState.dirty.add(assistant.item_id);
       }
+    } else if (type === "compaction.requested") {
+      conversation.compaction = {
+        ...(conversation.compaction || {}),
+        pending: true,
+        message_id: event.message_id ?? null,
+      };
+      if (conversation.state !== "running") conversation.state = "queued";
+    } else if (compactionRun) {
+      // Nothing of the request's own run is shown.
     } else if ([
       "permission.requested",
       "input.requested",
@@ -7436,6 +7708,8 @@ async function chatRenderOpen(
       "run.unknown",
       "run.process.ended",
       "context.compacted",
+      "compaction.failed",
+      "compaction.not_reported",
       "message.reground",
     ].includes(type)) {
       const itemId = `event:${sequence}`;
@@ -7511,7 +7785,14 @@ async function chatRenderOpen(
     if (["run.completed", "run.interrupted"].includes(type))
       conversation.state = chatQueuedCount(messages) ? "queued" : "idle";
     if (["run.failed", "run.unknown"].includes(type))
-      conversation.state = "error";
+      // A manual compaction that failed leaves the chat as it was.
+      conversation.state = compactionRun
+        ? (chatQueuedCount(messages) ? "queued" : "idle") : "error";
+    if (conversation.compaction?.pending && (
+      ["compaction.failed", "compaction.not_reported"].includes(type)
+      || (compactionRun && ["run.completed", "run.failed", "run.interrupted",
+        "run.unknown"].includes(type))))
+      conversation.compaction = { ...conversation.compaction, pending: false };
     if (type === "conversation.closed") {
       conversation.state = "closed";
       clearImageAttachments();
@@ -7538,6 +7819,8 @@ async function chatRenderOpen(
     paint();
     if (["message.accepted", "run.completed", "run.failed",
          "run.interrupted", "run.unknown",
+         "compaction.requested", "compaction.failed",
+         "compaction.not_reported",
          "conversation.updated", "conversation.renamed",
          "conversation.close.requested",
          "conversation.closed", "conversation.reopened"].includes(type))
@@ -7554,6 +7837,13 @@ async function chatRenderOpen(
     },
   );
   checkHarnessAvailability();
+  // "Returns to a chat" is opening it, coming back to a tab that was left
+  // open on it, and putting the cursor back in its composer. The document
+  // listener ends with this chat's view.
+  document.addEventListener(
+    "visibilitychange", checkColdReturn, { signal: readSignal });
+  composer.onfocus = checkColdReturn;
+  checkColdReturn();
 }
 
 async function renderInterface(root) {
@@ -7565,6 +7855,7 @@ async function renderInterface(root) {
   chatStopHistoryPoll();
   chatStopReview();
   chatModeController = null;
+  chatNewChatAction = null;
   const generation = ++chatRenderGeneration;
   root.replaceChildren(
     el("div", { className: "chat-loading" }, "Loading conversations…"));
@@ -7772,6 +8063,7 @@ async function renderInterface(root) {
     textContent: "Configure",
     disabled: adminCliOnly,
   });
+  chatNewChatAction = adminCliOnly ? null : () => newChat.click();
   newChat.onclick = async () => {
     if (!await chatCloseForSwitch(selectedConversation)) return;
     watchCatalogueOnNewChat();  // fire-and-forget: creation never waits on it

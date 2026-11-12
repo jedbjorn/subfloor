@@ -114,6 +114,10 @@ class BrokerRun:
     process_group_id: int | None = None
     transcript_path: str | None = None
     transcript_offset: int | None = None
+    # True when the trigger is the engine's manual compact request: the run
+    # asks the harness to compact the stored session instead of sending a
+    # message (Feature #95).
+    compaction: bool = False
 
     def context(self) -> ConversationContext:
         # Browser conversations run with worktree command access.
@@ -352,6 +356,7 @@ class BrokerStore:
             process_group_id=row["process_group_id"],
             transcript_path=row["transcript_path"],
             transcript_offset=row["transcript_offset"],
+            compaction=bool(row["manual_compaction"]),
         )
 
     @staticmethod
@@ -364,6 +369,8 @@ class BrokerStore:
             "r.state AS run_state,c.harness,c.provider,c.model,c.effort,"
             "c.route_contract_version,c.route_binding,"
             "c.worktree,c.title,m.body,"
+            + conversation_compaction.manual_compact_sql("m")
+            + " AS manual_compaction,"
             "1+(SELECT COUNT(*) FROM conversation_events reopened "
             " WHERE reopened.conversation_id=r.conversation_id "
             " AND reopened.event_type='conversation.reopened') AS lifecycle_epoch,"
@@ -392,6 +399,8 @@ class BrokerStore:
                     "c.shell_id,c.harness,c.provider,c.model,c.effort,"
                     "c.route_contract_version,c.route_binding,c.worktree,"
                     "c.title,c.harness_session_ref,m.body,m.state AS message_state,"
+                    + conversation_compaction.manual_compact_sql("m")
+                    + " AS manual_compaction,"
                     "1+(SELECT COUNT(*) FROM conversation_events reopened "
                     " WHERE reopened.conversation_id=c.conversation_id "
                     " AND reopened.event_type='conversation.reopened') AS lifecycle_epoch "
@@ -503,6 +512,7 @@ class BrokerStore:
                     route_binding=binding,
                     binding_digest=binding_digest,
                     lifecycle_epoch=int(row["lifecycle_epoch"]),
+                    compaction=bool(row["manual_compaction"]),
                 )
         except db_driver.IntegrityError as exc:
             # A second broker can race the eligibility read. BEGIN IMMEDIATE
@@ -849,8 +859,12 @@ class BrokerStore:
                 row = con.execute(
                     "SELECT r.conversation_id,r.trigger_message_id,r.state,"
                     "c.shell_id,c.harness,c.provider,c.model,c.title,c.created_at,"
-                    "c.harness_session_ref FROM conversation_runs r "
+                    "c.harness_session_ref,"
+                    + conversation_compaction.manual_compact_sql("m")
+                    + " AS manual_compaction FROM conversation_runs r "
                     "JOIN conversations c ON c.conversation_id=r.conversation_id "
+                    "JOIN conversation_messages m "
+                    " ON m.message_id=r.trigger_message_id "
                     "WHERE r.run_id=?",
                     (run_id,),
                 ).fetchone()
@@ -861,8 +875,15 @@ class BrokerStore:
                         "CONVERSATION_RUN_TERMINAL",
                         f"run {run_id} is already {row['state']}",
                     )
+                manual = bool(row["manual_compaction"])
                 sequences = []
                 for event in events:
+                    if manual and event.type not in (
+                        conversation_compaction.MANUAL_COMPACT_RUN_EVENTS
+                    ):
+                        # A manual compaction records that the harness
+                        # compacted, never the summary it streamed.
+                        continue
                     if self._compaction_recorded(
                         con, row["conversation_id"], event
                     ):
@@ -872,14 +893,26 @@ class BrokerStore:
                         payload["native_type"] = event.native_type
                     if event.interrupt_evidence:
                         payload["interrupt_evidence"] = event.interrupt_evidence
+                    marker = manual and event.type == "context.compacted"
+                    if marker:
+                        # The engine asked for this one, whatever the harness
+                        # states. It is recorded on the chat, not on the
+                        # request's run: the transcript lists operator turns,
+                        # and the marker has to show without one.
+                        payload["trigger"] = "manual"
+                        payload["request_message_id"] = int(
+                            row["trigger_message_id"]
+                        )
                     sequences.append(
                         self._append_event(
                             con,
                             conversation_id=row["conversation_id"],
                             event_type=event.type,
                             payload=payload,
-                            message_id=row["trigger_message_id"],
-                            run_id=run_id,
+                            message_id=(
+                                None if marker else row["trigger_message_id"]
+                            ),
+                            run_id=None if marker else run_id,
                         )
                     )
                 con.execute(
@@ -935,6 +968,11 @@ class BrokerStore:
                 row = con.execute(
                     "SELECT r.state,r.conversation_id,r.trigger_message_id,"
                     "c.state AS conversation_state,c.shell_id,"
+                    "(SELECT "
+                    + conversation_compaction.manual_compact_sql("m")
+                    + " FROM conversation_messages m "
+                    " WHERE m.message_id=r.trigger_message_id) "
+                    "AS manual_compaction,"
                     "EXISTS(SELECT 1 FROM conversation_events closing "
                     " WHERE closing.conversation_id=r.conversation_id "
                     " AND closing.event_type='conversation.close.requested' "
@@ -1008,9 +1046,12 @@ class BrokerStore:
                     ).fetchone()
                     is not None
                 )
+                manual = bool(row["manual_compaction"])
+                # A manual compaction that failed leaves the session as it
+                # was: the chat is not in error, it just was not compacted.
                 conversation_target = (
                     "error"
-                    if outcome in {"failed", "unknown"}
+                    if outcome in {"failed", "unknown"} and not manual
                     else "queued"
                     if pending
                     else "idle"
@@ -1069,6 +1110,15 @@ class BrokerStore:
                     message_id=row["trigger_message_id"],
                     run_id=run_id,
                 )
+                if manual:
+                    self._append_compaction_outcome(
+                        con,
+                        conversation_id=row["conversation_id"],
+                        message_id=int(row["trigger_message_id"]),
+                        outcome=outcome,
+                        error_code=error_code,
+                        error_detail=error_detail,
+                    )
                 if close_after and not already_closed:
                     require_transition(
                         "conversation",
@@ -1100,6 +1150,67 @@ class BrokerStore:
             str(conversation_id),
         )
         return True
+
+    @staticmethod
+    def _append_compaction_outcome(
+        con,
+        *,
+        conversation_id: str,
+        message_id: int,
+        outcome: str,
+        error_code: str | None,
+        error_detail: str | None,
+    ) -> int | None:
+        """Close one manual compact request with exactly one visible result.
+
+        The marker (``context.compacted``) is written while the run streams.
+        When the run ends without one, this writes the other result: the
+        error line for a run that did not succeed, or the notice that the
+        harness finished without reporting a compaction. Both sit on the
+        chat, not on the request's run, like the marker. Nothing is written
+        when a result is already in the log, so a request has one.
+        """
+        requested = con.execute(
+            "SELECT COALESCE(MAX(sequence),0) FROM conversation_events "
+            "WHERE conversation_id=? AND message_id=? AND event_type=?",
+            (
+                conversation_id,
+                message_id,
+                conversation_compaction.COMPACTION_REQUESTED,
+            ),
+        ).fetchone()[0]
+        settled = con.execute(
+            "SELECT 1 FROM conversation_events "
+            "WHERE conversation_id=? AND sequence>? "
+            "AND event_type IN ('context.compacted',?,?) LIMIT 1",
+            (
+                conversation_id,
+                int(requested),
+                conversation_compaction.COMPACTION_FAILED,
+                conversation_compaction.COMPACTION_NOT_REPORTED,
+            ),
+        ).fetchone()
+        if settled is not None:
+            return None
+        if outcome == "succeeded":
+            event_type = conversation_compaction.COMPACTION_NOT_REPORTED
+            payload: dict[str, Any] = {}
+        else:
+            event_type = conversation_compaction.COMPACTION_FAILED
+            payload = {"outcome": outcome}
+            if error_code:
+                payload["error"] = error_code
+            if error_detail:
+                payload["detail"] = error_detail[:2000]
+        payload["request_message_id"] = message_id
+        return BrokerStore._append_event(
+            con,
+            conversation_id=conversation_id,
+            event_type=event_type,
+            payload=payload,
+            message_id=None,
+            run_id=None,
+        )
 
     def open_continuation(self, run_id: int, owner: str) -> int | None:
         """Reopen a lingering turn as the next attempt of the same message.
@@ -2159,6 +2270,11 @@ class ConversationBroker(threading.Thread):
                     )
                     adapter = self.adapter_factory(run.harness)
                     active.adapter = adapter
+                    if run.compaction and not run.session_before:
+                        raise BrokerError(
+                            "COMPACTION_NO_SESSION",
+                            "this chat has no harness session to compact yet",
+                        )
                 except Exception as exc:
                     # A shell still running this chat's previous process has
                     # not failed this turn; every other refusal here is proven.
@@ -2174,9 +2290,12 @@ class ConversationBroker(threading.Thread):
                 # A resumed session that was compacted since its last message
                 # is told once to re-read its durable state. The line goes on
                 # the dispatched text only; ``run.body`` is the stored message.
+                # A manual compact request is not a message: nothing is added
+                # to it and no line is spent on it, so the first real message
+                # after it still carries the re-ground line.
                 reground = (
                     compaction.pending_compaction
-                    if run.session_before
+                    if run.session_before and not run.compaction
                     else None
                 )
                 dispatched = (
@@ -2186,11 +2305,16 @@ class ConversationBroker(threading.Thread):
                 )
                 self.store.mark_starting(run.run_id, self.owner)
                 try:
-                    turn = (
-                        adapter.resume(run.session_before, context, dispatched)
-                        if run.session_before
-                        else adapter.start(context, dispatched)
-                    )
+                    if run.compaction:
+                        turn = adapter.compact(run.session_before, context)
+                    else:
+                        turn = (
+                            adapter.resume(
+                                run.session_before, context, dispatched
+                            )
+                            if run.session_before
+                            else adapter.start(context, dispatched)
+                        )
                 except Exception as exc:
                     # The adapter may have sent the prompt before its transport
                     # failed. Starting is the explicit uncertain crash window.

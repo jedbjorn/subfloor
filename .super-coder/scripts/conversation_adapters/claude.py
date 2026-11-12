@@ -55,6 +55,11 @@ INPUT_SIDE_KEYS = (
 
 class ClaudeAdapter(ConversationAdapter):
     harness = "claude"
+    # A resumed headless run whose prompt is ``/compact`` (2.1.322). It makes
+    # one summarising request, writes a ``compact_boundary`` with trigger
+    # ``manual``, and ends with a ``result`` that names ``local_command``.
+    manual_compaction = True
+    COMPACT_PROMPT = "/compact"
 
     def __init__(
         self,
@@ -142,6 +147,7 @@ class ClaudeAdapter(ConversationAdapter):
         session_ref: str,
         *,
         resume: bool,
+        compaction: bool = False,
     ) -> NativeTurn:
         worktree = context.checked_worktree()
         if (
@@ -185,6 +191,7 @@ class ClaudeAdapter(ConversationAdapter):
                 "resumed": resume,
                 "transcript_path": str(transcript),
                 "transcript_offset": transcript_offset,
+                **({"compaction": True} if compaction else {}),
             },
             opaque=process,
         )
@@ -222,6 +229,68 @@ class ClaudeAdapter(ConversationAdapter):
             resume=True,
         )
 
+    def compact(
+        self,
+        session_ref: str,
+        context: ConversationContext,
+    ) -> NativeTurn:
+        """A resumed headless run whose whole prompt is ``/compact``."""
+        try:
+            uuid.UUID(session_ref)
+        except ValueError as exc:
+            raise AdapterError(
+                "HARNESS_SESSION_LOST",
+                f"Claude session ref is not a UUID: {session_ref}",
+            ) from exc
+        if not self.inspect(session_ref, context).exists:
+            raise AdapterError(
+                "HARNESS_SESSION_LOST",
+                f"Claude session does not exist: {session_ref}",
+            )
+        return self._launch(
+            context,
+            self.COMPACT_PROMPT,
+            session_ref,
+            resume=True,
+            compaction=True,
+        )
+
+    @staticmethod
+    def _compact_refusal(raw: Mapping[str, Any]) -> str | None:
+        """Why a ``/compact`` run did not compact, in Claude's own words.
+
+        Two shapes (2.1.322): a ``status`` line whose ``compact_result`` is
+        ``failed``, and a locally written assistant message (model
+        ``<synthetic>``) such as "Error: No messages to compact". Neither is
+        an error ``result``: the run still ends with subtype ``success``.
+        """
+        if raw.get("type") == "system" and raw.get("subtype") == "status":
+            if raw.get("compact_result") != "failed":
+                return None
+            error = raw.get("compact_error")
+            return (
+                error.strip()
+                if isinstance(error, str) and error.strip()
+                else "Claude reported that the compaction failed"
+            )
+        if raw.get("type") != "assistant":
+            return None
+        message = raw.get("message")
+        if not isinstance(message, dict) or message.get("model") != "<synthetic>":
+            return None
+        content = message.get("content")
+        texts = [
+            block["text"].strip()
+            for block in (content if isinstance(content, list) else [])
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ]
+        text = " ".join(part for part in texts if part)
+        if not text:
+            return None
+        return text.removeprefix("Error:").strip() or text
+
     @staticmethod
     def _session_from(raw: Mapping[str, Any]) -> str | None:
         for field in ("session_id", "sessionId"):
@@ -244,8 +313,14 @@ class ClaudeAdapter(ConversationAdapter):
         it as terminal completed the run with an empty reply and left the
         child running the real turn unobserved. The prompt's own ``result``
         follows in the same process and remains the terminal.
+
+        The ``result`` of a ``/compact`` run has the same zero-turn shape but
+        names the command it ran (``local_command``): it is that run's
+        terminal, never a preamble.
         """
         if raw.get("is_error"):
+            return False
+        if raw.get("local_command"):
             return False
         if str(raw.get("subtype") or "").startswith("error"):
             return False
@@ -492,6 +567,10 @@ class ClaudeAdapter(ConversationAdapter):
             "session-id-or-resume",
         )
         terminal = False
+        # A manual compaction: the run reports a boundary, or says why not.
+        compacting = bool(turn.metadata.get("compaction"))
+        compacted = False
+        refusal: str | None = None
         for line in stdout:
             if not line.strip():
                 continue
@@ -505,7 +584,26 @@ class ClaudeAdapter(ConversationAdapter):
             native_session = self._session_from(raw)
             if native_session:
                 ensure_exact_session(turn.session_ref, native_session)
+            if compacting and isinstance(raw, dict):
+                refusal = self._compact_refusal(raw) or refusal
             for event in self._normalize(raw):
+                if compacting and event.type == "context.compacted":
+                    compacted = True
+                if (
+                    compacting
+                    and event.type == "run.completed"
+                    and refusal
+                    and not compacted
+                ):
+                    event = NormalizedEvent(
+                        "run.failed",
+                        {
+                            "status": "failed",
+                            "error": "HARNESS_COMPACT_REFUSED",
+                            "detail": refusal,
+                        },
+                        event.native_type,
+                    )
                 if event.type in TERMINAL_EVENTS:
                     terminal = True
                     turn.metadata["terminal"] = event.type

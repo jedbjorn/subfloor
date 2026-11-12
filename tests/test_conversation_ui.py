@@ -490,8 +490,9 @@ const readController = new AbortController(), readSignal = readController.signal
 let chatReadController = readController;
 const generation = 1, selectedId = "cv_fixture";
 let chatRenderGeneration = 1, chatRouteMode = "chat", chatModeController = null;
+let chatNewChatAction = null;
 const CHAT_MODES = ["chat", "diff"];
-const document = {body: el("body", {})};
+const document = {body: el("body", {}), hidden: false, addEventListener() {}};
 const frames = [];
 const requestAnimationFrame = (callback) => { frames.push(callback); return frames.length; };
 const cancelAnimationFrame = () => {};
@@ -503,6 +504,10 @@ const chatHeaderLabel = () => "header";
 const chatConversationName = () => "fixture";
 const chatTranscriptAtBottom = () => true;
 const chatPaintContextMeter = () => {};
+const CHAT_COMPACT_TOOLTIP = "";
+const chatCompactButtonState = () => ({visible: false, disabled: true,
+  pending: false, label: "Compact", title: ""});
+const chatColdReturnDue = () => false;
 const chatFlushTranscript = (node, state) => {
   node.textContent = [...state.items.values()].map((item) => item.text).join("\n");
 };

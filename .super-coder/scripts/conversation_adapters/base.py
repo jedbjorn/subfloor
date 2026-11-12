@@ -384,10 +384,31 @@ class ConversationAdapter(abc.ABC):
     """The only harness surface the broker consumes."""
 
     harness: str
+    # True when the harness has a confirmed way to compact a stored session
+    # on request (Feature #95). The chat shows the compact button only then.
+    manual_compaction = False
 
     def __init__(self, manifest: Mapping[str, Any]) -> None:
         self.manifest = dict(manifest)
         self.capabilities = AdapterCapabilities.from_manifest(manifest)
+
+    def compact(
+        self,
+        session_ref: str,
+        context: ConversationContext,
+    ) -> NativeTurn:
+        """Ask the harness to compact ``session_ref`` now.
+
+        The returned turn is streamed like any other. It yields the
+        compaction the harness reports, tagged ``manual``, and ends with a
+        terminal event: ``run.failed`` when the harness refused or the
+        request broke, ``run.completed`` otherwise, with or without a
+        reported compaction. The wait for a report is bounded.
+        """
+        raise AdapterError(
+            "HARNESS_COMPACT_UNSUPPORTED",
+            f"{self.harness} has no confirmed manual compaction trigger",
+        )
 
     @abc.abstractmethod
     def probe(self) -> ProbeResult:

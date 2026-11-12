@@ -733,8 +733,8 @@ body.interface-view main {
 .chat-compose-actions .chat-stop { color: var(--danger); }
 .chat-compose-actions .chat-stop:disabled { cursor: default; opacity: .45; }
 .chat-pending { color: var(--warn); font-size: .72rem; }
-/* Bottom left of the composer: the context meter (and, next, the manual
-   compact button). The right-hand actions keep their place. */
+/* Bottom left of the composer: the context meter and the manual compact
+   button. The right-hand actions keep their place. */
 .chat-compose-left {
   display: flex; align-items: center; gap: .6rem; margin-right: auto;
   margin-top: .5rem; min-width: 0;
@@ -754,6 +754,35 @@ body.interface-view main {
   padding: .45rem .65rem; font-variant-numeric: tabular-nums;
 }
 .chat-bubble.chat-activity.chat-reground-note { font-style: italic; }
+/* The manual compact button sits beside the meter. Greyed out and inert
+   during a turn and while a requested compaction runs. */
+.chat-compose-left .act.chat-compact {
+  margin-top: 0; padding: .2rem .55rem; font-size: .72rem;
+}
+.chat-compose-left .act.chat-compact[hidden] { display: none; }
+.chat-compose-left .act.chat-compact:disabled { cursor: default; opacity: .45; }
+/* A manual compaction that did not happen, and one the harness did not
+   report: one line each, where the marker would have been. */
+.chat-bubble.chat-activity.chat-compaction-failed {
+  align-self: stretch; text-align: center; color: var(--danger);
+  border-color: var(--danger);
+}
+.chat-bubble.chat-activity.chat-compaction-unreported {
+  align-self: stretch; text-align: center; color: var(--warn);
+  border-color: var(--warn);
+}
+/* The cold-return notice: one line above the composer. A suggestion, so it
+   never covers or disables the composer. */
+.chat-cold-return {
+  display: flex; align-items: center; flex-wrap: wrap; gap: .6rem;
+  margin-bottom: .5rem; padding: .45rem .65rem; font-size: .78rem;
+  color: var(--warn); border: 1px solid var(--warn); border-radius: var(--r);
+}
+.chat-cold-return[hidden] { display: none; }
+.chat-cold-return-text { flex: 1 1 18rem; }
+.chat-cold-return .act { margin-top: 0; padding: .2rem .55rem; font-size: .72rem; }
+.chat-cold-return .act[hidden] { display: none; }
+.chat-cold-return .act:disabled { cursor: default; opacity: .45; }
 .chat-new-form {
   width: min(620px, calc(100% - 2rem)); margin: auto; padding: 1.4rem;
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);

@@ -25,6 +25,7 @@ import time
 import uuid
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -75,6 +76,9 @@ _UPLOADS_PATH = re.compile(
     r"^/api/conversations/(cv_[0-9a-f]{32})/uploads$"
 )
 _EVENTS_PATH = re.compile(r"^/api/conversations/(cv_[0-9a-f]{32})/events$")
+_COMPACTIONS_PATH = re.compile(
+    r"^/api/conversations/(cv_[0-9a-f]{32})/compactions$"
+)
 _INTERRUPTIONS_PATH = re.compile(
     r"^/api/conversations/(cv_[0-9a-f]{32})/interruptions$"
 )
@@ -472,6 +476,11 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
         " WHERE queued.conversation_id=c.conversation_id "
         " AND queued.message_kind!='control' "
         " AND queued.state IN ('accepted','queued')) AS queued_count,"
+        "(SELECT MAX(m.message_id) FROM conversation_messages m "
+        " WHERE m.conversation_id=c.conversation_id "
+        " AND " + conversation_compaction.manual_compact_sql("m") +
+        " AND m.state IN ('accepted','queued','running')) "
+        "AS pending_compaction_message_id,"
         "(SELECT active.run_id FROM conversation_runs active "
         " WHERE active.conversation_id=c.conversation_id "
         " AND active.state IN ('leased','starting','running') "
@@ -514,6 +523,41 @@ def _process_projection(row) -> dict:
     }
 
 
+def _manual_compaction_supported(harness: str) -> bool:
+    """True when the harness's adapter has a confirmed manual trigger."""
+    return bool(getattr(ADAPTER_TYPES.get(harness), "manual_compaction", False))
+
+
+def _compaction_controls(row) -> dict:
+    """What the compact button needs: whether to show it and whether it is on.
+
+    ``supported`` is the harness; ``available`` adds a stored session to
+    compact and an open chat, and is what shows the button. ``enabled`` is
+    false while a turn or an earlier request is in flight: the button is
+    then greyed out, and the server refuses a press for the same reason.
+    """
+    supported = _manual_compaction_supported(row["harness"])
+    pending = row["pending_compaction_message_id"]
+    available = (
+        supported
+        and bool(row["harness_session_ref"])
+        and row["state"] != "closed"
+    )
+    busy = (
+        row["state"] in ("queued", "running", "waiting")
+        or row["active_run_id"] is not None
+        or pending is not None
+        or row["close_requested_at"] is not None
+    )
+    return {
+        "supported": supported,
+        "available": available,
+        "enabled": available and not busy,
+        "pending": pending is not None,
+        "message_id": int(pending) if pending is not None else None,
+    }
+
+
 def _conversation_projection(row) -> dict:
     contract_version = int(row["route_contract_version"])
     binding = None
@@ -540,6 +584,13 @@ def _conversation_projection(row) -> dict:
         control_state = binding["control_state"]
         native_variant_id = binding["native_variant_id"]
         native_option_id = binding.get("native_option_id")
+    # The compact button's state needs columns only the single-chat read
+    # carries; a list row has none and its chats show no button.
+    detail = (
+        {"compaction": _compaction_controls(row)}
+        if "pending_compaction_message_id" in row.keys()
+        else {}
+    )
     return {
         "conversation_id": row["conversation_id"],
         "shell": {
@@ -569,6 +620,8 @@ def _conversation_projection(row) -> dict:
         "close_requested_at": row["close_requested_at"],
         "sprint_managed": bool(row["sprint_managed"]),
         "process": _process_projection(row),
+        **detail,
+        "cold_return": conversation_compaction.cold_return_settings(),
         "version": int(row["version"]),
     }
 
@@ -2035,6 +2088,131 @@ def _create_message(con, operator: dict, conversation_id: str, headers, body: di
     )
 
 
+def _request_compaction(
+    con, operator: dict, conversation_id: str, headers, body: dict
+):
+    """The manual compact button: ask the chat's harness to compact now.
+
+    The request joins the chat's own queue as an engine-sent control
+    message, so the broker runs it like a turn (one at a time, in order,
+    interruptible) and a message sent meanwhile waits behind it. It is not
+    an operator message and never shows as one: the transcript lists prompts
+    only, and the request is recorded as ``compaction.requested``. The press
+    ends in a ``context.compacted`` marker, a ``compaction.failed`` line or
+    a ``compaction.not_reported`` notice, written by the broker.
+    """
+    _only_fields(body, set())
+    key = _idempotency_key(headers)
+    request_hash = _request_hash({"compact": True})
+
+    with db_driver.write_transaction(con, "conversation.compaction.create"):
+        conversation = _require_conversation(
+            con,
+            conversation_id,
+            operator["user_id"],
+        )
+        existing = con.execute(
+            "SELECT message_id,request_hash,state FROM conversation_messages "
+            "WHERE conversation_id=? AND idempotency_key=?",
+            (conversation_id, key),
+        ).fetchone()
+        if existing is not None:
+            if existing["request_hash"] != request_hash:
+                raise ApiError(
+                    409,
+                    "MESSAGE_IDEMPOTENCY_CONFLICT",
+                    "Idempotency-Key was reused with a different request",
+                )
+            return _json(
+                202,
+                {
+                    "compaction": {
+                        "message_id": int(existing["message_id"]),
+                        "state": existing["state"],
+                    },
+                },
+            )
+        controls = _compaction_controls(conversation)
+        if not controls["supported"]:
+            raise ApiError(
+                409,
+                "COMPACTION_UNSUPPORTED",
+                f"{conversation['harness']} has no manual compaction trigger",
+            )
+        if conversation["state"] == "closed":
+            raise ApiError(
+                409, "CONVERSATION_CLOSED", "the conversation is closed"
+            )
+        if conversation["close_requested_at"] is not None:
+            raise ApiError(
+                409,
+                "CONVERSATION_CLOSING",
+                "the conversation is stopping active work before it closes",
+            )
+        if not conversation["harness_session_ref"]:
+            raise ApiError(
+                409,
+                "COMPACTION_NO_SESSION",
+                "this chat has no harness session to compact yet",
+            )
+        if controls["pending"]:
+            raise ApiError(
+                409,
+                "COMPACTION_PENDING",
+                "a compaction is already in progress for this chat",
+                {"message_id": controls["message_id"]},
+            )
+        if not controls["enabled"]:
+            raise ApiError(
+                409,
+                "CONVERSATION_BUSY",
+                "the chat is working; compact it when the turn has finished",
+            )
+        message_id = int(
+            con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'engine',?,'control',?,?,?,'queued')",
+                (
+                    conversation_id,
+                    conversation_compaction.MANUAL_COMPACT_SENDER,
+                    conversation_compaction.MANUAL_COMPACT_BODY,
+                    key,
+                    request_hash,
+                ),
+            ).lastrowid
+        )
+        con.execute(
+            "INSERT INTO conversation_outbox (conversation_id,message_id) "
+            "VALUES (?,?)",
+            (conversation_id, message_id),
+        )
+        con.execute(
+            "UPDATE conversations SET state='queued',version=version+1 "
+            "WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        _append_event(
+            con,
+            conversation_id,
+            conversation_compaction.COMPACTION_REQUESTED,
+            {
+                "message_id": message_id,
+                "initiated_by": "engine",
+                "requested_by_user_id": int(operator["user_id"]),
+                "harness": conversation["harness"],
+            },
+            message_id=message_id,
+        )
+    conversation_events.notify(conversation_id)
+    conversation_broker.notify_commit()
+    return _json(
+        202,
+        {"compaction": {"message_id": message_id, "state": "queued"}},
+    )
+
+
 def _queue_position(con, message_id: int) -> int:
     row = con.execute(
         "SELECT COUNT(*) FROM conversation_outbox target "
@@ -2306,17 +2484,30 @@ def _compaction_projection(payload: dict) -> dict:
     }
 
 
-def _compaction_label(payload: dict) -> str:
-    """"Context compacted · 123k → 28k · automatic"; unknown parts left out."""
+def _compaction_label(payload: dict, harness: str | None = None) -> str:
+    """"Context compacted · 123k → 28k · automatic"; unknown parts left out.
+
+    Claude's figure after is the summary alone (``post_tokens``): the next
+    request also carries the system prompt and tools and is several times
+    larger. Its marker says "summary" so the figure is not read as the new
+    context size. The stored event is the same for every harness.
+    """
     marker = _compaction_projection(payload)
     before, after = marker["tokens_before"], marker["tokens_after"]
+    summary = " summary" if harness == "claude" else ""
     parts = ["Context compacted"]
     if before is not None and after is not None:
-        parts.append(f"{_short_tokens(before)} → {_short_tokens(after)}")
+        parts.append(
+            f"{_short_tokens(before)} → {_short_tokens(after)}{summary}"
+        )
     elif before is not None:
         parts.append(f"from {_short_tokens(before)}")
     elif after is not None:
-        parts.append(f"now {_short_tokens(after)}")
+        parts.append(
+            f"{_short_tokens(after)} summary"
+            if summary
+            else f"now {_short_tokens(after)}"
+        )
     if marker["trigger"] == "auto":
         parts.append("automatic")
     elif marker["trigger"] == "manual":
@@ -2324,9 +2515,34 @@ def _compaction_label(payload: dict) -> str:
     return " · ".join(parts)
 
 
-def _transcript_activity_label(event_type: str, payload: dict) -> str:
+def _compaction_failed_label(payload: dict) -> str:
+    """The one-line error of a manual compaction that did not happen."""
+    if payload.get("outcome") == "cancelled":
+        return "Compaction stopped — the context was not compacted"
+    reason = payload.get("detail") or payload.get("error")
+    reason = " ".join(str(reason).split()) if reason else ""
+    return (
+        f"Compaction failed — {reason}"
+        if reason
+        else "Compaction failed — the context was not compacted"
+    )
+
+
+COMPACTION_NOT_REPORTED_LABEL = (
+    "Compaction not reported — the harness finished without reporting a "
+    "compaction"
+)
+
+
+def _transcript_activity_label(
+    event_type: str, payload: dict, harness: str | None = None
+) -> str:
     if event_type == "context.compacted":
-        label = _compaction_label(payload)
+        label = _compaction_label(payload, harness)
+    elif event_type == "compaction.failed":
+        label = _compaction_failed_label(payload)
+    elif event_type == "compaction.not_reported":
+        label = COMPACTION_NOT_REPORTED_LABEL
     elif event_type == "message.reground":
         label = "Re-ground line added to this message (context was compacted)"
     elif event_type == "permission.requested":
@@ -2602,7 +2818,8 @@ def _transcript_projection(
                 "(message_id IS NULL AND run_id IS NULL AND event_type IN "
                 "('permission.requested','input.requested','run.failed',"
                 "'run.interrupted','run.unknown','run.process.ended',"
-                "'context.compacted'))"
+                "'context.compacted','compaction.failed',"
+                "'compaction.not_reported'))"
             )
         event_scope_sql = " OR ".join(event_scope) or "0"
         event_rows = con.execute(
@@ -2736,6 +2953,8 @@ def _transcript_projection(
             "run.unknown",
             "run.process.ended",
             "context.compacted",
+            "compaction.failed",
+            "compaction.not_reported",
             "message.reground",
         }
         for event in events:
@@ -2892,6 +3111,7 @@ def _transcript_projection(
                 "label": _transcript_activity_label(
                     event["event_type"],
                     event["payload"],
+                    conversation["harness"],
                 ),
                 "sequence": event["sequence"],
             }
@@ -2955,6 +3175,7 @@ def _transcript_projection(
                     int(active_run_id) if active_run_id is not None else None
                 ),
                 "close_requested_at": conversation["close_requested_at"],
+                "compaction": _compaction_controls(conversation),
             },
             "items": items,
             "older_cursor": older_cursor,
@@ -3004,6 +3225,27 @@ def _transcript_projection(
             ):
                 applied = None
             meter["compact_window"] = applied
+            # The cold-return rule, evaluated as the chat is opened: large
+            # and idle past the settings means the provider cache is gone
+            # and the next message re-reads the whole context. The page
+            # re-checks the same rule against its own clock while it stays
+            # open. Never during a turn, never for a managed participant.
+            cold = conversation_compaction.cold_return_settings()
+            projection["cold_return"] = {
+                **cold,
+                "last_activity_at": conversation["last_activity_at"],
+                "due": (
+                    conversation["state"] in ("idle", "error")
+                    and active_run_id is None
+                    and not bool(conversation["sprint_managed"])
+                    and conversation_compaction.cold_return_due(
+                        meter["context_tokens"],
+                        conversation["last_activity_at"],
+                        datetime.now(timezone.utc),
+                        cold,
+                    )
+                ),
+            }
             projection["context"] = meter
         if warnings:
             projection["warnings"] = warnings
@@ -3100,6 +3342,11 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
                         owner_user_id=operator["user_id"],
                         query=query,
                     ),
+                )
+            compactions = _COMPACTIONS_PATH.fullmatch(parsed.path)
+            if compactions and method == "POST":
+                return _request_compaction(
+                    con, operator, compactions.group(1), headers, body
                 )
             interruptions = _INTERRUPTIONS_PATH.fullmatch(parsed.path)
             if interruptions and method == "POST":

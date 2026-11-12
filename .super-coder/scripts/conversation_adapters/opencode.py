@@ -55,6 +55,11 @@ SERVER_STATE = ENGINE / "run" / "opencode-server.json"
 SHELL_RUNTIME_DIR = ENGINE / "run" / "opencode-shells"
 TURN_TIMEOUT_SECONDS = 5400.0
 TURN_CLEANUP_TIMEOUT_SECONDS = 10.0
+# The manual compaction (1.19.5): ``POST /session/{id}/summarize`` answers
+# ``true`` when the summary is written, having emitted ``session.compacted``
+# and then ``session.idle``. This is how long the stream waits for that idle
+# once the request has answered.
+COMPACT_SETTLE_SECONDS = 15.0
 _SERVER_LOCK = threading.RLock()
 _SERVER_PROCESS: subprocess.Popen | None = None
 _SERVER_ENDPOINT = SERVER_ENDPOINT
@@ -869,6 +874,7 @@ atexit.register(stop_server)
 
 class OpenCodeAdapter(ConversationAdapter):
     harness = "opencode"
+    manual_compaction = True
 
     def __init__(
         self,
@@ -1222,6 +1228,51 @@ class OpenCodeAdapter(ConversationAdapter):
         # sending permission rules duplicates them in native session state.
         return self._turn(session_ref, context, message, resumed=True)
 
+    def compact(
+        self,
+        session_ref: str,
+        context: ConversationContext,
+    ) -> NativeTurn:
+        """Ask the engine-owned server to summarise the stored session."""
+        self._ensure_transport()
+        self._prepare_shell_environment(context)
+        if (
+            isinstance(context.route_binding, Mapping)
+            and context.route_binding.get("contract_version")
+            == route_transport.route_bindings.LIVE_NATIVE_CONTRACT_VERSION
+        ):
+            self._prepare_live_route(context)
+        if self._route(context) is None:
+            # The request names the summarising model; the server refuses it
+            # without one, and the engine does not pick a model for the chat.
+            raise AdapterError(
+                "HARNESS_COMPACT_MODEL_UNKNOWN",
+                "OpenCode needs this chat's provider and model to summarise it",
+            )
+        inspected = self.inspect(session_ref, context)
+        if not inspected.exists:
+            raise AdapterError(
+                "HARNESS_SESSION_LOST",
+                f"OpenCode session does not exist: {session_ref}",
+            )
+        turn = self._turn(session_ref, context, "/compact", resumed=True)
+        turn.metadata["compaction"] = True
+        # The size before is the chat's last recorded request. The request
+        # this stream sees is the summariser's own, which runs under another
+        # prompt and is not the size of the chat's context (on 1.19.5 it
+        # reported 449 input tokens for a 13.6k session).
+        turn.metadata["context_tokens"] = token_count(context.context_tokens)
+        return turn
+
+    def _summarize(self, session_ref: str, context: ConversationContext) -> Any:
+        provider, model = self._route(context)
+        return self.transport.request(
+            "POST",
+            f"/session/{session_ref}/summarize",
+            query=self._query(context.checked_worktree()),
+            body={"providerID": provider, "modelID": model},
+        )
+
     @staticmethod
     def _event_payload(raw: Mapping[str, Any]) -> Mapping[str, Any]:
         payload = raw.get("payload")
@@ -1379,6 +1430,11 @@ class OpenCodeAdapter(ConversationAdapter):
             )
             return
 
+        # A manual compaction dispatches the summarise request instead of a
+        # prompt and records only that the session compacted: the summary the
+        # server streams, and the usage of the request that wrote it, are
+        # never passed on.
+        compacting = bool(turn.metadata.get("compaction"))
         projection = _OpenCodeProjection()
         coordination: queue.Queue[tuple[str, Any]] = queue.Queue()
         stop = threading.Event()
@@ -1404,10 +1460,14 @@ class OpenCodeAdapter(ConversationAdapter):
             if stop.is_set():
                 return
             try:
-                prompt_state["response"] = self._prompt(
-                    turn.session_ref,
-                    context,
-                    message,
+                prompt_state["response"] = (
+                    self._summarize(turn.session_ref, context)
+                    if compacting
+                    else self._prompt(
+                        turn.session_ref,
+                        context,
+                        message,
+                    )
                 )
                 coordination.put(("prompt.done", None))
             except BaseException as exc:  # noqa: BLE001 - cross-thread handoff
@@ -1444,7 +1504,23 @@ class OpenCodeAdapter(ConversationAdapter):
         sse_ended = False
         try:
             while terminal is None and failure is None:
-                kind, value = coordination.get()
+                try:
+                    kind, value = coordination.get(
+                        timeout=(
+                            COMPACT_SETTLE_SECONDS
+                            if compacting and prompt_done
+                            else None
+                        )
+                    )
+                except queue.Empty:
+                    # The summarise request answered and the session never
+                    # reported idle: the wait is bounded, the run ends here.
+                    terminal = NormalizedEvent(
+                        "run.completed",
+                        {"status": "completed", "compaction_wait": "elapsed"},
+                        "compaction.wait",
+                    )
+                    continue
                 if kind == "prompt.done":
                     prompt_done = True
                     continue
@@ -1483,6 +1559,22 @@ class OpenCodeAdapter(ConversationAdapter):
                 if event_session and event_session != turn.session_ref:
                     continue
                 for event in self._normalize(value, projection):
+                    if compacting and event.type == "context.compacted":
+                        # OpenCode states no trigger; the engine asked.
+                        event = compaction_event(
+                            trigger="manual",
+                            tokens_before=turn.metadata.get("context_tokens"),
+                            native_type=event.native_type,
+                        )
+                        observed_activity = True
+                    elif (
+                        compacting
+                        and event.type not in TERMINAL_EVENTS
+                        and event.type != "run.started"
+                    ):
+                        if event.type != "usage":
+                            observed_activity = True
+                        continue
                     if event.type == "run.completed" and not observed_activity:
                         continue
                     if event.type == "run.completed":
@@ -1574,8 +1666,11 @@ class OpenCodeAdapter(ConversationAdapter):
                 "OpenCode turn ended without a terminal event",
                 retryable=True,
             )
-        for event in projection.reconcile_response(prompt_state.get("response")):
-            yield event
+        if not compacting:
+            for event in projection.reconcile_response(
+                prompt_state.get("response")
+            ):
+                yield event
         turn.metadata["terminal"] = terminal.type
         if terminal.interrupt_evidence:
             turn.metadata["interrupt_evidence"] = terminal.interrupt_evidence

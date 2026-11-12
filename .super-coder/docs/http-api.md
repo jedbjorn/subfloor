@@ -257,6 +257,7 @@ the Chats rail in the GUI. Conversation ids are `cv_` + 32 hex.
 | `GET /api/conversations/{cv}/source` | source projection for the chat |
 | `POST /api/conversations/{cv}/uploads` | raw image bytes, not JSON — routed before the body parse; extension inferred from content |
 | `POST /api/conversations/{cv}/interruptions` | interrupt or replay the live run |
+| `POST /api/conversations/{cv}/compactions` | ask the chat's harness to compact its stored session now (the compact button); empty body, `Idempotency-Key` required; `202` with the queued request, `409` when the harness has no trigger, the chat has no session, a turn is in flight or a compaction is already pending |
 | `POST /api/conversations/shell-release` | release a shell a CLI or browser session owns |
 | `GET /api/conversations/{cv}/events` | **SSE only.** `text/event-stream`, `id:` = event sequence, `?after=`/`Last-Event-ID` resume, `: keepalive` heartbeat. Served by `stream_events` straight off the transport; the ordinary handler answers `406 SSE_REQUIRED`. The session is checked again before each batch and after each wait; when it is gone the stream sends `event: sign_in_required` and closes |
 
