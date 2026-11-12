@@ -88,6 +88,26 @@ interrupted prompt. Browser-mediated permission responses remain unproven, so
 the manifest advertises that capability as false until the adapter has a typed
 permission bridge.
 
+**Current pin.** Minimum `2.1.304`, verified `2.1.322`, below `2.2.0`. The six
+proofs (two-turn exact resume, same-worktree isolation, structured streaming,
+interruption, resume after compute exit, session inspection) were re-run
+through the adapter on `2.1.322 (Claude Code)`, 2026-11-12, with five small
+requests, and all passed. Two shapes differ from the earlier builds and the
+adapter reads both:
+
+- **Interrupt result.** After `SIGINT` the result is `subtype:
+  error_during_execution`, `is_error: true`, `terminal_reason:
+  aborted_streaming`. An interruption is read from `subtype` or
+  `terminal_reason`; an execution error naming an abort in neither is a
+  failure.
+- **Transcript tail.** The stored session ends with bookkeeping entries
+  (`last-prompt`, `mode`, `cost-state`) after the reply. Inspection reads the
+  last `user` or `assistant` message entry and ignores every other entry type,
+  known or not.
+
+The minimum is the first build known to accept `--autocompact` (see the
+compatibility caution below, which also covers a build below the minimum).
+
 ## GUI background conversion
 
 Non-Admin launches carry `SC_SEAT=gui|tui`. Only the GUI seat uses
@@ -149,7 +169,7 @@ Checked on `2.1.322 (Claude Code)`, 2026-11-12, with three small requests.
 
 **Compatibility caution.** `--autocompact` is present in the 2.1.319, 2.1.321
 and 2.1.322 binaries and named in the changelog at 2.1.304; nothing earlier is
-established, and the manifest's floor is still 2.1.220. A build below the
+established, so the manifest's minimum is 2.1.304. A build below the
 manifest minimum is warn-only (status shows `older-unverified · best-effort`;
 nothing refuses the launch), so an older Claude fails every browser-chat
 launch on `--autocompact` unless `SC_CHAT_COMPACT_WINDOW_CLAUDE=off`.

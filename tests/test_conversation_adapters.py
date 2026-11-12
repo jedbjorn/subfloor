@@ -970,13 +970,13 @@ class ConversationAdapterTest(unittest.TestCase):
 
     def test_declared_compatibility_ranges_enforce_floor_and_flag_newer(self) -> None:
         cases = {
-            "claude": ("2.1.219", "2.1.220", "2.1.223", "2.2.0"),
+            "claude": ("2.1.303", "2.1.304", "2.1.322", "2.2.0"),
             "codex": ("0.144.999", "0.145.0", "0.155.1", "0.168.0"),
             "opencode": ("1.18.8", "1.18.9", "1.18.13", "1.20.0"),
             "kimi": ("0.29.999", "0.30.0", "0.33.0", "2.6.0"),
         }
         current_observed = {
-            "claude": "2.1.223 (Claude Code)",
+            "claude": "2.1.322 (Claude Code)",
             "codex": "codex-cli 0.155.1",
             "opencode": "1.18.13",
             "kimi": "0.33.0",
@@ -1036,9 +1036,9 @@ class ConversationAdapterTest(unittest.TestCase):
 
     def test_verified_probe_result_names_missing_manifest_keys(self) -> None:
         adapter, _native = self.build("claude")
-        result = adapter._probe_result("2.1.223 (Claude Code)")
+        result = adapter._probe_result("2.1.322 (Claude Code)")
         self.assertEqual(result.compatibility, "verified")
-        self.assertEqual(result.verified_version, "2.1.223")
+        self.assertEqual(result.verified_version, "2.1.322")
         self.assertEqual(result.maximum_version_exclusive, "2.2.0")
 
         manifest = json.loads(
