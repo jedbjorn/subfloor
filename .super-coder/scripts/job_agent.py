@@ -306,7 +306,10 @@ def build_command(
         requested_effort=effort,
         effective_effort=route.effort or DEFAULT_EFFORT,
         argv=argv,
-        env=child_env,
+        # The sandbox-only env a shell or chat launch of this harness gets,
+        # from the same manifest key: claude refuses its bypass flag as root
+        # in the container without IS_SANDBOX.
+        env={**run_mod.sandbox_launch_env(adapter, env), **child_env},
         # An inherited effort variable would otherwise outlive an omitted effort.
         env_unset=(effort_env,) if effort_env and not child_env else (),
         stdin=stdin,

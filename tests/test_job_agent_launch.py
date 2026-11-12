@@ -218,6 +218,21 @@ class GroupEndTest(DelegationCase, unittest.TestCase):
         # The leader exited by itself; what it left in its group went with it.
         self.assert_gone(start["pid"], start["spawned"])
 
+    def test_children_in_their_own_session_do_not_outlive_the_run(self):
+        # Codex starts its commands in their own process group and session; a
+        # stop of the harness group alone left them running in the worktree.
+        row = self.launch("SLEEP:120\nDETACH:1")
+        start = self.wait_started()[0]
+        self.assertTrue(self.alive(start["detached"]))
+        self.assertEqual(self.cli("kill", str(row["run_id"])).returncode, 0)
+        self.assertEqual(self.finished(row)["state"], "killed")
+        self.assert_gone(start["pid"], start["detached"])
+        # A harness that exits by itself leaves nothing working in its worktree.
+        row = self.finished(self.launch("DETACH:1\nRESULT:finished normally"))
+        start = self.starts()[1]
+        self.assertEqual((row["state"], row["exit_code"]), ("done", 0))
+        self.assert_gone(start["detached"])
+
 
 class ReportReadTest(unittest.TestCase):
     """The log is read a line at a time; the answers match the whole-text readers."""

@@ -11,10 +11,14 @@ watchers for one shell.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import subprocess
 import sys
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
@@ -199,6 +203,44 @@ class WatchTimerTest(WatchCase, unittest.TestCase):
         self.assertEqual(lines[0], f"Run {row['run_id']} (watch timer: nudge) killed; exit=unknown.")
         self.assertEqual(lines[2], "Final state: killed.")
         self.assertNotEqual(self.cli("watch", "timer", "--after", "0").returncode, 0)
+
+    def test_a_slow_but_live_supervisor_is_a_started_watch_not_an_error(self):
+        # Under several concurrent launches the supervisor can take longer to
+        # report than the verb waits; a registered watch with a live
+        # supervisor is reported as started, exit 0.
+        def slow():
+            return subprocess.Popen(["sleep", "30"])
+
+        def dead():
+            process = subprocess.Popen(["true"])
+            process.wait()
+            return process
+
+        for detach, expect in ((slow, 0), (dead, "unconfirmed")):
+            spawned: list = []
+
+            def supervisor(_jobdir, make=detach, spawned=spawned):
+                spawned.append(make())
+                return spawned[-1]
+
+            with self.subTest(supervisor=detach.__name__), \
+                    unittest.mock.patch.object(job, "START_WAIT", 0.3), \
+                    unittest.mock.patch.object(job, "_detach_supervisor", supervisor), \
+                    unittest.mock.patch.object(job.project_root, "invocation_cwd",
+                                               return_value=self.root):
+                out = io.StringIO()
+                if expect == 0:
+                    with contextlib.redirect_stdout(out):
+                        self.assertEqual(job.main(["watch", "timer", "--after", "60"]), 0)
+                    row = job._api("GET", "/_sc/runs")["runs"][0]
+                    self.assertIn(f"job: {row['run_id']} registered", out.getvalue())
+                    self.assertIn("had not reported its start after 0.3s", out.getvalue())
+                    spawned[0].kill()
+                    spawned[0].wait()
+                else:
+                    with self.assertRaises(SystemExit) as caught:
+                        job.main(["watch", "timer", "--after", "60"])
+                    self.assertIn("supervisor startup unconfirmed", str(caught.exception.code))
 
     def test_a_timer_is_limited_to_twenty_four_hours(self):
         refused = self.cli("watch", "timer", "--after", "86401")
