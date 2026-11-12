@@ -130,8 +130,8 @@ constructor default with no env override.
 | `SC_REAPER_KILL_GRACE_SECONDS` | `15` | `SIGTERM` → `SIGKILL` wait; `0` allowed |
 | `SC_REAPER_YOUNG_GRACE_SECONDS` | `30` | minimum run age before the ladder starts |
 | `SC_CHAT_INACTIVITY_CEILING` | `3600` | seconds of chat silence before the active chat is closed for inactivity |
-| `SC_CHAT_COMPACT_WINDOW_CLAUDE` | `120000` | auto-compact window (tokens) passed to Claude browser chats; `off` restores the harness default |
-| `SC_CHAT_COMPACT_WINDOW_CODEX` | `120000` | the same for Codex browser chats; `off` restores the harness default |
+| `SC_CHAT_COMPACT_WINDOW_CLAUDE` | `250000` | auto-compact window (tokens) passed to Claude browser chats; `off` restores the harness default |
+| `SC_CHAT_COMPACT_WINDOW_CODEX` | `250000` | the same for Codex browser chats; `off` restores the harness default |
 | `SC_CHAT_COLD_RETURN_TOKENS` | `60000` | context size (tokens) at or above which an idle chat gets the cold-return notice |
 | `SC_CHAT_COLD_RETURN_MINUTES` | `60` | minutes since the chat's last activity after which that notice is due |
 
@@ -213,8 +213,8 @@ harness's own compaction earlier and visible.
   harness has none, the setting is `off`, or the model's window is smaller).
 - **The percentage is of the compact window**, not of the model's window
   (decision #451), so 100% is where the harness compacts:
-  `Context 95k · 79% of 120k compact window` on a Claude Haiku chat with a
-  1,000,000-token model window, `Context 84k · 70% of 120k compact window`
+  `Context 95k · 38% of 250k compact window` on a Claude Haiku chat with a
+  1,000,000-token model window, `Context 84k · 34% of 250k compact window`
   on a Codex chat with a 258,400-token one. It is shown only when
   `compact_window` is set; a Kimi or OpenCode chat, a setting of `off`, or a
   model whose window is smaller than the setting shows the size alone, and

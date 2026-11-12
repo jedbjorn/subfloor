@@ -149,7 +149,7 @@ its operator-only reverify endpoint is
 Checked on `2.1.322 (Claude Code)`, 2026-11-12, with three small requests.
 
 - **Earlier compact window.** A browser chat is launched with
-  `--autocompact <tokens>` (default 120,000; `SC_CHAT_COMPACT_WINDOW_CLAUDE`
+  `--autocompact <tokens>` (default 250,000; `SC_CHAT_COMPACT_WINDOW_CLAUDE`
   sets it, `off` restores Claude's default). The value is the window Claude
   compacts within, not the trigger: compaction fires somewhat below it. The
   flag is accepted on a new session and on `--resume … -p` (both exit 0 and
