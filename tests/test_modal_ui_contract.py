@@ -146,5 +146,6 @@ def test_all_modal_callers_use_semantic_action_or_named_viewer_slots():
     # eight, plus the engine-operation confirmation and the device revoke
     assert APP.count("const close = openActionModal({") == 10
     assert APP.count("footerStart:") == 5  # helper + four viewer callers
-    assert APP.count("footerEnd:") == 8  # helper + seven callers, including receipt attachment
+    # helper + eight callers, including receipt attachment and a subagent's result
+    assert APP.count("footerEnd:") == 9
     assert "if (overlay?.closeModal) overlay.closeModal();" in APP
