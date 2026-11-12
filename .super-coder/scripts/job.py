@@ -357,9 +357,10 @@ def supervise_agent(jobdir: Path, meta: dict, notify) -> int:
     in, so a slow creation is a running run and never a registered row with no
     process. Ending the run, by exit, time limit, stop or a signal to this
     supervisor, signals the harness's whole process group, then the
-    processes it started outside that group (its descendants, and anything
-    left working in the run's worktree), so no harness process outlives its
-    run. Without /proc only the group is signalled.
+    processes it started outside that group (its descendants, and any
+    process carrying this run's SC_JOB_AGENT_RUN left working in the run's
+    worktree), so no harness process outlives its run. Without /proc only
+    the group is signalled.
     """
     import job_agent as agent
 
@@ -438,9 +439,11 @@ def supervise_agent(jobdir: Path, meta: dict, notify) -> int:
                         break
             # The leader is gone; whatever it left in its group goes with it,
             # and so does what it started outside the group: its descendants
-            # read before the stop, and anything still working in the worktree.
+            # read before the stop, and any process of this run (its run id in
+            # the environment) still working in the worktree.
             _kill_group(child.pid)
-            _stop_strays({**strays, **_in_worktree(worktree)})
+            marker = f'{agent.RUN_VARIABLE}={int(run_id)}'.encode()
+            _stop_strays({**strays, **_in_worktree(worktree, marker)})
     finally:
         for number, handler in previous.items():
             signal.signal(number, handler)
@@ -645,16 +648,26 @@ def _descendants(pid: int) -> dict[int, int]:
     return found
 
 
-def _in_worktree(worktree: Path) -> dict[int, int]:
-    """The processes whose working directory is inside the run's own worktree."""
+def _in_worktree(worktree: Path, marker: bytes) -> dict[int, int]:
+    """The run's processes still working inside its worktree.
+
+    A working directory alone is not the run's: an operator's terminal or a
+    shell's `git log` can sit there too. A process counts only when its
+    environment also holds `marker`, the exact `SC_JOB_AGENT_RUN=<run id>`
+    entry the harness was started with and its descendants inherit. An
+    environment that cannot be read leaves the process alone.
+    """
     home = os.path.realpath(worktree)
     found = {}
     for pid, (_, ticks) in _processes().items():
         try:
             cwd = os.readlink(f'/proc/{pid}/cwd')
+            if not (cwd == home or cwd.startswith(home + os.sep)):
+                continue
+            environ = Path(f'/proc/{pid}/environ').read_bytes()
         except OSError:
             continue
-        if cwd == home or cwd.startswith(home + os.sep):
+        if marker in environ.split(b'\0'):
             found[pid] = ticks
     return found
 

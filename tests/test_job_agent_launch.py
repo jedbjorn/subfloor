@@ -218,20 +218,51 @@ class GroupEndTest(DelegationCase, unittest.TestCase):
         # The leader exited by itself; what it left in its group went with it.
         self.assert_gone(start["pid"], start["spawned"])
 
+    def stop_pid(self, pid: int) -> None:
+        """Test cleanup by exact pid, never by pattern."""
+        if self.alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
     def test_children_in_their_own_session_do_not_outlive_the_run(self):
         # Codex starts its commands in their own process group and session; a
-        # stop of the harness group alone left them running in the worktree.
-        row = self.launch("SLEEP:120\nDETACH:1")
+        # stop of the harness group alone left them running. This child also
+        # works outside the worktree, so only the descendants read before the
+        # stop can find it.
+        row = self.launch("SLEEP:120\nDETACH:out")
         start = self.wait_started()[0]
+        self.addCleanup(self.stop_pid, start["detached"])
         self.assertTrue(self.alive(start["detached"]))
+        self.assertEqual(os.readlink(f"/proc/{start['detached']}/cwd"), "/")
         self.assertEqual(self.cli("kill", str(row["run_id"])).returncode, 0)
         self.assertEqual(self.finished(row)["state"], "killed")
         self.assert_gone(start["pid"], start["detached"])
-        # A harness that exits by itself leaves nothing working in its worktree.
-        row = self.finished(self.launch("DETACH:1\nRESULT:finished normally"))
-        start = self.starts()[1]
+
+    def test_at_the_end_only_the_runs_own_processes_in_the_worktree_are_stopped(self):
+        # A harness that exits by itself leaves nothing of its run working in
+        # its worktree; a process that merely sits there (an operator's
+        # terminal, a shell's `git log`) carries no run id and is left alone.
+        row = self.launch("SLEEP:3\nDETACH:1\nRESULT:finished normally")
+        start = self.wait_started()[0]
+        self.addCleanup(self.stop_pid, start["detached"])
+        sub = Path(start["cwd"]) / "sub"
+        sub.mkdir()
+        strangers = []
+        for cwd in (start["cwd"], sub):
+            stranger = subprocess.Popen(["sleep", "300"], cwd=cwd, env=self.env,
+                                        start_new_session=True)
+            self.addCleanup(stranger.wait)
+            self.addCleanup(self.stop_pid, stranger.pid)
+            strangers.append(stranger)
+        self.assertNotIn("SC_JOB_AGENT_RUN", self.env)
+        row = self.finished(row)
         self.assertEqual((row["state"], row["exit_code"]), ("done", 0))
         self.assert_gone(start["detached"])
+        for stranger in strangers:
+            self.assertIsNone(stranger.poll())
+            self.assertTrue(self.alive(stranger.pid))
 
 
 class ReportReadTest(unittest.TestCase):

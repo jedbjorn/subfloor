@@ -174,8 +174,9 @@ sc job list [--kind agent|probe|job] [--all]
   the supervisor itself all end with a signal to the whole group, then to what
   the harness started outside it (Codex runs its commands in their own group
   and session): its descendants, read before the group is signalled, and any
-  process still working in the run's worktree; never pid 1 or the
-  supervisor's own group. So no harness process outlives its run (on a host
+  process still working in the run's worktree whose environment carries this
+  run's `SC_JOB_AGENT_RUN` (a terminal or shell merely sitting in the
+  worktree is left alone); never pid 1 or the supervisor's own group. So no harness process outlives its run (on a host
   without `/proc`, only the group is signalled). A supervisor stopped by a
   signal records `failed` with that reason.
 - **A supervisor that is killed** cannot do that. The runtime pulse then finds
