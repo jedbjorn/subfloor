@@ -106,7 +106,8 @@ adapter reads both:
   known or not.
 
 The minimum is the first build known to accept `--autocompact` (see the
-compatibility caution below, which also covers a build below the minimum).
+compatibility caution below). What happens below it is under "Below the
+minimum".
 
 ## GUI background conversion
 
@@ -169,7 +170,20 @@ Checked on `2.1.322 (Claude Code)`, 2026-11-12, with three small requests.
 
 **Compatibility caution.** `--autocompact` is present in the 2.1.319, 2.1.321
 and 2.1.322 binaries and named in the changelog at 2.1.304; nothing earlier is
-established, so the manifest's minimum is 2.1.304. A build below the
-manifest minimum is warn-only (status shows `older-unverified · best-effort`;
-nothing refuses the launch), so an older Claude fails every browser-chat
-launch on `--autocompact` unless `SC_CHAT_COMPACT_WINDOW_CLAUDE=off`.
+established, so the manifest's minimum is 2.1.304.
+
+**Below the minimum.** The minimum is reported, not enforced. Read from the
+code, not run on an older build:
+
+- Harness status shows `older-unverified · best-effort` with no error
+  (`harness_versions.compatibility_status`).
+- Route resolution still resolves the route and marks it `best-effort`; it
+  refuses only on a probe error or a missing version, not on an old one
+  (`route_bindings._require_runtime`, `_runtime_support_state`).
+- The adapter's own `probe()` raises `HARNESS_VERSION_UNSUPPORTED`. Its only
+  callers are the Sprint preflights, which ignore that code.
+
+Nothing therefore stops the launch, and an older Claude fails every
+browser-chat launch on the unknown `--autocompact` flag. The fix is to update
+Claude Code to 2.1.304 or later. `SC_CHAT_COMPACT_WINDOW_CLAUDE=off` stops
+the engine passing the flag and is a stopgap only.
