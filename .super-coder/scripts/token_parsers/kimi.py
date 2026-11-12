@@ -39,7 +39,7 @@ USAGE_MAP = {  # wire.jsonl usage.record field → row key, 1:1
 }
 
 
-def _ts(value) -> "str | None":
+def _ts(value) -> str | None:
     """v1 ISO string or v2 epoch-milliseconds → ISO UTC."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return iso_utc(value / 1000)
