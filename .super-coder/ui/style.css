@@ -733,6 +733,27 @@ body.interface-view main {
 .chat-compose-actions .chat-stop { color: var(--danger); }
 .chat-compose-actions .chat-stop:disabled { cursor: default; opacity: .45; }
 .chat-pending { color: var(--warn); font-size: .72rem; }
+/* Bottom left of the composer: the context meter (and, next, the manual
+   compact button). The right-hand actions keep their place. */
+.chat-compose-left {
+  display: flex; align-items: center; gap: .6rem; margin-right: auto;
+  margin-top: .5rem; min-width: 0;
+}
+.chat-context-meter {
+  color: var(--dim); font-size: .72rem; font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.chat-context-meter[hidden] { display: none; }
+.chat-context-meter.chat-context-high { color: var(--warn); }
+/* The compaction marker spans the transcript like a rule, so it cannot be
+   read as one more activity line. */
+.chat-bubble.chat-activity.chat-compaction-marker {
+  align-self: stretch; text-align: center; border-style: solid;
+  border-width: 1px 0; border-radius: 0; border-color: var(--accent);
+  color: var(--accent); font-size: .8rem; font-weight: 600;
+  padding: .45rem .65rem; font-variant-numeric: tabular-nums;
+}
+.chat-bubble.chat-activity.chat-reground-note { font-style: italic; }
 .chat-new-form {
   width: min(620px, calc(100% - 2rem)); margin: auto; padding: 1.4rem;
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);

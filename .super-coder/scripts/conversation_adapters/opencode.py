@@ -39,10 +39,13 @@ from .base import (
     SessionInspection,
     UrlHttpTransport,
     command_version,
+    compaction_event,
     ensure_exact_session,
     ensure_nonempty_message,
     load_manifest,
     terminal_outcome,
+    token_count,
+    usage_event,
 )
 
 ENGINE = Path(__file__).resolve().parents[2]
@@ -100,6 +103,7 @@ class _OpenCodeProjection:
         self.tool_states: dict[str, str] = {}
         self.run_started = False
         self.last_usage: tuple[tuple[str, int | float], ...] | None = None
+        self.last_context_tokens: int | None = None
 
     def _flush_text(self, part_id: str, native_type: str) -> list[NormalizedEvent]:
         kind = self.part_kinds.get(part_id)
@@ -224,6 +228,17 @@ class _OpenCodeProjection:
                     "native" if interrupted else None,
                 )
             ]
+        if native_type == "session.compacted":
+            # OpenCode names the session and nothing else: no trigger and no
+            # counts. The size before is the last request this stream saw;
+            # the size after stays empty until the next request reports it.
+            return [
+                compaction_event(
+                    trigger="unknown",
+                    tokens_before=self.last_context_tokens,
+                    native_type=native_type,
+                )
+            ]
         if native_type == "message.updated":
             return self._message_updated(props, native_type)
         if native_type == "message.part.delta":
@@ -314,7 +329,28 @@ class _OpenCodeProjection:
         if usage == self.last_usage:
             return events
         self.last_usage = usage
-        events.append(NormalizedEvent("usage", {"tokens": safe}, native_type))
+        # One assistant message is one model request. Its input side is the
+        # uncached input plus the cache read and write; OpenCode states no
+        # window here, so the meter shows the size alone.
+        cache = tokens.get("cache")
+        cache = cache if isinstance(cache, dict) else {}
+        parts = [
+            token_count(tokens.get("input")),
+            token_count(cache.get("read")),
+            token_count(cache.get("write")),
+        ]
+        present = [part for part in parts if part is not None]
+        context_tokens = sum(present) if present else None
+        if context_tokens:
+            self.last_context_tokens = context_tokens
+        events.append(
+            usage_event(
+                safe,
+                native_type,
+                scope="request",
+                context_tokens=context_tokens or None,
+            )
+        )
         return events
 
     def _part_delta(

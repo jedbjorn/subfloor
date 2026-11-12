@@ -4999,12 +4999,47 @@ async function chatCloseForSwitch(conversation) {
   }
 }
 
-function chatContextTokenLabel(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? `${fmt(value)} tok` : "";
+// Feature #95 — the context meter and the compaction marker. Every figure
+// here is one the harness reported. A size or a window that was not
+// reported is null and renders as nothing: no figure is ever guessed.
+// A reply's label: "84k · 33%" with a known window, "84k tok" without one.
+function chatContextTokenLabel(value, windowTokens = null) {
+  const size = chatTokenCount(value);
+  if (size === null) return "";
+  const percent = chatContextPercent(size, windowTokens);
+  return percent
+    ? `${chatShortTokens(size)} · ${percent}`
+    : `${chatShortTokens(size)} tok`;
 }
 
-function chatUpdateContextTokens(node, value) {
-  const text = chatContextTokenLabel(value);
+function chatTokenCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function chatShortTokens(value) {
+  return value >= 1000 ? `${Math.round(value / 1000)}k` : String(value);
+}
+
+// The share of the window in use, or "" when the window is unknown.
+function chatContextPercent(value, windowTokens) {
+  const size = chatTokenCount(value);
+  const total = chatTokenCount(windowTokens);
+  if (size === null || !total) return "";
+  return `${Math.round((size / total) * 100)}%`;
+}
+
+function chatContextTokenTitle(value, windowTokens = null) {
+  const size = chatTokenCount(value);
+  if (size === null) return "";
+  const total = chatTokenCount(windowTokens);
+  return total
+    ? `${fmt(size)} of ${fmt(total)} tokens in context on this reply's last model request`
+    : `${fmt(size)} tokens in context on this reply's last model request; `
+      + "the harness has not reported this model's window";
+}
+
+function chatUpdateContextTokens(node, value, windowTokens = null) {
+  const text = chatContextTokenLabel(value, windowTokens);
   let label = node.querySelector(".chat-context-tokens");
   if (!text) {
     if (label) label.remove();
@@ -5015,6 +5050,77 @@ function chatUpdateContextTokens(node, value) {
     node.append(label);
   }
   label.textContent = text;
+  label.title = chatContextTokenTitle(value, windowTokens);
+}
+
+// The chat-level meter beside the composer: the latest size, and the share
+// of the window when the harness has stated one.
+function chatContextMeterText(context) {
+  const size = chatTokenCount(context?.context_tokens);
+  if (size === null) return "";
+  const total = chatTokenCount(context?.context_window);
+  const percent = chatContextPercent(size, total);
+  return percent
+    ? `Context ${chatShortTokens(size)} · ${percent} of ${chatShortTokens(total)}`
+    : `Context ${chatShortTokens(size)}`;
+}
+
+function chatPaintContextMeter(node, context) {
+  const text = chatContextMeterText(context);
+  node.hidden = !text;
+  node.textContent = text;
+  const size = chatTokenCount(context?.context_tokens);
+  const total = chatTokenCount(context?.context_window);
+  node.title = !text ? ""
+    : total
+      ? `${fmt(size)} of ${fmt(total)} tokens in context on the latest model request`
+      : `${fmt(size)} tokens in context on the latest model request; `
+        + "the harness has not reported this model's window, so no percentage is shown";
+  const share = total ? size / total : 0;
+  node.classList.toggle("chat-context-high", share >= 0.8);
+}
+
+// The marker's wording, shared by the live event and the loaded transcript:
+// "Context compacted · 123k → 28k · automatic". A figure the harness did not
+// state is left out, and an unknown trigger is not named.
+function chatCompactionLabel(payload) {
+  const before = chatTokenCount(payload?.tokens_before);
+  const after = chatTokenCount(payload?.tokens_after);
+  const parts = ["Context compacted"];
+  if (before !== null && after !== null)
+    parts.push(`${chatShortTokens(before)} → ${chatShortTokens(after)}`);
+  else if (before !== null) parts.push(`from ${chatShortTokens(before)}`);
+  else if (after !== null) parts.push(`now ${chatShortTokens(after)}`);
+  if (payload?.trigger === "auto") parts.push("automatic");
+  else if (payload?.trigger === "manual") parts.push("manual");
+  return parts.join(" · ");
+}
+
+function chatRegroundLabel() {
+  return "Re-ground line added to this message (context was compacted)";
+}
+
+// What a live usage or compaction event does to the chat's meter. Returns
+// true when the window changed, so every reply's percentage is repainted.
+function chatApplyContextEvent(context, event) {
+  const payload = event.payload || {};
+  if (event.event_type === "context.compacted") {
+    // A compaction that states no size after leaves the size unknown until
+    // the next request: the larger figure from before it is no longer true.
+    context.context_tokens = chatTokenCount(payload.tokens_after);
+    context.measured_at = event.created_at || null;
+    return false;
+  }
+  if (event.event_type !== "usage") return false;
+  const size = chatTokenCount(payload.context_tokens);
+  if (payload.scope === "request" && size !== null) {
+    context.context_tokens = size;
+    context.measured_at = event.created_at || null;
+  }
+  const total = chatTokenCount(payload.context_window);
+  if (!total || total === context.context_window) return false;
+  context.context_window = total;
+  return true;
 }
 
 function chatCollapseOtherReasoning(disclosure) {
@@ -5135,9 +5241,13 @@ function chatBubble(
   }
   if (meta) bubble.append(el("div", { className: "chat-meta" }, meta));
   if (kind === "assistant") {
-    const tokenLabel = chatContextTokenLabel(contextTokens);
+    const windowTokens = conversation?.context?.context_window;
+    const tokenLabel = chatContextTokenLabel(contextTokens, windowTokens);
     if (tokenLabel)
-      bubble.append(el("div", { className: "chat-context-tokens" }, tokenLabel));
+      bubble.append(el("div", {
+        className: "chat-context-tokens",
+        title: chatContextTokenTitle(contextTokens, windowTokens),
+      }, tokenLabel));
   }
   return bubble;
 }
@@ -5187,7 +5297,8 @@ function chatOpenStream(
     "conversation.reopened",
     "message.accepted", "session.started", "run.started",
     "assistant.delta", "tool.started", "tool.completed", "permission.requested",
-    "input.requested", "usage", "run.completed", "run.resumed", "run.failed",
+    "input.requested", "usage", "context.compacted", "message.reground",
+    "run.completed", "run.resumed", "run.failed",
     "run.interrupt.requested", "run.interrupted", "run.unknown",
     "run.deferred", "run.reaped", "run.process.snapshot", "run.process.ended",
   ];
@@ -6343,8 +6454,22 @@ function chatTrackLiveTranscriptItem(state, itemId, startsTurn = false) {
 }
 
 function chatTranscriptItemNode(item, conversation, retry) {
-  if (item.kind === "activity")
-    return chatBubble("activity", item.label || item.activity_type);
+  if (item.kind === "activity") {
+    const activity = chatBubble("activity", item.label || item.activity_type);
+    if (item.activity_type === "context.compacted") {
+      // The marker: a full-width rule in the transcript, so a compaction is
+      // never mistaken for an ordinary activity line.
+      activity.classList.add("chat-compaction-marker");
+      activity.setAttribute("role", "separator");
+      activity.title = "The harness compacted this chat's context here. "
+        + "The figures are the ones it reported.";
+    } else if (item.activity_type === "message.reground") {
+      activity.classList.add("chat-reground-note");
+      activity.title = "Added by the engine to the text sent to the shell; "
+        + "your stored message is unchanged.";
+    }
+    return activity;
+  }
   const node = chatBubble(
     item.kind,
     item.text || "",
@@ -6372,7 +6497,8 @@ function chatUpdateTranscriptNode(node, item, retry, conversation) {
     const rendered = mdBlock(item.text || "");
     body.replaceChildren(...rendered.childNodes);
     chatWireLocalFileLinks(body, conversation);
-    chatUpdateContextTokens(node, item.context_tokens);
+    chatUpdateContextTokens(
+      node, item.context_tokens, conversation?.context?.context_window);
     return;
   }
   if (item.kind !== "user") return;
@@ -6683,6 +6809,12 @@ async function chatRenderOpen(
     hidden: true,
   });
   const pending = el("div", { className: "chat-pending", hidden: true });
+  // Bottom left of the composer: the context meter. The left group is also
+  // where the manual compact button belongs (spec #272).
+  const contextMeter = el("div", {
+    className: "chat-context-meter", hidden: true, role: "status",
+  });
+  const composeLeft = el("div", { className: "chat-compose-left" }, contextMeter);
   const unavailable = el("div", {
     className: "chat-harness-unavailable",
     hidden: true,
@@ -6696,7 +6828,8 @@ async function chatRenderOpen(
   const composerRow = el("div", { className: "chat-composer" },
     unavailable, availabilityRetry,
     el("div", { className: "chat-composer-field" }, composer, attachmentChips),
-    el("div", { className: "chat-compose-actions" }, pending, send, stop));
+    el("div", { className: "chat-compose-actions" },
+      composeLeft, pending, send, stop));
   const reviewWorkspace = chatReviewWorkspace(reviewHost, conversation);
   const updateStreamStatus = () => {
     const connected = streamStatus === "connected";
@@ -6790,6 +6923,8 @@ async function chatRenderOpen(
     conversation.state = snapshot.controls.conversation_state;
     conversation.close_requested_at = snapshot.controls.close_requested_at;
     conversation.active_run_id = snapshot.controls.active_run_id;
+    // Only the newest page carries the meter; an older page leaves it be.
+    if (snapshot.context) conversation.context = { ...snapshot.context };
   };
   const reconcileTranscript = async (manual = false) => {
     if (manual) reconcileFailures = 0;
@@ -6874,6 +7009,7 @@ async function chatRenderOpen(
     const queued = chatQueuedCount(messages);
     queueState.hidden = queued === 0;
     queueState.textContent = `${queued} queued`;
+    chatPaintContextMeter(contextMeter, conversation.context);
     updateStreamStatus();
     const closed = conversation.state === "closed";
     const closing = !closed && Boolean(conversation.close_requested_at);
@@ -7142,6 +7278,9 @@ async function chatRenderOpen(
   paint();
   const activityLabel = (event) => {
     const payload = event.payload || {};
+    if (event.event_type === "context.compacted")
+      return chatCompactionLabel(payload);
+    if (event.event_type === "message.reground") return chatRegroundLabel();
     if (event.event_type === "run.process.ended") return payload.label || "Turn process ended";
     if (event.event_type === "permission.requested")
       return "Waiting for permission";
@@ -7266,9 +7405,11 @@ async function chatRenderOpen(
       "run.interrupted",
       "run.unknown",
       "run.process.ended",
+      "context.compacted",
+      "message.reground",
     ].includes(type)) {
       const itemId = `event:${sequence}`;
-      transcriptState.items.set(itemId, {
+      const activity = {
         item_id: itemId,
         kind: "activity",
         order_sequence: sequence,
@@ -7278,9 +7419,27 @@ async function chatRenderOpen(
         activity_type: type,
         label: activityLabel(event),
         sequence,
-      });
+      };
+      if (type === "context.compacted")
+        activity.compaction = {
+          trigger: ["auto", "manual"].includes(event.payload?.trigger)
+            ? event.payload.trigger : "unknown",
+          tokens_before: chatTokenCount(event.payload?.tokens_before),
+          tokens_after: chatTokenCount(event.payload?.tokens_after),
+        };
+      transcriptState.items.set(itemId, activity);
       chatTrackLiveTranscriptItem(transcriptState, itemId);
       transcriptState.dirty.add(itemId);
+    }
+
+    if (type === "usage" || type === "context.compacted") {
+      conversation.context ||= {
+        context_tokens: null, context_window: null, measured_at: null,
+      };
+      // A window learned mid-chat gives every loaded reply its percentage.
+      if (chatApplyContextEvent(conversation.context, event))
+        for (const item of transcriptState.items.values())
+          if (item.kind === "assistant") transcriptState.dirty.add(item.item_id);
     }
 
     transcriptState.lastSequence = sequence;

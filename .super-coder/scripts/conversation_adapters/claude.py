@@ -29,6 +29,7 @@ from .base import (
     SessionInspection,
     SubprocessRunner,
     command_version,
+    compaction_event,
     ensure_exact_session,
     ensure_nonempty_message,
     load_manifest,
@@ -36,6 +37,19 @@ from .base import (
     merged_env,
     signal_owned_process,
     terminal_outcome,
+    token_count,
+    usage_event,
+)
+
+# Claude reads its auto-compact window from this variable before it reads the
+# configured one (2.1.322: the resolver returns the env value first), so a
+# value in the operator's environment would silently win over the engine's
+# ``--autocompact``. The launch drops it whenever it passes the flag.
+AUTO_COMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+INPUT_SIDE_KEYS = (
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
 )
 
 
@@ -58,6 +72,9 @@ class ClaudeAdapter(ConversationAdapter):
         self.attach_poll_seconds = attach_poll_seconds
         self.sleep = sleep
         self.signal_group = signal_group
+        # The model the harness named in ``system.init``; it selects the
+        # matching ``modelUsage`` entry when a result states a window.
+        self._model: str | None = None
 
     def probe(self) -> ProbeResult:
         launch = self.manifest["headless"]["launch"][0]
@@ -109,6 +126,11 @@ class ClaudeAdapter(ConversationAdapter):
                     "Claude adapter cannot apply effort",
                 )
             command.extend([effort["flag"], effort_value])
+        compact_window = context.effective_compact_window()
+        if compact_window is not None:
+            # The value is the window Claude compacts within, not the trigger
+            # point; it is passed through as set, with no engine floor.
+            command.extend(["--autocompact", str(compact_window)])
         if context.permission_mode == "unrestricted":
             command.append("--dangerously-skip-permissions")
         return command
@@ -143,10 +165,13 @@ class ClaudeAdapter(ConversationAdapter):
         transcript_offset = (
             transcript.stat().st_size if transcript.is_file() else 0
         )
+        env = merged_env(self.manifest, context)
+        if context.effective_compact_window() is not None:
+            env.pop(AUTO_COMPACT_WINDOW_ENV, None)
         process = self.runner.spawn(
             command,
             cwd=worktree,
-            env=merged_env(self.manifest, context),
+            env=env,
         )
         pid = getattr(process, "pid", None)
         return NativeTurn(
@@ -240,12 +265,85 @@ class ClaudeAdapter(ConversationAdapter):
             if isinstance(value, (int, float))
         }
 
+    @staticmethod
+    def _context_tokens(usage: Mapping[str, Any]) -> int | None:
+        """Input side of one request: uncached input, cache read, cache write."""
+        parts = [token_count(usage.get(key)) for key in INPUT_SIDE_KEYS]
+        present = [part for part in parts if part is not None]
+        return sum(present) if present else None
+
+    @staticmethod
+    def _compaction(
+        raw: Mapping[str, Any],
+        native_type: str,
+    ) -> list[NormalizedEvent]:
+        """A compact boundary, in the stream's or the transcript's spelling.
+
+        The stream writes ``compact_metadata`` with ``pre_tokens``; the stored
+        transcript writes ``compactMetadata`` with ``preTokens``. Both become
+        the same single event, and the summary text is never read.
+        """
+        if raw.get("type") != "system" or raw.get("subtype") != "compact_boundary":
+            return []
+        metadata = raw.get("compact_metadata")
+        if not isinstance(metadata, dict):
+            metadata = raw.get("compactMetadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        def field(snake: str, camel: str) -> Any:
+            value = metadata.get(snake)
+            return metadata.get(camel) if value is None else value
+
+        return [
+            compaction_event(
+                trigger=metadata.get("trigger"),
+                tokens_before=field("pre_tokens", "preTokens"),
+                tokens_after=field("post_tokens", "postTokens"),
+                compaction_ref=raw.get("uuid"),
+                native_type=native_type,
+            )
+        ]
+
+    def _context_window(self, raw: Mapping[str, Any]) -> int | None:
+        """The window a result states for the chat's own model, else None.
+
+        ``modelUsage`` is keyed by model and can also hold a delegated
+        agent's model. Only an entry that names the chat's model, or the
+        single entry of a one-model turn, is read; anything else is unknown.
+        """
+        model_usage = raw.get("modelUsage")
+        if not isinstance(model_usage, dict) or not model_usage:
+            return None
+
+        def bare(name: str) -> str:
+            return name.split("[", 1)[0]
+
+        entry = None
+        if self._model:
+            entry = model_usage.get(self._model)
+            if entry is None:
+                matches = [
+                    value
+                    for key, value in model_usage.items()
+                    if isinstance(key, str) and bare(key) == bare(self._model)
+                ]
+                entry = matches[0] if len(matches) == 1 else None
+        if entry is None and len(model_usage) == 1:
+            entry = next(iter(model_usage.values()))
+        if not isinstance(entry, dict):
+            return None
+        return token_count(entry.get("contextWindow")) or None
+
     def _normalize(
         self,
         raw: Mapping[str, Any],
     ) -> list[NormalizedEvent]:
         native_type = raw.get("type")
         if native_type == "system" and raw.get("subtype") == "init":
+            model = raw.get("model")
+            if isinstance(model, str) and model:
+                self._model = model
             return [
                 NormalizedEvent(
                     "run.started",
@@ -253,6 +351,8 @@ class ClaudeAdapter(ConversationAdapter):
                     "system.init",
                 ),
             ]
+        if native_type == "system" and raw.get("subtype") == "compact_boundary":
+            return self._compaction(raw, "system.compact_boundary")
         if native_type == "stream_event":
             event = raw.get("event")
             if not isinstance(event, dict):
@@ -288,11 +388,15 @@ class ClaudeAdapter(ConversationAdapter):
             if event_type == "message_delta":
                 usage = self._usage(event)
                 if usage:
+                    # One model request. A delegated agent's request is not
+                    # the chat's context, so it carries no meter reading.
+                    delegated = raw.get("parent_tool_use_id") is not None
                     return [
-                        NormalizedEvent(
-                            "usage",
-                            {"tokens": usage},
+                        usage_event(
+                            usage,
                             "stream_event.message_delta",
+                            scope="subagent" if delegated else "request",
+                            context_tokens=self._context_tokens(usage),
                         )
                     ]
             return []
@@ -331,11 +435,14 @@ class ClaudeAdapter(ConversationAdapter):
             events: list[NormalizedEvent] = []
             usage = self._usage(raw)
             if usage:
+                # The result sums every request of the turn: it is not the
+                # size of the context, so it carries the window only.
                 events.append(
-                    NormalizedEvent(
-                        "usage",
-                        {"tokens": usage},
+                    usage_event(
+                        usage,
                         "result",
+                        scope="turn",
+                        context_window=self._context_window(raw),
                     )
                 )
             result_type = (
@@ -430,6 +537,11 @@ class ClaudeAdapter(ConversationAdapter):
         raw: Mapping[str, Any],
     ) -> tuple[list[NormalizedEvent], str | None]:
         """Normalize one transcript entry; report its assistant text."""
+        # A compact boundary has no ``message``; it is read before that guard
+        # so restart recovery records the compaction the stream would have.
+        compaction = self._compaction(raw, "transcript.compact_boundary")
+        if compaction:
+            return compaction, None
         message = raw.get("message")
         if not isinstance(message, dict):
             return [], None
@@ -442,6 +554,16 @@ class ClaudeAdapter(ConversationAdapter):
             return [], None
         events: list[NormalizedEvent] = []
         text: str | None = None
+        usage = self._usage(raw)
+        if usage and not raw.get("isSidechain"):
+            events.append(
+                usage_event(
+                    usage,
+                    "assistant.usage",
+                    scope="request",
+                    context_tokens=self._context_tokens(usage),
+                )
+            )
         for block in content:
             if not isinstance(block, dict):
                 continue

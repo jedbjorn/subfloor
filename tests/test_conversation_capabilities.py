@@ -29,6 +29,7 @@ NORMALIZED_EVENTS = {
     "permission.requested",
     "input.requested",
     "usage",
+    "context.compacted",
     "run.completed",
     "run.failed",
     "run.interrupted",

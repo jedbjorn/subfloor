@@ -38,6 +38,7 @@ if str(ENGINE / "api") not in sys.path:
 import active_chat_registry
 import browser_gate
 import conversation_broker
+import conversation_compaction
 import conversation_events
 import conversation_git_targets
 import db_driver
@@ -2286,8 +2287,49 @@ def _utf8_prefix(value: str, maximum: int) -> str:
     return raw[:maximum].decode("utf-8", errors="ignore")
 
 
+def _short_tokens(value: int) -> str:
+    """A token figure as the chat shows it: 123456 -> "123k", 850 -> "850"."""
+    return f"{round(value / 1000)}k" if value >= 1000 else str(value)
+
+
+def _compaction_projection(payload: dict) -> dict:
+    """The marker's figures: what the harness stated, and nothing else."""
+    trigger = payload.get("trigger")
+    return {
+        "trigger": (
+            trigger
+            if trigger in ("auto", "manual", "unknown")
+            else "unknown"
+        ),
+        "tokens_before": _token_count(payload.get("tokens_before")),
+        "tokens_after": _token_count(payload.get("tokens_after")),
+    }
+
+
+def _compaction_label(payload: dict) -> str:
+    """"Context compacted · 123k → 28k · automatic"; unknown parts left out."""
+    marker = _compaction_projection(payload)
+    before, after = marker["tokens_before"], marker["tokens_after"]
+    parts = ["Context compacted"]
+    if before is not None and after is not None:
+        parts.append(f"{_short_tokens(before)} → {_short_tokens(after)}")
+    elif before is not None:
+        parts.append(f"from {_short_tokens(before)}")
+    elif after is not None:
+        parts.append(f"now {_short_tokens(after)}")
+    if marker["trigger"] == "auto":
+        parts.append("automatic")
+    elif marker["trigger"] == "manual":
+        parts.append("manual")
+    return " · ".join(parts)
+
+
 def _transcript_activity_label(event_type: str, payload: dict) -> str:
-    if event_type == "permission.requested":
+    if event_type == "context.compacted":
+        label = _compaction_label(payload)
+    elif event_type == "message.reground":
+        label = "Re-ground line added to this message (context was compacted)"
+    elif event_type == "permission.requested":
         label = "Waiting for permission"
     elif event_type == "input.requested":
         label = "Waiting for input"
@@ -2559,7 +2601,8 @@ def _transcript_projection(
             event_scope.append(
                 "(message_id IS NULL AND run_id IS NULL AND event_type IN "
                 "('permission.requested','input.requested','run.failed',"
-                "'run.interrupted','run.unknown','run.process.ended'))"
+                "'run.interrupted','run.unknown','run.process.ended',"
+                "'context.compacted'))"
             )
         event_scope_sql = " OR ".join(event_scope) or "0"
         event_rows = con.execute(
@@ -2691,6 +2734,8 @@ def _transcript_projection(
             "run.interrupted",
             "run.unknown",
             "run.process.ended",
+            "context.compacted",
+            "message.reground",
         }
         for event in events:
             run_id = event["run_id"]
@@ -2824,7 +2869,7 @@ def _transcript_projection(
             run_id = event["run_id"]
             if run_id is not None and int(run_id) not in retained_runs:
                 continue
-            items.append({
+            item = {
                 "item_id": f"event:{event['sequence']}",
                 "kind": "activity",
                 "order_sequence": event["sequence"],
@@ -2839,7 +2884,10 @@ def _transcript_projection(
                     event["payload"],
                 ),
                 "sequence": event["sequence"],
-            })
+            }
+            if event["event_type"] == "context.compacted":
+                item["compaction"] = _compaction_projection(event["payload"])
+            items.append(item)
         items.sort(key=lambda item: (item["order_sequence"], item["item_id"]))
 
         message_source_limited = (
@@ -2927,6 +2975,14 @@ def _transcript_projection(
                     else active_run["latest_boundary_sequence"]
                 ),
             }
+        if cursor is None:
+            # The context meter: the latest size and window the harness
+            # reported, read from the events this page already loaded (the
+            # projection's read budget is fixed). Either is None when it was
+            # not reported; the page shows nothing rather than a guess.
+            projection["context"] = conversation_compaction.meter_reading(
+                reversed(events)
+            )
         if warnings:
             projection["warnings"] = warnings
         _bound_transcript_response(
@@ -3133,6 +3189,20 @@ def _project_event_payload(
 ) -> dict:
     projected = _redact_event_value(payload, secrets)
     if event_type != "usage":
+        return projected
+    # An adapter that states a scope has already said what this event
+    # measures: a ``request`` carries its own ``context_tokens``, and a
+    # ``turn`` total or a ``subagent`` request is not the chat's context, so
+    # no figure is derived for it. Only an event recorded before the scope
+    # existed (or by an adapter that states none) falls back to the sum.
+    if "scope" in payload:
+        if (
+            payload.get("scope") != "request"
+            or _token_count(payload.get("context_tokens")) is None
+        ):
+            projected.pop("context_tokens", None)
+        if _token_count(payload.get("context_window")) is None:
+            projected.pop("context_window", None)
         return projected
     context_tokens = _usage_context_tokens(projected)
     if context_tokens is not None:

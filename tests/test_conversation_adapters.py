@@ -3857,7 +3857,12 @@ class ConversationAdapterTest(unittest.TestCase):
                     "outputTokens": 345,
                     "reasoningOutputTokens": 200,
                     "totalTokens": 12345,
-                }
+                },
+                # Feature #95: the last request's input side, and the window
+                # Codex states beside it (discarded before).
+                "scope": "request",
+                "context_tokens": 12000,
+                "context_window": 258400,
             },
         )
         self.assertNotIn("98765", repr(usage.payload))
