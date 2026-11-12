@@ -994,6 +994,13 @@ def _cancel_queued_turns(con, conversation_id: str) -> int:
         f"WHERE message_id IN ({marks}) AND state IN ('pending','claimed')",
         message_ids,
     )
+    # A queued manual compact request still ends in its one line.
+    conversation_compaction.settle_cancelled_requests(
+        con,
+        conversation_id,
+        message_ids,
+        error_code="CONVERSATION_CLOSING",
+    )
     return int(cancelled)
 
 
@@ -3227,21 +3234,44 @@ def _transcript_projection(
             meter["compact_window"] = applied
             # The cold-return rule, evaluated as the chat is opened: large
             # and idle past the settings means the provider cache is gone
-            # and the next message re-reads the whole context. The page
-            # re-checks the same rule against its own clock while it stays
-            # open. Never during a turn, never for a managed participant.
+            # and the next message re-reads the whole context. Idle is
+            # measured from the last model activity, not from the chat row's
+            # stamp, which close, reopen, rename and Stop all move. The page
+            # re-checks the rule while it stays open, against this server's
+            # clock (``server_time``), never its own. Never during a turn,
+            # never for a managed participant. A closed chat counts when a
+            # message would reopen it onto its stored session, which is how
+            # the operator usually comes back to one.
             cold = conversation_compaction.cold_return_settings()
+            server_now = datetime.now(timezone.utc)
+            # Read from the events this page already loaded, like the meter:
+            # the projection's read budget is fixed.
+            last_model_activity = conversation_compaction.last_model_activity(
+                reversed(events)
+            )
+            returnable = conversation["state"] in ("idle", "error") or (
+                conversation["state"] == "closed"
+                and conversation["conversation_scope"] == "normal"
+                and bool(conversation["harness_session_ref"])
+            )
             projection["cold_return"] = {
                 **cold,
-                "last_activity_at": conversation["last_activity_at"],
+                "last_model_activity_at": last_model_activity,
+                # Stated only when there is an activity to time against it:
+                # a chat whose model never answered has nothing to go cold.
+                "server_time": (
+                    server_now.strftime("%Y-%m-%d %H:%M:%S")
+                    if last_model_activity is not None
+                    else None
+                ),
                 "due": (
-                    conversation["state"] in ("idle", "error")
+                    returnable
                     and active_run_id is None
                     and not bool(conversation["sprint_managed"])
                     and conversation_compaction.cold_return_due(
                         meter["context_tokens"],
-                        conversation["last_activity_at"],
-                        datetime.now(timezone.utc),
+                        last_model_activity,
+                        server_now,
                         cold,
                     )
                 ),

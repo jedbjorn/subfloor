@@ -381,7 +381,35 @@ class ClaudeAdapter(ConversationAdapter):
         ]
 
     def _context_window(self, raw: Mapping[str, Any]) -> int | None:
-        """The window a result states for the chat's own model, else None.
+        """The window a result states for the chat's own model, else None."""
+        entry = self._model_usage(raw)
+        if entry is None:
+            return None
+        return token_count(entry.get("contextWindow")) or None
+
+    def _compaction_usage(self, raw: Mapping[str, Any]) -> dict[str, int]:
+        """What a ``/compact`` run spent, in the stream's usage spelling.
+
+        Its ``result.usage`` is all zeros (2.1.322): the summarising request
+        is counted only in ``modelUsage``, which is that process's total and
+        so this run's alone.
+        """
+        entry = self._model_usage(raw)
+        if entry is None:
+            return {}
+        spelling = {
+            "input_tokens": "inputTokens",
+            "output_tokens": "outputTokens",
+            "cache_read_input_tokens": "cacheReadInputTokens",
+            "cache_creation_input_tokens": "cacheCreationInputTokens",
+        }
+        usage = {
+            key: token_count(entry.get(camel)) for key, camel in spelling.items()
+        }
+        return {key: value for key, value in usage.items() if value is not None}
+
+    def _model_usage(self, raw: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """The ``modelUsage`` entry of the chat's own model, else None.
 
         ``modelUsage`` is keyed by model and can also hold a delegated
         agent's model. Only an entry that names the chat's model, or the
@@ -406,9 +434,7 @@ class ClaudeAdapter(ConversationAdapter):
                 entry = matches[0] if len(matches) == 1 else None
         if entry is None and len(model_usage) == 1:
             entry = next(iter(model_usage.values()))
-        if not isinstance(entry, dict):
-            return None
-        return token_count(entry.get("contextWindow")) or None
+        return entry if isinstance(entry, dict) else None
 
     def _normalize(
         self,
@@ -516,6 +542,8 @@ class ClaudeAdapter(ConversationAdapter):
             failed = bool(raw.get("is_error")) or subtype.startswith("error")
             events: list[NormalizedEvent] = []
             usage = self._usage(raw)
+            if raw.get("local_command") == "compact" and not any(usage.values()):
+                usage = self._compaction_usage(raw)
             if usage:
                 # The result sums every request of the turn: it is not the
                 # size of the context, so it carries the window only.

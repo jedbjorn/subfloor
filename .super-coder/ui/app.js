@@ -5203,24 +5203,60 @@ function chatEngineTime(value) {
   return Number.isFinite(stamp) ? stamp : null;
 }
 
-// True when the chat is at or above the token setting and its last activity
-// is more than the minute setting ago. Never during a turn or a pending
-// compaction, never for a closed chat, and never for a managed participant.
+// The server's cold-return reading, with how far this page's clock is from
+// the server's. The rule is then always read on the server's clock, so a
+// browser whose clock is wrong does not move it.
+function chatColdReturnClock(coldReturn, nowMs, previous = null) {
+  if (!coldReturn) return previous;
+  const serverNow = chatEngineTime(coldReturn.server_time);
+  return {
+    ...coldReturn,
+    clock_offset_ms: serverNow === null
+      ? (previous?.clock_offset_ms ?? 0) : nowMs - serverNow,
+  };
+}
+
+// A chat the operator can come back to and send into: an idle one, or a
+// closed one that a message reopens onto its stored session (opening another
+// chat on the shell closes this one, so that is the usual way back).
+function chatColdReturnable(conversation) {
+  const state = conversation?.state;
+  return ["idle", "error"].includes(state)
+    || (state === "closed" && conversation?.scope === "normal");
+}
+
+// True when the chat is at or above the token setting and its last model
+// activity is more than the minute setting ago, on the server's clock.
+// Never during a turn or a pending compaction, never for a closing chat,
+// and never for a managed participant. A closed chat with no session has no
+// recorded context size, so it is never due.
 function chatColdReturnDue(conversation, nowMs) {
   const limits = conversation?.cold_return || {};
   const tokens = chatTokenCount(limits.context_tokens) || CHAT_COLD_RETURN_TOKENS;
   const minutes = chatTokenCount(limits.idle_minutes)
     || CHAT_COLD_RETURN_IDLE_MINUTES;
-  if (!["idle", "error"].includes(conversation?.state)) return false;
+  if (!chatColdReturnable(conversation)) return false;
   if (conversation?.active_run_id != null) return false;
   if (conversation?.close_requested_at) return false;
   if (conversation?.sprint_managed) return false;
   if (conversation?.compaction?.pending) return false;
   const size = chatTokenCount(conversation?.context?.context_tokens);
-  const last = chatEngineTime(conversation?.last_activity_at);
+  const last = chatEngineTime(limits.last_model_activity_at);
   if (size === null || last === null || !Number.isFinite(nowMs)) return false;
   if (size < tokens) return false;
-  return nowMs - last > minutes * 60000;
+  const offset = Number.isFinite(limits.clock_offset_ms)
+    ? limits.clock_offset_ms : 0;
+  return nowMs - offset - last > minutes * 60000;
+}
+
+// The server's button state, keeping the last compact request's id when the
+// new reading no longer names one: a late event of that request's run is
+// then still recognised as its own, not shown as a failed turn.
+function chatKeepCompactionRequest(next, previous) {
+  if (!next) return previous;
+  const requestId = previous?.message_id ?? null;
+  return next.message_id == null && requestId != null
+    ? { ...next, message_id: requestId } : { ...next };
 }
 
 function chatColdReturnText(conversation) {
@@ -6855,20 +6891,24 @@ async function chatRenderOpen(
     context: initialSnapshot.context
       ? { ...initialSnapshot.context } : conversation.context,
     compaction: initialSnapshot.controls.compaction || conversation.compaction,
-    cold_return: initialSnapshot.cold_return || conversation.cold_return,
+    cold_return: chatColdReturnClock(
+      initialSnapshot.cold_return, Date.now(), conversation.cold_return),
   };
   // The page keeps what only the transcript snapshot and the live stream
-  // report (the meter) when a conversation read replaces the object.
+  // report (the meter, the last model activity and the server's clock) when
+  // a conversation read replaces the object.
   const adoptConversation = (next) => {
-    // The last compact request stays known after it finishes, so a late
-    // event of its run is still recognised as that run's.
-    const requestId = conversation.compaction?.message_id ?? null;
-    conversation = { ...next, context: conversation.context };
-    if (conversation.compaction && conversation.compaction.message_id == null
-        && requestId != null)
-      conversation.compaction = {
-        ...conversation.compaction, message_id: requestId,
-      };
+    const previous = conversation;
+    conversation = {
+      ...next,
+      context: previous.context,
+      compaction: chatKeepCompactionRequest(
+        next.compaction, previous.compaction),
+      cold_return: {
+        ...(previous.cold_return || {}),
+        ...(next.cold_return || {}),
+      },
+    };
   };
   let streamStatus = "connecting";
   let stopRequest = null;
@@ -7119,15 +7159,12 @@ async function chatRenderOpen(
     conversation.state = snapshot.controls.conversation_state;
     conversation.close_requested_at = snapshot.controls.close_requested_at;
     conversation.active_run_id = snapshot.controls.active_run_id;
-    if (snapshot.controls.compaction)
-      conversation.compaction = { ...snapshot.controls.compaction };
+    conversation.compaction = chatKeepCompactionRequest(
+      snapshot.controls.compaction, conversation.compaction);
     // Only the newest page carries the meter; an older page leaves it be.
     if (snapshot.context) conversation.context = { ...snapshot.context };
-    if (snapshot.cold_return) {
-      conversation.cold_return = snapshot.cold_return;
-      conversation.last_activity_at = snapshot.cold_return.last_activity_at
-        || conversation.last_activity_at;
-    }
+    conversation.cold_return = chatColdReturnClock(
+      snapshot.cold_return, Date.now(), conversation.cold_return);
   };
   const reconcileTranscript = async (manual = false) => {
     if (manual) reconcileFailures = 0;
@@ -7200,14 +7237,16 @@ async function chatRenderOpen(
   // large idle chat. It stays until it is dismissed; it never blocks a send.
   const checkColdReturn = () => {
     if (coldReturnShown || document.hidden) return;
-    if (coldReturnDismissedFor === conversation.last_activity_at) return;
+    const lastActivity = conversation.cold_return?.last_model_activity_at;
+    if (lastActivity && coldReturnDismissedFor === lastActivity) return;
     if (!chatColdReturnDue(conversation, Date.now())) return;
     coldReturnShown = true;
     paint();
   };
   const dismissColdReturn = () => {
     coldReturnShown = false;
-    coldReturnDismissedFor = conversation.last_activity_at;
+    coldReturnDismissedFor
+      = conversation.cold_return?.last_model_activity_at || null;
   };
   const paint = () => {
     const rename = el("button", {
@@ -7237,7 +7276,7 @@ async function chatRenderOpen(
     // The notice is a suggestion for an idle chat. Sending a message or
     // requesting a compaction puts the chat to work, and that dismisses it.
     if (coldReturnShown && (
-      !["idle", "error"].includes(conversation.state) || compactState.pending))
+      !chatColdReturnable(conversation) || compactState.pending))
       dismissColdReturn();
     coldReturn.hidden = !coldReturnShown;
     if (coldReturnShown) {
@@ -7737,6 +7776,9 @@ async function chatRenderOpen(
     }
 
     if (type === "usage" || type === "context.compacted") {
+      // The model answered: this is the chat's last model activity.
+      if (conversation.cold_return && event.created_at)
+        conversation.cold_return.last_model_activity_at = event.created_at;
       conversation.context ||= {
         context_tokens: null, context_window: null, measured_at: null,
       };

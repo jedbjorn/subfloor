@@ -52,11 +52,15 @@ COMPACTION_REQUESTED = "compaction.requested"
 COMPACTION_FAILED = "compaction.failed"
 COMPACTION_NOT_REPORTED = "compaction.not_reported"
 # What a manual request's own run may write to the chat's log. The summary a
-# harness streams while it compacts is never among them, and neither is a
-# usage figure from the summarising request (it is the size before).
+# harness streams while it compacts is never among them. The tokens the
+# summarising request spent are kept, under their own scope: they are a cost
+# of the chat, never a reading of how full its context is.
 MANUAL_COMPACT_RUN_EVENTS = frozenset(
-    {"session.started", "run.started", "context.compacted"}
+    {"session.started", "run.started", "context.compacted", "usage"}
 )
+COMPACTION_USAGE_SCOPE = "compaction"
+# The events that say the model answered: what "last model activity" reads.
+MODEL_ACTIVITY_EVENT_TYPES = ("usage", "context.compacted")
 
 # The cold-return notice: a chat this large, idle this long, has lost its
 # provider cache, so the next message re-reads the whole context uncached.
@@ -117,6 +121,81 @@ def manual_compact_sql(alias: str = "m") -> str:
     )
 
 
+def compaction_usage_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The usage of a manual compaction's own request, as it is stored.
+
+    None when the harness stated no tokens at all (a refused request spends
+    none). The figure is the summarising request's, so it never carries a
+    context size: the meter reads ``request`` readings only.
+    """
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, Mapping) or not any(
+        isinstance(value, (int, float)) and not isinstance(value, bool) and value
+        for value in tokens.values()
+    ):
+        return None
+    stored = {
+        key: value for key, value in payload.items() if key != "context_tokens"
+    }
+    stored["scope"] = COMPACTION_USAGE_SCOPE
+    return stored
+
+
+def settle_cancelled_requests(
+    con,
+    conversation_id: str,
+    message_ids: Iterable[int],
+    *,
+    error_code: str,
+    error_detail: str | None = None,
+) -> int:
+    """Give each cancelled manual compact request its one result line.
+
+    For the paths that cancel a run or a queued message without the broker
+    finishing it (the reaper, a chat closed or displaced with work queued):
+    every press still ends in a line, here "Compaction stopped". Messages
+    that are not compact requests, and requests that already have a result,
+    are left alone. Runs inside the caller's write transaction.
+    """
+    from conversation_broker import BrokerStore
+
+    written = 0
+    for message_id in message_ids:
+        request = con.execute(
+            "SELECT 1 FROM conversation_messages m WHERE m.message_id=? AND "
+            + manual_compact_sql("m"),
+            (int(message_id),),
+        ).fetchone()
+        if request is None:
+            continue
+        sequence = BrokerStore._append_compaction_outcome(
+            con,
+            conversation_id=conversation_id,
+            message_id=int(message_id),
+            outcome="cancelled",
+            error_code=error_code,
+            error_detail=error_detail,
+        )
+        if sequence is not None:
+            written += 1
+    return written
+
+
+def last_model_activity(rows: Iterable[Mapping[str, Any]]) -> str | None:
+    """When the chat's model last answered, or None when it never has.
+
+    ``rows`` are the chat's events, newest first; the answer is the time of
+    the newest usage or compaction event among them. Closing, reopening,
+    renaming, stopping and a refused compact request all stamp the chat's
+    ``last_activity_at``; none of them warms a provider cache, so the
+    cold-return rule reads this instead.
+    """
+    for row in rows:
+        if row["event_type"] in MODEL_ACTIVITY_EVENT_TYPES:
+            return row["created_at"]
+    return None
+
+
 def _positive_setting(
     name: str,
     default: int,
@@ -172,8 +251,9 @@ def cold_return_due(
     """True when the chat is large and has been idle past the threshold.
 
     Large is at or above the token setting; idle is more than the minute
-    setting since the chat's last activity. A size the harness never
-    reported, or a time that cannot be read, is not a reason to warn.
+    setting since the chat's last model activity (``last_activity_at`` here
+    is that time, not the conversation row's stamp). A size the harness
+    never reported, or a time that cannot be read, is not a reason to warn.
     """
     limits = settings or cold_return_settings()
     size = _count(context_tokens)

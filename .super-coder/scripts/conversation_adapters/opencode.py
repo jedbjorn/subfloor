@@ -57,8 +57,10 @@ TURN_TIMEOUT_SECONDS = 5400.0
 TURN_CLEANUP_TIMEOUT_SECONDS = 10.0
 # The manual compaction (1.19.5): ``POST /session/{id}/summarize`` answers
 # ``true`` when the summary is written, having emitted ``session.compacted``
-# and then ``session.idle``. This is how long the stream waits for that idle
-# once the request has answered.
+# and then ``session.idle``. The stream waits this long for the request to
+# answer (a request that does not is abandoned and the chat shows the error
+# line), then this long for that idle once it has.
+COMPACT_REQUEST_SECONDS = 600.0
 COMPACT_SETTLE_SECONDS = 15.0
 _SERVER_LOCK = threading.RLock()
 _SERVER_PROCESS: subprocess.Popen | None = None
@@ -1505,9 +1507,8 @@ class OpenCodeAdapter(ConversationAdapter):
             return
 
         # A manual compaction dispatches the summarise request instead of a
-        # prompt and records only that the session compacted: the summary the
-        # server streams, and the usage of the request that wrote it, are
-        # never passed on.
+        # prompt and records that the session compacted and what the request
+        # cost: the summary the server streams is never passed on.
         compacting = bool(turn.metadata.get("compaction"))
         projection = _OpenCodeProjection()
         # A compaction's size before is the chat's last request before the
@@ -1581,6 +1582,9 @@ class OpenCodeAdapter(ConversationAdapter):
 
         observed_activity = False
         prompt_done = False
+        # A manual compaction is bounded end to end: this long for the
+        # summarise request to answer, then the settle wait for idle.
+        compact_deadline = time.monotonic() + COMPACT_REQUEST_SECONDS
         terminal: NormalizedEvent | None = None
         failure: BaseException | None = None
         sse_ended = False
@@ -1589,12 +1593,22 @@ class OpenCodeAdapter(ConversationAdapter):
                 try:
                     kind, value = coordination.get(
                         timeout=(
-                            COMPACT_SETTLE_SECONDS
-                            if compacting and prompt_done
+                            max(0.0, compact_deadline - time.monotonic())
+                            if compacting
                             else None
                         )
                     )
                 except queue.Empty:
+                    if not prompt_done:
+                        # The summarise request never answered. The request
+                        # is abandoned (and aborted below); the chat shows
+                        # the error line.
+                        failure = AdapterError(
+                            "HARNESS_COMPACT_TIMEOUT",
+                            "OpenCode did not answer the summarise request "
+                            f"within {COMPACT_REQUEST_SECONDS:g} seconds",
+                        )
+                        continue
                     # The summarise request answered and the session never
                     # reported idle: the wait is bounded, the run ends here.
                     terminal = NormalizedEvent(
@@ -1605,6 +1619,8 @@ class OpenCodeAdapter(ConversationAdapter):
                     continue
                 if kind == "prompt.done":
                     prompt_done = True
+                    # From the answer on, only the settle wait remains.
+                    compact_deadline = time.monotonic() + COMPACT_SETTLE_SECONDS
                     continue
                 if kind == "prompt.error":
                     failure = value
@@ -1652,10 +1668,12 @@ class OpenCodeAdapter(ConversationAdapter):
                     elif (
                         compacting
                         and event.type not in TERMINAL_EVENTS
-                        and event.type != "run.started"
+                        and event.type not in {"run.started", "usage"}
                     ):
-                        if event.type != "usage":
-                            observed_activity = True
+                        # The summary text and anything else the compaction
+                        # agent streams. Its usage is passed on: the broker
+                        # keeps it as the compaction's cost.
+                        observed_activity = True
                         continue
                     if event.type == "run.completed" and not observed_activity:
                         continue

@@ -126,6 +126,15 @@ def close_for_displacement(
                 "completed_at=datetime('now') WHERE message_id IN (" + marks + ")",
                 message_ids,
             )
+            # A queued manual compact request still ends in its one line.
+            import conversation_compaction
+
+            conversation_compaction.settle_cancelled_requests(
+                con,
+                active.chat_id,
+                message_ids,
+                error_code="CONVERSATION_DISPLACED",
+            )
         con.execute(
             "UPDATE conversation_outbox SET state='cancelled',claim_owner=NULL,"
             "claimed_at=NULL,lease_expires_at=NULL "

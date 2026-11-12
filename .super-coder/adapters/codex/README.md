@@ -256,6 +256,14 @@ Checked on `codex-cli 0.167.1`, 2026-11-12, with one small model request.
   300 s for it to finish; a request that is accepted and then shows no
   compaction in that time ends the run without one, and the chat says the
   harness did not report a compaction. A refused request, or a compaction
-  turn that ends `failed`, is the chat's one-line error. **Not checked:** the
-  request on a thread with a turn in progress (the engine never sends it
-  then), and Stop during a compaction before its turn id is known.
+  turn that ends `failed`, is the chat's one-line error. The adopted turn id
+  replaces the placeholder on the run row as soon as it is known, so Stop and
+  recovery after a broker restart name the real turn. Stop before it is
+  known cannot be sent to Codex (there is no turn to name): it ends the wait
+  at once, the run is interrupted, the chat shows "Compaction stopped", and
+  the app-server is closed with the run. Codex states no token usage for the
+  compaction request (the updates around the item are the last turn's,
+  replayed, and its estimate of the new context), so none is recorded for the
+  run. **Not checked live:** the request on a thread with a turn in progress
+  (the engine never sends it then), Stop during a compaction, and recovery of
+  a compaction after a broker restart.

@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import unittest
 from collections.abc import Mapping
@@ -29,9 +30,12 @@ SCRIPTS = ROOT / ".super-coder" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
 
+import active_chat_registry  # noqa: E402
 import conversation_compaction  # noqa: E402
 import conversation_events  # noqa: E402
+import conversation_reaper  # noqa: E402
 import conversation_routes  # noqa: E402
+from conversation_broker import BrokerStore  # noqa: E402
 from conversation_adapters import (  # noqa: E402
     ADAPTER_TYPES,
     AdapterError,
@@ -42,6 +46,7 @@ from conversation_adapters import (  # noqa: E402
     NormalizedEvent,
     OpenCodeAdapter,
 )
+from conversation_adapters import opencode as opencode_adapter  # noqa: E402
 from conversation_adapters.base import (  # noqa: E402
     ConversationAdapter,
     compaction_event,
@@ -160,6 +165,9 @@ class CompactingCodexRpc(FakeCodexRpc):
         self.refuse = refuse
 
     def request(self, method: str, params: Mapping[str, Any]) -> Any:
+        if method == "turn/interrupt":
+            self.requests.append((method, dict(params)))
+            return {}
         if method == "thread/compact/start":
             self.requests.append((method, dict(params)))
             if self.refuse:
@@ -244,7 +252,7 @@ class ClaudeManualCompactTest(AdapterCase):
     def compact(self, rows: list[dict[str, Any]]):
         adapter, runner = self.claude(rows)
         path = adapter._session_path(SESSION, self.worktree)
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"type": "user", "sessionId": SESSION}) + "\n")
         turn = adapter.compact(SESSION, self.context(compact_window=120000))
         return runner, turn, list(adapter.stream(turn))
@@ -286,6 +294,36 @@ class ClaudeManualCompactTest(AdapterCase):
         self.assertEqual(events[-1].type, "run.failed")
         self.assertEqual(events[-1].payload["error"], "HARNESS_COMPACT_REFUSED")
         self.assertEqual(events[-1].payload["detail"], "No messages to compact")
+
+    def test_a_refusal_line_does_not_override_a_real_boundary(self) -> None:
+        _runner, _turn, events = self.compact([
+            CLAUDE_INIT, CLAUDE_REFUSAL, CLAUDE_MANUAL_BOUNDARY,
+            CLAUDE_COMPACT_RESULT,
+        ])
+        self.assertEqual(len(of_type(events, "context.compacted")), 1)
+        self.assertEqual(events[-1].type, "run.completed")
+        self.assertEqual(of_type(events, "run.failed"), [])
+
+    def test_the_requests_cost_is_read_from_model_usage(self) -> None:
+        # The run's ``usage`` is all zeros; the summarising request is
+        # counted in ``modelUsage`` only.
+        result = {**CLAUDE_COMPACT_RESULT, "modelUsage": {"claude-test-model": {
+            "inputTokens": 2000, "outputTokens": 815,
+            "cacheReadInputTokens": 32955, "cacheCreationInputTokens": 22812,
+            "contextWindow": 200000}}}
+        _runner, _turn, events = self.compact([
+            CLAUDE_INIT, CLAUDE_MANUAL_BOUNDARY, result])
+        [usage] = of_type(events, "usage")
+        self.assertEqual(usage.payload["tokens"], {
+            "input_tokens": 2000, "output_tokens": 815,
+            "cache_read_input_tokens": 32955,
+            "cache_creation_input_tokens": 22812,
+        })
+        self.assertNotIn("context_tokens", usage.payload)
+        # A refused run made no request and states no usage at all.
+        _runner, _turn, refused = self.compact([
+            CLAUDE_INIT, CLAUDE_REFUSAL, CLAUDE_COMPACT_RESULT])
+        self.assertEqual(of_type(refused, "usage"), [])
 
     def test_a_failed_compaction_status_ends_the_run_failed(self) -> None:
         _runner, _turn, events = self.compact([
@@ -364,12 +402,67 @@ class CodexManualCompactTest(AdapterCase):
                 return None
 
         native = SilentRpc([])
-        adapter = CodexAdapter(rpc=native, compact_start_seconds=7.0)
+        adapter = CodexAdapter(rpc=native, compact_start_seconds=0.3)
         turn = adapter.compact("thread-1", self.context())
+        started = time.monotonic()
         events = list(adapter.stream(turn))
         self.assertEqual(events[-1].type, "run.completed")
-        [waited] = native.waits
-        self.assertTrue(0 < waited <= 7.0)
+        self.assertEqual(events[-1].payload["compaction_wait"], "elapsed")
+        # Waited in short slices, and never past the bound.
+        self.assertTrue(native.waits)
+        self.assertTrue(all(0 < wait <= 0.25 for wait in native.waits))
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_stop_before_the_turn_is_known_ends_the_wait_as_stopped(self) -> None:
+        class SilentRpc(CompactingCodexRpc):
+            def next_notification(self, timeout: float):
+                time.sleep(min(timeout, 0.01))
+                return None
+
+        native = SilentRpc([])
+        adapter = CodexAdapter(rpc=native, compact_start_seconds=30.0)
+        turn = adapter.compact("thread-1", self.context())
+        # No turn id yet: nothing can be sent to Codex, the wait just ends.
+        self.assertTrue(adapter.interrupt(turn).acknowledged)
+        started = time.monotonic()
+        events = list(adapter.stream(turn))
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(events[-1].type, "run.interrupted")
+        self.assertEqual(events[-1].interrupt_evidence, "operator")
+        self.assertEqual(turn.metadata["terminal"], "run.interrupted")
+        self.assertNotIn(
+            "turn/interrupt", [method for method, _params in native.requests])
+        self.assertFalse(adapter.compaction_requested)
+
+    def test_stop_after_adoption_names_the_real_turn(self) -> None:
+        native, adapter, turn = self.compact(CODEX_MANUAL_SEQUENCE[:3])
+        stream = adapter.stream(turn)
+        seen = [next(stream), next(stream)]      # session.started, run.started
+        self.assertEqual(seen[-1].type, "run.started")
+        self.assertEqual(turn.run_ref, COMPACT_TURN)
+        adapter.interrupt(turn)
+        self.assertEqual(native.requests[-1], (
+            "turn/interrupt", {"threadId": "thread-1", "turnId": COMPACT_TURN}))
+
+    def test_a_compaction_flushed_at_the_end_of_the_wait_is_still_manual(self):
+        # The item completed, but neither its size after nor the turn's end
+        # arrived before the wait ran out.
+        _native, adapter, turn = self.compact([
+            CODEX_COMPACT_STARTED,
+            compact_note("item/started", item=CODEX_COMPACT_ITEM),
+            compact_note("item/completed", item=CODEX_COMPACT_ITEM),
+        ])
+        events = list(adapter.stream(turn))
+        [compacted] = of_type(events, "context.compacted")
+        self.assertEqual(compacted.payload["trigger"], "manual")
+        self.assertEqual(events[-1].type, "run.completed")
+        self.assertFalse(adapter.compaction_requested)
+
+    def test_the_updates_around_the_item_are_not_this_runs_usage(self) -> None:
+        # Codex states no tokens for the compaction request: the updates are
+        # the last turn's, replayed, and its estimate of the new context.
+        _native, adapter, turn = self.compact(CODEX_MANUAL_SEQUENCE)
+        self.assertEqual(of_type(adapter.stream(turn), "usage"), [])
 
     def test_a_refused_request_raises_and_clears_the_tag(self) -> None:
         native = CompactingCodexRpc([], refuse="thread is busy")
@@ -425,9 +518,88 @@ class OpenCodeManualCompactTest(AdapterCase):
         self.assertEqual(compacted.payload["trigger"], "manual")
         self.assertEqual(compacted.payload["tokens_before"], 13657)
         self.assertEqual(events[-1].type, "run.completed")
-        # Neither the summary nor the summarising request's usage is passed on.
+        # The summary is never passed on. The summarising request's tokens
+        # are, as usage with no context size: they are a cost, not a reading.
         self.assertEqual(of_type(events, "assistant.delta"), [])
-        self.assertEqual(of_type(events, "usage"), [])
+        [usage] = of_type(events, "usage")
+        self.assertEqual(usage.payload["tokens"]["input"], 13657)
+        self.assertNotIn("context_tokens", usage.payload)
+
+    def test_a_summarise_request_that_never_answers_is_bounded(self) -> None:
+        release = threading.Event()
+
+        class HungServer(FakeOpenCodeServer):
+            def request(self, method, path, *, query=None, body=None):
+                if method == "POST" and path.endswith("/summarize"):
+                    self.requests.append((method, path, body))
+                    release.wait(10)
+                    raise AdapterError("HARNESS_UNAVAILABLE", "aborted")
+                if method == "POST" and path.endswith("/abort"):
+                    release.set()
+                return super().request(method, path, query=query, body=body)
+
+            def stream(self, path, *, query=None):
+                class Silent:
+                    def __iter__(self):
+                        return self
+
+                    def __next__(self):
+                        release.wait(10)
+                        raise StopIteration
+
+                    def close(self):
+                        release.set()
+
+                return Silent()
+
+        server = HungServer([])
+        adapter = self.adapter(server)
+        turn = adapter.compact(OPENCODE_SESSION, self.context())
+        started = time.monotonic()
+        with mock.patch.object(opencode_adapter, "COMPACT_REQUEST_SECONDS", 0.2):
+            with self.assertRaises(AdapterError) as raised:
+                list(adapter.stream(turn))
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertEqual(raised.exception.code, "HARNESS_COMPACT_TIMEOUT")
+        self.assertIn("within 0.2 seconds", raised.exception.detail)
+        # The hung request was abandoned.
+        self.assertIn(
+            ("POST", f"/session/{OPENCODE_SESSION}/abort", None), server.requests)
+
+    def test_the_wait_for_idle_after_the_answer_is_bounded(self) -> None:
+        done = threading.Event()
+
+        class NeverIdle(FakeOpenCodeServer):
+            def stream(self, path, *, query=None):
+                events = iter(self.events)
+
+                class Open:
+                    def __iter__(self):
+                        return self
+
+                    def __next__(self):
+                        try:
+                            return next(events)
+                        except StopIteration:
+                            done.wait(10)
+                            raise
+
+                    def close(self):
+                        done.set()
+
+                return Open()
+
+        # Busy, compacted, and then no idle at all.
+        server = NeverIdle(OPENCODE_MANUAL_SEQUENCE[:4])
+        adapter = self.adapter(server)
+        turn = adapter.compact(OPENCODE_SESSION, self.context())
+        started = time.monotonic()
+        with mock.patch.object(opencode_adapter, "COMPACT_SETTLE_SECONDS", 0.2):
+            events = list(adapter.stream(turn))
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertEqual(len(of_type(events, "context.compacted")), 1)
+        self.assertEqual(events[-1].type, "run.completed")
+        self.assertEqual(events[-1].payload["compaction_wait"], "elapsed")
 
     def test_size_before_is_the_chats_reading_never_the_summarisers(self) -> None:
         # The summarising request reports its own, much smaller, input side.
@@ -737,8 +909,17 @@ class CompactingAdapter(RecordingAdapter):
         yield NormalizedEvent("run.started", {"status": "running"})
         # What a harness streams while it summarises. None of it is kept.
         yield NormalizedEvent("assistant.delta", {"text": "PRIVATE SUMMARY TEXT"})
-        yield usage_event({"inputTokens": 90000}, "fixture", scope="request",
-                          context_tokens=90000)
+        yield usage_event({"inputTokens": 90000, "outputTokens": 700}, "fixture",
+                          scope="request", context_tokens=90000)
+        if self.result == "renamed":
+            # The harness names the turn only after dispatch (Codex).
+            turn.run_ref = "turn-adopted"
+            yield NormalizedEvent("run.started", {"status": "running"})
+        if self.result == "stopped":
+            yield NormalizedEvent(
+                "run.interrupted", {"status": "cancelled"},
+                interrupt_evidence="operator")
+            return
         if self.result == "compacted":
             # The harness states no trigger; the engine asked.
             yield compaction_event(trigger="unknown", tokens_before=90000,
@@ -894,9 +1075,77 @@ class ManualCompactBrokerTest(DispatchCase):
         self.assertEqual(recorded[0]["payload"]["initiated_by"], "engine")
         kinds = {event["type"] for event in recorded}
         self.assertNotIn("assistant.delta", kinds)
-        self.assertNotIn("usage", kinds)
         self.assertNotIn("message.reground", kinds)
         self.assertNotIn("PRIVATE SUMMARY TEXT", json.dumps(recorded))
+
+    def test_the_requests_tokens_are_recorded_but_never_as_the_context(self):
+        _adapter, broker, conversation_id, message_id, _outcome, before = (
+            self.pressed("compacted")
+        )
+        [usage] = [event for event in self.events(conversation_id, before)
+                   if event["type"] == "usage"]
+        self.assertEqual(
+            usage["payload"]["tokens"], {"inputTokens": 90000, "outputTokens": 700})
+        self.assertEqual(usage["payload"]["scope"], "compaction")
+        self.assertNotIn("context_tokens", usage["payload"])
+        # On the request's own run, not on the chat.
+        self.assertEqual(usage["message_id"], message_id)
+        self.assertIsNotNone(usage["run_id"])
+        # The meter reads what the compaction left, not the summarising
+        # request's 90k input side.
+        state = broker.store.compaction_state(conversation_id)
+        self.assertEqual(state.context_tokens, 12000)
+
+    def test_a_request_that_spent_nothing_records_no_usage(self) -> None:
+        self.assertIsNone(conversation_compaction.compaction_usage_payload(
+            {"tokens": {"input_tokens": 0, "output_tokens": 0}, "scope": "turn"}))
+        self.assertIsNone(conversation_compaction.compaction_usage_payload({}))
+
+    def test_a_press_does_not_spend_a_reground_line_already_owed(self) -> None:
+        # The first turn compacted on its own, so a line is owed. The press
+        # must not take it: the next real message still carries it.
+        adapter = CompactingAdapter(result="silent", compact_on={1})
+        broker = self.start_broker(lambda _harness: adapter)
+        conversation_id = self.add_conversation()
+        self.deliver(broker, conversation_id, "start the work")
+        self.assertIsNotNone(
+            broker.store.compaction_state(conversation_id).pending_compaction)
+        self.settle(broker, self.press(conversation_id))
+        self.assertEqual(self.reground_events(conversation_id), [])
+        self.assertIsNotNone(
+            broker.store.compaction_state(conversation_id).pending_compaction)
+        following = self.deliver(broker, conversation_id, "carry on")
+        self.assertEqual(adapter.dispatched[-1], f"carry on\n\n{LINE}")
+        [(reground_message, _payload)] = self.reground_events(conversation_id)
+        self.assertEqual(reground_message, following)
+
+    def test_a_stopped_request_is_the_stopped_line_not_the_notice(self) -> None:
+        _adapter, _broker, conversation_id, message_id, outcome, before = (
+            self.pressed("stopped")
+        )
+        self.assertEqual(outcome, "cancelled")
+        [stopped] = self.results(conversation_id, before)
+        self.assertEqual(stopped["type"], "compaction.failed")
+        self.assertEqual(stopped["payload"]["outcome"], "cancelled")
+        self.assertEqual(stopped["payload"]["request_message_id"], message_id)
+        self.assertEqual(
+            conversation_routes._compaction_failed_label(stopped["payload"]),
+            "Compaction stopped — the context was not compacted",
+        )
+        self.assertEqual(self.state(conversation_id), "idle")
+
+    def test_a_turn_named_after_dispatch_is_what_the_run_row_names(self) -> None:
+        _adapter, _broker, _conversation_id, message_id, outcome, _before = (
+            self.pressed("renamed")
+        )
+        self.assertEqual(outcome, "succeeded")
+        con = self.connect()
+        runner_ref = con.execute(
+            "SELECT runner_ref FROM conversation_runs WHERE trigger_message_id=?",
+            (message_id,),
+        ).fetchone()[0]
+        con.close()
+        self.assertEqual(runner_ref, "turn-adopted")
 
     def test_the_first_real_message_after_it_carries_the_reground_line(self):
         adapter, broker, conversation_id, _message_id, _outcome, _before = (
@@ -982,6 +1231,111 @@ class ManualCompactBrokerTest(DispatchCase):
         self.assertEqual(order[-2:], [request, message])
         self.assertEqual(
             adapter.dispatched[-1], f"sent while compacting\n\n{LINE}")
+
+
+class CancelledRequestTest(DispatchCase):
+    """A request cancelled without the broker finishing it still ends in a
+    line: the reaper, and a chat closed or displaced with the request queued."""
+
+    press = ManualCompactBrokerTest.press
+    events = ManualCompactBrokerTest.events
+    results = ManualCompactBrokerTest.results
+
+    def running_request(self, *, ordinary: bool = False) -> tuple[str, int, int]:
+        """A manual compaction (or an ordinary turn) a dead broker left running."""
+        conversation_id = self.add_conversation(
+            state="running", session_ref="native-session")
+        message_id = (
+            self.send(conversation_id, "hello") if ordinary
+            else self.press(conversation_id)
+        )
+        con = self.connect()
+        con.execute(
+            "UPDATE conversations SET state='running' WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        con.execute(
+            "UPDATE conversation_messages SET state='running' WHERE message_id=?",
+            (message_id,),
+        )
+        run_id = int(con.execute(
+            "INSERT INTO conversation_runs "
+            "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+            "lease_expires_at,started_at,heartbeat_at,process_pid,"
+            "process_start_ticks,process_group_id) "
+            "VALUES (?,1,?,'running','dead-broker','2000-01-01 00:00:00',"
+            "datetime('now'),datetime('now'),4242,9001,4242)",
+            (conversation_id, message_id),
+        ).lastrowid)
+        con.execute(
+            "UPDATE conversation_outbox SET state='claimed',"
+            "claim_owner='dead-broker',claimed_at=datetime('now'),"
+            "lease_expires_at='2000-01-01 00:00:00',attempts=attempts+1 "
+            "WHERE message_id=?",
+            (message_id,),
+        )
+        con.execute(
+            "UPDATE conversation_outbox SET state='dispatched',run_id=?,"
+            "dispatched_at=datetime('now') WHERE message_id=?",
+            (run_id, message_id),
+        )
+        con.commit()
+        con.close()
+        return conversation_id, message_id, run_id
+
+    def reap(self, conversation_id: str, message_id: int, run_id: int) -> bool:
+        candidate = conversation_reaper.ReaperCandidate(
+            run_id=run_id, conversation_id=conversation_id,
+            message_id=message_id, pid=4242, start_ticks=9001,
+            process_group_id=4242, started_at=datetime.now(timezone.utc),
+            last_signal=None, signaled_at=None,
+        )
+        return conversation_reaper.ReaperStore(self.db_path).finish_interrupted(
+            candidate, "orphaned after broker death", process_exited=True)
+
+    def test_a_reaped_request_ends_in_the_stopped_line(self) -> None:
+        conversation_id, message_id, run_id = self.running_request()
+        self.assertTrue(self.reap(conversation_id, message_id, run_id))
+        [stopped] = self.results(conversation_id, 0)
+        self.assertEqual(stopped["type"], "compaction.failed")
+        self.assertEqual(stopped["payload"], {
+            "outcome": "cancelled", "error": "CONVERSATION_RUN_REAPED",
+            "detail": "orphaned after broker death",
+            "request_message_id": message_id,
+        })
+        # On the chat, like every result.
+        self.assertIsNone(stopped["run_id"])
+        self.assertIsNone(stopped["message_id"])
+
+    def test_a_reaped_request_that_already_compacted_keeps_its_marker(self):
+        conversation_id, message_id, run_id = self.running_request()
+        BrokerStore(self.db_path).append_event(run_id, compaction_event(
+            trigger="unknown", tokens_before=90000, tokens_after=12000,
+            native_type="fixture"))
+        self.assertTrue(self.reap(conversation_id, message_id, run_id))
+        [marker] = self.results(conversation_id, 0)
+        self.assertEqual(marker["type"], "context.compacted")
+
+    def test_a_reaped_ordinary_turn_writes_no_compaction_line(self) -> None:
+        conversation_id, message_id, run_id = self.running_request(ordinary=True)
+        self.assertTrue(self.reap(conversation_id, message_id, run_id))
+        self.assertEqual(self.results(conversation_id, 0), [])
+
+    def test_a_request_queued_when_its_chat_is_displaced_ends_stopped(self):
+        conversation_id = self.add_conversation(session_ref="native-session")
+        message_id = self.press(conversation_id)
+        con = self.connect()
+        with con:
+            closed = active_chat_registry.close_for_displacement(
+                con, 1, allow_live_process=True)
+        con.close()
+        self.assertEqual(closed.chat_id, conversation_id)
+        [stopped] = self.results(conversation_id, 0)
+        self.assertEqual(stopped["type"], "compaction.failed")
+        self.assertEqual(stopped["payload"], {
+            "outcome": "cancelled", "error": "CONVERSATION_DISPLACED",
+            "request_message_id": message_id,
+        })
 
 
 # ── AC14, AC15: the route and what the chat view is told ────────────────────
@@ -1131,11 +1485,44 @@ class ManualCompactRouteTest(ManualCompactApiCase):
         status, _, body = self.request(
             "POST", f"/api/conversations/{conversation_id}/compactions", body={})
         self.assertEqual(body["error"]["code"], "IDEMPOTENCY_KEY_REQUIRED")
+        # The button takes no text and no instructions.
+        for field in ("text", "instructions"):
+            with self.subTest(field=field):
+                status, _, body = self.request(
+                    "POST", f"/api/conversations/{conversation_id}/compactions",
+                    body={field: "keep the plan"}, key=f"press-{field}",
+                )
+                self.assertEqual(status, 422, body)
+        with closing(self.connect()) as con:
+            self.assertEqual(con.execute(
+                "SELECT COUNT(*) FROM conversation_messages "
+                "WHERE conversation_id=?", (conversation_id,),
+            ).fetchone()[0], 0)
+
+    def test_closing_a_chat_with_the_request_queued_ends_it_stopped(self) -> None:
+        conversation_id = self.conversation(number=908)
+        _, _, pressed = self.press(conversation_id)
+        version = self.detail(conversation_id)["version"]
         status, _, body = self.request(
-            "POST", f"/api/conversations/{conversation_id}/compactions",
-            body={"instructions": "keep the plan"}, key="press-text",
+            "PATCH", f"/api/conversations/{conversation_id}",
+            body={"state": "closed", "version": version},
         )
-        self.assertEqual(status, 422, body)
+        self.assertEqual(status, 200, body)
+        with closing(self.connect()) as con:
+            rows = con.execute(
+                "SELECT payload,message_id,run_id FROM conversation_events "
+                "WHERE conversation_id=? AND event_type='compaction.failed'",
+                (conversation_id,),
+            ).fetchall()
+        [(payload, message_id, run_id)] = [tuple(row) for row in rows]
+        self.assertEqual(json.loads(payload), {
+            "outcome": "cancelled", "error": "CONVERSATION_CLOSING",
+            "request_message_id": pressed["compaction"]["message_id"],
+        })
+        self.assertEqual((message_id, run_id), (None, None))
+        labels = [item["label"] for item in self.transcript(conversation_id)["items"]]
+        self.assertEqual(
+            labels, ["Compaction stopped — the context was not compacted"])
 
 
 class CompactButtonDataTest(ManualCompactApiCase):
@@ -1324,31 +1711,144 @@ class ColdReturnRuleTest(unittest.TestCase):
 
 
 class ColdReturnProjectionTest(ManualCompactApiCase):
-    def cold(self, *, number: int, tokens: int, minutes: float, **fields) -> dict:
-        stamp = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).strftime(
+    @staticmethod
+    def stamp(minutes: float) -> str:
+        return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).strftime(
             "%Y-%m-%d %H:%M:%S")
-        conversation_id = self.conversation(
-            number=number, activity=stamp, **fields)
+
+    def model_activity(
+        self, conversation_id: str, *, tokens: int, minutes: float,
+        active: bool = False,
+    ) -> str:
+        """One turn whose usage the model reported ``minutes`` ago."""
+        stamp = self.stamp(minutes)
         with closing(self.connect()) as con:
-            self.seed_segmented_trace(
-                con, conversation_id=conversation_id,
-                active=fields.get("state") == "running",
-                events=(
-                    ("assistant.delta", {"text": "working"}),
-                    ("usage", {"tokens": {"inputTokens": tokens},
-                               "scope": "request", "context_tokens": tokens,
-                               "context_window": 258400}),
-                ),
+            message_id = int(con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state,completed_at) "
+                "VALUES (?,'user','operator','prompt','hello',?,?,?,?)",
+                (conversation_id, f"turn-{stamp}", f"hash-{stamp}",
+                 "running" if active else "completed",
+                 None if active else stamp),
+            ).lastrowid)
+            run_id = int(con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,lease_owner,"
+                "lease_expires_at,state,started_at,ended_at) "
+                "SELECT ?,shell_id,?,'fixture','2099-01-01 00:00:00',?,?,? "
+                "FROM conversations WHERE conversation_id=?",
+                (conversation_id, message_id,
+                 "running" if active else "succeeded", stamp,
+                 None if active else stamp, conversation_id),
+            ).lastrowid)
+            start = con.execute(
+                "SELECT COALESCE(MAX(sequence),0) FROM conversation_events "
+                "WHERE conversation_id=?", (conversation_id,),
+            ).fetchone()[0]
+            events = (
+                ("message.accepted", {"text": "hello"}, None),
+                ("run.started", {}, run_id),
+                ("assistant.delta", {"text": "working"}, run_id),
+                ("usage", {"tokens": {"inputTokens": tokens}, "scope": "request",
+                           "context_tokens": tokens, "context_window": 258400},
+                 run_id),
             )
+            for offset, (kind, payload, run) in enumerate(events, start=1):
+                con.execute(
+                    "INSERT INTO conversation_events "
+                    "(conversation_id,sequence,event_type,payload,message_id,"
+                    "run_id,created_at) VALUES (?,?,?,?,?,?,?)",
+                    (conversation_id, start + offset, kind, json.dumps(payload),
+                     message_id, run, stamp),
+                )
             con.commit()
+        return stamp
+
+    def cold(
+        self, *, number: int, tokens: int, minutes: float,
+        row_minutes: float | None = None, **fields,
+    ) -> dict:
+        """``minutes`` since the model answered; ``row_minutes`` since the
+        conversation row was last stamped (the same unless stated)."""
+        conversation_id = self.conversation(
+            number=number,
+            activity=self.stamp(minutes if row_minutes is None else row_minutes),
+            **fields,
+        )
+        stamp = self.model_activity(
+            conversation_id, tokens=tokens, minutes=minutes,
+            active=fields.get("state") == "running")
         cold = self.transcript(conversation_id)["cold_return"]
         # The single-chat read reports the same two settings.
         self.assertEqual(
             self.detail(conversation_id)["cold_return"],
             {key: cold[key] for key in ("context_tokens", "idle_minutes")},
         )
-        self.assertEqual(cold["last_activity_at"], stamp)
+        self.assertEqual(cold["last_model_activity_at"], stamp)
         return cold
+
+    def test_idle_is_measured_from_model_activity_not_the_rows_stamp(self):
+        # Closed, reopened, renamed or stopped a minute ago: the row was just
+        # stamped, but the model last answered two hours ago.
+        self.assertTrue(self.cold(
+            number=941, tokens=90000, minutes=120, row_minutes=1)["due"])
+
+    def test_a_stale_row_stamp_does_not_make_a_fresh_chat_cold(self) -> None:
+        self.assertFalse(self.cold(
+            number=942, tokens=90000, minutes=5, row_minutes=600)["due"])
+
+    def test_a_refused_compact_press_is_not_model_activity(self) -> None:
+        conversation_id = self.conversation(number=943, activity=self.stamp(120))
+        self.model_activity(conversation_id, tokens=90000, minutes=120)
+        self.add_event(conversation_id, "compaction.requested", {"message_id": 9})
+        self.add_event(conversation_id, "compaction.failed", {
+            "outcome": "failed", "request_message_id": 9})
+        self.assertTrue(self.transcript(conversation_id)["cold_return"]["due"])
+        # A compaction that happened is: the model answered just now.
+        self.add_event(conversation_id, "context.compacted", {
+            "trigger": "manual", "tokens_before": 90000, "tokens_after": 70000})
+        self.assertFalse(self.transcript(conversation_id)["cold_return"]["due"])
+
+    def test_due_for_a_closed_chat_a_message_would_reopen(self) -> None:
+        # Opening another chat on the shell closes this one: the usual way
+        # back is to a closed chat that still has its session.
+        self.assertTrue(self.cold(
+            number=944, tokens=90000, minutes=120, state="closed")["due"])
+
+    def test_not_due_for_a_closed_chat_with_no_session_to_reopen(self) -> None:
+        self.assertFalse(self.cold(
+            number=945, tokens=90000, minutes=120, state="closed",
+            session=None)["due"])
+
+    def test_not_due_for_a_chat_the_engine_manages(self) -> None:
+        # The fixture's participant chat, in a run that is still armed.
+        seed = next(
+            getattr(self, name) for name in dir(ConversationApiCase)
+            if name.startswith("seed_") and name.endswith("_conversation")
+            and name != "seed_conversation"
+        )
+        conversation_id = seed()
+        managed = next(
+            key for key in self.detail(conversation_id) if key.endswith("_managed"))
+        self.assertTrue(self.detail(conversation_id)[managed])
+        with closing(self.connect()) as con:
+            con.execute(
+                "UPDATE conversations SET harness_session_ref='native-session' "
+                "WHERE conversation_id=?", (conversation_id,),
+            )
+            con.commit()
+        self.model_activity(conversation_id, tokens=90000, minutes=120)
+        transcript = self.transcript(conversation_id)
+        self.assertEqual(transcript["context"]["context_tokens"], 90000)
+        self.assertFalse(transcript["cold_return"]["due"])
+
+    def test_the_server_states_its_own_clock(self) -> None:
+        cold = self.cold(number=946, tokens=90000, minutes=120)
+        stated = datetime.strptime(
+            cold["server_time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        self.assertLess(
+            abs((datetime.now(timezone.utc) - stated).total_seconds()), 60)
 
     def test_due_for_a_large_idle_chat_with_its_thresholds(self) -> None:
         cold = self.cold(number=931, tokens=90000, minutes=120)
@@ -1517,10 +2017,24 @@ const now = Date.parse("2026-11-12T12:00:00Z");
 const ago = (minutes) => new Date(now - minutes * 60000).toISOString()
   .slice(0, 19).replace("T", " ");
 const chat = (tokens, minutes, extra = {}) => ({
-  state: "idle", last_activity_at: ago(minutes),
+  state: "idle", scope: "normal",
+  // The conversation row's own stamp is never the rule's clock.
+  last_activity_at: ago(0),
   context: {context_tokens: tokens},
-  cold_return: {context_tokens: 60000, idle_minutes: 60}, ...extra});
+  cold_return: {context_tokens: 60000, idle_minutes: 60,
+    last_model_activity_at: ago(minutes)}, ...extra});
 const due = (...args) => chatColdReturnDue(chat(...args), now);
+// A browser clock three hours fast, corrected by the server's stated time.
+const skew = 3 * 3600000;
+const skewed = (minutes) => {
+  const conversation = chat(90000, minutes);
+  conversation.cold_return = chatColdReturnClock(
+    {...conversation.cold_return, server_time: ago(0)}, now + skew);
+  return {offset: conversation.cold_return.clock_offset_ms,
+    due: chatColdReturnDue(conversation, now + skew),
+    // An hour later on that same wrong clock.
+    later: chatColdReturnDue(conversation, now + skew + 3600000)};
+};
 console.log(JSON.stringify({
   largeIdle: due(90000, 120),
   atTokenThreshold: due(60000, 61),
@@ -1531,15 +2045,28 @@ console.log(JSON.stringify({
   error: due(90000, 120, {state: "error"}),
   running: due(90000, 120, {state: "running"}),
   queued: due(90000, 120, {state: "queued"}),
-  closed: due(90000, 120, {state: "closed"}),
+  closedReopenable: due(90000, 120, {state: "closed"}),
+  closedManaged: due(90000, 120, {state: "closed", scope: "other"}),
+  closedNoContext: due(null, 120, {state: "closed"}),
   closing: due(90000, 120, {close_requested_at: "t"}),
+  skewedRecent: skewed(5),
+  skewedIdle: skewed(120),
+  keptClock: chatColdReturnClock(null, now, {clock_offset_ms: 7}),
+  noServerTime: chatColdReturnClock({idle_minutes: 60}, now).clock_offset_ms,
+  returnable: [chatColdReturnable({state: "idle"}),
+    chatColdReturnable({state: "closed", scope: "normal"}),
+    chatColdReturnable({state: "closed", scope: "other"}),
+    chatColdReturnable({state: "running"})],
   managed: due(90000, 120, {[MANAGED_FLAG]: true}),
   compacting: due(90000, 120, {compaction: {pending: true}}),
   unknownSize: due(null, 120),
-  unknownTime: chatColdReturnDue({...chat(90000, 120), last_activity_at: null}, now),
-  defaults: chatColdReturnDue({...chat(90000, 120), cold_return: undefined}, now),
+  unknownTime: chatColdReturnDue({...chat(90000, 120),
+    cold_return: {context_tokens: 60000, idle_minutes: 60}}, now),
+  defaults: chatColdReturnDue({...chat(90000, 120),
+    cold_return: {last_model_activity_at: ago(120)}}, now),
   settings: chatColdReturnDue({...chat(25000, 6),
-    cold_return: {context_tokens: 20000, idle_minutes: 5}}, now),
+    cold_return: {context_tokens: 20000, idle_minutes: 5,
+      last_model_activity_at: ago(6)}}, now),
   text: chatColdReturnText(chat(90400, 120)),
   textUnknown: chatColdReturnText({}),
   engineTime: [chatEngineTime("2026-11-12 11:00:00"),
@@ -1555,10 +2082,23 @@ console.log(JSON.stringify({
     assert result["justOver"] is True
     assert result["recent"] is False
     assert result["error"] is True
-    # Never during a turn, for a closed or closing chat, for a managed
-    # participant, or while a compaction is already pending.
-    for name in ("running", "queued", "closed", "closing", "managed", "compacting"):
+    # Never during a turn, for a closing chat, for a managed participant, or
+    # while a compaction is already pending.
+    for name in ("running", "queued", "closing", "managed", "compacting"):
         assert result[name] is False, name
+    # A closed chat a message would reopen counts: it is the usual way back.
+    assert result["closedReopenable"] is True
+    assert result["closedManaged"] is False
+    assert result["closedNoContext"] is False
+    assert result["returnable"] == [True, True, False, False]
+    # The rule runs on the server's clock: a browser three hours fast does
+    # not make a chat used five minutes ago look cold, and still sees a cold
+    # one, and an hour later on that clock is an hour later on the server's.
+    assert result["skewedRecent"] == {
+        "offset": 3 * 3600000, "due": False, "later": True}
+    assert result["skewedIdle"]["due"] is True
+    assert result["keptClock"] == {"clock_offset_ms": 7}
+    assert result["noServerTime"] == 0
     assert result["unknownSize"] is False
     assert result["unknownTime"] is False
     assert result["defaults"] is True
@@ -1747,7 +2287,8 @@ const chatApi = async (url, method = "GET", body = null, key = null) => {
   }
   throw new Error("unexpected request " + url);
 };
-const chatRefreshConversation = () => {};
+let rereads = [];
+const chatRefreshConversation = (id, generation, onUpdate) => rereads.push(onUpdate);
 const now = Date.now();
 const ago = (minutes) => new Date(now - minutes * 60000).toISOString()
   .slice(0, 19).replace("T", " ");
@@ -1755,7 +2296,8 @@ const open = async (overrides = {}) => {
   const conversation = {conversation_id: "cv_fixture", scope: "normal",
     route: {harness: "codex"}, shell: {shortname: "dev", display_name: "Dev",
       shell_id: 1},
-    last_activity_at: ago(overrides.minutes ?? 120)};
+    // The row's own stamp is fresh: the rule must not read it.
+    last_activity_at: ago(0)};
   const snapshot = {conversation_id: "cv_fixture", projection_version: 3,
     through_sequence: 10,
     controls: {conversation_state: overrides.state ?? "idle",
@@ -1764,10 +2306,11 @@ const open = async (overrides = {}) => {
         enabled: true, pending: false, message_id: null}},
     context: {context_tokens: overrides.tokens ?? 90400, context_window: 258400},
     cold_return: {context_tokens: 60000, idle_minutes: 60,
-      last_activity_at: conversation.last_activity_at},
+      last_model_activity_at: ago(overrides.minutes ?? 120),
+      server_time: ago(0)},
     items: []};
   host.replaceChildren();
-  posts.length = 0; refuse = null; keys = 0;
+  posts.length = 0; refuse = null; keys = 0; rereads = [];
   await chatRenderOpen(host, conversation, snapshot, readSignal);
   await new Promise(setImmediate);
   const find = (test) => all(host).find(test);
@@ -1829,6 +2372,15 @@ def test_button_sits_bottom_left_and_one_press_is_one_request() -> None:
     created_at: "t", payload: {}});
   const done = {disabled: view.compact.disabled, label: view.compact.textContent,
     meter: view.meter.textContent};
+  // The page re-reads the conversation after the run. That read carries no
+  // meter: the page keeps the one it has.
+  rereads.at(-1)({conversation_id: "cv_fixture", scope: "normal", state: "idle",
+    route: {harness: "codex"}, shell: {shortname: "dev", shell_id: 1},
+    version: 2, compaction: {supported: true, available: true, enabled: true,
+      pending: false, message_id: null},
+    cold_return: {context_tokens: 60000, idle_minutes: 60}}, []);
+  const reread = {meter: view.meter.textContent, hidden: view.meter.hidden,
+    button: view.compact.textContent};
 
   const running = await open({minutes: 5, state: "running"});
   const turn = {hidden: running.compact.hidden, disabled: running.compact.disabled};
@@ -1845,7 +2397,7 @@ def test_button_sits_bottom_left_and_one_press_is_one_request() -> None:
   await failing.compact.onclick();
   const refused = {toasts: [...toasts], disabled: failing.compact.disabled,
     label: failing.compact.textContent};
-  console.log(JSON.stringify({placed, during, pressed, inert, done, turn,
+  console.log(JSON.stringify({placed, during, pressed, inert, done, reread, turn,
     refusedByState, kimiHidden: kimi.compact.hidden,
     noSessionHidden: noSession.compact.hidden, refused}));
 """))
@@ -1865,6 +2417,8 @@ def test_button_sits_bottom_left_and_one_press_is_one_request() -> None:
     assert result["inert"] == 1
     assert result["done"] == {
         "disabled": False, "label": "Compact", "meter": "Context 12k · 5% of 258k"}
+    assert result["reread"] == {
+        "meter": "Context 12k · 5% of 258k", "hidden": False, "button": "Compact"}
     # Greyed out and inert during a running turn.
     assert result["turn"] == {"hidden": False, "disabled": True}
     assert result["refusedByState"] == 0
@@ -1923,13 +2477,22 @@ def test_cold_return_notice_shows_offers_and_is_dismissed() -> None:
   const returned = view.notice.hidden;
   Date.now = () => now;
 
+  // A browser clock three hours fast does not make a fresh chat look cold.
+  Date.now = () => now + 3 * 3600000;
+  const skewed = (await open({minutes: 5})).notice.hidden;
+  Date.now = () => now;
+
+  // A closed chat that a message would reopen: the usual way back.
+  const closed = shown(await open({state: "closed"}));
+
   const small = shown(await open({tokens: 20000}));
   const recent = shown(await open({minutes: 5}));
   const running = shown(await open({state: "running"}));
   const noButton = shown(await open({compaction: {supported: false,
     available: false, enabled: false, pending: false, message_id: null}}));
   console.log(JSON.stringify({large, continued, stays, sent, compacted, declined,
-    started, fresh, returned, small: small.hidden, recent: recent.hidden,
+    started, fresh, returned, skewed, closed,
+    small: small.hidden, recent: recent.hidden,
     running: running.hidden, noButton}));
 """))
     large = result["large"]
@@ -1955,6 +2518,12 @@ def test_cold_return_notice_shows_offers_and_is_dismissed() -> None:
     assert "Only control-plane state carries over" in result["started"]["reminder"]
     assert result["fresh"] is True
     assert result["returned"] is False
+    assert result["skewed"] is True
+    # Shown on a closed chat too; with no live session to compact there, it
+    # offers no compaction, and the composer still takes the reopening send.
+    assert result["closed"]["hidden"] is False
+    assert result["closed"]["actions"] == ["Continue here", "New chat"]
+    assert result["closed"]["composer"] is False
     # None on a small chat, a recently used chat, or during a running turn.
     assert result["small"] is True
     assert result["recent"] is True
@@ -1962,6 +2531,38 @@ def test_cold_return_notice_shows_offers_and_is_dismissed() -> None:
     # Where there is no button, the notice offers no compaction.
     assert result["noButton"]["hidden"] is False
     assert result["noButton"]["actions"] == ["Continue here", "New chat"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_a_reread_keeps_the_last_compact_requests_id() -> None:
+    """A transcript or conversation re-read between the run's end and its
+    last events must not turn those events into a "Turn failed" line."""
+    script = JS_PRELUDE + HELPERS + r"""
+const finished = {supported: true, available: true, enabled: true,
+  pending: false, message_id: null};
+console.log(JSON.stringify({
+  kept: chatKeepCompactionRequest(finished, {pending: true, message_id: 9}),
+  newer: chatKeepCompactionRequest({...finished, pending: true, message_id: 12},
+    {pending: false, message_id: 9}),
+  first: chatKeepCompactionRequest(finished, undefined),
+  absent: chatKeepCompactionRequest(undefined, {pending: true, message_id: 9}),
+}));
+"""
+    result = run_js(script)
+    assert result["kept"]["message_id"] == 9
+    assert result["kept"]["pending"] is False
+    assert result["newer"]["message_id"] == 12
+    assert result["first"]["message_id"] is None
+    assert result["absent"] == {"pending": True, "message_id": 9}
+    # Both re-reads go through it: the transcript snapshot and the
+    # conversation read.
+    install = APP[APP.index("  const installSnapshot = (snapshot) =>"):
+                  APP.index("  const reconcileTranscript = async")]
+    adopt = APP[APP.index("  const adoptConversation = (next) =>"):
+                APP.index("  let streamStatus = ")]
+    assert "chatKeepCompactionRequest(" in install
+    assert "chatKeepCompactionRequest(" in adopt
+    assert "context: previous.context" in adopt
 
 
 def test_chat_view_wires_the_button_the_notice_and_the_listeners() -> None:

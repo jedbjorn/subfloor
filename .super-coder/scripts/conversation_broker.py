@@ -156,6 +156,10 @@ class _ActiveRun:
     interrupt_requested: bool = False
     interrupt_sent: bool = False
     continuation_run_id: int | None = None
+    # The native run reference the run row currently names. A harness that
+    # learns its turn id only after dispatch (a Codex manual compaction)
+    # changes ``turn.run_ref``; the row follows so recovery finds the turn.
+    runner_ref: str | None = None
 
     @property
     def run_id(self) -> int:
@@ -889,6 +893,15 @@ class BrokerStore:
                     ):
                         continue
                     payload = dict(event.payload)
+                    if manual and event.type == "usage":
+                        # The summarising request's tokens are a cost of the
+                        # chat, kept under their own scope so they never read
+                        # as the size of its context.
+                        payload = conversation_compaction.compaction_usage_payload(
+                            payload
+                        )
+                        if payload is None:
+                            continue
                     if event.native_type:
                         payload["native_type"] = event.native_type
                     if event.interrupt_evidence:
@@ -1036,6 +1049,12 @@ class BrokerStore:
                             f"WHERE message_id IN ({marks}) "
                             "AND state IN ('pending','claimed')",
                             queued_ids,
+                        )
+                        conversation_compaction.settle_cancelled_requests(
+                            con,
+                            str(row["conversation_id"]),
+                            queued_ids,
+                            error_code="CONVERSATION_CLOSING",
                         )
                 pending = (
                     con.execute(
@@ -1310,6 +1329,23 @@ class BrokerStore:
             con.close()
         conversation_events.notify(conversation_id)
         return continuation_id
+
+    def set_runner_ref(self, run_id: int, runner_ref: str) -> bool:
+        """Name the native turn a live run turned out to be."""
+        con = self.connect()
+        try:
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.set_runner_ref",
+            ):
+                changed = con.execute(
+                    "UPDATE conversation_runs SET runner_ref=? "
+                    "WHERE run_id=? AND state IN ('starting','running')",
+                    (runner_ref, run_id),
+                ).rowcount
+                return changed == 1
+        finally:
+            con.close()
 
     def release_process_link(self, run_id: int) -> bool:
         """Clear the registry link a lingering finish deliberately kept.
@@ -1963,6 +1999,22 @@ class ConversationBroker(threading.Thread):
                 except queue.Empty:
                     item = None
 
+                if (
+                    active.runner_ref is not None
+                    and turn.run_ref != active.runner_ref
+                ):
+                    # The harness named the turn after dispatch. A failed
+                    # write is retried on the next pass.
+                    adopted = turn.run_ref
+                    persisted, _changed = self._retry_busy(
+                        partial(
+                            self.store.set_runner_ref, active.run_id, adopted
+                        ),
+                        wait=False,
+                    )
+                    if persisted:
+                        active.runner_ref = adopted
+
                 if isinstance(item, NormalizedEvent):
                     silent_since = time.monotonic()
                     if item.type in TERMINAL_EVENTS:
@@ -2322,6 +2374,7 @@ class ConversationBroker(threading.Thread):
                     return
                 active.turn = turn
                 self.store.mark_native_started(run.run_id, self.owner, turn)
+                active.runner_ref = turn.run_ref
                 if reground is not None:
                     try:
                         self.store.record_reground(run.run_id, reground)

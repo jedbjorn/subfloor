@@ -508,6 +508,9 @@ const CHAT_COMPACT_TOOLTIP = "";
 const chatCompactButtonState = () => ({visible: false, disabled: true,
   pending: false, label: "Compact", title: ""});
 const chatColdReturnDue = () => false;
+const chatColdReturnable = () => true;
+const chatColdReturnClock = (coldReturn, now, previous) => coldReturn || previous;
+const chatKeepCompactionRequest = (next, previous) => next || previous;
 const chatFlushTranscript = (node, state) => {
   node.textContent = [...state.items.values()].map((item) => item.text).join("\n");
 };

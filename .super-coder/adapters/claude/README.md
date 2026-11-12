@@ -186,6 +186,10 @@ Checked on `2.1.322 (Claude Code)`, 2026-11-12, with three small requests.
   the binary's schema, not observed). A run with no boundary and no reason
   ends `run.completed`, which the chat shows as "not reported". `/compact`
   takes no instructions here. `--autocompact` is still passed on this run.
+  The run's `usage` is all zeros; what the summarising request spent is in
+  `modelUsage` (2,000 input, 815 output, 32,955 cache read and 22,812 cache
+  write in the run above), and that is what the adapter reports as the run's
+  usage. A refused run has no `modelUsage` and reports none.
   **Not checked:** a manual compaction of a large session, and one
   interrupted part-way.
 

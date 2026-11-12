@@ -158,9 +158,13 @@ was not repeated; an installed 1.19.5 reports `supported`. CI still installs
   failing that the newest operator message's `model`. That stored shape was
   read from a scratch session on 1.19.5; the lookup itself is covered by test
   only. If neither names a model the chat gets the one-line error, which says
-  that the chat names no model and its session records none. If the request answers and the session does not report idle
-  within 15 s, the run ends there; with no `session.compacted` the chat says
-  the harness did not report a compaction. **Not checked:** the engine-owned
+  that the chat names no model and its session records none. Both waits are
+  bounded. If the request has not answered within 600 s it is abandoned and
+  aborted, and the chat shows the error line. If it answers and the session
+  does not report idle within 15 s, the run ends there; with no
+  `session.compacted` the chat says the harness did not report a compaction.
+  The summarising request's tokens are passed on as the run's usage, with no
+  context size. **Not checked:** the engine-owned
   shared server (the check used a private one), and a large session.
 - The meter reads the assistant message's `tokens`
   (`input` + `cache.read` + `cache.write`). OpenCode states no window there,
