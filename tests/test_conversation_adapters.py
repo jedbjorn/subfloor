@@ -3094,6 +3094,82 @@ class ConversationAdapterTest(unittest.TestCase):
         result = adapter.reconcile(turn, self.context)
         self.assertEqual((result.outcome, result.proven), ("succeeded", True))
 
+    def test_claude_reconcile_offset_is_a_byte_position_at_a_line_start(
+        self,
+    ) -> None:
+        adapter, _runner = self.build("claude")
+
+        def reply(text: str) -> dict:
+            return {
+                "type": "assistant",
+                "cwd": str(self.root),
+                "message": {"content": [{"type": "text", "text": text}]},
+            }
+
+        def prompt(text: str) -> dict:
+            return {
+                "type": "user",
+                "cwd": str(self.root),
+                "message": {"role": "user", "content": text},
+            }
+
+        cases = {
+            # The stale reply is the last line before the offset, so its
+            # newline ends exactly there.
+            "reply ends at the offset": (prompt("first"), reply("stale")),
+            # Multi-byte text makes the byte offset larger than the
+            # character count; counting characters would read the stale
+            # reply as written after the launch.
+            "non-ASCII before the offset": (
+                prompt("pr\u00e9c\u00e9dent \u2014 \u65e5\u672c\u8a9e \U0001f600" * 60),
+                reply("r\u00e9ponse p\u00e9rim\u00e9e \u2014 \u53e4\u3044"),
+            ),
+        }
+        for index, (label, earlier) in enumerate(cases.items(), 1):
+            with self.subTest(transcript=label):
+                session_ref = f"88888888-8888-4888-8888-{index:012d}"
+                path = adapter._session_path(session_ref, self.root)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    "".join(
+                        json.dumps(
+                            {"sessionId": session_ref, **row},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                        for row in earlier
+                    ),
+                    encoding="utf-8",
+                )
+                offset = path.stat().st_size
+                self.assertGreaterEqual(offset, len(path.read_text("utf-8")))
+                turn = NativeTurn(
+                    harness="claude",
+                    session_ref=session_ref,
+                    run_ref="claude-run",
+                    worktree=self.root,
+                    metadata={
+                        "transcript_path": str(path),
+                        "transcript_offset": offset,
+                    },
+                )
+
+                result = adapter.reconcile(turn, self.context)
+                self.assertEqual(
+                    (result.outcome, result.proven), ("unknown", False)
+                )
+
+                with path.open("a", encoding="utf-8") as stream:
+                    for row in (prompt("second"), reply("own reply")):
+                        stream.write(
+                            json.dumps({"sessionId": session_ref, **row})
+                            + "\n"
+                        )
+                result = adapter.reconcile(turn, self.context)
+                self.assertEqual(
+                    (result.outcome, result.proven), ("succeeded", True)
+                )
+
     def test_claude_interrupt_falls_back_to_the_recorded_process_group(
         self,
     ) -> None:
