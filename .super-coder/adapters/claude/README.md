@@ -147,7 +147,9 @@ Checked on `2.1.322 (Claude Code)`, 2026-11-12, with three small requests.
   either. The window is `result.modelUsage[<model>].contextWindow` for the
   chat's own model, so it is known only after a chat's first completed turn.
 
-**Compatibility caution.** `--autocompact` is confirmed on 2.1.322 only. The
-manifest's floor is 2.1.220; an older in-range build that does not know the
-flag would refuse the launch. `SC_CHAT_COMPACT_WINDOW_CLAUDE=off` is the way
-back.
+**Compatibility caution.** `--autocompact` is present in the 2.1.319, 2.1.321
+and 2.1.322 binaries and named in the changelog at 2.1.304; nothing earlier is
+established, and the manifest's floor is still 2.1.220. A build below the
+manifest minimum is warn-only (status shows `older-unverified · best-effort`;
+nothing refuses the launch), so an older Claude fails every browser-chat
+launch on `--autocompact` unless `SC_CHAT_COMPACT_WINDOW_CLAUDE=off`.
