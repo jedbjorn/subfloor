@@ -130,3 +130,5 @@ pause/recovery, conformance and cleanup.
 For daily operation, use [browser conversations](README.md#browser-conversations),
 [the command route map](README.md#cli--dev-kit), and
 [maintenance and removal](README.md#update-a-fork).
+
+<!-- throwaway watch-pr live probe 2026-11-12; do not merge -->
