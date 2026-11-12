@@ -209,7 +209,9 @@ button sits at the bottom left of the composer, beside the meter.
   broke, or it was stopped); or `compaction.not_reported` (the harness
   accepted the request and finished without reporting a compaction, within a
   bounded wait). A failed request does not put the chat in `error`: the
-  session is as it was.
+  session is as it was. One exception: a chat that is closed (or reaped)
+  while its compact request is still queued gets no result line; the request
+  is cancelled with the chat.
 - **The re-ground line** is not added to the request and is not spent by it.
   The first real message after a manual compaction carries it, exactly as
   after an automatic one.

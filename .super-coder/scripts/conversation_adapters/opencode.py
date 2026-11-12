@@ -346,6 +346,12 @@ class _OpenCodeProjection:
         ]
         present = [part for part in parts if part is not None]
         context_tokens = sum(present) if present else None
+        if info.get("summary") is True:
+            # The request that writes a compaction summary runs under the
+            # compaction agent's own prompt: its input side is not the size
+            # of the chat's context (449 for a 13.6k session on 1.19.5). It
+            # is neither a meter reading nor the size before a compaction.
+            context_tokens = None
         if context_tokens:
             self.last_context_tokens = context_tokens
         events.append(
@@ -1242,30 +1248,85 @@ class OpenCodeAdapter(ConversationAdapter):
             == route_transport.route_bindings.LIVE_NATIVE_CONTRACT_VERSION
         ):
             self._prepare_live_route(context)
-        if self._route(context) is None:
-            # The request names the summarising model; the server refuses it
-            # without one, and the engine does not pick a model for the chat.
-            raise AdapterError(
-                "HARNESS_COMPACT_MODEL_UNKNOWN",
-                "OpenCode needs this chat's provider and model to summarise it",
-            )
         inspected = self.inspect(session_ref, context)
         if not inspected.exists:
             raise AdapterError(
                 "HARNESS_SESSION_LOST",
                 f"OpenCode session does not exist: {session_ref}",
             )
+        # The request names the summarising model and the server refuses it
+        # without one. A chat on a harness-default route names none, so the
+        # model its session has been using is read back from the server. The
+        # engine never picks one of its own.
+        route = self._route(context) or self._session_model(
+            session_ref, context.checked_worktree()
+        )
+        if route is None:
+            raise AdapterError(
+                "HARNESS_COMPACT_MODEL_UNKNOWN",
+                "OpenCode needs a provider and model to summarise a chat; "
+                "this chat names none and its session records none to use",
+            )
         turn = self._turn(session_ref, context, "/compact", resumed=True)
         turn.metadata["compaction"] = True
-        # The size before is the chat's last recorded request. The request
-        # this stream sees is the summariser's own, which runs under another
-        # prompt and is not the size of the chat's context (on 1.19.5 it
-        # reported 449 input tokens for a 13.6k session).
-        turn.metadata["context_tokens"] = token_count(context.context_tokens)
+        turn.metadata["summarize_model"] = route
         return turn
 
-    def _summarize(self, session_ref: str, context: ConversationContext) -> Any:
-        provider, model = self._route(context)
+    @staticmethod
+    def _named_model(value: Any) -> tuple[str, str] | None:
+        """(provider, model) from one of OpenCode's model records, or None."""
+        if not isinstance(value, Mapping):
+            return None
+        provider = value.get("providerID")
+        model = value.get("modelID") or value.get("id")
+        if isinstance(provider, str) and provider and isinstance(model, str) and model:
+            return provider, model
+        return None
+
+    def _session_model(
+        self,
+        session_ref: str,
+        worktree: Path,
+    ) -> tuple[str, str] | None:
+        """The model a stored session has been using, read from the server.
+
+        The newest reply states it (``providerID`` / ``modelID`` on an
+        assistant message; a summary message is skipped, since the compaction
+        agent's model need not be the chat's); failing that, the newest
+        operator message's ``model``. A session with neither is unknown.
+        """
+        try:
+            messages = self.transport.request(
+                "GET",
+                f"/session/{session_ref}/message",
+                query=self._query(worktree),
+            )
+        except AdapterError:
+            return None
+        infos = [
+            entry.get("info")
+            for entry in (messages if isinstance(messages, list) else [])
+            if isinstance(entry, Mapping) and isinstance(entry.get("info"), Mapping)
+        ]
+        for info in reversed(infos):
+            if info.get("role") == "assistant" and info.get("summary") is not True:
+                found = self._named_model(info)
+                if found:
+                    return found
+        for info in reversed(infos):
+            if info.get("role") == "user":
+                found = self._named_model(info.get("model"))
+                if found:
+                    return found
+        return None
+
+    def _summarize(
+        self,
+        session_ref: str,
+        context: ConversationContext,
+        route: tuple[str, str] | None = None,
+    ) -> Any:
+        provider, model = route or self._route(context)
         return self.transport.request(
             "POST",
             f"/session/{session_ref}/summarize",
@@ -1436,6 +1497,10 @@ class OpenCodeAdapter(ConversationAdapter):
         # never passed on.
         compacting = bool(turn.metadata.get("compaction"))
         projection = _OpenCodeProjection()
+        # A compaction's size before is the chat's last request before the
+        # summarising one: the latest this stream saw, or, when it compacts
+        # before any request of this turn, the chat's last recorded reading.
+        projection.last_context_tokens = token_count(context.context_tokens)
         coordination: queue.Queue[tuple[str, Any]] = queue.Queue()
         stop = threading.Event()
         sse_entered = threading.Event()
@@ -1461,7 +1526,11 @@ class OpenCodeAdapter(ConversationAdapter):
                 return
             try:
                 prompt_state["response"] = (
-                    self._summarize(turn.session_ref, context)
+                    self._summarize(
+                        turn.session_ref,
+                        context,
+                        turn.metadata.get("summarize_model"),
+                    )
                     if compacting
                     else self._prompt(
                         turn.session_ref,
@@ -1563,7 +1632,7 @@ class OpenCodeAdapter(ConversationAdapter):
                         # OpenCode states no trigger; the engine asked.
                         event = compaction_event(
                             trigger="manual",
-                            tokens_before=turn.metadata.get("context_tokens"),
+                            tokens_before=event.payload.get("tokens_before"),
                             native_type=event.native_type,
                         )
                         observed_activity = True

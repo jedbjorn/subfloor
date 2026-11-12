@@ -201,15 +201,24 @@ OPENCODE_MANUAL_SEQUENCE = [
 
 
 class FakeOpenCodeServer:
-    def __init__(self, events: list[dict[str, Any]], *, refuse: bool = False):
+    def __init__(
+        self, events: list[dict[str, Any]], *, refuse: bool = False,
+        messages: list[dict[str, Any]] | None = None,
+    ):
         self.events = events
         self.refuse = refuse
+        self.messages = messages or []
         self.requests: list[tuple[str, str, Any]] = []
 
     def request(self, method, path, *, query=None, body=None):
         self.requests.append((method, path, body))
         if method == "GET" and path == f"/session/{OPENCODE_SESSION}":
             return {"id": OPENCODE_SESSION, "title": "chat"}
+        if method == "GET" and path == f"/session/{OPENCODE_SESSION}/message":
+            return self.messages
+        if method == "POST" and path == f"/session/{OPENCODE_SESSION}/message":
+            return {"info": {"role": "assistant", "sessionID": OPENCODE_SESSION},
+                    "parts": []}
         if path == "/session/status":
             return {OPENCODE_SESSION: {"type": "idle"}}
         if method == "POST" and path.endswith("/summarize"):
@@ -461,13 +470,140 @@ class OpenCodeManualCompactTest(AdapterCase):
             list(adapter.stream(turn))
         self.assertIn("Session not found", raised.exception.detail)
 
-    def test_a_chat_with_no_named_model_is_refused_before_the_request(self):
-        server = FakeOpenCodeServer([])
+    # Stored messages as ``GET /session/{id}/message`` returns them (1.19.5):
+    # a reply names ``providerID`` / ``modelID``; an operator message names
+    # ``model``; the compaction agent's own reply is marked ``summary``.
+    USER = {"info": {"role": "user", "model": {
+        "providerID": "ollama-cloud", "modelID": "glm-user"}}, "parts": []}
+    REPLY = {"info": {"role": "assistant", "providerID": "opencode",
+                      "modelID": "glm-reply", "mode": "build"}, "parts": []}
+    SUMMARY = {"info": {"role": "assistant", "providerID": "opencode",
+                        "modelID": "compaction-model", "summary": True,
+                        "mode": "compaction"}, "parts": []}
+
+    def default_route_compact(self, messages):
+        """A chat on a harness-default route: the context names no model."""
+        server = FakeOpenCodeServer(OPENCODE_MANUAL_SEQUENCE, messages=messages)
         adapter = self.adapter(server)
-        with self.assertRaises(AdapterError) as raised:
-            adapter.compact(OPENCODE_SESSION, AdapterCase.context(self))
-        self.assertEqual(raised.exception.code, "HARNESS_COMPACT_MODEL_UNKNOWN")
-        self.assertEqual(server.requests, [])
+        turn = adapter.compact(OPENCODE_SESSION, AdapterCase.context(self))
+        list(adapter.stream(turn))
+        return [request[2] for request in server.requests
+                if request[1].endswith("/summarize")]
+
+    def test_a_harness_default_chat_uses_the_model_of_its_last_reply(self):
+        self.assertEqual(
+            self.default_route_compact([self.USER, self.REPLY, self.USER]),
+            [{"providerID": "opencode", "modelID": "glm-reply"}],
+        )
+
+    def test_the_compaction_agents_own_reply_is_not_the_chats_model(self):
+        self.assertEqual(
+            self.default_route_compact([self.USER, self.REPLY, self.SUMMARY]),
+            [{"providerID": "opencode", "modelID": "glm-reply"}],
+        )
+
+    def test_with_no_reply_the_last_operator_messages_model_is_used(self):
+        self.assertEqual(
+            self.default_route_compact([self.USER, self.SUMMARY]),
+            [{"providerID": "ollama-cloud", "modelID": "glm-user"}],
+        )
+
+    def test_a_named_route_is_used_without_asking_the_session(self) -> None:
+        server = FakeOpenCodeServer(
+            OPENCODE_MANUAL_SEQUENCE, messages=[self.REPLY])
+        adapter = self.adapter(server)
+        list(adapter.stream(adapter.compact(OPENCODE_SESSION, self.context())))
+        self.assertNotIn(
+            ("GET", f"/session/{OPENCODE_SESSION}/message", None), server.requests)
+        self.assertIn(
+            ("POST", f"/session/{OPENCODE_SESSION}/summarize",
+             {"providerID": "opencode", "modelID": "glm-test"}),
+            server.requests,
+        )
+
+    def test_a_chat_whose_model_cannot_be_determined_says_why(self) -> None:
+        for messages in ([], [{"info": {"role": "assistant"}}, {"parts": []}]):
+            with self.subTest(messages=messages):
+                server = FakeOpenCodeServer([], messages=messages)
+                adapter = self.adapter(server)
+                with self.assertRaises(AdapterError) as raised:
+                    adapter.compact(OPENCODE_SESSION, AdapterCase.context(self))
+                self.assertEqual(
+                    raised.exception.code, "HARNESS_COMPACT_MODEL_UNKNOWN")
+                self.assertEqual(
+                    raised.exception.detail,
+                    "OpenCode needs a provider and model to summarise a chat; "
+                    "this chat names none and its session records none to use",
+                )
+                # Nothing was asked of the model.
+                self.assertEqual(
+                    [r for r in server.requests if r[0] == "POST"], [])
+
+
+class OpenCodeAutomaticCompactionTest(AdapterCase):
+    """An automatic OpenCode compaction: its size before is the chat's last
+    request before the summarising one, never the summarising request."""
+
+    REQUEST = opencode_event(
+        "message.updated",
+        info={"id": "msg-reply", "role": "assistant", "mode": "build",
+              "sessionID": OPENCODE_SESSION,
+              "tokens": {"total": 80120, "input": 2000, "output": 120,
+                         "reasoning": 0, "cache": {"read": 77000, "write": 1000}}},
+    )
+    SUMMARISER = opencode_event(
+        "message.updated",
+        info={"id": "msg-summary", "role": "assistant", "summary": True,
+              "mode": "compaction", "sessionID": OPENCODE_SESSION,
+              "tokens": {"total": 520, "input": 449, "output": 71,
+                         "reasoning": 0, "cache": {"read": 0, "write": 0}}},
+    )
+
+    def turn(self, events, **context) -> list[NormalizedEvent]:
+        adapter = OpenCodeAdapter(
+            transport=FakeOpenCodeServer(events),
+            shell_runtime_dir=self.root / "runtime-shells")
+        native = adapter.resume(
+            OPENCODE_SESSION,
+            self.context(provider="opencode", model="glm-test", **context),
+            "carry on",
+        )
+        return list(adapter.stream(native))
+
+    def tail(self) -> list[dict[str, Any]]:
+        return [self.SUMMARISER, opencode_event("session.compacted"),
+                opencode_event("session.idle")]
+
+    def test_before_is_the_request_seen_before_the_summarising_one(self) -> None:
+        events = self.turn([
+            opencode_event("session.status", status={"type": "busy"}),
+            self.REQUEST, *self.tail(),
+        ], context_tokens=60000)
+        [compacted] = of_type(events, "context.compacted")
+        self.assertEqual(compacted.payload["tokens_before"], 80000)
+        self.assertEqual(compacted.payload["trigger"], "unknown")
+        self.assertNotIn("tokens_after", compacted.payload)
+        # The summarising request is recorded as usage, but never as a
+        # reading of the chat's context.
+        readings = [event.payload.get("context_tokens")
+                    for event in of_type(events, "usage")]
+        self.assertEqual(readings, [80000, None])
+
+    def test_with_no_request_this_turn_before_is_the_chats_last_reading(self):
+        events = self.turn([
+            opencode_event("session.status", status={"type": "busy"}),
+            *self.tail(),
+        ], context_tokens=70000)
+        [compacted] = of_type(events, "context.compacted")
+        self.assertEqual(compacted.payload["tokens_before"], 70000)
+
+    def test_with_no_reading_at_all_before_is_left_out(self) -> None:
+        events = self.turn([
+            opencode_event("session.status", status={"type": "busy"}),
+            *self.tail(),
+        ])
+        [compacted] = of_type(events, "context.compacted")
+        self.assertNotIn("tokens_before", compacted.payload)
 
 
 class TriggerAvailabilityTest(unittest.TestCase):
