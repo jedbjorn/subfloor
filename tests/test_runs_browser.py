@@ -183,7 +183,7 @@ def test_subagents_watches_limits_and_worktree_labels(broker_case, monkeypatch):
     engine = case.root / 'engine'
     now = datetime.now(timezone.utc)
     ago = lambda **delta: (now - timedelta(**delta)).isoformat()  # noqa: E731
-    note = ("harness process 4242 is still running and was not stopped: "
+    note = ("harness process 4242 was running and was left running: "
             "it could not be tied to this run's worktree")
     with case.connect() as con:
         store = RunStore(con, engine)
@@ -357,7 +357,7 @@ def test_subagents_watches_limits_and_worktree_labels(broker_case, monkeypatch):
             assert 'Subagents: 3 of 6 live on this install; one shell may run 3.' in fleet
             assert 'Watchers: 2 live on this install; one shell may run 10.' in fleet
             assert 'SH1 is at its limit of 3 live subagents.' in fleet
-            assert f'Still running: {note}' in fleet
+            assert f'When the run was marked lost: {note}' in fleet
             assert 'watch timer · 600 seconds pass' in fleet
             assert 'Runs (4)' in page.locator('.vtabs').text_content()
             if captures:

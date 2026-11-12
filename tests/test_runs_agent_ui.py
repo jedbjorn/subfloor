@@ -393,16 +393,16 @@ console.log(JSON.stringify({
 
 
 @needs_node
-def test_a_lost_run_whose_process_was_left_running_says_so_on_its_row():
+def test_a_lost_run_says_what_the_engine_found_of_its_harness_on_its_row():
     out = run_page(r"""
-const note = "harness process 4242 is still running and was not stopped: it could not be tied to this run's worktree";
+const note = "harness process 4242 was running and was left running: it could not be tied to this run's worktree";
 const lost = run(30, {kind: "agent", state: "lost", exit_code: null, finished_at: "2026-11-12T11:30:00+00:00",
   timeout_seconds: 7200, agent: agent(30),
   terminal_json: JSON.stringify({state: "lost", finished_at: "x", spawn_error: note})});
 const failed = run(31, {kind: "agent", state: "failed", exit_code: 127, agent: agent(31),
   terminal_json: JSON.stringify({state: "failed", exit_code: 127, spawn_error: "subagent not started: no worktree"})});
 const blocked = run(32, {kind: "agent", state: "running", wake_state: "blocked", finished_at: null,
-  agent: agent(32), last_error: "reconciliation blocked; harness stopped: its supervisor is gone"});
+  agent: agent(32), last_error: "reconciliation blocked; the engine stopped harness process 4243: its supervisor was gone"});
 const quiet = run(33, {kind: "agent", state: "lost", exit_code: null, agent: agent(33),
   terminal_json: JSON.stringify({state: "lost"}), last_error: "kept as a tooltip only"});
 const host = el("div");
@@ -411,10 +411,12 @@ console.log(JSON.stringify(byClass(host, "run-row").map((row) => byClass(row, "r
 """)
     assert out == [
         [],
-        ["reconciliation blocked; harness stopped: its supervisor is gone"],
+        ["reconciliation blocked; the engine stopped harness process 4243: "
+         "its supervisor was gone"],
         ["Reason: subagent not started: no worktree"],
-        ["Still running: harness process 4242 is still running and was not stopped: "
-         "it could not be tied to this run's worktree"],
+        # What the engine found when it marked the run lost, not a present-tense claim.
+        ["When the run was marked lost: harness process 4242 was running and was left "
+         "running: it could not be tied to this run's worktree"],
     ]
 
 

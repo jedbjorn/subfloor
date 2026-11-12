@@ -914,9 +914,9 @@ function runRow(run, shells, refresh, thread = null) {
     body.append(tokens);
   }
   // The engine's own note on how the run ended. For a lost subagent it says
-  // that the harness process was left running.
+  // what the engine found of the harness process at that time.
   if (terminal.spawn_error) body.append(el("div", { className: "run-note" },
-    `${run.state === "lost" ? "Still running" : "Reason"}: ${terminal.spawn_error}`));
+    `${run.state === "lost" ? "When the run was marked lost" : "Reason"}: ${terminal.spawn_error}`));
   if (run.wake_state === "blocked" && run.last_error) body.append(el("div", { className: "run-note" }, run.last_error));
   row.append(body);
   const actions = el("div", { className: "run-actions" });
