@@ -22,7 +22,22 @@
     "launch": ["kimi"],
     "prompt_flag": "-p",
     "model_flag": "-m",
-    "effort": { "env": "KIMI_MODEL_THINKING_EFFORT" }
+    "effort": { "env": "KIMI_MODEL_THINKING_EFFORT" },
+    "agent": {
+      "brief": { "delivery": "argument" },
+      "result": {
+        "flags": ["--output-format", "stream-json"],
+        "source": "stdout_jsonl",
+        "select": { "role": "assistant" },
+        "field": "content"
+      },
+      "session": {
+        "source": "event",
+        "select": { "type": "session.resume_hint" },
+        "field": "session_id"
+      },
+      "resume": { "flag": "-S" }
+    }
   },
   "conversation": {
     "contract_version": 1,

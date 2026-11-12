@@ -56,7 +56,18 @@
   "headless": {
     "launch": ["opencode", "run"],
     "model_flag": "--model",
-    "effort": { "flag": "--variant" }
+    "effort": { "flag": "--variant" },
+    "agent": {
+      "brief": { "delivery": "stdin" },
+      "result": {
+        "flags": ["--format", "json"],
+        "source": "stdout_jsonl",
+        "select": { "type": "text" },
+        "field": "part.text"
+      },
+      "session": { "source": "event", "field": "sessionID" },
+      "resume": { "flag": "-s" }
+    }
   },
   "conversation": {
     "contract_version": 1,

@@ -171,3 +171,23 @@ was not repeated; an installed 1.19.5 reports `supported`. CI still installs
   so the chat shows the size with no percentage.
 - OpenCode gets no compact-window setting in this delivery: its control is an
   on/off switch, not a token count.
+
+## Subagent keys (`headless.agent`, Feature #96, spec #273)
+
+`scripts/job_agent.py` builds an `sc job` subagent command from the `headless`
+block and these optional keys; no harness name appears in the job code. An
+adapter without them is refused for a subagent by the name of the missing key
+and is unaffected otherwise.
+
+| Key | Value | Meaning |
+|---|---|---|
+| `brief.delivery` | `stdin` | the message positional is omitted; the brief is read from standard input |
+| `result` | `--format json`, `stdout_jsonl`, `type: text`, field `part.text` | the last text event is the final message |
+| `session` | `event`, field `sessionID` | every event carries the session id |
+| `resume` | `-s` | `-s <id>` continues the session; the id is unchanged |
+
+Checked on OpenCode 1.19.5, 2026-11-12, model
+`ollama-cloud/deepseek-v4.1-flash`, two requests: one launch and one resume
+that recalled the first reply. Observed without a request: SIGTERM while
+waiting on standard input ends the process by the signal (status -15); `-s`
+with an unknown id exits 1 with "Session not found".

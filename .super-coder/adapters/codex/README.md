@@ -267,3 +267,28 @@ Checked on `codex-cli 0.167.1`, 2026-11-12, with one small model request.
   run. **Not checked live:** the request on a thread with a turn in progress
   (the engine never sends it then), Stop during a compaction, and recovery of
   a compaction after a broker restart.
+
+## Subagent keys (`headless.agent`, Feature #96, spec #273)
+
+`scripts/job_agent.py` builds an `sc job` subagent command from the `headless`
+block and these optional keys; no harness name appears in the job code. An
+adapter without them is refused for a subagent by the name of the missing key
+and is unaffected otherwise.
+
+| Key | Value | Meaning |
+|---|---|---|
+| `brief.delivery` | `stdin`, argument `-` | the prompt positional is `-`, so the prompt is read from standard input |
+| `result` | `--json`, `file`, `-o` | the final message is written to the `-o` file; events go to stdout as JSONL |
+| `session` | `event`, `thread.started`, field `thread_id` | the session reference is read from the event stream |
+| `resume` | subcommand `resume`, `-c sandbox_mode="danger-full-access"` | `codex exec resume <id> -`; that subcommand has no `--sandbox` or `-C` option, so the policy travels as config |
+
+Checked on codex-cli 0.167.1, 2026-11-12, model `gpt-6-luna` at effort `low`,
+two requests: one launch and one `codex exec resume <id> -` that recalled the
+first reply. The `--json` stream is `thread.started` (with `thread_id`),
+`turn.started`, `item.completed` (an `agent_message` item) and
+`turn.completed`; the `-o` file holds the final message alone; the resumed run
+reports the same `thread_id`, and the `-c sandbox_mode=…` form was accepted.
+Both runs were made outside a repository and so also carried
+`--skip-git-repo-check`, which a subagent's worktree does not need. Observed
+without a request: SIGTERM while `codex exec -` waits on standard input ends
+the process by the signal (status -15).

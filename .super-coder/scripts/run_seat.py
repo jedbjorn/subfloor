@@ -11,6 +11,9 @@ def select(flavor: str | None, *, headless: bool) -> str | None:
 def inject(env: dict[str, str], seat: str | None) -> None:
     # A nested Admin launch must not inherit the invoking shell's seat.
     env.pop("SC_SEAT", None)
+    # A shell session started from inside a subagent's process tree is not that
+    # subagent: left set, its own subagent launches would be refused as nested.
+    env.pop("SC_JOB_AGENT_RUN", None)
     if seat is not None:
         env["SC_SEAT"] = seat
 

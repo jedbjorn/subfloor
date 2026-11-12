@@ -226,6 +226,12 @@ def create_shell(con, *, flavor: str | None, name: str,
         raise ValueError(
             "a shortname cannot start with 'flavor:' — that prefix addresses "
             "a flavor pack in `sc skill grant|revoke`")
+    # `.sc-worktrees/agent-<run_id>` is a subagent's worktree (spec #273); a
+    # shell named that way would have a run's worktree read as its own.
+    if shortname.lower().startswith("agent-"):
+        raise ValueError(
+            "a shortname cannot start with 'agent-' — that prefix names the "
+            "worktree of an `sc job` subagent run, never a shell")
 
     api_key = secrets.token_urlsafe(32)
     lineage_seed = LINEAGE_SEED if seed_identity else None

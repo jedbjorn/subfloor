@@ -177,3 +177,27 @@ count.
 Kimi has no compact button either. Its `/compact` is an interactive command
 and no headless trigger has been confirmed, so the adapter declares none
 (`manual_compaction` is false) and the chat hides the button.
+
+## Subagent keys (`headless.agent`, Feature #96, spec #273)
+
+`scripts/job_agent.py` builds an `sc job` subagent command from the `headless`
+block and these optional keys; no harness name appears in the job code. An
+adapter without them is refused for a subagent by the name of the missing key
+and is unaffected otherwise.
+
+| Key | Value | Meaning |
+|---|---|---|
+| `brief.delivery` | `argument` | the brief is the value of `-p`; the ledger records the token `{brief}`, never the text |
+| `result` | `--output-format stream-json`, `stdout_jsonl`, `role: assistant`, field `content` | the last assistant record is the final message |
+| `session` | `event`, `session.resume_hint`, field `session_id` | the final meta record names the session |
+| `resume` | `-S` | `-S <id>` continues the session; the id is unchanged |
+
+Checked on Kimi Code 2.5.3, 2026-11-12, model alias
+`kimi-code/kimi-for-coding-highspeed`, four requests: a text-mode launch, a
+`stream-json` resume with `-S` that recalled the first reply, and two fresh
+`stream-json` launches whose briefs began with `---` and with `-h`. Both were
+accepted as the value of `-p`, so a brief may start with dashes. Text mode
+prints the reply on stdout behind a bullet and the resume hint on stderr, so
+the structured stream is used. `kimi session list --cwd <dir> --json` also lists
+the session without a request. Exit codes on stop and timeout were not
+observed.

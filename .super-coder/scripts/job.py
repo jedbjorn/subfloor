@@ -454,7 +454,8 @@ def cmd_start(args) -> int:
     try:
         registered = _api('POST', '/_sc/runs', {
             'registration_key': uuid.uuid4().hex, 'kind': 'probe' if until is not None else getattr(args, 'kind', 'job'), 'label': args.label,
-            'argv': cmd, 'cwd': cwd, 'commit': commit.stdout.strip() or None})
+            'argv': cmd, 'cwd': cwd, 'commit': commit.stdout.strip() or None,
+            'timeout_seconds': args.timeout})
     except (urllib.error.URLError, OSError, ValueError) as exc:
         die(f'registration failed ({type(exc).__name__}); no command launched')
     job_id = str(registered['run_id'])
