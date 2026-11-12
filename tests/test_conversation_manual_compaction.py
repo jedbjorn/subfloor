@@ -597,6 +597,86 @@ class OpenCodeAutomaticCompactionTest(AdapterCase):
         [compacted] = of_type(events, "context.compacted")
         self.assertEqual(compacted.payload["tokens_before"], 70000)
 
+    @staticmethod
+    def text_part(message: str, part: str, text: str) -> list[dict[str, Any]]:
+        """One text part as the bus streams it: opened, deltas, then whole."""
+        def updated(value: str) -> dict[str, Any]:
+            return opencode_event("message.part.updated", part={
+                "id": part, "messageID": message, "type": "text",
+                "sessionID": OPENCODE_SESSION, "text": value})
+        half = len(text) // 2
+        return [
+            updated(""),
+            opencode_event("message.part.delta", messageID=message,
+                           partID=part, field="text", delta=text[:half]),
+            opencode_event("message.part.delta", messageID=message,
+                           partID=part, field="text", delta=text[half:]),
+            updated(text),
+        ]
+
+    def summary_stream(self, marker: dict[str, Any]) -> list[NormalizedEvent]:
+        announced = opencode_event("message.updated", info={
+            "id": "msg-summary", "role": "assistant", "agent": "compaction",
+            "sessionID": OPENCODE_SESSION, **marker})
+        later = opencode_event("message.updated", info={
+            "id": "msg-later", "role": "assistant", "mode": "build",
+            "sessionID": OPENCODE_SESSION})
+        return self.turn([
+            opencode_event("session.status", status={"type": "busy"}),
+            self.REQUEST,
+            *self.text_part("msg-reply", "part-reply", "Here is the answer."),
+            # The summary message is announced before any of its text.
+            announced,
+            *self.text_part("msg-summary", "part-summary", "PRIVATE SUMMARY TEXT"),
+            self.SUMMARISER,
+            opencode_event("session.compacted"),
+            later,
+            *self.text_part("msg-later", "part-later", " And the rest."),
+            opencode_event("session.idle"),
+        ])
+
+    def test_summary_text_is_never_passed_on_and_replies_are_unaffected(self):
+        markers = (
+            {"summary": True, "mode": "compaction"},   # as 1.19.5 sends it
+            {"summary": True},
+            {"mode": "compaction"},
+        )
+        for marker in markers:
+            with self.subTest(marker=marker):
+                events = self.summary_stream(marker)
+                text = "".join(
+                    event.payload["text"]
+                    for event in of_type(events, "assistant.delta"))
+                # The reply before the compaction and the one after it both
+                # stream in full; the summary between them does not.
+                self.assertEqual(text, "Here is the answer. And the rest.")
+                self.assertNotIn("PRIVATE SUMMARY TEXT", json.dumps(
+                    [dict(event.payload) for event in events]))
+                # The marker is what the operator sees instead.
+                [compacted] = of_type(events, "context.compacted")
+                self.assertEqual(compacted.payload["tokens_before"], 80000)
+                self.assertEqual(events[-1].type, "run.completed")
+
+    def test_an_operator_messages_summary_object_hides_nothing(self) -> None:
+        # OpenCode also writes ``summary: {"diffs": []}`` on user messages.
+        events = self.turn([
+            opencode_event("session.status", status={"type": "busy"}),
+            opencode_event("message.updated", info={
+                "id": "msg-user", "role": "user", "summary": {"diffs": []},
+                "sessionID": OPENCODE_SESSION}),
+            opencode_event("message.updated", info={
+                "id": "msg-reply", "role": "assistant", "mode": "build",
+                "sessionID": OPENCODE_SESSION}),
+            *self.text_part("msg-reply", "part-reply", "An ordinary reply."),
+            opencode_event("session.idle"),
+        ])
+        self.assertEqual(
+            "".join(event.payload["text"]
+                    for event in of_type(events, "assistant.delta")),
+            "An ordinary reply.",
+        )
+        self.assertEqual(of_type(events, "context.compacted"), [])
+
     def test_with_no_reading_at_all_before_is_left_out(self) -> None:
         events = self.turn([
             opencode_event("session.status", status={"type": "busy"}),

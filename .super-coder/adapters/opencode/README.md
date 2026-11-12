@@ -129,7 +129,16 @@ was not repeated; an installed 1.19.5 reports `supported`. CI still installs
   `summary: true`) runs under the compaction agent's own prompt and is never
   read as the chat's context, for the marker or for the meter: on 1.19.5 it
   reported 449 input tokens for a session whose last request was about
-  13,600. A manual summarise on 1.19.5 emitted it (below);
+  13,600.
+- **No summary text is stored.** The compaction agent's reply is an assistant
+  message carrying `summary: true`, `mode: "compaction"` and
+  `agent: "compaction"`; in the event stream recorded on 1.19.5 its
+  `message.updated` arrives before any of its text parts. The adapter passes
+  on none of that message's text, on an automatic compaction as on a manual
+  one: the chat shows the compaction marker instead. Either `summary: true`
+  or `mode: "compaction"` marks it. An operator message's `summary` is an
+  object and marks nothing, and ordinary replies before and after the
+  compaction stream as usual. A manual summarise on 1.19.5 emitted it (below);
   **no automatic one has been seen**, and whether OpenCode auto-compacts under
   the engine is the open verification (spec #272 criterion 12).
 - **Manual compaction.** `POST /session/{id}/summarize` with

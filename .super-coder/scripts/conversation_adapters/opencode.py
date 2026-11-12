@@ -106,6 +106,9 @@ class _OpenCodeProjection:
         self.part_text: dict[str, str] = {}
         self.part_emitted: dict[str, str] = {}
         self.tool_states: dict[str, str] = {}
+        # Assistant messages that are a compaction's summary. Their text is
+        # never passed on: the chat shows the compaction marker instead.
+        self.summary_messages: set[str] = set()
         self.run_started = False
         self.last_usage: tuple[tuple[str, int | float], ...] | None = None
         self.last_context_tokens: int | None = None
@@ -116,6 +119,8 @@ class _OpenCodeProjection:
         if kind not in {"text", "reasoning"} or not message_id:
             return []
         if self.message_roles.get(message_id) != "assistant":
+            return []
+        if message_id in self.summary_messages:
             return []
         text = self.part_text.get(part_id, "")
         emitted = self.part_emitted.get(part_id, "")
@@ -315,6 +320,14 @@ class _OpenCodeProjection:
         events: list[NormalizedEvent] = []
         if isinstance(message_id, str) and isinstance(role, str):
             self.message_roles[message_id] = role
+            # The compaction agent's reply (1.19.5: ``summary: true`` and
+            # ``mode: "compaction"`` on the assistant message, announced
+            # before any of its text parts). An operator message's
+            # ``summary`` is an object, never ``true``.
+            if role == "assistant" and (
+                info.get("summary") is True or info.get("mode") == "compaction"
+            ):
+                self.summary_messages.add(message_id)
             for part_id, owner in tuple(self.part_messages.items()):
                 if owner == message_id:
                     events.extend(self._flush_text(part_id, native_type))
@@ -346,7 +359,7 @@ class _OpenCodeProjection:
         ]
         present = [part for part in parts if part is not None]
         context_tokens = sum(present) if present else None
-        if info.get("summary") is True:
+        if message_id in self.summary_messages:
             # The request that writes a compaction summary runs under the
             # compaction agent's own prompt: its input side is not the size
             # of the chat's context (449 for a 13.6k session on 1.19.5). It
