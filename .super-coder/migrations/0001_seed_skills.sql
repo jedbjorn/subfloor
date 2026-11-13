@@ -1752,11 +1752,14 @@ delivery unit here.
 4. **Record the crossing.** Append a narrative entry — identity event for a
    shell that updates its own floor. Note what changed + write the handoff.
 
-5. **Commit only the public update.**
-   Stage `.sc-state/engine.ref` (the pin), the root `sc` dispatcher if it
-   changed, and other deliberately authored public files. Snapshot SQL and
-   `_sc` renders remain ignored beneath `.sc-state/local/`; never force-add
-   them. `.super-coder/` and `engine.ref.prev` are also gitignored in forks.
+5. **Let the engine land the repin.** In a fork, `sc update` (and every
+   `sc launch` / `sc restart`) commits the engine-managed files — `sc`,
+   `.sc-state/engine.ref`, `.sc-state/engine.source`, the managed `.gitignore`
+   block — to the `subfloor/repin` PR, merges it and fast-forwards main. Never
+   stage those by hand; a `⚠ repin:` warning names what to fix and the next
+   launch retries. Snapshot SQL and `_sc` renders remain ignored beneath
+   `.sc-state/local/`; never force-add them. In the source repo, commit the
+   reconciled tree on a branch as usual.
 
 6. **Reboot** the session -> boot onto the new floor.
 

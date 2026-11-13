@@ -959,6 +959,17 @@ clean boot. Merging is a standing operator grant scoped to this engine-authored
 PR alone. It needs a GitHub `origin` and a signed-in `gh`; any failure is a
 one-line warning and the next launch retries.
 
+Without a GitHub `origin` or a signed-in `gh`, land the pin by hand:
+
+```bash
+git add .sc-state/engine.ref sc && git commit --no-verify -m "chore: update subfloor"
+```
+
+That manual update commit is a deliberate operator-owned commit on the
+protected default branch. Launched shells still create a feature branch first;
+the pre-commit refusal shows every caller the same `--no-verify` recovery, so
+the branch rule is a reminder rail, not a gate.
+
 `./sc update` first runs a `git pull --ff-only` for the tracked checkout itself
 — advisory, never blocking: an unsafe or offline pull warns and the engine
 update continues from the current tree, and update never merges, rebases or
