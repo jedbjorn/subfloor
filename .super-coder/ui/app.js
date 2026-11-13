@@ -5336,11 +5336,30 @@ function chatPaintContextMeter(node, context, harness = null) {
 // says "summary". The stored event is the same for every harness.
 // A figure after that is not lower than the figure before is not shown as a
 // reduction: "Context compacted · 21k, nothing to drop · manual".
+// The opening names why the chat compacted (spec #275): the button
+// ("compacted"), the trigger, an idle chat, or the harness on its own. A
+// marker recorded before causes existed keeps "automatic" / "manual".
+const CHAT_COMPACTION_HARNESS_NAMES = {
+  claude: "Claude", codex: "Codex", kimi: "Kimi", opencode: "OpenCode",
+};
+const CHAT_COMPACTION_CAUSES = ["operator", "threshold", "idle", "harness"];
+
+function chatCompactionCausePhrase(cause, harness) {
+  if (cause === "threshold") return "Context compacted at the trigger";
+  if (cause === "idle") return "Context compacted while idle";
+  if (cause === "harness")
+    return `Context compacted by ${
+      CHAT_COMPACTION_HARNESS_NAMES[harness] || harness || "the harness"}`;
+  return "Context compacted";
+}
+
 function chatCompactionLabel(payload, harness = null) {
   const before = chatTokenCount(payload?.tokens_before);
   const after = chatTokenCount(payload?.tokens_after);
   const summary = harness === "claude" ? " summary" : "";
-  const parts = ["Context compacted"];
+  const cause = CHAT_COMPACTION_CAUSES.includes(payload?.cause)
+    ? payload.cause : null;
+  const parts = [chatCompactionCausePhrase(cause, harness)];
   if (before !== null && after !== null && after >= before)
     parts.push(`${chatShortTokens(before)}, nothing to drop`);
   else if (before !== null && after !== null)
@@ -5350,8 +5369,14 @@ function chatCompactionLabel(payload, harness = null) {
   else if (after !== null)
     parts.push(summary
       ? `${chatShortTokens(after)} summary` : `now ${chatShortTokens(after)}`);
-  if (payload?.trigger === "auto") parts.push("automatic");
-  else if (payload?.trigger === "manual") parts.push("manual");
+  if (cause === null) {
+    if (payload?.trigger === "auto") parts.push("automatic");
+    else if (payload?.trigger === "manual") parts.push("manual");
+  } else if (cause === "threshold") {
+    const trigger = chatTokenCount(payload?.trigger_tokens);
+    if (trigger !== null && after !== null && after >= trigger)
+      parts.push("still at or above the trigger");
+  }
   return parts.join(" · ");
 }
 
@@ -7995,6 +8020,8 @@ async function chatRenderOpen(
         activity.compaction = {
           trigger: ["auto", "manual"].includes(event.payload?.trigger)
             ? event.payload.trigger : "unknown",
+          cause: CHAT_COMPACTION_CAUSES.includes(event.payload?.cause)
+            ? event.payload.cause : null,
           tokens_before: chatTokenCount(event.payload?.tokens_before),
           tokens_after: chatTokenCount(event.payload?.tokens_after),
         };

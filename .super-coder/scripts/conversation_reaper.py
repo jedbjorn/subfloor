@@ -610,16 +610,47 @@ class ConversationReaper(threading.Thread):
                 )
         return advanced
 
-    def run(self) -> None:  # pragma: no cover - loop tested through sweep seam
+    def idle_once(self) -> list[str]:
+        """The idle-compaction step of one heartbeat (Feature #95, spec #275).
+
+        Judged entirely from the database against this reaper's clock, so it
+        resumes as it was after an engine restart. A failure is logged and
+        never reaches the orphan ladder. Returns the chats queued.
+        """
+        import conversation_compaction
+
+        try:
+            queued = conversation_compaction.run_idle_compaction(
+                self.store.connect, self.clock()
+            )
+        except Exception as exc:  # noqa: BLE001 - never stops the reaper
+            print(f"conversation-reaper: idle compaction error ({exc})", flush=True)
+            return []
+        if queued:
+            for conversation_id in queued:
+                conversation_events.notify(conversation_id)
+            import conversation_broker
+
+            conversation_broker.notify_commit()
+        return queued
+
+    def beat(self) -> None:
+        """One heartbeat: the orphan ladder, then idle compaction."""
         try:
             self.sweep_once()
+        finally:
+            self.idle_once()
+
+    def run(self) -> None:  # pragma: no cover - loop tested through sweep seam
+        try:
+            self.beat()
             self.store.heartbeat(self.config.heartbeat_seconds)
         except Exception as exc:  # noqa: BLE001 - service must retry next beat
             print(f"conversation-reaper: startup error ({exc})", flush=True)
         self._started_once.set()
         while not self._stop_event.wait(self.config.heartbeat_seconds):
             try:
-                self.sweep_once()
+                self.beat()
                 self.store.heartbeat(self.config.heartbeat_seconds)
             except Exception as exc:  # noqa: BLE001 - service must stay live
                 print(f"conversation-reaper: heartbeat error ({exc})", flush=True)
