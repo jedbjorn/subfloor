@@ -783,7 +783,7 @@ def idle_verdict(
         return verdict(3, "a turn is running or work is queued")
     # 4. Large enough: the meter reading is at or above the idle size.
     size = read_meter(con, conversation_id)["context_tokens"]
-    if size is None or size < settings.idle_min_tokens:
+    if size is None or size < settings.effective_idle_min_tokens:
         return verdict(
             4, "the context is under the idle size", context_tokens=size
         )

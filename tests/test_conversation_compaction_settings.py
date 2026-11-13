@@ -22,7 +22,7 @@ import time
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest import mock
 
 import pytest
@@ -558,12 +558,129 @@ class PassThroughTest(DispatchCase):
         self.assertFalse(OpenCodeAdapter.compact_window_native)
         with closing(db_driver.connect(self.db_path)) as con:
             compaction_settings.save(
-                con, "opencode", {"auto_enabled": True, "trigger_tokens": 20000}
+                con, "opencode", {"auto_enabled": True, "trigger_tokens": 90000}
             )
         dispatch = BrokerCompactWindowTest.dispatch_context
         self.assertIsNone(dispatch(self, "kimi", {}).compact_window)
         self.assertIsNone(dispatch(self, "opencode", {}).compact_window)
         self.assertEqual(dispatch(self, "codex", {}).compact_window, 250000)
+
+    def test_pass_through_uses_the_trigger_raised_to_the_floor(self) -> None:
+        from test_conversation_compaction import BrokerCompactWindowTest
+
+        dispatch = BrokerCompactWindowTest.dispatch_context
+        # An environment trigger of 5,000 is raised to 90,000 for Codex; for
+        # Claude 90,000 is under its 100k-1M flag range, so no flag is passed
+        # and the engine's between-turn check covers it.
+        self.assertEqual(
+            dispatch(self, "codex", {"SC_CHAT_COMPACT_WINDOW_CODEX": "5000"}).compact_window,
+            90000,
+        )
+        context = dispatch(self, "claude", {"SC_CHAT_COMPACT_WINDOW_CLAUDE": "5000"})
+        self.assertEqual(context.compact_window, 90000)
+        self.assertNotIn("--autocompact", self.claude_argv(compact_window=90000))
+
+
+# ── The engine floor: never an engine compaction below 90,000 tokens ───────
+
+
+class EngineFloorTest(SettingsCase):
+    """FnB ruling (2026-11-13): the engine never compacts a chat on its own
+    below 90,000 tokens, by threshold or while idle; the button is not bound
+    by it. A value under the floor is refused on save and, wherever it comes
+    from, raised to the floor when the engine decides."""
+
+    LOW_ENV: ClassVar[dict[str, str]] = {"SC_CHAT_COMPACT_WINDOW_CLAUDE": "5000"}
+
+    def hand_edit(self, harness: str, trigger: int, idle_min: int,
+                  wait: int | None = 50) -> None:
+        con = self.connect()
+        con.execute(
+            "INSERT INTO chat_compaction_settings (harness,auto_enabled,"
+            "trigger_tokens,idle_after_minutes,idle_min_tokens) "
+            "VALUES (?,1,?,?,?)", (harness, trigger, wait, idle_min),
+        )
+        con.commit()
+        con.close()
+
+    def threshold(self, conversation_id: str, env: dict[str, str] | None = None):
+        con = db_driver.connect(self.db_path)
+        try:
+            with db_driver.write_transaction(con, "test.threshold"):
+                return conversation_compaction.threshold_compaction(
+                    con, conversation_id, run_id=1, trigger_message_id=0,
+                    env=env,
+                )
+        finally:
+            con.close()
+
+    def test_a_save_below_the_floor_is_refused_for_both_fields(self) -> None:
+        for field in ("trigger_tokens", "idle_min_tokens"):
+            with self.subTest(field=field):
+                with self.assertRaises(compaction_settings.SettingsError) as refused:
+                    self.save("claude", **{field: 89_999})
+                self.assertEqual(refused.exception.code, "COMPACTION_SETTING_INVALID")
+                self.assertIn("at least 90,000", refused.exception.message)
+                self.assertIsNone(self.resolve("claude").updated_at)
+        saved = self.save("claude", trigger_tokens=90_000, idle_min_tokens=90_000)
+        self.assertEqual((saved.trigger_tokens, saved.idle_min_tokens), (90_000, 90_000))
+
+    def test_an_environment_value_below_the_floor_resolves_to_the_floor(self) -> None:
+        settings = self.resolve("claude", self.LOW_ENV)
+        self.assertEqual(settings.trigger_tokens, 5000)
+        self.assertEqual(settings.sources["trigger_tokens"], "environment")
+        self.assertEqual(settings.effective_trigger, 90_000)
+        shown = settings.as_dict()
+        self.assertTrue(shown["trigger_raised_to_floor"])
+        self.assertFalse(shown["idle_min_raised_to_floor"])
+        self.assertEqual(shown["floor_tokens"], 90_000)
+
+    def test_an_environment_value_below_the_floor_never_compacts_early(self) -> None:
+        small = self.chat("claude")
+        self.usage(small, 60_000, T0)
+        self.assertIsNone(self.threshold(small, self.LOW_ENV))
+        self.assertEqual(self.requests(small), [])
+        # At the floor the threshold check fires, at the floor's figure.
+        large = self.chat("claude", shell_id=2)
+        self.usage(large, 95_000, T0)
+        result = self.threshold(large, self.LOW_ENV)
+        assert result is not None
+        self.assertTrue(result.queued)
+        [request] = self.requests(large)
+        self.assertEqual((request["cause"], request["trigger_tokens"]), ("threshold", 90_000))
+
+    def test_a_hand_edited_row_below_the_floor_still_clamps(self) -> None:
+        self.hand_edit("claude", trigger=20_000, idle_min=20_000)
+        settings = self.resolve("claude")
+        self.assertEqual(settings.effective_trigger, 90_000)
+        self.assertEqual(settings.effective_idle_min_tokens, 90_000)
+        small = self.chat("claude")
+        self.usage(small, 60_000, T0)
+        self.assertIsNone(self.threshold(small))
+        # Quiet past the 50-minute wait, inside the cache life, but under the
+        # floor: no idle compaction either.
+        self.assertEqual(self.heartbeat(T0 + timedelta(minutes=51)), [])
+        self.assertEqual(self.requests(small), [])
+        with closing(db_driver.connect(self.db_path)) as con:
+            verdict = conversation_compaction.idle_verdict(
+                con, small, T0 + timedelta(minutes=51))
+        self.assertEqual(verdict.failed_rule, 4)
+
+    def test_idle_compaction_at_or_above_the_floor_still_fires(self) -> None:
+        self.hand_edit("claude", trigger=20_000, idle_min=20_000)
+        chat = self.chat("claude")
+        self.usage(chat, 95_000, T0)
+        self.assertEqual(self.heartbeat(T0 + timedelta(minutes=51)), [chat])
+
+    def test_the_manual_button_is_not_bound_by_the_floor(self) -> None:
+        chat = self.chat("claude")
+        self.usage(chat, 20_000, T0)
+        with closing(db_driver.connect(self.db_path)) as con:
+            result = conversation_compaction.request_compaction(
+                con, chat, "operator", idempotency_key="press-1", user_id=1)
+        self.assertTrue(result.queued, result)
+        [request] = self.requests(chat)
+        self.assertEqual(request["cause"], "operator")
 
 
 # ── AC4: a turn ending above the trigger gets exactly one compaction ────────
