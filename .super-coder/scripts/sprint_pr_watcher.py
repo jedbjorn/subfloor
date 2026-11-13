@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import subprocess
 import threading
 import time
 from collections import defaultdict
@@ -21,14 +22,12 @@ from pathlib import Path
 from typing import Any
 
 import db_driver
-import git_hygiene
 import sprint_liveness
 from github_pull_requests import (
     GITHUB_TIMEOUT_SECONDS,
     GitHubPullRequestReader,
     GitHubReadError,
     PullRequest,
-    newest_by_branch,
     normalize_state,
 )
 from sprint_domain import (
@@ -49,24 +48,42 @@ MAX_BACKOFF_SECONDS = 300.0
 RATE_BACKOFF_SECONDS = 60.0
 _REPOSITORY = re.compile(r"^[^/\s]+/[^/\s]+$")
 _PR_URL_REPOSITORY = re.compile(r"^https?://[^/]+/([^/\s]+/[^/\s]+)/pull/\d+/?$")
+_SHELL_TRAILER = re.compile(r"<([^@<>\s]+)@subfloor\.local>", re.IGNORECASE)
 
 
-def shell_worktree_branches(repo_root: str | Path) -> dict[str, str]:
-    """Lowercase shell shortname -> branch checked out in `.sc-worktrees/<n>`.
+def commit_shell_shortname(repo_root: str | Path, sha: str) -> str | None:
+    """Lowercase shortname from the first shell attribution trailer on a commit.
 
-    Detached worktrees and worktrees outside the managed directory are omitted.
+    The prepare-commit-msg hook stamps every shell commit with
+    `Co-Authored-By: <name> <SHORTNAME@subfloor.local>`; the first such trailer
+    names the shell that wrote it (an amend by another shell appends a second).
+    Returns None for a commit without one. Raises LookupError when the commit
+    is not in the local object store, so the caller can retry later.
     """
-    root = Path(repo_root).resolve()
-    result: dict[str, str] = {}
-    for block in git_hygiene._porcelain_worktrees(cwd=root):
-        path = Path(block.get("abs", ""))
-        branch = block.get("branch")
-        if not branch or block.get("detached"):
-            continue
-        if path.parent != root / ".sc-worktrees":
-            continue
-        result[path.name.lower()] = str(branch)
-    return result
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "log",
+                "-1",
+                "--format=%(trailers:key=Co-authored-by,valueonly)",
+                sha,
+                "--",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LookupError(f"commit {sha} unreadable: {exc}") from exc
+    if result.returncode != 0:
+        raise LookupError(f"commit {sha} is not local")
+    match = _SHELL_TRAILER.search(result.stdout)
+    return match.group(1).lower() if match else None
 
 
 def _parse_stamp(value: str) -> datetime:
@@ -347,7 +364,7 @@ class _FailureBackoff:
 
 
 class PRSubscriptionStore:
-    """Own engine-wide PR observation registrations by Developer shell."""
+    """Own engine-wide PR observation registrations by owning shell."""
 
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
@@ -367,11 +384,11 @@ class PRSubscriptionStore:
         if not isinstance(pr_number, int) or pr_number < 1:
             raise ValueError("PR number must be a positive integer")
         owner = self.con.execute(
-            "SELECT flavor FROM shells WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
+            "SELECT 1 FROM shells WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
             (owner_shell_id,),
         ).fetchone()
-        if owner is None or str(owner["flavor"]) != "dev":
-            raise SprintInvariantError("PR subscription owner must be a Developer shell")
+        if owner is None:
+            raise SprintInvariantError("PR subscription owner must be a live shell")
         existing = self.con.execute(
             "SELECT * FROM pr_subscriptions WHERE repository=? AND pr_number=?",
             (repository, pr_number),
@@ -887,7 +904,7 @@ class SprintPRWatcher:
         repo_root: str | Path,
         reader_factory: Callable[[str | None], Any] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
-        worktree_branches: Callable[[], dict[str, str]] | None = None,
+        commit_shell: Callable[[str], str | None] | None = None,
         discovery_seconds: float = DISCOVERY_SECONDS,
     ) -> None:
         self.con = con
@@ -899,9 +916,10 @@ class SprintPRWatcher:
             )
         )
         self.monotonic = monotonic
-        self.worktree_branches = worktree_branches or (
-            lambda: shell_worktree_branches(self.repo_root)
+        self.commit_shell = commit_shell or (
+            lambda sha: commit_shell_shortname(self.repo_root, sha)
         )
+        self._commit_shells: dict[str, str | None] = {}
         self.discovery_seconds = discovery_seconds
         self._next_discovery = 0.0
         self.registration = SprintPRRegistrationStore(con)
@@ -937,83 +955,101 @@ class SprintPRWatcher:
         return receipt
 
     def discover_once(self, *, force: bool = False) -> int:
-        """Enrol Developer shells in PRs whose head is their worktree's branch.
+        """Subscribe every PR a shell authored to that shell.
 
-        The engine can see every managed worktree, so a shell never has to
-        remember to subscribe: the newest PR per checked-out feature branch is
-        subscribed to that worktree's Developer with the same receipt path as
-        `sc pr subscribe`. Lists GitHub at most once per discovery interval, and
-        only while some feature branch lacks a live subscription.
+        The owner is the shell named by the head commit's attribution trailer
+        (`commit_shell_shortname`), so a shell never has to remember to
+        subscribe and what it has checked out later does not matter. An open PR
+        is always eligible; a merged or closed one only above the repository's
+        high-water mark, so a PR opened and merged between two passes still
+        wakes its owner while an upgraded install never replays history. Lists
+        GitHub at most once per discovery interval.
         """
         now = self.monotonic()
         if not force and now < self._next_discovery:
             return 0
         self._next_discovery = now + self.discovery_seconds
-        candidates = self._discovery_candidates()
-        if not candidates:
-            return 0
         try:
-            listed = newest_by_branch(self.reader_factory(None).list())
+            listed = self.reader_factory(None).list()
         except GitHubReadError as exc:
             print(f"sprint-pr-watcher: PR discovery failed ({exc})", flush=True)
             return 0
-        discovered = 0
-        for branch, owner_shell_id in candidates.items():
-            pull_request = listed.get(branch)
-            if pull_request is None:
-                continue
-            match = _PR_URL_REPOSITORY.match(pull_request.url or "")
-            if match is None:
-                continue
-            repository = match.group(1).lower()
-            if self.con.execute(
-                "SELECT 1 FROM pr_subscriptions WHERE repository=? AND pr_number=?",
-                (repository, pull_request.number),
-            ).fetchone():
-                continue
-            try:
-                self.subscribe(
-                    owner_shell_id=owner_shell_id,
-                    repository=repository,
-                    pr_number=pull_request.number,
-                )
-            except (SprintInvariantError, ValueError) as exc:
-                print(
-                    f"sprint-pr-watcher: PR discovery skipped {repository}#"
-                    f"{pull_request.number} for shell {owner_shell_id} ({exc})",
-                    flush=True,
-                )
-                continue
-            discovered += 1
-        return discovered
-
-    def _discovery_candidates(self) -> dict[str, int]:
-        """Feature branch -> Developer shell id for worktrees still uncovered."""
-        developers = {
+        shells = {
             str(row["shortname"]).lower(): int(row["shell_id"])
             for row in self.con.execute(
-                "SELECT shell_id,shortname FROM shells WHERE flavor='dev' "
-                "AND shortname IS NOT NULL AND COALESCE(is_deleted,0)=0"
+                "SELECT shell_id,shortname FROM shells "
+                "WHERE shortname IS NOT NULL AND COALESCE(is_deleted,0)=0"
             )
         }
-        covered = {
-            str(row[0])
-            for row in self.con.execute(
-                "SELECT json_extract(latest.evidence,'$.head_ref') "
-                "FROM pr_subscription_transitions latest "
-                "WHERE latest.transition_id IN ("
-                "SELECT MAX(transition_id) FROM pr_subscription_transitions "
-                "GROUP BY subscription_id) "
-                "AND latest.normalized_state NOT IN ('merged','closed')"
+        by_repository: dict[str, list[PullRequest]] = defaultdict(list)
+        for pull_request in listed:
+            match = _PR_URL_REPOSITORY.match(pull_request.url or "")
+            if match is not None:
+                by_repository[match.group(1).lower()].append(pull_request)
+        discovered = 0
+        for repository, pull_requests in by_repository.items():
+            mark = self._watermark(repository)
+            for pull_request in pull_requests:
+                if pull_request.state != "OPEN" and (
+                    mark is None or pull_request.number <= mark
+                ):
+                    continue
+                if self.con.execute(
+                    "SELECT 1 FROM pr_subscriptions WHERE repository=? AND pr_number=?",
+                    (repository, pull_request.number),
+                ).fetchone():
+                    continue
+                owner_shell_id = shells.get(
+                    self._head_shell(pull_request.head_sha) or ""
+                )
+                if owner_shell_id is None:
+                    continue
+                try:
+                    self.subscribe(
+                        owner_shell_id=owner_shell_id,
+                        repository=repository,
+                        pr_number=pull_request.number,
+                    )
+                except (SprintInvariantError, ValueError) as exc:
+                    print(
+                        f"sprint-pr-watcher: PR discovery skipped {repository}#"
+                        f"{pull_request.number} for shell {owner_shell_id} ({exc})",
+                        flush=True,
+                    )
+                    continue
+                discovered += 1
+            self._advance_watermark(
+                repository, max(item.number for item in pull_requests)
             )
-        }
-        candidates: dict[str, int] = {}
-        for shortname, branch in self.worktree_branches().items():
-            shell_id = developers.get(shortname)
-            if shell_id is None or branch.startswith("shell/") or branch in covered:
-                continue
-            candidates[branch] = shell_id
-        return candidates
+        return discovered
+
+    def _head_shell(self, sha: str | None) -> str | None:
+        """Cached attribution; a commit not yet local is retried next pass."""
+        if not sha:
+            return None
+        if sha not in self._commit_shells:
+            try:
+                self._commit_shells[sha] = self.commit_shell(sha)
+            except LookupError:
+                return None
+        return self._commit_shells[sha]
+
+    def _watermark(self, repository: str) -> int | None:
+        row = self.con.execute(
+            "SELECT pr_number FROM pr_discovery_watermarks WHERE repository=?",
+            (repository,),
+        ).fetchone()
+        return int(row["pr_number"]) if row is not None else None
+
+    def _advance_watermark(self, repository: str, pr_number: int) -> None:
+        with db_driver.write_transaction(self.con, "pr.discovery.watermark"):
+            self.con.execute(
+                "INSERT INTO pr_discovery_watermarks (repository,pr_number) "
+                "VALUES (?,?) ON CONFLICT(repository) DO UPDATE SET "
+                "pr_number=MAX(pr_number,excluded.pr_number),"
+                "updated_at=datetime('now')",
+                (repository, pr_number),
+            )
 
     def register(
         self,
@@ -1632,13 +1668,16 @@ class SprintPRWatcherService(threading.Thread):
             force_history=startup,
             history_eligible=startup,
         )
-        observed = watcher.poll_once(
-            startup=startup,
-            repository_complete=heartbeat.beat,
-        )
-        if not observed and not startup:
-            heartbeat.beat(0)
-        watcher.discover_once(force=startup)
+        try:
+            observed = watcher.poll_once(
+                startup=startup,
+                repository_complete=heartbeat.beat,
+            )
+            if not observed and not startup:
+                heartbeat.beat(0)
+        finally:
+            # A failing poll must never starve enrolment of new PRs.
+            watcher.discover_once(force=startup)
         return observed
 
     def run(self) -> None:

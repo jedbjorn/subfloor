@@ -41,10 +41,6 @@ class VerifyCleanCloneTest(unittest.TestCase):
                 checkout / ".super-coder" / "scripts" / "verify.py",
             )
             shutil.copy2(
-                ROOT / ".super-coder" / "scripts" / "pr_cli.py",
-                checkout / ".super-coder" / "scripts" / "pr_cli.py",
-            )
-            shutil.copy2(
                 ROOT / ".super-coder" / "scripts" / "run.py",
                 checkout / ".super-coder" / "scripts" / "run.py",
             )

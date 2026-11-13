@@ -173,7 +173,6 @@ owning Planner may call `dispatch` or `monitor`.
 | `GET /_sc/model-routes?harness=&selector=` | shell | model route catalogue; each filter once and non-empty, else `400` |
 | `POST /_sc/search` | shell | `{query, max_results, depth}` → Tavily results; the host-held key never crosses the boundary. Errors are `{error, code}` at the status `web_search` picked. `sc search` |
 | `POST /_sc/browser` | shell | `{action: status\|open}` only — setup, lifecycle and arm are the FnB's (`403`). `open` requires the `drive_browser` grant (`403`) and accepts no config overrides (`400`); returns `proxy_url`, `tab_group`, `output_dir`. `sc browser` |
-| `POST /_sc/pr/subscribe` | shell | `{repository, pr_number}` → `{subscription_id, created}`; `201` on create, `200` when already subscribed. `sc pr` |
 | `POST /_sc/skills/{put\|grant\|revoke\|rm\|retire\|unretire}` | Planner shell | fork-local skill catalogue mutations, enforced server-side against the same rules as the host CLI |
 | `PUT /_sc/skills/assign` | Planner shell | `{name, shell\|shells, granted}` — grant or revoke in one verb |
 | `PUT /_sc/skills/retire/{name}` | Planner shell | `{retired: bool}` (default `true`) — the same retire/unretire lane and Planner check as the `POST` routes |

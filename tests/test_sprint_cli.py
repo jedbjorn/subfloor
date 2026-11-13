@@ -22,7 +22,6 @@ ENGINE = ROOT / ".super-coder"
 sys.path[:0] = [str(ENGINE / "scripts"), str(ENGINE / "api"), str(ROOT / "tests")]
 
 import mem
-import pr_cli
 import server
 import sprint_cli
 import sprint_domain
@@ -409,13 +408,6 @@ class SprintCliApiTest(unittest.TestCase):
             self.assertEqual(0, sprint_cli.main(list(argv)))
         return json.loads(output.getvalue())
 
-    def run_pr_cli(self, token: str, *argv: str) -> dict:
-        mem.SC_API_TOKEN = token
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            self.assertEqual(0, pr_cli.main(list(argv)))
-        return json.loads(output.getvalue())
-
     def test_followup_endpoint_is_removed(self):
         mem.SC_API_TOKEN = TOKENS["admin"]
         with self.assertRaisesRegex(SystemExit, "HTTP 404"):
@@ -531,49 +523,15 @@ class SprintCliApiTest(unittest.TestCase):
         finally:
             con.close()
 
-    def test_engine_wide_subscription_uses_authenticated_developer_identity(self):
-        with mock.patch.object(
-            server.sprint_pr_watcher,
-            "GitHubPullRequestReader",
-            return_value=Reader(),
-        ):
-            receipt = self.run_pr_cli(
-                TOKENS["developer"],
-                "subscribe",
-                "--repository",
-                "Acme/Outside",
-                "--pr",
-                "85",
-            )
-
-        self.assertTrue(receipt["created"])
-        con = sqlite3.connect(self.db)
-        try:
-            subscription = con.execute(
-                "SELECT owner_shell_id,repository,pr_number,"
-                "sprint_registered_pr_id FROM pr_subscriptions "
-                "WHERE subscription_id=?",
-                (receipt["subscription_id"],),
-            ).fetchone()
-            transitions = [
-                str(row[0])
-                for row in con.execute(
-                    "SELECT normalized_state FROM pr_subscription_transitions "
-                    "WHERE subscription_id=? ORDER BY transition_id",
-                    (receipt["subscription_id"],),
-                )
-            ]
-            message = con.execute(
-                "SELECT 1 FROM wake_message "
-                "WHERE idempotency_key LIKE 'pr-transition:%:shell:1'"
-            ).fetchone()
-        finally:
-            con.close()
-        self.assertEqual((1, "acme/outside", 85, None), subscription)
-        # The initial snapshot is durable and a first green outside a Sprint
-        # wakes the owner: the FnB merges on green (decision #327).
-        self.assertEqual(["green"], transitions)
-        self.assertIsNotNone(message)
+    def test_manual_pr_subscription_endpoint_is_removed(self):
+        # PR ownership comes from the head commit's attribution trailer; a
+        # shell never subscribes by hand.
+        mem.SC_API_TOKEN = TOKENS["developer"]
+        with self.assertRaisesRegex(SystemExit, "HTTP 404"):
+            mem._api("POST", "/_sc/pr/subscribe", {
+                "repository": "acme/outside",
+                "pr_number": 85,
+            })
 
     def test_reconcile_pr_allows_originating_planner_and_projects_receipt(self):
         argv = (
