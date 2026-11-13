@@ -149,20 +149,29 @@ its operator-only reverify endpoint is
 Checked on `2.1.322 (Claude Code)`, 2026-11-12, with three small requests.
 
 - **Earlier compact window.** A browser chat is launched with
-  `--autocompact <tokens>` (default 250,000; `SC_CHAT_COMPACT_WINDOW_CLAUDE`
-  sets it, `off` restores Claude's default). The value is the window Claude
-  compacts within, not the trigger: compaction fires somewhat below it. The
-  flag is accepted on a new session and on `--resume … -p` (both exit 0 and
-  complete the turn). **Not checked:** that a resumed run then compacts at
-  that window; forcing it costs at least 100,000 tokens. The engine passes the
-  value as set; Claude applies its own 100k minimum and clamps to the model's
-  window. A chat whose recorded window is smaller than the setting is launched
-  without the flag. Terminal seats are untouched.
+  `--autocompact <tokens>`, the Claude trigger in effect. Since spec #275
+  that is the **Auto compaction** setting on the Claude card in
+  **Shells → Harness**: a value saved there wins; with nothing saved,
+  `SC_CHAT_COMPACT_WINDOW_CLAUDE` supplies it; otherwise the default 250,000.
+  A value below 90,000 is raised to 90,000 (decision #460: the engine never
+  auto-compacts below that). Auto compaction off (on the card, or `off` in
+  the variable with nothing saved) passes no flag, so Claude's own default
+  applies; it does not touch idle compaction. The flag is passed only from
+  100,000 to 1,000,000, Claude's accepted range (a change from spec #272,
+  which passed any positive value), and not for a chat whose recorded window
+  is smaller than the trigger. Outside the range the engine's between-turn
+  check compacts the chat instead (see the engine's conversation-runtime
+  doc). The value is the window Claude compacts within, not the trigger:
+  compaction fires somewhat below it. The flag is accepted on a new session
+  and on `--resume … -p` (both exit 0 and complete the turn). **Not
+  checked:** that a resumed run then compacts at that window; forcing it
+  costs at least 100,000 tokens. Terminal seats are untouched.
 - **The environment variable wins, so the launch clears it.** In the installed
   binary the window resolver returns `CLAUDE_CODE_AUTO_COMPACT_WINDOW` before
   it reads the configured window. Whenever the engine passes `--autocompact`
-  it removes that variable from the browser chat's environment. With the
-  setting `off` the variable is left alone. This is read from the binary, not
+  it removes that variable from the browser chat's environment. When no flag
+  is passed (auto compaction off, or a trigger outside the range) the
+  variable is left alone. This is read from the binary, not
   observed in a compaction.
 - **Signal.** Stream line `type: system`, `subtype: compact_boundary`, with
   `compact_metadata` (`trigger`, `pre_tokens`, optional `post_tokens`). The
@@ -242,8 +251,9 @@ code, not run on an older build:
 
 Nothing stops a browser-chat launch, and an older Claude fails every
 browser-chat launch on the unknown `--autocompact` flag. The fix is to update
-Claude Code to 2.1.304 or later. `SC_CHAT_COMPACT_WINDOW_CLAUDE=off` stops
-the engine passing the flag and is a stopgap only.
+Claude Code to 2.1.304 or later. Turning Auto compaction off on the Claude
+card (or `SC_CHAT_COMPACT_WINDOW_CLAUDE=off` while nothing is saved there)
+stops the engine passing the flag and is a stopgap only.
 
 ## Subagent keys (`headless.agent`, Feature #96, spec #273)
 

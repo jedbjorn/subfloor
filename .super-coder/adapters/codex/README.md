@@ -210,8 +210,16 @@ is introduced by this lane.
 Checked on `codex-cli 0.167.1`, 2026-11-12, with one small model request.
 
 - **Earlier compact window.** A browser chat is given
-  `model_auto_compact_token_limit` (default 250,000; `SC_CHAT_COMPACT_WINDOW_CODEX`
-  sets it, `off` restores Codex's default). It is stated twice, and both forms
+  `model_auto_compact_token_limit`, the Codex trigger in effect. Since spec
+  #275 that is the **Auto compaction** setting on the Codex card in
+  **Shells → Harness**: a value saved there wins; with nothing saved,
+  `SC_CHAT_COMPACT_WINDOW_CODEX` supplies it; otherwise the default 250,000.
+  A value below 90,000 is raised to 90,000 (decision #460: the engine never
+  auto-compacts below that). Auto compaction off (on the card, or `off` in
+  the variable with nothing saved) passes nothing, so Codex's own default
+  applies; it does not touch idle compaction. The engine also checks the
+  chat after each turn and compacts it once at the trigger when Codex has
+  not. It is stated twice, and both forms
   were accepted: as `-c model_auto_compact_token_limit=<n>` on the
   `codex … app-server --stdio` launch, where `config/read` then reports the
   value with origin `sessionFlags`; and in the `config` object of
@@ -221,7 +229,7 @@ Checked on `codex-cli 0.167.1`, 2026-11-12, with one small model request.
   thread therefore gets it by either route. **Not checked:** that Codex then
   compacts at that figure, and the accepted range; that is the post-merge
   live check (spec #272 criterion 10). It is skipped for a chat whose recorded
-  `modelContextWindow` is smaller than the setting. Terminal seats are untouched.
+  `modelContextWindow` is smaller than the trigger. Terminal seats are untouched.
 - **Signal.** The `contextCompaction` item is the one signal. It is recorded
   once as `context.compacted` and no longer surfaces as a tool event; the
   deprecated `thread/compacted` notification is ignored. The item carries no
