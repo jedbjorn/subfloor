@@ -636,6 +636,9 @@ body.interface-view main {
   align-self: flex-start; display: inline-flex; align-items: baseline;
   margin-left: .8rem; color: var(--accent); font-size: .78rem;
 }
+.chat-waiting-indicator {
+  align-self: flex-start; margin-left: .8rem; color: var(--dim); font-size: .78rem;
+}
 .chat-bubble-head {
   display: flex; align-items: baseline; justify-content: space-between;
   gap: .8rem; margin-bottom: .22rem;
