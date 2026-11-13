@@ -3703,13 +3703,28 @@ class ConversationAdapterTest(unittest.TestCase):
                 "tool.completed",
                 "assistant.delta",
                 "usage",
+                "usage",
+                "usage",
                 "run.completed",
             ],
         )
         self.assertEqual(events[2].payload["text"], "chunk")
         self.assertEqual(events[3].payload["tool_ref"], "tool-1")
         self.assertEqual(events[4].payload["tool_ref"], "tool-2")
-        usage = next(event for event in events if event.type == "usage")
+        # One request reading per turn-scoped record (spec #275), then the
+        # whole-turn total labelled ``turn``.
+        readings = [
+            event.payload for event in events
+            if event.type == "usage" and event.payload["scope"] == "request"
+        ]
+        self.assertEqual(
+            [reading["context_tokens"] for reading in readings], [13, 12]
+        )
+        usage = next(
+            event for event in events
+            if event.type == "usage" and event.payload["scope"] == "turn"
+        )
+        self.assertNotIn("context_tokens", usage.payload)
         self.assertEqual(
             usage.payload["tokens"],
             {
@@ -3782,8 +3797,13 @@ class ConversationAdapterTest(unittest.TestCase):
                 "run.started",
                 "assistant.delta",
                 "usage",
+                "usage",
                 "run.completed",
             ],
+        )
+        self.assertEqual(
+            [event.payload["scope"] for event in events if event.type == "usage"],
+            ["request", "turn"],
         )
         self.assertEqual(events[-1].native_type, "usage.record")
 
@@ -3871,16 +3891,30 @@ class ConversationAdapterTest(unittest.TestCase):
                 "tool.completed",
                 "assistant.delta",
                 "usage",
+                "usage",
+                "usage",
                 "run.completed",
             ],
         )
         self.assertEqual(
-            next(event for event in events if event.type == "usage").payload,
+            [
+                event.payload.get("context_tokens")
+                for event in events
+                if event.type == "usage"
+            ],
+            [10, 5, None],
+        )
+        self.assertEqual(
+            next(
+                event for event in events
+                if event.type == "usage" and event.payload["scope"] == "turn"
+            ).payload,
             {
                 "tokens": {
                     "input_tokens": 15,
                     "output_tokens": 5,
-                }
+                },
+                "scope": "turn",
             },
         )
         self.assertEqual(
