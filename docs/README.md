@@ -944,14 +944,20 @@ floor with every row intact. (The shell-facing version of this is the
 `self_update` skill — same procedure, framed as the handoff it is.)
 
 ```bash
-./sc update                     # fetch + materialize the engine, reconcile in place
-git add .sc-state/engine.ref sc && git commit --no-verify -m "chore: update subfloor"
+./sc update                     # fetch + materialize the engine, reconcile, land the repin
 ```
 
-The update commit is another deliberate operator-owned commit on the protected
-default branch. Launched shells still create a feature branch first; the
-pre-commit refusal shows every caller the same `--no-verify` recovery, so the
-branch rule is a reminder rail, not a gate.
+The engine lands its own repin. After the update — and again on every
+`./sc launch` and `./sc restart` — it compares the engine-managed tracked files
+(`sc`, `.sc-state/engine.ref`, `.sc-state/engine.source`, the managed block of
+`.gitignore`) with `origin/<default>`. On drift it commits only those files on
+top of the remote branch (your checkout's branch, index and other edits are
+untouched), force-pushes the `subfloor/repin` branch, opens or reuses its PR
+and merges it — or enables auto-merge when the base requires checks — then
+fast-forwards the main checkout. Shell worktrees pick the pin up on their next
+clean boot. Merging is a standing operator grant scoped to this engine-authored
+PR alone. It needs a GitHub `origin` and a signed-in `gh`; any failure is a
+one-line warning and the next launch retries.
 
 `./sc update` first runs a `git pull --ff-only` for the tracked checkout itself
 — advisory, never blocking: an unsafe or offline pull warns and the engine
@@ -966,7 +972,7 @@ your unsnapshotted in-session writes survive), syncs the skills catalogue
 (id-stable, so grants stay valid), re-grants any new common skills, refreshes the
 repo map, re-installs the `subfloor` shell function for bash and fish, and
 re-snapshots the live state. Nothing under `.super-coder/` is
-committed — you commit only the bumped `.sc-state/engine.ref` and any
+committed — the engine lands the bumped pin itself (above); you commit only
 deliberately authored project changes. Generated snapshots and `_sc` renders
 remain ignored. Then restart the session to boot onto the new floor.
 
