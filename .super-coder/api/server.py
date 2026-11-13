@@ -88,6 +88,8 @@ import artifact_policy  # noqa: E402
 import run_seat
 import seat_conversion
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
+import compaction_cards  # Harness cards: compaction settings + data, spec #275
+import compaction_settings  # per-harness compaction settings, spec #275
 import conversation_broker  # noqa: E402  (Feature #24 durable turn service)
 import conversation_launch  # noqa: E402  (canonical shell launch preparation)
 import conversation_reaper  # noqa: E402  (Feature #31 orphan process ladder)
@@ -350,6 +352,14 @@ TASK_STATUSES = {"pending", "in_progress", "done", "cancelled"}
 # A plan is OPEN while any of its tasks is outside this set. Named once so a
 # reader of `retire` and a reader of the task lifecycle see the same rule.
 TERMINAL_TASK_STATUSES = {"done", "cancelled"}
+# The status each refused Harness-card compaction request is answered with.
+COMPACTION_REFUSAL_STATUS = {
+    "COMPACTION_HARNESS_UNKNOWN": 404,
+    "COMPACTION_SETTING_UNKNOWN": 422,
+    "COMPACTION_SETTING_INVALID": 422,
+    "COMPACTION_SETTINGS_EMPTY": 400,
+    "COMPACTION_DAYS_INVALID": 400,
+}
 
 
 def db():
@@ -3150,6 +3160,35 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    # The Harness cards' compaction routes (Feature #95, spec #275): operator
+    # only, like the conversion Re-verify beside them. A refused setting is
+    # answered with its code and field and writes nothing.
+    def _harness_compaction(self, con, path: str, put: bool = False):
+        if not self._require_browser_operator(con, "harness settings"):
+            return None
+        if put and not self._require_browser_mutation_origin(
+                "harness settings changes"):
+            return None
+        try:
+            if path == "/api/harnesses/compaction":
+                return self._send(200, compaction_cards.cards(con))
+            harness = unquote(path.strip("/").split("/")[2])
+            if put:
+                session = browser_gate.operator_session(
+                    self.headers, lambda _user_id: True)
+                saved = compaction_settings.save(
+                    con, harness, self._body(),
+                    user_id=session["user_id"] if session else None)
+                return self._send(200, compaction_cards.card(con, saved))
+            raw = parse_qs(urlparse(self.path).query).get("days", ["7"])[0]
+            days = int(raw) if raw.isdigit() else 0
+            return self._send(200, compaction_cards.card_data(con, harness, days))
+        except compaction_settings.SettingsError as exc:
+            return self._send(
+                COMPACTION_REFUSAL_STATUS.get(exc.code, 400),
+                {"error": {"code": exc.code, "message": exc.message,
+                           "details": {"field": exc.field} if exc.field else {}}})
+
     def _sprint_board_error(self, exc: Exception):
         if isinstance(exc, sprint_board.ProjectionError):
             return self._send(exc.status, {"error": {
@@ -5821,6 +5860,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"templates": shell_factory.flavors()})
             if path == "/api/flavor-defaults":
                 return self._send(200, get_flavor_defaults(con))
+            if path == "/api/harnesses/compaction" or (
+                    path.startswith("/api/harnesses/")
+                    and path.endswith("/compaction-data")):
+                return self._harness_compaction(con, path)
             if path.startswith("/api/shells/"):
                 sid = int(path.rsplit("/", 1)[1])
                 shell = get_shell(con, sid)
@@ -6448,6 +6491,9 @@ class Handler(BaseHTTPRequestHandler):
                     con, parts[2], self._body()
                 )
                 return self._send(status, payload)
+            if (len(parts) == 4 and parts[:2] == ["api", "harnesses"]
+                    and parts[3] == "compaction"):
+                return self._harness_compaction(con, path, put=True)
             if len(parts) == 5 and parts[1] == "flavors" and parts[3] == "skills":
                 ok, err = set_flavor_grant(
                     con, parts[2], int(parts[4]),
