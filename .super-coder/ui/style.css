@@ -1940,16 +1940,29 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .run-process { margin-top: 8px; font-size: 11px; }
 .run-process code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-log { white-space: pre-wrap; overflow-wrap: anywhere; }
-.conversion-status { margin-bottom: 16px; }
 .run-filters select { width: auto; flex: 1; min-width: 130px; }
 .shell-pane .run-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(220px, 1fr) auto; align-items: center; gap: 12px; }
-.shell-pane .conversion-status .run-row { display: block; }
-/* Harness cards: compaction summary line, Settings then Data (Feature 95). */
-.harness-card .cc { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 6px; }
-.cc-summary { background: none; border: 0; padding: 2px 0; color: var(--ink); cursor: pointer; text-align: left; font: inherit; }
-.cc-summary:focus-visible { box-shadow: var(--focus-ring); outline: none; }
-.cc-body { display: grid; gap: 12px; margin-top: 8px; }
-.cc-body h4 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); }
+/* Harness cards: one collapsible card per harness; the header carries the
+   name, provider and a one-line summary, the body its titled sections
+   (Background conversion, then Compaction settings and data; Feature 95). */
+.conversion-status { display: grid; gap: 8px; margin-bottom: 16px; }
+.conversion-status > h3 { margin: 0 0 2px; }
+.harness-card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); min-width: 0; }
+.hc-head { display: grid; grid-template-columns: 1.2em minmax(0, 1fr); column-gap: 6px; row-gap: 2px; width: 100%;
+  padding: 10px 12px; background: none; border: 0; border-radius: var(--r); color: var(--ink); cursor: pointer; text-align: left; font: inherit; }
+.hc-head:hover { background: var(--accent2); }
+.hc-head:focus-visible { box-shadow: var(--focus-ring); outline: none; }
+.hc-head > :not(.hc-chevron) { grid-column: 2; }
+.hc-chevron { grid-row: 1; color: var(--dim); }
+.hc-summary { font-size: 12px; }
+.hc-error { font-size: 12px; }
+.hc-body { padding: 0 12px 12px calc(12px + 1.2em + 6px); }
+.hc-section { border-top: 1px solid var(--line-soft); padding: 10px 0 2px; }
+.hc-section + .hc-section { margin-top: 10px; }
+.hc-section h4 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); }
+.hc-conversion > div + div { margin-top: 2px; }
+.hc-conversion .act { margin-top: 8px; }
+.cc-days .act[aria-pressed="true"] { border-color: var(--accent); color: var(--text-strong); }
 .cc-setting { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin: 6px 0; }
 .cc-name { font-weight: 600; }
 .cc-number { width: 9em; }

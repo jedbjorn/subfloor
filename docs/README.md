@@ -1655,14 +1655,17 @@ The landing tab has five sub-views. **Harness** and **Skills** are scoped to the
 selected shell; the other three are fork-wide, and the shell selector greys out on
 them.
 
-- **Harness** — opens on one card per shipped harness (its GUI
-  background-conversion status, with Claude's **Re-verify**), then the
-  selected shell's own sections. The cards are install-wide: they read the
-  same whichever shell is selected. The Claude, Codex, Kimi and OpenCode
-  cards also carry browser-chat **compaction**: collapsed, one line (auto
-  compaction on or off with its trigger, the idle wait, and this week's
-  compaction count); click it to expand **Settings** then **Data** (the
-  browser remembers which cards are open). Vibe's card has no compaction.
+- **Harness** — opens on **Harnesses**, one collapsible card per shipped
+  harness, then the selected shell's own sections. The cards are
+  install-wide: they read the same whichever shell is selected. Collapsed, a
+  card shows the harness, its provider and one summary line (its
+  background-conversion tier and, where it compacts, auto compaction on or
+  off with its trigger, the idle wait, and this week's compaction count).
+  Click the header to expand its sections (the browser remembers which
+  cards are open): **Background conversion** (the GUI conversion status,
+  with Claude's **Re-verify**), then, on the Claude, Codex, Kimi and
+  OpenCode cards, browser-chat **Compaction settings** and **Compaction
+  data**. Vibe's card has no compaction.
   - *Auto compaction* — a switch and a trigger in tokens; tooltip:
     "Compacts a chat when its context reaches the trigger size, checked after
     each turn."

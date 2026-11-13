@@ -638,6 +638,9 @@ function all(root, predicate, found = []) {
   return found;
 }
 const has = (cls) => (node) => (node.className || "").split(" ").includes(cls);
+const cardsOf = (host) => host.children.filter((node) => node.nodeType === 1 && has("harness-card")(node));
+const nameOf = (node) => all(node, has("hc-name"))[0]?.textContent;
+const cardIn = (host, harness) => cardsOf(host).find((node) => nameOf(node) === harness);
 const choices = (life) => [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55].filter((m) => m < life);
 const cardFor = (harness, overrides = {}) => {
   const life = { claude: 60, codex: 45, kimi: 30, opencode: 60 }[harness];
@@ -717,8 +720,8 @@ def render(body: str) -> dict:
 (async () => {
   const host = new FakeElement("section");
   await renderConversionStatus(host);
-  const rows = () => host.children.filter((node) => node.nodeType === 1 && has("run-row")(node));
-  const card = (harness) => rows().find((row) => row.children[0].textContent === harness);
+  const rows = () => cardsOf(host);
+  const card = (harness) => cardIn(host, harness);
   const out = {};
 """ + body + r"""
   console.log(JSON.stringify(out));
@@ -730,34 +733,46 @@ def render(body: str) -> dict:
 def test_cards_keep_the_heading_order_and_conversion_content_collapsed():
     out = render(r"""
   out.heading = host.children[0].tagName + ":" + host.children[0].textContent;
-  out.names = rows().map((row) => row.children[0].textContent);
-  out.vibe = card("vibe").textContent;
-  out.vibeCards = all(card("vibe"), has("cc")).length;
-  out.claude = card("claude").textContent;
-  out.collapsedBodies = all(host, has("cc-body")).length;
-  out.summaries = Object.fromEntries(["claude", "codex", "kimi", "opencode"].map(
-    (h) => [h, all(card(h), has("cc-summary"))[0].textContent]));
+  out.names = rows().map(nameOf);
+  out.collapsedBodies = all(host, has("hc-body")).length;
+  out.heads = Object.fromEntries(["claude", "codex", "kimi", "opencode", "vibe"].map(
+    (h) => [h, all(card(h), has("hc-head"))[0].textContent]));
+  out.summaries = Object.fromEntries(["claude", "codex", "kimi", "opencode", "vibe"].map(
+    (h) => [h, all(card(h), has("hc-summary"))[0].textContent]));
   out.labels = Object.fromEntries(["claude", "codex", "kimi", "opencode"].map(
     (h) => [h, all(card(h), has("cc-label"))[0].textContent]));
+  out.vibeLabels = all(card("vibe"), has("cc-label")).length;
+  for (const h of ["claude", "vibe"]) await all(card(h), has("hc-head"))[0].onclick();
+  await flush();
+  out.vibeSections = all(card("vibe"), (n) => n.tagName === "h4").map((n) => n.textContent);
+  out.vibe = all(card("vibe"), has("hc-body"))[0].textContent;
+  out.vibeSettings = all(card("vibe"), has("cc-setting")).length;
+  out.claude = all(card("claude"), has("hc-conversion"))[0].textContent;
   const verify = all(card("claude"), (n) => n.tagName === "button" && n.textContent === "Re-verify")[0];
   await verify.onclick();
   out.verified = requests.some((r) => r.method === "POST" && r.path === "/harnesses/claude/conversion/verify");
 """)
-    assert out["heading"] == "h3:GUI background conversion"
+    assert out["heading"] == "h3:Harnesses"
     assert out["names"] == ["claude", "codex", "kimi", "opencode", "vibe"]
-    # Vibe's card keeps exactly what it showed and gains nothing.
-    assert out["vibe"] == "vibeNo conversion hook; use sc job for durable GUI work."
-    assert out["vibeCards"] == 0
-    # Claude's conversion content and Re-verify are there without expanding.
+    # Every card starts collapsed to its header: name, provider, one summary.
+    assert out["collapsedBodies"] == 0
+    for harness, head in out["heads"].items():
+        assert head.startswith("▸" + harness), head
+    # Vibe's card holds conversion only.
+    assert out["vibeSections"] == ["Background conversion"]
+    assert out["vibe"] == "Background conversionNo conversion hook; use sc job for durable GUI work."
+    assert out["vibeSettings"] == 0
+    assert out["vibeLabels"] == 0
+    # Claude's conversion content and Re-verify sit in its first section.
     for text in ("2.1.322 · rewrite", "Background calls become durable jobs.",
                  "Verified: 2026-11-13", "Re-verify"):
         assert text in out["claude"]
     assert out["verified"] is True
-    assert out["collapsedBodies"] == 0
     assert out["summaries"]["claude"] == (
-        "▸ Auto compaction on at 250k · Idle compaction after 50 min · 3 compactions this week")
+        "Conversion rewrite · Auto compaction on at 250k · Idle compaction after 50 min · 3 compactions this week")
     assert out["summaries"]["opencode"] == (
-        "▸ Auto compaction off · Idle compaction off · 3 compactions this week")
+        "No conversion hook · Auto compaction off · Idle compaction off · 3 compactions this week")
+    assert out["summaries"]["vibe"] == "No conversion hook"
     assert out["labels"] == {
         "claude": "Claude (Anthropic)", "codex": "Codex (OpenAI)", "kimi": "Kimi (Moonshot)",
         "opencode": "One setting for every model provider behind OpenCode",
@@ -769,7 +784,7 @@ def test_cards_tooltips_are_exact_on_the_four_compacting_cards():
     out = render(r"""
   out.cards = {};
   for (const h of ["claude", "codex", "kimi", "opencode"]) {
-    await all(card(h), has("cc-summary"))[0].onclick();
+    await all(card(h), has("hc-head"))[0].onclick();
     const settings = all(card(h), has("cc-setting"));
     out.cards[h] = settings.map((setting) => {
       const info = all(setting, has("cc-info"))[0];
@@ -799,9 +814,9 @@ def test_cards_expand_to_settings_then_data_with_limited_dropdowns_and_sources()
     out = render(r"""
   out.cards = {};
   for (const h of ["claude", "codex", "kimi", "opencode"]) {
-    await all(card(h), has("cc-summary"))[0].onclick();
+    await all(card(h), has("hc-head"))[0].onclick();
     await flush();
-    const body = all(card(h), has("cc-body"))[0];
+    const body = all(card(h), has("hc-body"))[0];
     const wait = all(body, has("cc-wait"))[0];
     out.cards[h] = {
       sections: all(body, (n) => n.tagName === "h4").map((n) => n.textContent),
@@ -830,7 +845,8 @@ def test_cards_expand_to_settings_then_data_with_limited_dropdowns_and_sources()
     assert "cache life not measured" in cards["opencode"]["life"]
     assert "cache life not measured" not in cards["claude"]["life"]
     for harness, card in cards.items():
-        assert card["sections"] == ["Settings", "Data"], harness
+        assert card["sections"] == [
+            "Background conversion", "Compaction settings", "Compaction data"], harness
         assert card["note"], harness
         assert card["figures"][0] == "Chats, model requests"
     assert cards["claude"]["sources"][0] == "switch: default · trigger: environment"
@@ -851,9 +867,9 @@ def test_cards_expand_to_settings_then_data_with_limited_dropdowns_and_sources()
 @needs_node
 def test_cards_save_on_change_and_show_saved_or_the_refusal_inline():
     out = render(r"""
-  await all(card("codex"), has("cc-summary"))[0].onclick();
+  await all(card("codex"), has("hc-head"))[0].onclick();
   await flush();
-  let body = all(card("codex"), has("cc-body"))[0];
+  let body = all(card("codex"), has("hc-body"))[0];
   const dataCalls = () => requests.filter((r) => r.path.startsWith("/harnesses/codex/compaction-data")).length;
   out.dataCallsBefore = dataCalls();
   const trigger = all(body, has("cc-number"))[0];
@@ -862,12 +878,12 @@ def test_cards_save_on_change_and_show_saved_or_the_refusal_inline():
   const saving = trigger.onchange();
   // Before the reload answers, the repaint still shows the loaded figures.
   await new Promise((resolve) => setImmediate(resolve));
-  const during = all(card("codex"), has("cc-body"))[0];
+  const during = all(card("codex"), has("hc-body"))[0];
   out.duringSave = all(during, has("cc-data-body"))[0].textContent.includes("Loading") ? "loading"
     : all(during, (n) => n.tagName === "dd").length;
   dataGate.open(); dataGate = null;
   await saving;
-  body = all(card("codex"), has("cc-body"))[0];
+  body = all(card("codex"), has("hc-body"))[0];
   out.dataCallsAfter = dataCalls();
   out.figuresAfter = all(body, (n) => n.tagName === "dd").map((n) => n.textContent);
   out.loadingAfter = all(body, has("cc-data-body"))[0].textContent.includes("Loading");
@@ -875,13 +891,15 @@ def test_cards_save_on_change_and_show_saved_or_the_refusal_inline():
   out.put = requests.filter((r) => r.method === "PUT").map((r) => [r.path, r.body]);
   out.saved = all(body, has("cc-status")).map((n) => n.textContent).filter(Boolean);
   out.sources = all(body, has("cc-source"))[0].textContent;
-  out.summary = all(card("codex"), has("cc-summary"))[0].textContent;
+  out.summary = all(card("codex"), has("hc-head"))[0].textContent;
+  out.days = all(body, (n) => n.tagName === "button" && n.textContent.endsWith("days"))
+    .map((b) => [b.textContent, b.ariaPressed, b.className]);
   const wait = all(body, has("cc-wait"))[0];
   wait.value = "";
   await wait.onchange();
   out.waitPut = requests.filter((r) => r.method === "PUT").at(-1).body;
   refuse = "COMPACTION_SETTING_INVALID: trigger_tokens must be a whole number of at least 90,000";
-  body = all(card("codex"), has("cc-body"))[0];
+  body = all(card("codex"), has("hc-body"))[0];
   const low = all(body, has("cc-number"))[0];
   low.value = "89999";
   await low.onchange();
@@ -902,7 +920,12 @@ def test_cards_save_on_change_and_show_saved_or_the_refusal_inline():
     ]
     assert out["saved"] == ["Saved"]
     assert out["sources"] == "switch: default · trigger: saved"
-    assert out["summary"].startswith("▾ Auto compaction on at 180k")
+    assert out["summary"].startswith("▾codex")
+    assert "Auto compaction on at 180k" in out["summary"]
+    # The period switch marks its choice with aria-pressed, never .active-tab:
+    # that underline is absolutely positioned and spanned the whole page.
+    assert out["days"] == [["7 days", "true", "act"], ["30 days", "false", "act"]]
+    assert '.cc-days .act[aria-pressed="true"]' in STYLE
     assert out["waitPut"] == {"idle_after_minutes": None}
     assert out["refused"] == [
         "COMPACTION_SETTING_INVALID: trigger_tokens must be a whole number of at least 90,000"]
@@ -915,9 +938,9 @@ def test_cards_remember_expansion_switch_period_and_show_a_settings_failure_inli
   const again = new FakeElement("section");
   await renderConversionStatus(again);
   await flush();
-  const opencode = again.children.find((n) => n.nodeType === 1 && n.children[0]?.textContent === "opencode");
-  out.reopened = all(opencode, has("cc-body")).length;
-  out.closed = all(again.children.find((n) => n.nodeType === 1 && n.children[0]?.textContent === "claude"), has("cc-body")).length;
+  const opencode = cardIn(again, "opencode");
+  out.reopened = all(opencode, has("hc-body")).length;
+  out.closed = all(cardIn(again, "claude"), has("hc-body")).length;
   const thirty = all(opencode, (n) => n.tagName === "button" && n.textContent === "30 days")[0];
   await thirty.onclick();
   out.period = requests.filter((r) => r.path.includes("compaction-data")).at(-1).path;
@@ -925,17 +948,22 @@ def test_cards_remember_expansion_switch_period_and_show_a_settings_failure_inli
   settingsFail = "COMPACTION_BROKEN: settings table unreadable";
   const failed = new FakeElement("section");
   await renderConversionStatus(failed);
-  const claude = failed.children.find((n) => n.nodeType === 1 && n.children[0]?.textContent === "claude");
+  const claude = cardIn(failed, "claude");
+  out.failedHead = all(claude, has("hc-head"))[0].textContent;
+  await all(claude, has("hc-head"))[0].onclick();
   out.failedText = claude.textContent;
+  out.failedSections = all(claude, (n) => n.tagName === "h4").map((n) => n.textContent);
 """)
     assert out["reopened"] == 1
     assert out["closed"] == 0
     assert out["period"] == "/harnesses/opencode/compaction-data?days=30"
     assert out["figures"][0] == "2 chats · 6 model requests"
     assert "115k" in out["figures"]
-    # A failed settings call shows inside the card; conversion content stays.
-    assert "Compaction settings unavailable: COMPACTION_BROKEN" in out["failedText"]
+    # A failed settings call shows on the card's header, even collapsed;
+    # the conversion section still opens.
+    assert "Compaction settings unavailable: COMPACTION_BROKEN" in out["failedHead"]
     assert "Re-verify" in out["failedText"]
+    assert out["failedSections"] == ["Background conversion"]
 
 
 def test_no_tab_or_hash_route_is_added():
@@ -953,16 +981,16 @@ def test_cards_show_the_value_in_effect_when_raised_to_the_engine_floor():
     trigger_tokens: "environment", idle_after_minutes: "default", idle_min_tokens: "default" } };
   const again = new FakeElement("section");
   await renderConversionStatus(again);
-  const codex = again.children.find((n) => n.nodeType === 1 && n.children[0]?.textContent === "codex");
-  out.summary = all(codex, has("cc-summary"))[0].textContent;
-  await all(codex, has("cc-summary"))[0].onclick();
+  const codex = cardIn(again, "codex");
+  out.summary = all(codex, has("hc-summary"))[0].textContent;
+  await all(codex, has("hc-head"))[0].onclick();
   await flush();
-  const body = all(codex, has("cc-body"))[0];
+  const body = all(codex, has("hc-body"))[0];
   out.floor = all(body, has("cc-floor")).map((n) => n.textContent);
   out.mins = all(body, has("cc-number")).map((n) => n.min);
   out.claudeFloor = all(card("claude"), has("cc-floor")).length;
 """)
-    assert out["summary"].startswith("▸ Auto compaction on at 90k")
+    assert out["summary"].startswith("No conversion hook · Auto compaction on at 90k")
     assert out["floor"] == [
         "In effect: 90k, raised to the engine floor (the engine never compacts below 90k)"]
     assert out["mins"] == [90000, 90000]
