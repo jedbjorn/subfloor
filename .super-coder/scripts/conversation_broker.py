@@ -1186,8 +1186,10 @@ class BrokerStore:
                         message_id=None,
                         run_id=run_id,
                     )
+                # Any turn that ends, failed and unproven ones included,
+                # is checked; an operator's Stop (cancelled) is not.
                 if (
-                    outcome == "succeeded"
+                    outcome in ("succeeded", "failed", "unknown")
                     and not manual
                     and not close_after
                     and not already_closed

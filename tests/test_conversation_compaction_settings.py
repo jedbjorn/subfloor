@@ -69,6 +69,12 @@ from test_conversation_compaction import (
     request_usage,
 )
 from test_conversation_manual_compaction import (
+    HELPERS as MANUAL_HELPERS,
+)
+from test_conversation_manual_compaction import (
+    JS_PRELUDE as MANUAL_JS_PRELUDE,
+)
+from test_conversation_manual_compaction import (
     CompactingAdapter,
     ManualCompactBrokerTest,
 )
@@ -573,7 +579,12 @@ class ThresholdRecordedStreamTest(SettingsCase):
         self.addCleanup(vm.stop)
         self.store = BrokerStore(self.db_path)
 
-    def turn(self, harness: str, events: list[NormalizedEvent]) -> tuple[str, int]:
+    def turn(
+        self,
+        harness: str,
+        events: list[NormalizedEvent],
+        outcome: str = "succeeded",
+    ) -> tuple[str, int]:
         """One finished turn with ``events`` recorded on it."""
         conversation_id, _message_id, run_id = self.add_live_run(
             state="running", session_after="native-session",
@@ -589,8 +600,17 @@ class ThresholdRecordedStreamTest(SettingsCase):
         recorded = [event for event in events if event.type not in TERMINAL_EVENTS]
         if recorded:
             self.store.append_events(run_id, recorded)
+        terminal = {
+            "succeeded": "run.completed",
+            "failed": "run.failed",
+            "unknown": "run.unknown",
+            "cancelled": "run.interrupted",
+        }[outcome]
         self.assertTrue(
-            self.store.finish_run(run_id, "succeeded", event_type="run.completed")
+            self.store.finish_run(
+                run_id, outcome, event_type=terminal,
+                error_code=None if outcome == "succeeded" else "HARNESS_FAILED",
+            )
         )
         return conversation_id, run_id
 
@@ -723,6 +743,26 @@ class ThresholdRecordedStreamTest(SettingsCase):
             TURN_STARTED, codex_usage(input_tokens=215900, total=216150),
             TURN_COMPLETED,
         ]))
+        self.assertEqual(self.requests(conversation_id), [])
+
+    def failed_turn_gets_one(self, outcome: str) -> None:
+        self.save("codex", trigger_tokens=150000)
+        conversation_id, run_id = self.turn("codex", self.codex_events([
+            TURN_STARTED, codex_usage(input_tokens=215900, total=216150),
+        ]), outcome=outcome)
+        self.assert_one_threshold(conversation_id, run_id, 215900, 150000)
+
+    def test_a_failed_turn_above_the_trigger_gets_one_too(self) -> None:
+        self.failed_turn_gets_one("failed")
+
+    def test_an_unproven_turn_above_the_trigger_gets_one_too(self) -> None:
+        self.failed_turn_gets_one("unknown")
+
+    def test_none_after_an_operator_stop(self) -> None:
+        self.save("codex", trigger_tokens=150000)
+        conversation_id, _run_id = self.turn("codex", self.codex_events([
+            TURN_STARTED, codex_usage(input_tokens=215900, total=216150),
+        ]), outcome="cancelled")
         self.assertEqual(self.requests(conversation_id), [])
 
     def test_none_below_the_trigger(self) -> None:
@@ -1227,3 +1267,63 @@ def test_browser_words_each_cause_like_the_server() -> None:
         for payload, harness in payloads
     ]
     assert labels[2] == "Context compacted while idle · 141k → 29k summary"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_live_threshold_marker_streams_its_trigger_and_wording() -> None:
+    """The streaming path, event to transcript item: a threshold compaction
+    that left the chat above its trigger says so live, and the item carries
+    the trigger like the server's projection, without a reload."""
+    labels = APP[APP.index("  const activityLabel = (event) =>"):
+                 APP.index("  const reduceEvent = (event) =>")]
+    reducer = APP[APP.index("  const reduceEvent = (event) =>"):
+                  APP.index("  chatOpenStream(\n",
+                            APP.index("  const reduceEvent = (event) =>"))]
+    script = MANUAL_JS_PRELUDE + MANUAL_HELPERS + r"""
+const reconcileTranscript = () => {}, refresh = () => {};
+const paint = () => {}, scheduleTranscript = () => {};
+const clearImageAttachments = () => {};
+const chatTrackLiveTranscriptItem = (state, itemId) => state.order.push(itemId);
+const chatQueuedCount = () => 0;
+let stopRequest = null;
+const onWakeDelivered = null;
+const transcriptState = {lastSequence: 40, items: new Map(), order: [],
+  dirty: new Set(), assistantAnchors: new Map(), assistantSegments: new Map()};
+const messages = [];
+const conversation = {state: "idle", active_run_id: null,
+  route: {harness: "codex"}, shell: {shell_id: 1},
+  context: {context_tokens: 300000, context_window: 1000000},
+  compaction: {supported: true, available: true, pending: false,
+    message_id: null}};
+""" + labels + reducer + r"""
+let sequence = 40;
+const emit = (event_type, payload = {}, ids = {}) => reduceEvent({event_type,
+  sequence: ++sequence, payload, message_id: ids.message ?? null,
+  run_id: ids.run ?? null, created_at: "t"});
+emit("compaction.requested", {message_id: 9, initiated_by: "engine",
+  cause: "threshold", trigger_tokens: 250000}, {message: 9});
+emit("session.started", {}, {message: 9, run: 3});
+emit("run.started", {}, {message: 9, run: 3});
+emit("context.compacted", {trigger: "manual", cause: "threshold",
+  trigger_tokens: 250000, tokens_before: 300000, tokens_after: 260000,
+  request_message_id: 9});
+emit("run.completed", {}, {message: 9, run: 3});
+const items = transcriptState.order.map((id) => transcriptState.items.get(id));
+console.log(JSON.stringify(items.map((item) => ({
+  type: item.activity_type, label: item.label, compaction: item.compaction}))));
+"""
+    [marker] = run_js(script)
+    assert marker["type"] == "context.compacted"
+    assert marker["label"] == (
+        "Context compacted at the trigger · 300k → 260k · "
+        "still at or above the trigger"
+    )
+    assert marker["compaction"] == {
+        "trigger": "manual", "cause": "threshold", "tokens_before": 300000,
+        "tokens_after": 260000, "trigger_tokens": 250000,
+    }
+    # The same figures the server projects for a reloaded transcript.
+    assert conversation_routes._compaction_projection({
+        "trigger": "manual", "cause": "threshold", "trigger_tokens": 250000,
+        "tokens_before": 300000, "tokens_after": 260000,
+    }) == marker["compaction"]

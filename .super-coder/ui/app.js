@@ -8024,6 +8024,9 @@ async function chatRenderOpen(
             ? event.payload.cause : null,
           tokens_before: chatTokenCount(event.payload?.tokens_before),
           tokens_after: chatTokenCount(event.payload?.tokens_after),
+          // The trigger a threshold compaction was made at, as the server's
+          // projection carries it.
+          trigger_tokens: chatTokenCount(event.payload?.trigger_tokens),
         };
       transcriptState.items.set(itemId, activity);
       chatTrackLiveTranscriptItem(transcriptState, itemId);
