@@ -5349,6 +5349,45 @@ function chatWorkingIndicator() {
   return indicator;
 }
 
+// Live subagents and jobs of the open shell, as the rail's Jobs and Sub Agents
+// drawers last listed them. Between turns they are what the shell waits on.
+let chatRunWaits = { agents: 0, jobs: 0 };
+
+function chatWaitingLabel({ agents, jobs }) {
+  const part = (count, noun) =>
+    count ? `${count > 1 ? `${count} ` : ""}${noun}${count > 1 ? "s" : ""}` : "";
+  const parts = [part(agents, "agent"), part(jobs, "job")].filter(Boolean);
+  return parts.length ? `Waiting on ${parts.join(" and ")}` : "";
+}
+
+// The transcript's tail line: the animated <Working> while a turn runs; a
+// still grey "Waiting on …" between turns while the shell's subagents or jobs
+// are live, so an idle chat that will be woken does not read as stalled.
+function chatPaintTranscriptTail(transcript) {
+  const state = transcript.dataset.conversationState || "idle";
+  const label = state === "running" || state === "closed"
+    ? "" : chatWaitingLabel(chatRunWaits);
+  let working = transcript.querySelector(".chat-working-indicator");
+  if (state === "running" && !working)
+    transcript.append(chatWorkingIndicator());
+  else if (state !== "running" && working)
+    working.remove();
+  let waiting = transcript.querySelector(".chat-waiting-indicator");
+  if (!label) {
+    waiting?.remove();
+    return;
+  }
+  if (!waiting) {
+    waiting = el("div", {
+      className: "chat-waiting-indicator",
+      role: "status",
+      title: "No turn is running. The live runs are in the rail's Jobs and Sub Agents drawers.",
+    });
+    transcript.append(waiting);
+  }
+  waiting.textContent = label;
+}
+
 const CHAT_SHELL_STATE_CLASSES = [
   "active-chat", "state-idle", "state-queued", "state-running",
   "state-waiting", "state-error",
@@ -7304,8 +7343,9 @@ function chatFlushTranscript(
           .slice(index + 1)
           .map((nextId) => state.nodes.get(nextId))
           .find(Boolean);
-        const working = transcript.querySelector(".chat-working-indicator");
-        transcript.insertBefore(node, next || working || null);
+        const tail = transcript.querySelector(
+          ".chat-working-indicator, .chat-waiting-indicator");
+        transcript.insertBefore(node, next || tail || null);
       } else {
         chatUpdateTranscriptNode(node, item, retry, conversation);
       }
@@ -7314,11 +7354,8 @@ function chatFlushTranscript(
   }
   chatUpdateTranscriptHistoryControl(transcript, state, loadOlder);
   chatUpdateTranscriptWindowGap(transcript, state);
-  const working = transcript.querySelector(".chat-working-indicator");
-  if (conversation.state === "running" && !working)
-    transcript.append(chatWorkingIndicator());
-  else if (conversation.state !== "running" && working)
-    working.remove();
+  transcript.dataset.conversationState = conversation.state || "idle";
+  chatPaintTranscriptTail(transcript);
   transcript.scrollTop = followTail
     ? transcript.scrollHeight
     : anchor?.isConnected ? anchor.offsetTop - anchorOffset : previousTop;
@@ -8371,6 +8408,7 @@ async function renderInterface(root) {
   chatStopReview();
   chatModeController = null;
   chatNewChatAction = null;
+  chatRunWaits = { agents: 0, jobs: 0 };
   const generation = ++chatRenderGeneration;
   root.replaceChildren(
     el("div", { className: "chat-loading" }, "Loading conversations…"));
@@ -8539,6 +8577,16 @@ async function renderInterface(root) {
       const listed = await Promise.all(runDrawers.map((drawer) =>
         api(`/runs?shell_id=${shell.shell_id}&${drawer.filter}&limit=${LIST_LIMIT}`)));
       if (generation !== chatRenderGeneration) return;
+      const liveRuns = (index) => listed[index].runs
+        .filter((run) => RUN_LIVE.includes(run.state)).length;
+      chatRunWaits = { jobs: liveRuns(0), agents: liveRuns(1) };
+      const transcript = root.querySelector(".chat-pane .chat-transcript");
+      if (transcript) {
+        const atTail = transcript.scrollHeight - transcript.scrollTop
+          - transcript.clientHeight < 8;
+        chatPaintTranscriptTail(transcript);
+        if (atTail) transcript.scrollTop = transcript.scrollHeight;
+      }
       runDrawers.forEach((drawer, index) => {
         const { runs, total, limits } = listed[index];
         drawer.summary.textContent = `${drawer.label} (${countLabel(runs.length, total)})`;

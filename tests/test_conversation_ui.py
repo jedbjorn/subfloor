@@ -2503,13 +2503,66 @@ def test_working_state_is_plain_animated_transcript_text_not_a_header_pill():
     assert 'indicator.append("<Working>", chatWorkingDots())' in interface
     assert 'className: "chat-working-indicator"' in interface
     assert 'role: "status"' in interface
-    assert 'if (conversation.state === "running" && !working)' in transcript
-    assert "transcript.append(chatWorkingIndicator())" in transcript
+    tail = interface[interface.index("function chatPaintTranscriptTail"):
+                     interface.index("const CHAT_SHELL_STATE_CLASSES")]
+    assert 'transcript.dataset.conversationState = conversation.state || "idle"' in transcript
+    assert "chatPaintTranscriptTail(transcript)" in transcript
+    assert 'if (state === "running" && !working)' in tail
+    assert "transcript.append(chatWorkingIndicator())" in tail
     assert "chatStatePill(conversation.state)" not in transcript
     assert "header.append(title, queueState, actions)" in header
     assert "chatStatePill(conversation.state)" not in header
     assert "border" not in indicator_style
     assert "background" not in indicator_style
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_idle_chat_with_live_runs_shows_a_still_grey_waiting_line():
+    tail = APP[APP.index("let chatRunWaits"):
+               APP.index("const CHAT_SHELL_STATE_CLASSES")]
+    style = STYLE[STYLE.index(".chat-waiting-indicator {"):
+                  STYLE.index("}", STYLE.index(".chat-waiting-indicator {"))]
+    assert "color: var(--dim)" in style
+    assert "animation" not in style
+    script = r"""
+const el = (tag, props = {}) => ({ tag, ...props });
+const chatWorkingIndicator = () => ({ className: "chat-working-indicator" });
+const transcript = {
+  dataset: {}, kids: [],
+  append(node) { this.kids.push(node); },
+  querySelector(selector) {
+    return this.kids.find((node) => selector === `.${node.className}`) || null;
+  },
+};
+""" + tail + r"""
+const remove = (node) => { node.remove = () => {
+  transcript.kids = transcript.kids.filter((kid) => kid !== node); }; };
+const paint = (state, waits) => {
+  transcript.dataset.conversationState = state;
+  chatRunWaits = waits;
+  transcript.kids.forEach(remove);
+  chatPaintTranscriptTail(transcript);
+  return transcript.kids.map((node) => node.textContent || node.className);
+};
+console.log(JSON.stringify({
+  agent: paint("idle", {agents: 1, jobs: 0}),
+  job: paint("idle", {agents: 0, jobs: 1}),
+  both: paint("waiting", {agents: 2, jobs: 1}),
+  running: paint("running", {agents: 1, jobs: 1}),
+  backToIdle: paint("idle", {agents: 0, jobs: 3}),
+  nothingLive: paint("idle", {agents: 0, jobs: 0}),
+  closed: paint("closed", {agents: 1, jobs: 0}),
+}));
+"""
+    assert run_js(script) == {
+        "agent": ["Waiting on agent"],
+        "job": ["Waiting on job"],
+        "both": ["Waiting on 2 agents and job"],
+        "running": ["chat-working-indicator"],
+        "backToIdle": ["Waiting on 3 jobs"],
+        "nothingLive": [],
+        "closed": [],
+    }
 
 
 def test_shell_accent_colors_cover_idle_working_waiting_and_error_states():
