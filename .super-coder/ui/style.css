@@ -1944,7 +1944,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .run-filters select { width: auto; flex: 1; min-width: 130px; }
 .shell-pane .run-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(220px, 1fr) auto; align-items: center; gap: 12px; }
 .shell-pane .conversion-status .run-row { display: block; }
-/* Harness cards: compaction summary line, Settings then Data (spec #275). */
+/* Harness cards: compaction summary line, Settings then Data (Feature 95). */
 .harness-card .cc { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 6px; }
 .cc-summary { background: none; border: 0; padding: 2px 0; color: var(--ink); cursor: pointer; text-align: left; font: inherit; }
 .cc-summary:focus-visible { box-shadow: var(--focus-ring); outline: none; }
