@@ -440,38 +440,6 @@ def request_hash(cause: str) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _append_event(
-    con,
-    conversation_id: str,
-    event_type: str,
-    payload: Mapping[str, Any],
-    *,
-    message_id: int | None = None,
-) -> int:
-    import conversation_events
-
-    sequence = int(
-        con.execute(
-            "SELECT COALESCE(MAX(sequence),0)+1 FROM conversation_events "
-            "WHERE conversation_id=?",
-            (conversation_id,),
-        ).fetchone()[0]
-    )
-    con.execute(
-        "INSERT INTO conversation_events "
-        "(conversation_id,sequence,event_type,payload,message_id) "
-        "VALUES (?,?,?,?,?)",
-        (
-            conversation_id,
-            sequence,
-            conversation_events.require_event_type(event_type),
-            json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":")),
-            message_id,
-        ),
-    )
-    return sequence
-
-
 # One chat's state as the helper and the idle rule read it. Columns, in
 # order: harness, state, harness_session_ref, close_requested,
 # pending_compaction_message_id, active_run_id, outbox_pending.
@@ -603,12 +571,16 @@ def enqueue_compaction(
         payload["requested_by_user_id"] = int(user_id)
     for key, value in (extra_payload or {}).items():
         payload.setdefault(key, value)
-    _append_event(
+    # The broker's canonical event writer, as settle_cancelled_requests uses.
+    from conversation_broker import BrokerStore
+
+    BrokerStore._append_event(
         con,
-        conversation_id,
-        COMPACTION_REQUESTED,
-        payload,
+        conversation_id=conversation_id,
+        event_type=COMPACTION_REQUESTED,
+        payload=payload,
         message_id=message_id,
+        run_id=None,
     )
     return EnqueueResult(message_id=message_id, state="queued")
 

@@ -38,6 +38,7 @@ import conversation_reaper
 import conversation_routes
 import db_driver
 import snapshot
+import test_conversation_compaction
 from conversation_adapters import (
     ClaudeAdapter,
     CodexAdapter,
@@ -51,6 +52,7 @@ from conversation_adapters.base import (
 )
 from conversation_adapters.opencode import _OpenCodeProjection
 from conversation_broker import BrokerStore
+from test_conversation_api import ConversationApiCase
 from test_conversation_broker import ConversationBrokerCase
 from test_conversation_compaction import (
     CLAUDE_INIT,
@@ -457,6 +459,36 @@ class SettingsApplyNextTurnTest(DispatchCase):
             kimi = compaction_settings.resolve(con, "kimi")
         assert kimi is not None
         self.assertEqual(kimi.idle_after_minutes, 15)
+
+
+class MeterReadsTheSavedTriggerTest(ConversationApiCase):
+    """Spec #275 "Context meter": the chat's compact window is the saved
+    trigger in effect, read inside the projection's fixed read budget."""
+
+    transcript = test_conversation_compaction.TranscriptMarkerAndMeterTest.transcript
+
+    def test_meter_window_follows_the_saved_trigger(self) -> None:
+        events = (
+            ("assistant.delta", {"text": "answer"}),
+            ("usage", {"tokens": {"inputTokens": 84000}, "scope": "request",
+                       "context_tokens": 84000, "context_window": 258400}),
+        )
+        with mock.patch.dict(os.environ, CLEARED_ENV):
+            self.assertEqual(
+                self.transcript(events, number=901)["context"]["compact_window"],
+                250000,
+            )
+            with closing(db_driver.connect(self.db_path)) as con:
+                compaction_settings.save(con, "codex", {"trigger_tokens": 180000})
+            self.assertEqual(
+                self.transcript(events, number=902)["context"]["compact_window"],
+                180000,
+            )
+            with closing(db_driver.connect(self.db_path)) as con:
+                compaction_settings.save(con, "codex", {"auto_enabled": False})
+            self.assertIsNone(
+                self.transcript(events, number=903)["context"]["compact_window"]
+            )
 
 
 # ── AC5: pass-through keeps its rules ───────────────────────────────────────

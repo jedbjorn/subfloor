@@ -450,6 +450,18 @@ _REGISTRY_PROCESS_JOIN = (
     " ON reg.shell_id=c.shell_id AND reg.chat_id=c.conversation_id"
 )
 
+# The harness's saved compaction settings (spec #275), joined into the chat
+# row so the transcript projection's meter reads them without a read of its
+# own. NULL columns mean "not saved": the environment and defaults apply.
+_COMPACTION_SETTINGS_COLUMNS = "".join(
+    f"ccs.{column} AS compaction_{column},"
+    for column in compaction_settings.SAVED_COLUMNS
+)
+
+_COMPACTION_SETTINGS_JOIN = (
+    " LEFT JOIN chat_compaction_settings ccs ON ccs.harness=c.harness"
+)
+
 _CLOSE_REQUESTED_AFTER_REOPEN = (
     "requested.event_type='conversation.close.requested' "
     "AND requested.sequence>COALESCE("
@@ -487,9 +499,11 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
         " AND active.state IN ('leased','starting','running') "
         " ORDER BY active.run_id DESC LIMIT 1) AS active_run_id,"
         + _REGISTRY_PROCESS_COLUMNS
+        + _COMPACTION_SETTINGS_COLUMNS
         + _SPRINT_MANAGED_COLUMN
         + " FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
         + _REGISTRY_PROCESS_JOIN
+        + _COMPACTION_SETTINGS_JOIN
         + " WHERE c.conversation_id=? AND c.owner_user_id=? "
         f"AND c.harness IN ({_BROWSER_HARNESS_SQL})",
         (conversation_id, owner_user_id, *_BROWSER_HARNESSES),
@@ -3214,8 +3228,15 @@ def _transcript_projection(
             # the harness has no settings, or the model's reported window is
             # smaller. It is where the engine compacts, so Kimi and OpenCode
             # show a percentage too when a trigger is in effect for them.
-            applied = compaction_settings.effective_trigger(
-                con, conversation["harness"]
+            settings = compaction_settings.from_saved(
+                conversation["harness"],
+                tuple(
+                    conversation[f"compaction_{column}"]
+                    for column in compaction_settings.SAVED_COLUMNS
+                ),
+            )
+            applied = (
+                settings.effective_trigger if settings is not None else None
             )
             if (
                 applied is not None

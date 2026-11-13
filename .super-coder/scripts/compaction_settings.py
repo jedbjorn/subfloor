@@ -208,8 +208,7 @@ def _environment_trigger(
 def _saved_row(con, harness: str):
     try:
         return con.execute(
-            f"SELECT auto_enabled,trigger_tokens,idle_after_minutes,"
-            f"idle_min_tokens,updated_at FROM {TABLE} WHERE harness=?",
+            f"SELECT {','.join(SAVED_COLUMNS)} FROM {TABLE} WHERE harness=?",
             (harness,),
         ).fetchone()
     except sqlite3.OperationalError as exc:
@@ -234,6 +233,33 @@ def resolve(
     if harness not in DEFAULTS:
         return None
     row = _saved_row(con, harness) if con is not None else None
+    return from_saved(harness, row, env)
+
+
+# The saved columns, in the order ``from_saved`` reads them. A caller that
+# already joins the table (the transcript projection, whose read budget is
+# fixed) selects these and passes the row instead of reading it again.
+SAVED_COLUMNS = (
+    "auto_enabled",
+    "trigger_tokens",
+    "idle_after_minutes",
+    "idle_min_tokens",
+    "updated_at",
+)
+
+
+def from_saved(
+    harness: str,
+    row: Any,
+    env: Mapping[str, str] | None = None,
+) -> HarnessCompactionSettings | None:
+    """``resolve`` over a saved row the caller already read (``SAVED_COLUMNS``
+    in order), or None for no saved row."""
+    if harness not in DEFAULTS:
+        return None
+    if row is not None and row[1] is None:
+        # A LEFT JOIN with no saved row for this harness.
+        row = None
     if row is not None:
         return HarnessCompactionSettings(
             harness=harness,
