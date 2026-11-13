@@ -272,24 +272,30 @@ class BrokerStore:
         seen twice when a turn is recovered: once on the pipe before the
         restart and again when the transcript is replayed from the turn's
         start. The second reading is dropped so the chat shows one marker.
+        A compaction request's cost that names its record (Kimi's
+        ``usage_ref``) is kept once in the same way.
         """
-        if event.type != "context.compacted":
+        key = {
+            "context.compacted": "compaction_ref",
+            "usage": "usage_ref",
+        }.get(event.type)
+        if key is None:
             return False
-        ref = event.payload.get("compaction_ref")
+        ref = event.payload.get(key)
         if not isinstance(ref, str) or not ref:
             return False
         rows = con.execute(
             "SELECT payload FROM conversation_events "
-            "WHERE conversation_id=? AND event_type='context.compacted' "
+            "WHERE conversation_id=? AND event_type=? "
             "ORDER BY sequence DESC LIMIT 50",
-            (conversation_id,),
+            (conversation_id, event.type),
         ).fetchall()
         for row in rows:
             try:
                 recorded = json.loads(row["payload"])
             except (TypeError, ValueError):
                 continue
-            if isinstance(recorded, dict) and recorded.get("compaction_ref") == ref:
+            if isinstance(recorded, dict) and recorded.get(key) == ref:
                 return True
         return False
 

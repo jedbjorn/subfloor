@@ -152,31 +152,57 @@ normalized events from print mode, resumes with `-S`, and interrupts with
 uses native stored evidence. The manifest does not advertise interactive
 permission responses. See `scripts/conversation_adapters/kimi.py` in the engine.
 
-### Compaction: not mapped (Feature #95, spec #272)
+### Context meter, compaction and the compact trigger (Feature #95, spec #275)
 
-Kimi emits no `context.compacted`, shows no marker, and feeds no context
-meter; its per-reply token label is unchanged. Recorded on `2.5.3`,
-2026-11-12, from the installed binary and this host's session store, with no
-session run:
+Checked on Kimi Code `2.5.3` with `kimi-code/k3.1-pro`, 2026-11-13, live on
+the delivery host. The adapter reads the main wire (`agents/main/wire.jsonl`)
+after the run ends, as it always has:
 
-- The binary names `compaction.started` / `compaction.completed`, and the
-  main wire (`agents/main/wire.jsonl`, the file this adapter already reads)
-  has its own records: `full_compaction.begin` (`source`),
-  `context.apply_compaction` (`tokensBefore`, `tokensAfter`) and
-  `full_compaction.complete`.
-- Across 648 stored wires there is exactly one compaction, and its `source`
-  is `manual`: an interactive `/compact` between turns. Nothing shows that a
-  `kimi -p` run compacts on its own, or what `source` an automatic one writes.
+- **Meter.** Each `usage.record` with `usageScope: turn` is one model request
+  of the chat and becomes one `usage` event with scope `request`:
+  `context_tokens` = `inputOther` + `inputCacheRead` + `inputCacheCreation`,
+  `context_window` = the model's `max_context_size` read (never written) from
+  the `config.toml` beside the session store, left out when unreadable.
+  Kimi events are ingested after the run, so `created_at` is ingest time;
+  each reading carries **`requested_at`, the record's own `time` in epoch
+  milliseconds (UTC, integer)**, for gap and cache figures. `usageScope:
+  session` records (a compaction's own request among them) give no reading.
+  The whole-turn total is kept as before, now labelled scope `turn` with no
+  `context_tokens`.
+- **Compaction event.** `context.apply_compaction` becomes `context.compacted`
+  with `tokens_before` / `tokens_after`; the trigger is the `source` of the
+  preceding `full_compaction.begin` (`manual`, `auto`, otherwise `unknown`)
+  and `compaction_ref` is `<session>@<time>`, so a replayed slice is not
+  recorded twice. `summary` and `contextSummary` are never read into an event.
+- **Trigger (the spec's gate).** `/compact` as the prompt of a resumed
+  `kimi -S <id> -p` run does **not** compact: it reaches the model as plain
+  text. `/compact` as ACP `session/prompt` (`kimi acp`, after `initialize`
+  and `session/load`) does: it answers `end_turn` at once and compacts in
+  the background, writing `full_compaction.begin` (`source: manual`),
+  `context.apply_compaction` and `full_compaction.complete`. The connection
+  must stay open until then; closing it cancels the compaction
+  (`full_compaction.cancel`). The first `session/load` of a session appends a
+  project-context injection just after it answers, and a compaction begun
+  before that lands is cancelled, so the adapter waits for the wire to go
+  quiet before it sends `/compact`. The manifest's `conversation.compact`
+  block records the mechanism; `manual_compaction` is true.
+- **Run identity.** A compaction run writes no `turn.prompt` and no `end_turn`
+  step, so it is found by the `full_compaction.begin` it appends after the
+  wire boundary taken just before `/compact` is sent (anything the load
+  wrote, a compaction of Kimi's own included, is never claimed; run ref
+  `kimi-<time>-<offset>`, like a turn's) and ends on `full_compaction.complete`
+  (`run.completed`, with the marker and the request's own usage under scope
+  `compaction`) or `full_compaction.cancel` (`run.failed`,
+  `HARNESS_COMPACT_REFUSED`). No end within 15 minutes ends the run with no
+  marker, which the chat shows as not reported. A recovered compaction run
+  reconciles from the same records and records the marker and the cost the
+  live stream did not; the cost names its record (`usage_ref`), so the store
+  keeps one copy of each.
 
-So the store format can carry a compaction with real figures, but the mode the
-engine uses has not been seen to produce one. Mapping it is left to the
-verification task (spec #272 criterion 12). Kimi gets no compact-window
-setting in this delivery: its control is a ratio of the window, not a token
-count.
-
-Kimi has no compact button either. Its `/compact` is an interactive command
-and no headless trigger has been confirmed, so the adapter declares none
-(`manual_compaction` is false) and the chat hides the button.
+Kimi takes no token-count trigger at launch (`compactionTriggerRatio` is a
+ratio of the window in the user's own `config.toml`, which the engine never
+edits), so `compact_window_native` is false: the engine compacts Kimi chats
+between turns when the meter reaches the harness's trigger, and while idle.
 
 ## Subagent keys (`headless.agent`, Feature #96, spec #273)
 

@@ -259,7 +259,9 @@ button sits at the bottom left of the composer, beside the meter.
   it. Instead of sending text it calls the adapter's `compact()`: Claude, a
   resumed headless run whose prompt is `/compact`; Codex,
   `thread/compact/start` on the resumed thread; OpenCode,
-  `POST /session/{id}/summarize`. Kimi has no confirmed trigger and no button.
+  `POST /session/{id}/summarize`; Kimi, `/compact` as ACP `session/prompt`
+  on the stored session (`kimi acp`; spec #275's gate, see
+  `.super-coder/adapters/kimi/README.md`).
 - **What is recorded.** `compaction.requested` (engine-initiated, with the
   requesting user) when the button is pressed. No operator message is
   created, and the transcript, which lists prompts only, never shows the
