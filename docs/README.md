@@ -789,24 +789,20 @@ Sprint skills and `sc sprint --help`.
 ### Pull-request wakes
 
 Nobody polls GitHub. The API server runs a watcher process that pulses every few
-seconds and turns real PR state changes into durable wakes for the **Developer
-that owns the PR**. You start nothing, and neither does a shell.
+seconds and turns real PR state changes into durable wakes for the **shell
+that opened the PR**. You start nothing, and neither does a shell.
 
-A subscription reaches the watcher three ways:
+A subscription reaches the watcher two ways:
 
-- **Discovery** — the normal path. The engine reads which branch each
-  `.sc-worktrees/<shortname>` has checked out and subscribes that Developer to
-  the newest open PR whose head is that branch. Disposable `shell/*` bases are
-  never candidates.
+- **Discovery** — the normal path. The engine attributes every PR to the shell
+  named by the `Co-Authored-By: … <SHORTNAME@subfloor.local>` trailer on its
+  head commit and subscribes that shell, whatever it has checked out since. A
+  PR opened and merged between two passes is still caught.
 - **`sc sprint register-pr`** — inside a lane, adding the work-unit link on top
   of the same subscription (and attaching to one discovery already made).
-- **`sc pr subscribe --repository <owner/name> --pr <number>`** — the manual
-  fallback for a PR whose head is not the worktree's checked-out branch. That is
-  the verb's only form.
 
-Ownership is taken from the caller's identity, not a flag, and must be a
-Developer shell; one subscription exists per PR, and a second shell claiming it
-is refused. Four states wake the owner — **red**, **green**, **closed**,
+There is no manual subscribe verb. One subscription exists per PR, and a second
+shell claiming it is refused. Four states wake the owner — **red**, **green**, **closed**,
 **merged** — each carrying the repository, number, head SHA and an instruction.
 A state that has not changed (same state, same head SHA) produces no repeat
 wake.

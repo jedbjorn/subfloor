@@ -1297,7 +1297,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|engine-ops|engine-ops-up|engine-ops-down|engine-ops-port|engine-ops-pin|auth|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|engine-ops|engine-ops-up|engine-ops-down|engine-ops-port|engine-ops-pin|auth|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1399,7 +1399,6 @@ case "$cmd" in
   # --file, --command-file) read them from the invocation cwd; they are
   # otherwise clients of the live instance.
   mem)          sc_project_env; exec "$PY" "$S/mem.py" "$@" ;;
-  pr)           exec "$PY" "$S/pr_cli.py" "$@" ;;
   sprint)       sc_python_probe; sc_project_env; exec "$PY" "$S/sprint_cli.py" "$@" ;;
   # Retired (Feature #94). It printed an Admin shell token as a "browser
   # sign-in token" for a paste-a-token flow that no longer exists; the GUI
@@ -2050,7 +2049,7 @@ Subfloor — forkable shell substrate for one repository
   Install & upkeep      install · init · doctor · ensure-harness · update-harnesses · harness-status
                         harness-cleanup · docker-cache-gc · rollback · runtime · feature · sandbox-memory
                         persist · alias · make-cleanup · actions-artifacts · remove · eject
-  Memory & catalogue    mem · context · skill · search · models · job · pr · sprint · token · analytics
+  Memory & catalogue    mem · context · skill · search · models · job · sprint · token · analytics
                         map · map-setup · map-sql · map-schema · map-extractor
   Engine (Admin)        rebuild · migrate · migration · snapshot · render · render-check · verify
                         seed-skills · engine-ref · artifact-mode · clean-db
@@ -2108,8 +2107,6 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              already wired to this launched shell, identity resolved by the engine — no DB path, no direct-DB fallback. `./sc mem which` to orient
                              reads are `mem get <surface> [<id>]`; every write takes --json (one object, ids included) and
                              text bodies take --body-file PATH|- ; `./sc mem --help` carries the exit-status table
-  ./sc pr subscribe --repository <owner/name> --pr <number>
-                           subscribe the authenticated Developer shell to engine-wide PR event wakes
   ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)
                              caller identity is resolved by the engine; report and review bodies use files, and mutating retries carry stable keys where required
   ./sc browser <verb>      setup/status/open/up/down/doctor/arm/disarm — opt-in Chromium profile driving

@@ -516,7 +516,6 @@ class LaneRig:
             self.con,
             repo_root=ROOT,
             reader_factory=lambda _repository: self.github,
-            worktree_branches=dict,
         ).poll_once()
 
     # -- observations -------------------------------------------------------

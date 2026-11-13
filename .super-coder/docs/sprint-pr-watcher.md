@@ -8,8 +8,8 @@ numbers and shortnames below are illustrative. Exact CLI syntax remains in
 
 
 The engine's GitHub observation service. It reads pull requests the fork's
-Developer shells own, turns each state change into a durable transition, and
-delivers the fact to the owning Developer as a message and a wake — inside a
+shells own, turns each state change into a durable transition, and
+delivers the fact to the owning shell as a message and a wake — inside a
 Sprint or outside one. **Headless shells never poll GitHub**; this is why. A
 terminal seat receives wakes only at its next boot, so there a shell sets up
 its own bounded monitors for what it is waiting on.
@@ -20,17 +20,23 @@ directive, or `sc sprint authorize-merge` inside an armed Sprint.
 
 ## What is watched
 
-A subscription is `(repository, pr_number)` owned by exactly one **Developer**
-shell — the store refuses any other flavor, and refuses an identity reused with
-different ownership. Subscriptions arrive two ways:
+A subscription is `(repository, pr_number)` owned by exactly one live shell,
+of any flavor — the store refuses a deleted shell and an identity reused with
+different ownership. A shell that opens a PR is always subscribed to it; there
+is no manual verb.
 
-- **explicitly** — `./sc pr subscribe --repository owner/name --pr 123`
-  (`POST /_sc/pr/subscribe`), which registers and takes an immediate first
-  observation;
-- **by discovery** — the watcher lists this repo's managed worktrees
-  (`.sc-worktrees/<shortname>`, attached and non-detached only) and subscribes
-  the Developer of any worktree whose checked-out branch heads an unsubscribed
-  PR, through the same receipt path. A shell never has to remember to subscribe.
+**Discovery** lists this repo's PRs (`gh pr list --state all`) and attributes
+each unsubscribed one to the shell named by the first
+`Co-Authored-By: <name> <SHORTNAME@subfloor.local>` trailer on its head commit —
+the trailer the `prepare-commit-msg` hook writes on every shell commit. What the
+shell has checked out afterwards does not matter. An open PR is always eligible.
+A merged or closed PR is eligible only above the repository's high-water mark
+(`pr_discovery_watermarks`, advanced every pass), so a PR opened and merged
+between two passes, or while the engine was down, still wakes its owner, while
+the first pass on an upgraded install never replays historic merges. A head
+commit not yet in the local object store is retried on the next pass; a PR with
+no shell trailer (an operator's own) is never subscribed. Each new subscription
+takes an immediate first observation.
 
 A Sprint's registered PRs are the same subscriptions with
 `sprint_registered_pr_id` linked, which adds Sprint events, work-unit resolution
@@ -41,7 +47,7 @@ and the review loop on top.
 | Interval | Value | Source |
 |---|---|---|
 | pulse | 5 s, and immediately on `notify_commit()` | `PULSE_SECONDS` |
-| discovery | at most every 60 s, forced on startup, skipped entirely when no feature branch is uncovered | `DISCOVERY_SECONDS` |
+| discovery | at most every 60 s, forced on startup, and run even when that pulse's polling failed | `DISCOVERY_SECONDS` |
 | heartbeat history | one bounded row per 60 s of scanning | `HEARTBEAT_HISTORY_SECONDS` |
 | GitHub call timeout | 20 s per `gh` read | `GITHUB_TIMEOUT_SECONDS` |
 | failure backoff | `min(300, 5 × 2^failures)` seconds, at least 60 s when the error mentions a rate limit | `MAX_BACKOFF_SECONDS`, `RATE_BACKOFF_SECONDS` |
@@ -83,7 +89,7 @@ chained `transition_key` (a hash over subscription, parent key, state and head),
 a row in `pr_subscription_transitions`, a mirrored `sprint_pr_transitions` row
 when the PR is registered, and a `pr.transition` Sprint event.
 
-Four states message the **owning Developer shell** — and only that shell —
+Four states message the **owning shell** — and only that shell —
 as a `notification` with `declared_type: "re-enter"` and an idempotency key of
 `pr-transition:<transition_key>:shell:<id>`, so a redelivery is a no-op:
 
@@ -166,7 +172,6 @@ subscription nudges it through `notify_commit()`.
 
 ```
 ./sc sprint watcher-state --sprint <id>    bounded durable evidence (JSON)
-./sc pr subscribe --repository owner/name --pr <n>
 ./sc logs                                  server.log, UTC-stamped
 ```
 
@@ -188,16 +193,18 @@ rate limit shows up in words. In `server.log`, look for
 **A PR event that never arrived**: confirm the subscription exists and is not
 already `merged`/`closed`; read `watcher-state` for a `stale` status or a
 poll-failure streak on it; confirm the fact is one of the four that message (a
-`pending` rollup is not); confirm the owner is the Developer you expect, since
-the message goes to the subscription owner and nobody else.
+`pending` rollup is not); confirm the owner is the shell you expect, since
+the message goes to the subscription owner and nobody else. No subscription at
+all: read the head commit's trailers (`git log -1 --format=%B <head>`) — no
+`@subfloor.local` trailer means the hook did not run for that commit.
 
 ## Limits
 
-- **Developer-owned only**, and there is **no unsubscribe verb**: `./sc pr`
-  offers `subscribe` alone, and a subscription leaves the scan by reaching
-  `merged` or `closed`.
-- **Discovery needs a managed worktree.** A branch checked out anywhere but
-  `.sc-worktrees/<shortname>`, or a detached worktree, is invisible to it.
+- **No subscribe or unsubscribe verb**: a subscription leaves the scan by
+  reaching `merged` or `closed`.
+- **Attribution needs the trailer.** A head commit made without the shell's
+  `SC_SHELL_*` environment (so without the hook's trailer), or one only on
+  another machine, is never attributed.
 - **`gh` is the whole transport.** No webhooks, no GitHub App: losing the host's
   `gh` authentication turns every subscription into a poll-failure streak rather
   than an error anyone is told about directly.

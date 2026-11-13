@@ -140,8 +140,9 @@ session the FnB types into is a terminal seat; a chat the engine opened is a
 headless one.
 
 Accepting Sprint work is an explicit act (the `sprint_protocol` skill). PR
-events (red, green, closed, merged) are sent to the Developer who owns the PR,
-inside or outside a Sprint, with the fact stated in the message.
+events (red, green, closed, merged) are sent to the shell that opened the PR —
+always, automatically, with nothing to subscribe — inside or outside a Sprint,
+with the fact stated in the message.
 
 Watching follows the same split. On a headless seat the engine's wakes are the
 watcher: never loop on `gh` in your own turn or schedule watchers of your own.
