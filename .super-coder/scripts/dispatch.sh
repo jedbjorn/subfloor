@@ -1639,6 +1639,9 @@ case "$cmd" in
       shift
     done
     sc_harness_cleanup
+    # Land the engine pin on the fork's default branch (decision #459): warns,
+    # never blocks. Host restart re-enters here through `"$0" launch`.
+    "$PY" "$S/fork_repin.py" sync || true
     if sc_host_runtime; then
       [ -z "$no_build" ] || echo "→ runtime host: --no-build is implied (there is no image)"
       sc_host_server_up || exit 1
@@ -1944,6 +1947,7 @@ case "$cmd" in
       sc_restart_health_summary "$launch_rc"
       exit $?
     fi
+    "$PY" "$S/fork_repin.py" sync || true
     dcheck
     if [ -n "$no_build" ]; then
       dimage_preflight
