@@ -1393,8 +1393,6 @@ a { color: var(--accent); }
 .shell-pane.skill-assignments { gap: 5px; }
 .viewer-head { display: flex; align-items: center; gap: .9rem; padding: 0 .2rem; margin-top: .2rem; }
 .vpanel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); }
-.viewer-panel { padding: 1rem 1.1rem; min-height: 12rem; }
-.desc-line { font-size: .8rem; margin-bottom: .8rem; line-height: 1.6; }
 .mono { font-family: ui-monospace, "Cascadia Mono", "Menlo", monospace; font-size: 12px; }
 
 /* accordions — grouped prompt/identity sections inside one panel */
@@ -1523,17 +1521,13 @@ a { color: var(--accent); }
 /* fit variant — popover takes exactly the trigger's width */
 .gmenu.gmenu-fit { width: 100%; min-width: 0; }
 .gmenu-fit .gmenu-row > .gmenu-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.gmenu-row, .gmenu-item { display: flex; align-items: center; width: 100%; white-space: nowrap; }
+.gmenu-row { display: flex; align-items: center; width: 100%; white-space: nowrap; }
 .gmenu-row {
   background: none; border: none; cursor: pointer; text-align: left; gap: .6rem;
   padding: .45rem .95rem; color: var(--text-hi); font: inherit; font-size: .85rem;
 }
-.gmenu-row:hover, .gmenu-item:hover { background: var(--tint-1); }
-.gmenu-item { padding: 0 .35rem; }
+.gmenu-row:hover { background: var(--tint-1); }
 .gmenu-name { flex: 1; text-align: left; background: none; border: none; color: var(--text-hi); cursor: pointer; padding: .45rem .4rem; font: inherit; }
-button.gmenu-name:hover { color: var(--text-strong); }
-.gmenu-check { background: none; border: none; color: var(--text-mid); cursor: pointer; padding: .3rem .4rem; font-size: .9rem; line-height: 1; }
-.gmenu-check:hover { color: var(--text-strong); }
 .gmenu-cap { color: var(--text-low); font-size: 10px; padding: 0 .7rem 0 .4rem; flex: none; }
 .active-row {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
@@ -1668,13 +1662,7 @@ button.act.primary.danger { background: var(--danger-strong); border-color: var(
 .md td:first-child, .md th:first-child { white-space: nowrap; }
 .md tbody tr { border-bottom: 1px solid var(--line-soft); }
 
-/* raw-markdown toggle + raw view */
-.rawtoggle {
-  margin-left: auto; background: none; border: none; cursor: pointer;
-  color: var(--text-low); font: 11px ui-monospace, monospace;
-  text-transform: uppercase; letter-spacing: .1em; padding: .2rem .4rem;
-}
-.rawtoggle:hover { color: var(--text-strong); }
+/* raw markdown view */
 .raw-pre {
   white-space: pre-wrap; overflow-wrap: break-word; margin: 0;
   font: 12px/1.55 ui-monospace, monospace; color: var(--text-hi);
@@ -1686,8 +1674,8 @@ button.act.primary.danger { background: var(--danger-strong); border-color: var(
 .flagbar .act { margin-top: 0; }
 
 /* ── Polish: motion + depth ──────────────────────────────────────────────── */
-nav button, button.act, .chip, #snapshot, .gdrop-btn, .gmenu-row, .gmenu-name,
-.gmenu-check, .vtabs button, .pencil { transition: background .12s, border-color .12s, color .12s; }
+nav button, button.act, .chip, #snapshot, .gdrop-btn, .gmenu-row,
+.vtabs button, .pencil { transition: background .12s, border-color .12s, color .12s; }
 .card { transition: border-color .12s; }
 textarea, input[type=text], select { transition: border-color .12s, outline-color .12s; }
 .bar-fill { transition: width .3s ease; }

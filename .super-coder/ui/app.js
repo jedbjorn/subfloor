@@ -360,7 +360,7 @@ function toast(msg) {
 function setStatus(s) { $("#status").textContent = s; }
 
 // ── Skill sections ──────────────────────────────────────────────────────────
-// One grouping rule for the Shells skill viewer AND Skill Assignments. "Repo
+// Grouping rule for Skill Assignments. "Repo
 // skills" are fork-local (origin='repo', derived server-side from the snapshot
 // rule: name not under engine assets/skills) and always lead; engine skills
 // section by their category.
@@ -386,15 +386,13 @@ function groupSkills(skills, { alwaysRepo = false } = {}) {
 // ── Shells ──────────────────────────────────────────────────────────────────
 // dos-arch-style viewer (ported from dos-arch shell_core/ui /shells): sticky
 // identity sub-header (pill shell picker + role/mandate), then Harness |
-// Skills | Skill Assignments | Default Models sub-tabs. Flat panels,
+// Skill Assignments | Default Models | Runs sub-tabs. Flat panels,
 // accordions, popover pickers, and a unified edit modal.
 let selectedShell = null;
-let shellTab = "harness";     // 'harness' | 'skills' | 'assignments' | 'models'
-let activeSkillId = null;     // skill-viewer selection; reset on shell switch
+let shellTab = "harness";     // 'harness' | 'assignments' | 'models' | 'runs'
 let shellRenderEpoch = 0;     // discard stale async renders after re-navigation
 const SHELL_TAB_HASH = {
   harness: "shells",
-  skills: "shells-skills",
   assignments: "shells-skill-assignments",
   models: "shells-default-models",
   runs: "shells-runs",
@@ -691,7 +689,7 @@ function openNewShellModal(templates, root) {
         flavor: fl.value || null,
         name: nm.value.trim(),
       });
-      selectedShell = r.shell_id; activeSkillId = null;
+      selectedShell = r.shell_id;
       close(); setStatus(`shell created — ${r.shortname}`); renderShells(root);
     } catch (e) { toast("error: " + e.message); create.disabled = false; create.textContent = "Create"; }
   };
@@ -1357,7 +1355,7 @@ async function renderShells(root) {
       caption: x.shortname ? "/" + x.shortname : (x.flavor || ""),
     })),
     value: selectedShell,
-    onChange: (v) => { selectedShell = Number(v); activeSkillId = null; renderShells(root); },
+    onChange: (v) => { selectedShell = Number(v); renderShells(root); },
   }));
   if (s.role) idy.append(el("div", { className: "kv" }, microlabel("Role"), el("span", {}, s.role)));
   if (s.mandate) idy.append(el("div", { className: "kv" }, microlabel("Mandate"), el("span", {}, s.mandate)));
@@ -1395,12 +1393,12 @@ async function renderShells(root) {
     sub.classList.add("subbar-inert");
   root.append(sub);
 
-  // Harness / Skills are scoped to the selected shell. Skill Assignments and
+  // Harness is scoped to the selected shell. Skill Assignments and
   // Default Models are fork-global views nested here to keep shell setup in
   // one place. Hash navigation gives every section a reload-safe URL.
   const tabs = el("div", { className: "vtabs" });
   let runsBadge;
-  for (const [key, label] of [["harness", "Harness"], ["skills", "Skills"],
+  for (const [key, label] of [["harness", "Harness"],
                               ["assignments", "Skill Assignments"],
                               ["models", "Default Models"], ["runs", "Runs"]]) {
     const b = el("button", { className: shellTab === key ? "active-tab" : "", type: "button", textContent: label });
@@ -1420,8 +1418,7 @@ async function renderShells(root) {
   if (shellTab === "runs") renderRunsFleet(pane, shells, runsBadge);
   else if (shellTab === "harness") renderHarness(pane, s);
   else if (shellTab === "models") renderDefaultModels(pane, s);
-  else if (shellTab === "assignments") renderSkillAssignments(pane);
-  else renderSkillViewer(pane, s);
+  else renderSkillAssignments(pane);
 }
 
 // Default Models — the flavor_defaults launch matrix: per flavor, a model per
@@ -2045,80 +2042,6 @@ function accordion(sec, s) {
   body.append(sec.node || (sec.text ? mdBlock(sec.text) : el("div", { className: "acc-text" }, "—")));
   d.append(body);
   return d;
-}
-
-// Skill Viewer — popover picker with inline grant toggles (☑/☐ — toggling
-// does not change the selection), then the selected skill's full content in a
-// panel with a char/token readout. Content lazy-loads per selection.
-function renderSkillViewer(root, s) {
-  const skills = s.skills;
-  if (!skills.length) { root.append(el("div", { className: "muted" }, "No skills in the catalogue.")); return; }
-  if (activeSkillId == null || !skills.find((k) => k.skill_id === activeSkillId))
-    activeSkillId = (skills.find((k) => k.granted) || skills[0]).skill_id;
-  const active = skills.find((k) => k.skill_id === activeSkillId);
-
-  const wrap = el("div", { className: "gdrop" });
-  const btn = el("button", { className: "gdrop-btn", type: "button" });
-  btn.append(el("span", { className: "gdrop-label mono" }, active.name),
-    el("span", { className: "gdrop-caret" }, "⇅"));
-  const menu = el("div", { className: "gmenu", hidden: true });
-  const grantPath = (skillId) => s.flavor
-    ? `/flavors/${encodeURIComponent(s.flavor)}/skills/${skillId}`
-    : `/shells/${s.shell_id}/skills/${skillId}`;
-  for (const k of skills) {
-    const row = el("div", { className: "gmenu-item" + (k.skill_id === activeSkillId ? " active-row" : "") });
-    const tog = el("button", { className: "gmenu-check", type: "button",
-      title: k.granted ? "Revoke" : "Grant", textContent: k.granted ? "☑" : "☐" });
-    tog.onclick = async () => {
-      try {
-        await api(grantPath(k.skill_id), "PUT", { granted: !k.granted });
-        k.granted = k.granted ? 0 : 1;
-        tog.textContent = k.granted ? "☑" : "☐";
-        tog.title = k.granted ? "Revoke" : "Grant";
-        setStatus(s.flavor
-          ? `${s.flavor} flavor pack updated`
-          : `${s.display_name} Bespoke pack updated`);
-      } catch (e) { toast("error: " + e.message); }
-    };
-    const sel = el("button", { className: "gmenu-name mono", type: "button", textContent: k.name });
-    sel.onclick = () => {
-      activeSkillId = k.skill_id; menu.hidden = true;
-      root.replaceChildren(); renderSkillViewer(root, s);
-    };
-    row.append(tog, sel, el("span", { className: "gmenu-cap" }, sectionLabel(sectionOf(k))));
-    menu.append(row);
-  }
-  btn.onclick = () => { menu.hidden = !menu.hidden; };
-  wrap.append(btn, menu);
-
-  // rendered markdown by default; the right-aligned toggle shows raw text
-  const rawBtn = el("button", { className: "rawtoggle", type: "button",
-    title: "Toggle raw markdown", textContent: "raw", hidden: true });
-  root.append(
-    el("div", { className: "muted note" },
-      s.flavor
-        ? `Shared ${s.flavor} pack — changes apply to every ${s.flavor} shell.`
-        : `Bespoke pack — changes apply only to ${s.display_name}.`),
-    el("div", { className: "viewer-head" }, microlabel("Skill Viewer"), wrap, rawBtn));
-  const stats = statRow([["Char Count", "…"], ["Est. Tokens", "…"]]);
-  const panel = el("div", { className: "vpanel viewer-panel" });
-  root.append(stats, panel);
-
-  api("/skills/" + activeSkillId).then((full) => {
-    stats.replaceWith(statRow([
-      ["Char Count", fmt((full.content || "").length)],
-      ["Est. Tokens", "~" + fmt(approxTokens(full.content || ""))]]));
-    if (full.description) panel.append(el("div", { className: "muted desc-line" }, full.description));
-    const rendered = mdBlock(full.content || "(no content)");
-    const raw = el("pre", { className: "raw-pre", hidden: true }, full.content || "");
-    panel.append(rendered, raw);
-    rawBtn.hidden = false;
-    rawBtn.onclick = () => {
-      raw.hidden = !raw.hidden;
-      rendered.hidden = !raw.hidden;
-      rawBtn.textContent = raw.hidden ? "raw" : "rendered";
-    };
-  }).catch((e) => panel.append(el("div", { className: "muted" }, "error: " + e.message)));
 }
 
 // ── Skill Assignments (catalogue, sectioned) ─────────────────────────────────
@@ -10192,8 +10115,8 @@ function show(tab) {
 // hash; hashchange drives show — back/forward and deep links work too. The
 // roadmap tab carries its sub-view in the hash: #roadmap (board) | #roadmap-flow.
 // The analytics tab does the same: #analytics (token) | #analytics-quota.
-// Shells: #shells (Harness) | #shells-skills | #shells-skill-assignments |
-// #shells-default-models.
+// Shells: #shells (Harness) | #shells-skill-assignments |
+// #shells-default-models | #shells-runs.
 let lastRoutedHash = null;
 function routeFromHash() {
   const hash = location.hash;
