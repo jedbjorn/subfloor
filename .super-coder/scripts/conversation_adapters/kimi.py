@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
 import signal
+import subprocess
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
 import route_transport
+import toml_compat
 
 from .base import (
     TERMINAL_EVENTS,
@@ -28,11 +31,14 @@ from .base import (
     SubprocessRunner,
     cleanup_owned_process,
     command_version,
+    compaction_event,
     ensure_nonempty_message,
     load_manifest,
     merged_env,
     signal_owned_process,
     terminal_outcome,
+    token_count,
+    usage_event,
 )
 
 SESSION_REF = re.compile(r"^session_[0-9a-fA-F-]{36}$")
@@ -43,14 +49,230 @@ USAGE_KEYS = {
     "inputCacheRead": "cache_read_tokens",
     "inputCacheCreation": "cache_write_tokens",
 }
+# The input side of one model request: what the model re-read, which is the
+# size of the chat's context at that request (Feature #95, spec #275).
+CONTEXT_KEYS = ("inputOther", "inputCacheRead", "inputCacheCreation")
 STDERR_LIMIT = 16384
 POLL_INTERVAL = 0.01
 COMPLETION_POLL_INTERVAL = 0.05
 COMPLETION_DRAIN_SECONDS = 0.1
 
+# Manual compaction (spec #275 gate, AC9a). Kimi Code 2.5.3 runs ``/compact``
+# only as a command of its ACP server: as the prompt of a resumed ``kimi -p``
+# run it reaches the model as plain text. Over ACP, ``session/prompt`` with
+# ``/compact`` answers at once and compacts in the background, so the
+# connection is held open until the main wire records the compaction's end;
+# closing it earlier cancels the compaction (``full_compaction.cancel``).
+COMPACT_PROMPT = "/compact"
+COMPACT_BEGIN = "full_compaction.begin"
+COMPACT_APPLY = "context.apply_compaction"
+COMPACT_COMPLETE = "full_compaction.complete"
+COMPACT_CANCEL = "full_compaction.cancel"
+COMPACT_SOURCES = {"manual": "manual", "auto": "auto"}
+ACP_PROTOCOL_VERSION = 1
+ACP_REQUEST_TIMEOUT = 60.0
+COMPACTION_TIMEOUT = 900.0
+# The first ACP ``session/load`` of a session appends a project-context
+# injection to the context a moment after it answers. A compaction that
+# begins before it lands is cancelled by Kimi when it does (seen live on
+# 2.5.3), so ``/compact`` waits until the main wire has been quiet this long.
+ACP_SETTLE_SECONDS = 1.0
+ACP_SETTLE_LIMIT_SECONDS = 10.0
+
+
+class KimiAcpClient:
+    """A minimal JSON-RPC client for ``kimi acp`` over stdio.
+
+    Only what a manual compaction needs: requests with responses, the
+    agent's message text (the reason a compaction did not start), and a
+    refusal of every agent-to-client request, since a compaction asks for
+    no permission and no file access.
+    """
+
+    def __init__(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout: float = ACP_REQUEST_TIMEOUT,
+    ) -> None:
+        self.timeout = timeout
+        self.process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=dict(env),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        self.process.__dict__["_sc_conversation_process_group"] = self.process.pid
+        self.stderr: list[str] = []
+        self.process.__dict__["_sc_conversation_stderr"] = self.stderr
+        self.agent_text: list[str] = []
+        self._write_lock = threading.Lock()
+        self._pending: dict[int, queue.Queue[Any]] = {}
+        self._pending_lock = threading.Lock()
+        self._next_id = 1
+        threading.Thread(
+            target=self._drain_stderr, name="kimi-acp-stderr", daemon=True
+        ).start()
+        threading.Thread(
+            target=self._read_loop, name="kimi-acp-reader", daemon=True
+        ).start()
+
+    def _drain_stderr(self) -> None:
+        stderr = self.process.stderr
+        if stderr is None:
+            return
+        remaining = STDERR_LIMIT
+        for line in stderr:
+            if remaining <= 0:
+                continue
+            chunk = line[:remaining]
+            self.stderr.append(chunk)
+            remaining -= len(chunk)
+
+    def _write(self, message: Mapping[str, Any]) -> None:
+        stdin = self.process.stdin
+        if stdin is None or stdin.closed:
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE", "Kimi ACP stdin is closed", retryable=True
+            )
+        encoded = json.dumps(
+            {"jsonrpc": "2.0", **message}, separators=(",", ":")
+        )
+        with self._write_lock:
+            try:
+                stdin.write(encoded + "\n")
+                stdin.flush()
+            except (OSError, ValueError) as exc:
+                raise AdapterError(
+                    "HARNESS_UNAVAILABLE",
+                    f"Kimi ACP write failed: {exc}",
+                    retryable=True,
+                ) from exc
+
+    def _read_loop(self) -> None:
+        stdout = self.process.stdout
+        if stdout is not None:
+            for line in stdout:
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(message, dict):
+                    self._dispatch(message)
+        closed = AdapterError(
+            "HARNESS_UNAVAILABLE", "Kimi ACP stream closed", retryable=True
+        )
+        with self._pending_lock:
+            waiters = list(self._pending.values())
+        for waiter in waiters:
+            waiter.put(closed)
+
+    def _dispatch(self, message: Mapping[str, Any]) -> None:
+        request_id = message.get("id")
+        method = message.get("method")
+        if request_id is not None and method is None:
+            with self._pending_lock:
+                waiter = self._pending.get(request_id)
+            if waiter is not None:
+                waiter.put(message)
+            return
+        if request_id is not None:
+            # An agent-to-client request. A compaction needs none of them.
+            reply: dict[str, Any] = {
+                "id": request_id,
+                "error": {"code": -32601, "message": "not supported"},
+            }
+            if method == "session/request_permission":
+                reply = {
+                    "id": request_id,
+                    "result": {"outcome": {"outcome": "cancelled"}},
+                }
+            try:
+                self._write(reply)
+            except AdapterError:
+                pass
+            return
+        if method == "session/update":
+            update = (message.get("params") or {}).get("update") or {}
+            content = update.get("content") if isinstance(update, dict) else None
+            if (
+                isinstance(update, dict)
+                and update.get("sessionUpdate") == "agent_message_chunk"
+                and isinstance(content, dict)
+                and isinstance(content.get("text"), str)
+            ):
+                self.agent_text.append(content["text"])
+
+    def request(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        timeout: float | None = None,
+    ) -> Any:
+        with self._pending_lock:
+            request_id = self._next_id
+            self._next_id += 1
+            waiter: queue.Queue[Any] = queue.Queue(maxsize=1)
+            self._pending[request_id] = waiter
+        try:
+            self._write({"id": request_id, "method": method, "params": params})
+            try:
+                response = waiter.get(
+                    timeout=self.timeout if timeout is None else timeout
+                )
+            except queue.Empty as exc:
+                raise AdapterError(
+                    "HARNESS_TIMEOUT",
+                    f"Kimi ACP request timed out: {method}",
+                    retryable=True,
+                ) from exc
+            if isinstance(response, AdapterError):
+                raise response
+            if "error" in response:
+                raise AdapterError(
+                    "HARNESS_PROTOCOL_ERROR",
+                    f"Kimi ACP {method} failed: {response['error']}",
+                )
+            return response.get("result")
+        finally:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+
+    def close(self, timeout: float = 5.0) -> None:
+        """End the connection: stdin first, so the server exits on its own."""
+        stdin = self.process.stdin
+        if stdin is not None and not stdin.closed:
+            try:
+                stdin.close()
+            except OSError:
+                pass
+        try:
+            self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+        if self.process.poll() is None:
+            cleanup_owned_process(self.process, 1.0)
+
+
+AcpFactory = Callable[..., Any]
+
 
 class KimiAdapter(ConversationAdapter):
     harness = "kimi"
+    # Gate passed live on Kimi Code 2.5.3 (spec #275 AC9a): ``/compact`` over
+    # ACP ``session/prompt`` writes ``context.apply_compaction`` and this
+    # adapter ends the run cleanly. ``/compact`` as a ``kimi -p`` prompt does
+    # not compact. Kimi takes no token-count trigger at launch (its own
+    # threshold is a ratio in the user's config), so the engine compacts it
+    # between turns instead: ``compact_window_native`` stays False.
+    manual_compaction = True
 
     def __init__(
         self,
@@ -59,13 +281,22 @@ class KimiAdapter(ConversationAdapter):
         manifest: Mapping[str, Any] | None = None,
         sessions_root: Path | None = None,
         identity_timeout: float = 5.0,
+        acp_factory: AcpFactory | None = None,
+        compaction_timeout: float = COMPACTION_TIMEOUT,
+        acp_settle_seconds: float = ACP_SETTLE_SECONDS,
     ) -> None:
         super().__init__(manifest or load_manifest(self.harness))
         if identity_timeout <= 0:
             raise ValueError("identity_timeout must be positive")
+        if compaction_timeout <= 0:
+            raise ValueError("compaction_timeout must be positive")
         self.runner = runner or SubprocessRunner(start_new_session=True)
         self.sessions_root = sessions_root
         self.identity_timeout = identity_timeout
+        self.acp_factory = acp_factory or KimiAcpClient
+        self.compaction_timeout = compaction_timeout
+        self.acp_settle_seconds = max(0.0, acp_settle_seconds)
+        self._acp: Any = None
 
     def probe(self) -> ProbeResult:
         launch = self.manifest["headless"]["launch"][0]
@@ -521,6 +752,7 @@ class KimiAdapter(ConversationAdapter):
         command: list[str],
         *,
         resumed: bool,
+        compaction: bool = False,
     ) -> NativeTurn:
         wire = self._wire_path(session_dir)
         pid = getattr(process, "pid", None)
@@ -537,6 +769,9 @@ class KimiAdapter(ConversationAdapter):
                 "wire_path": str(wire),
                 "prompt_offset": prompt_offset,
                 "prompt_time": prompt_time,
+                # A manual compaction's run is bounded by its
+                # ``full_compaction.begin`` record, not by a ``turn.prompt``.
+                **({"compaction": True} if compaction else {}),
             },
             opaque=process,
         )
@@ -632,6 +867,173 @@ class KimiAdapter(ConversationAdapter):
             command,
             resumed=True,
         )
+
+    def _compact_command(self) -> list[str]:
+        compact = self.manifest["conversation"].get("compact") or {}
+        return [
+            *self.manifest["headless"]["launch"],
+            *compact.get("command", ["acp"]),
+        ]
+
+    def _settle_wire(self, wire: Path) -> int:
+        """Wait, bounded, until the main wire stops growing; its size then."""
+        limit = time.monotonic() + ACP_SETTLE_LIMIT_SECONDS
+        size = -1
+        quiet_since = time.monotonic()
+        while True:
+            try:
+                current = wire.stat().st_size
+            except OSError:
+                current = size
+            now = time.monotonic()
+            if current != size:
+                size, quiet_since = current, now
+            if now - quiet_since >= self.acp_settle_seconds or now >= limit:
+                return size
+            time.sleep(COMPLETION_POLL_INTERVAL)
+
+    def _discover_compaction(
+        self,
+        wire: Path,
+        start_offset: int,
+        client: Any,
+    ) -> tuple[int, int]:
+        """The ``full_compaction.begin`` this request appended to the wire."""
+        deadline = time.monotonic() + self.identity_timeout
+        process = getattr(client, "process", None)
+        while True:
+            try:
+                records = self._wire_records(wire, start_offset=start_offset)
+            except AdapterError:
+                records = []
+            begins = [
+                (raw.get("time"), offset)
+                for offset, raw in records
+                if raw.get("type") == COMPACT_BEGIN
+            ]
+            if len(begins) > 1:
+                raise AdapterError(
+                    "HARNESS_SESSION_DISCOVERY_FAILED",
+                    "multiple Kimi compactions began for one request",
+                )
+            if begins:
+                begin_time, offset = begins[0]
+                if not isinstance(begin_time, int) or isinstance(begin_time, bool):
+                    raise AdapterError(
+                        "HARNESS_SESSION_DISCOVERY_FAILED",
+                        "Kimi emitted a malformed full_compaction.begin marker",
+                    )
+                return begin_time, offset
+            poll = getattr(process, "poll", None)
+            exited = callable(poll) and poll() is not None
+            if exited or time.monotonic() >= deadline:
+                said = "".join(getattr(client, "agent_text", []) or []).strip()
+                raise AdapterError(
+                    "HARNESS_COMPACT_REFUSED",
+                    said[:2000] or "Kimi started no compaction for /compact",
+                )
+            time.sleep(POLL_INTERVAL)
+
+    def compact(
+        self,
+        session_ref: str,
+        context: ConversationContext,
+    ) -> NativeTurn:
+        """``/compact`` through Kimi's ACP server, on the stored session.
+
+        The run is identified by the ``full_compaction.begin`` record the
+        request appends to the session's main wire, as a turn is by its
+        ``turn.prompt``. The ACP connection stays open, owned by this
+        adapter, until ``stream`` sees the compaction end.
+        """
+        session_ref = self._validate_session_ref(session_ref)
+        worktree = context.checked_worktree()
+        env, root = self._environment(context)
+        session_dir = self._matching_session_dir(root, session_ref)
+        if session_dir is None:
+            raise AdapterError(
+                "HARNESS_SESSION_LOST",
+                f"Kimi session does not exist: {session_ref}",
+            )
+        if self._state_worktree(session_dir) != worktree:
+            raise AdapterError(
+                "HARNESS_WORKTREE_MISMATCH",
+                "Kimi session belongs to a different worktree",
+            )
+        wire = self._wire_path(session_dir)
+        try:
+            start_offset = wire.stat().st_size
+        except OSError as exc:
+            raise AdapterError(
+                "HARNESS_SESSION_INSPECTION_FAILED",
+                f"cannot inspect Kimi main wire: {wire}",
+                retryable=True,
+            ) from exc
+        command = self._compact_command()
+        try:
+            client = self.acp_factory(command, cwd=worktree, env=env)
+        except OSError as exc:
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE",
+                f"cannot start Kimi ACP: {exc}",
+                retryable=True,
+            ) from exc
+        try:
+            client.request(
+                "initialize",
+                {
+                    "protocolVersion": ACP_PROTOCOL_VERSION,
+                    "clientCapabilities": {
+                        "fs": {"readTextFile": False, "writeTextFile": False},
+                        "terminal": False,
+                    },
+                    "clientInfo": {"name": "super-coder", "version": "1"},
+                },
+            )
+            client.request(
+                "session/load",
+                {
+                    "sessionId": session_ref,
+                    "cwd": str(worktree),
+                    "mcpServers": [],
+                },
+            )
+            self._settle_wire(wire)
+            # What the agent says from here on is its answer to /compact; the
+            # load replays the session's history first.
+            said = getattr(client, "agent_text", None)
+            if isinstance(said, list):
+                said.clear()
+            client.request(
+                "session/prompt",
+                {
+                    "sessionId": session_ref,
+                    "prompt": [{"type": "text", "text": COMPACT_PROMPT}],
+                },
+            )
+            begin_time, begin_offset = self._discover_compaction(
+                wire, start_offset, client
+            )
+        except Exception:
+            client.close()
+            raise
+        self._acp = client
+        return self._native_turn(
+            client.process,
+            worktree,
+            session_dir,
+            begin_time,
+            begin_offset,
+            command,
+            resumed=True,
+            compaction=True,
+        )
+
+    def close(self) -> None:
+        """Release a compaction's ACP connection the stream did not end."""
+        client, self._acp = self._acp, None
+        if client is not None:
+            client.close()
 
     @staticmethod
     def _normalize(raw: Mapping[str, Any]) -> list[NormalizedEvent]:
@@ -760,10 +1162,12 @@ class KimiAdapter(ConversationAdapter):
                 "HARNESS_SESSION_INSPECTION_FAILED",
                 "Kimi run prompt is missing from the main wire",
             )
+        compaction = bool(turn.metadata.get("compaction"))
+        marker = COMPACT_BEGIN if compaction else "turn.prompt"
         first_offset, first = records[0]
         if (
             first_offset != prompt_offset
-            or first.get("type") != "turn.prompt"
+            or first.get("type") != marker
             or first.get("time") != prompt_time
         ):
             raise AdapterError(
@@ -772,9 +1176,15 @@ class KimiAdapter(ConversationAdapter):
             )
         run: list[Mapping[str, Any]] = []
         for _offset, raw in records:
-            if run and raw.get("type") == "turn.prompt":
+            native_type = raw.get("type")
+            if run and (
+                native_type == "turn.prompt"
+                or (compaction and native_type == COMPACT_BEGIN)
+            ):
                 break
             run.append(raw)
+            if compaction and native_type in (COMPACT_COMPLETE, COMPACT_CANCEL):
+                break
         return run
 
     def turn_prompt(self, turn: NativeTurn) -> str | None:
@@ -798,6 +1208,166 @@ class KimiAdapter(ConversationAdapter):
                 if isinstance(value, (int, float)) and not isinstance(
                     value, bool
                 ):
+                    totals[normalized] = totals.get(normalized, 0) + value
+        return totals
+
+    @staticmethod
+    def _model_windows(turn: NativeTurn) -> dict[str, int]:
+        """Each model alias's ``max_context_size`` from Kimi's config.
+
+        Read only, from the ``config.toml`` beside the session store this
+        turn used; the engine never writes it. Empty when it cannot be read:
+        a window that is not known is left out, never guessed.
+        """
+        session_path = turn.metadata.get("session_path")
+        if not isinstance(session_path, str):
+            return {}
+        config = Path(session_path).parent.parent.parent / "config.toml"
+        if not toml_compat.AVAILABLE:
+            return {}
+        try:
+            parsed = toml_compat.loads(config.read_text(encoding="utf-8"))
+        except (OSError, RuntimeError, ValueError):
+            return {}
+        models = parsed.get("models")
+        if not isinstance(models, dict):
+            return {}
+        windows: dict[str, int] = {}
+        for alias, model in models.items():
+            if not isinstance(model, dict):
+                continue
+            size = token_count(model.get("max_context_size"))
+            if size:
+                windows[str(alias)] = size
+        return windows
+
+    @staticmethod
+    def _request_time(raw: Mapping[str, Any]) -> int | None:
+        value = raw.get("time")
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return None
+
+    @classmethod
+    def _request_reading(
+        cls,
+        raw: Mapping[str, Any],
+        windows: Mapping[str, int],
+    ) -> NormalizedEvent | None:
+        """One ``usage`` reading of scope ``request`` for one model step.
+
+        A ``usage.record`` with ``usageScope: turn`` is one model request of
+        the chat; ``context_tokens`` is its input side. Kimi's events are
+        read after the run ends, so ``created_at`` is ingest time:
+        ``requested_at`` carries the record's own ``time`` (epoch ms).
+        """
+        tokens = cls._usage([raw])
+        if not tokens:
+            return None
+        usage = raw.get("usage")
+        sizes = [
+            token_count(usage.get(key))
+            for key in CONTEXT_KEYS
+            if isinstance(usage, dict)
+        ]
+        present = [size for size in sizes if size is not None]
+        model = raw.get("model")
+        event = usage_event(
+            tokens,
+            "usage.record",
+            scope="request",
+            context_tokens=sum(present) if present else None,
+            context_window=windows.get(model) if isinstance(model, str) else None,
+        )
+        requested_at = cls._request_time(raw)
+        if requested_at is None:
+            return event
+        return NormalizedEvent(
+            event.type,
+            {**event.payload, "requested_at": requested_at},
+            event.native_type,
+        )
+
+    @staticmethod
+    def _compaction_marker(
+        raw: Mapping[str, Any],
+        source: Any,
+        session_ref: str,
+    ) -> NormalizedEvent:
+        """``context.apply_compaction`` as ``context.compacted``.
+
+        The figures only: ``summary`` and ``contextSummary`` are never read
+        into the event. The trigger is the ``source`` of the compaction's
+        ``full_compaction.begin``.
+        """
+        applied_at = raw.get("time")
+        return compaction_event(
+            trigger=COMPACT_SOURCES.get(source, "unknown"),
+            native_type=COMPACT_APPLY,
+            tokens_before=raw.get("tokensBefore"),
+            tokens_after=raw.get("tokensAfter"),
+            compaction_ref=(
+                f"{session_ref}@{applied_at}"
+                if isinstance(applied_at, int) and not isinstance(applied_at, bool)
+                else None
+            ),
+        )
+
+    @classmethod
+    def _wire_events(
+        cls,
+        records: list[Mapping[str, Any]],
+        windows: Mapping[str, int],
+        session_ref: str,
+    ) -> list[NormalizedEvent]:
+        """The meter readings and compactions of one turn, in wire order.
+
+        Session-scoped usage records (a compaction's own request among them)
+        are not requests of the chat and give no reading.
+        """
+        events: list[NormalizedEvent] = []
+        source: Any = None
+        for raw in records:
+            native_type = raw.get("type")
+            if native_type == COMPACT_BEGIN:
+                source = raw.get("source")
+            elif native_type == COMPACT_APPLY:
+                events.append(cls._compaction_marker(raw, source, session_ref))
+            elif (
+                native_type == "usage.record"
+                and raw.get("usageScope") == "turn"
+            ):
+                reading = cls._request_reading(raw, windows)
+                if reading is not None:
+                    events.append(reading)
+        return events
+
+    @staticmethod
+    def _compaction_outcome(
+        records: list[Mapping[str, Any]],
+    ) -> str | None:
+        """``completed``, ``cancelled``, or None while it is still running."""
+        for raw in records:
+            if raw.get("type") == COMPACT_COMPLETE:
+                return "completed"
+            if raw.get("type") == COMPACT_CANCEL:
+                return "cancelled"
+        return None
+
+    @staticmethod
+    def _compaction_cost(records: list[Mapping[str, Any]]) -> dict[str, int | float]:
+        """The tokens the compaction's own request spent (any usage scope:
+        Kimi records it as ``session``)."""
+        totals: dict[str, int | float] = {}
+        for raw in records:
+            if raw.get("type") != "usage.record":
+                continue
+            usage = raw.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            for native, normalized in USAGE_KEYS.items():
+                value = usage.get(native)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
                     totals[normalized] = totals.get(normalized, 0) + value
         return totals
 
@@ -848,7 +1418,108 @@ class KimiAdapter(ConversationAdapter):
             return str(getvalue())[:STDERR_LIMIT]
         return ""
 
+    def _stream_compaction(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
+        """A manual compaction's run, read from the main wire.
+
+        Waits, bounded, for the compaction's end record while the ACP
+        connection stays open, then ends the connection. Completed: the
+        marker, the request's own cost, ``run.completed``. Cancelled by
+        Kimi: ``run.failed``. No end within the bound: ``run.completed``
+        with no marker, which the broker records as not reported.
+        """
+        process = turn.opaque
+        yield NormalizedEvent(
+            "session.started",
+            {"session_ref": turn.session_ref, "resumed": True},
+            "native-session-store",
+        )
+        yield NormalizedEvent(
+            "run.started",
+            {"run_ref": turn.run_ref, "status": "running"},
+            COMPACT_BEGIN,
+        )
+        deadline = time.monotonic() + self.compaction_timeout
+        records: list[Mapping[str, Any]] = []
+        outcome: str | None = None
+        exited = False
+        while True:
+            try:
+                records = self._run_slice(turn)
+            except AdapterError:
+                records = []
+            outcome = self._compaction_outcome(records)
+            if outcome is not None:
+                break
+            poll = getattr(process, "poll", None)
+            if callable(poll) and poll() is not None:
+                if exited:
+                    break
+                # One more read: the end record may land as the server exits.
+                exited = True
+                continue
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(COMPLETION_POLL_INTERVAL)
+        client = self._acp
+        self._acp = None
+        if client is not None:
+            client.close()
+        elif process is not None and process.poll() is None:
+            self._cleanup_process(process, 1.0)
+        wait = getattr(process, "wait", None)
+        returncode = wait() if callable(wait) else None
+        turn.metadata["returncode"] = returncode
+        if turn.metadata.get("interrupt_acknowledged") and outcome != "completed":
+            event = NormalizedEvent(
+                "run.interrupted",
+                {"status": "interrupted"},
+                COMPACT_CANCEL if outcome == "cancelled" else "process.exit",
+                "operator",
+            )
+            turn.metadata["terminal"] = event.type
+            turn.metadata["interrupt_evidence"] = event.interrupt_evidence
+            yield event
+            return
+        if outcome == "completed":
+            yield from self._wire_events(records, {}, turn.session_ref)
+            cost = self._compaction_cost(records)
+            if cost:
+                yield usage_event(cost, "usage.record", scope="compaction")
+            event = NormalizedEvent(
+                "run.completed", {"status": "completed"}, COMPACT_COMPLETE
+            )
+        elif outcome == "cancelled" or exited:
+            said = "".join(getattr(client, "agent_text", []) or []).strip()
+            event = NormalizedEvent(
+                "run.failed",
+                {
+                    "status": "failed",
+                    "error": "HARNESS_COMPACT_REFUSED",
+                    "detail": (
+                        said[:2000]
+                        or (
+                            "Kimi cancelled the compaction"
+                            if outcome == "cancelled"
+                            else "Kimi ACP exited before the compaction ended"
+                        )
+                    ),
+                    "exit_code": returncode,
+                },
+                COMPACT_CANCEL if outcome == "cancelled" else "process.exit",
+            )
+        else:
+            # The bounded wait ran out: closing the connection cancelled the
+            # compaction, so nothing is reported.
+            event = NormalizedEvent(
+                "run.completed", {"status": "completed"}, "compaction.timeout"
+            )
+        turn.metadata["terminal"] = event.type
+        yield event
+
     def stream(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
+        if turn.metadata.get("compaction"):
+            yield from self._stream_compaction(turn)
+            return
         process = turn.opaque
         stdout = getattr(process, "stdout", None)
         if stdout is None:
@@ -914,6 +1585,14 @@ class KimiAdapter(ConversationAdapter):
             bool(turn.metadata.get("interrupt_acknowledged"))
             and returncode in {-signal.SIGINT, 128 + signal.SIGINT}
         )
+        # The context meter and compactions (spec #275): each model request
+        # the run made and each compaction Kimi applied, in wire order, on
+        # every ending. They are facts of the session whether or not the
+        # turn completed.
+        if records:
+            yield from self._wire_events(
+                records, self._model_windows(turn), turn.session_ref
+            )
         if cancelled or acknowledged_sigint:
             event = NormalizedEvent(
                 "run.interrupted",
@@ -928,11 +1607,9 @@ class KimiAdapter(ConversationAdapter):
         if native_completed.is_set() or returncode == 0:
             usage = self._usage(records)
             if usage:
-                yield NormalizedEvent(
-                    "usage",
-                    {"tokens": usage},
-                    "usage.record",
-                )
+                # The whole-turn total, as before, now labelled: it is not
+                # the size of the context, so it carries none.
+                yield usage_event(usage, "usage.record", scope="turn")
             event = NormalizedEvent(
                 "run.completed",
                 {"status": "completed"},
@@ -1073,6 +1750,25 @@ class KimiAdapter(ConversationAdapter):
                 False,
                 "Kimi exact run slice is unavailable",
             )
+        if turn.metadata.get("compaction"):
+            ended = self._compaction_outcome(records)
+            if ended == "completed":
+                return ReconcileResult(
+                    "succeeded",
+                    True,
+                    "Kimi main wire records this compaction's completion",
+                )
+            if ended == "cancelled":
+                return ReconcileResult(
+                    "failed",
+                    True,
+                    "Kimi main wire records this compaction as cancelled",
+                )
+            return ReconcileResult(
+                "unknown",
+                False,
+                "Kimi main wire has no end for this compaction",
+            )
         if any(raw.get("type") == "turn.cancel" for raw in records):
             return ReconcileResult(
                 "cancelled",
@@ -1091,3 +1787,29 @@ class KimiAdapter(ConversationAdapter):
             False,
             "Kimi exact run slice has no durable terminal proof",
         )
+
+    def recovered_events(
+        self,
+        turn: NativeTurn,
+        context: ConversationContext,
+    ) -> list[NormalizedEvent]:
+        """The compaction a recovered ``/compact`` run wrote, if it wrote one.
+
+        A recovered run whose process is gone is reconciled, not streamed,
+        so its marker is read from the main wire. One already recorded is
+        dropped by the store: the marker names its ``compaction_ref``.
+        """
+        if not turn.metadata.get("compaction"):
+            return []
+        try:
+            self._restore_recovered_run_metadata(turn, context)
+            records = self._run_slice(turn)
+        except AdapterError:
+            return []
+        if self._compaction_outcome(records) != "completed":
+            return []
+        return [
+            event
+            for event in self._wire_events(records, {}, turn.session_ref)
+            if event.type == "context.compacted"
+        ]
