@@ -1040,7 +1040,7 @@ async function renderRunsFleet(host, shells, badge) {
   await refresh();
 }
 async function renderConversionStatus(host) {
-  host.replaceChildren(el("div", { className: "muted" }, "Loading harness conversion status…"));
+  host.replaceChildren(el("div", { className: "muted" }, "Loading harness status…"));
   // The compaction settings of the four compacting harnesses come from one
   // added call (spec #275); its failure shows inside each card and never
   // hides the conversion content.
@@ -1052,36 +1052,42 @@ async function renderConversionStatus(host) {
     const { value: settings, error: settingsError } = await compaction;
     if (!host.isConnected) return;
     const cards = Object.fromEntries((settings?.harnesses || []).map((card) => [card.harness, card]));
-    host.replaceChildren(el("h3", {}, "GUI background conversion"));
-    const explanations = { rewrite: "Background calls become durable jobs.", "deny-only": "Background calls are refused; use sc job.", disarmed: "Conversion is off; use sc job manually." };
-    for (const [harness, status] of Object.entries(statuses)) {
-      const evidence = status.conversion;
-      const compacting = CC_HARNESSES.includes(harness);
-      const row = el("div", { className: compacting ? "run-row harness-card" : "run-row" }, el("strong", {}, harness));
-      if (compacting) row.append(" ", el("span", { className: "muted cc-label" }, CC_LABELS[harness]));
-      if (!evidence) row.append(el("div", { className: "muted" }, "No conversion hook; use sc job for durable GUI work."));
-      else {
-        row.append(el("div", {}, `${evidence.version || "version unverified"} · ${evidence.tier}`),
-          el("div", {}, explanations[evidence.tier] || "Conversion status unavailable."),
-          el("div", { className: "muted" }, `Verified: ${evidence.verified_at || "never"}`));
-        if (evidence.error) row.append(el("div", { className: "error" }, evidence.error));
-        const verify = el("button", { className: "act", type: "button" }, "Re-verify");
-        verify.onclick = async () => {
-          verify.disabled = true; verify.textContent = "Verifying…";
-          try { await api(`/harnesses/${harness}/conversion/verify`, "POST", {}); await renderConversionStatus(host); }
-          catch (error) { toast(error.message); verify.disabled = false; verify.textContent = "Re-verify"; }
-        };
-        row.append(verify);
-      }
-      if (compacting) row.append(compactionCard(harness, cards[harness], settingsError));
-      host.append(row);
-    }
+    host.replaceChildren(el("h3", {}, "Harnesses"));
+    const rerender = () => renderConversionStatus(host);
+    for (const [harness, status] of Object.entries(statuses))
+      host.append(harnessCard(harness, status?.conversion, cards[harness], settingsError, rerender));
   } catch (error) { host.replaceChildren(el("div", { className: "error" }, error.message)); }
 }
 
+const CONVERSION_EXPLANATIONS = {
+  rewrite: "Background calls become durable jobs.",
+  "deny-only": "Background calls are refused; use sc job.",
+  disarmed: "Conversion is off; use sc job manually.",
+};
+
+function conversionSection(harness, evidence, rerender) {
+  const section = el("section", { className: "hc-section hc-conversion" }, el("h4", {}, "Background conversion"));
+  if (!evidence) {
+    section.append(el("div", { className: "muted" }, "No conversion hook; use sc job for durable GUI work."));
+    return section;
+  }
+  section.append(el("div", {}, `${evidence.version || "version unverified"} · ${evidence.tier}`),
+    el("div", {}, CONVERSION_EXPLANATIONS[evidence.tier] || "Conversion status unavailable."),
+    el("div", { className: "muted" }, `Verified: ${evidence.verified_at || "never"}`));
+  if (evidence.error) section.append(el("div", { className: "error" }, evidence.error));
+  const verify = el("button", { className: "act", type: "button" }, "Re-verify");
+  verify.onclick = async () => {
+    verify.disabled = true; verify.textContent = "Verifying…";
+    try { await api(`/harnesses/${harness}/conversion/verify`, "POST", {}); await rerender(); }
+    catch (error) { toast(error.message); verify.disabled = false; verify.textContent = "Re-verify"; }
+  };
+  section.append(verify);
+  return section;
+}
+
 // ── Harness cards: compaction settings and data (Feature #95, spec #275) ─────
-// The Claude, Codex, Kimi and OpenCode cards above gain a summary line and,
-// expanded, Settings then Data. Vibe's card is untouched. Settings are
+// The Claude, Codex, Kimi and OpenCode cards add Compaction settings and
+// Compaction data sections; Vibe's card has conversion only. Settings are
 // install-wide and save on change; data is computed by the engine on request.
 const CC_HARNESSES = ["claude", "codex", "kimi", "opencode"];
 const CC_LABELS = {
@@ -1145,7 +1151,7 @@ function ccFloorNote(card, field) {
 
 function ccSettings(state, flash) {
   const { harness, card } = state;
-  const section = el("div", { className: "cc-settings" }, el("h4", {}, "Settings"),
+  const section = el("section", { className: "hc-section cc-settings" }, el("h4", {}, "Compaction settings"),
     el("div", { className: "muted" }, "Applies to every shell's browser chats on this install."));
   const off = !card.manual_trigger;
   if (off) section.append(el("div", { className: "cc-unavailable" }, card.unavailable_reason));
@@ -1238,10 +1244,12 @@ function ccDataRows(d) {
 
 function ccData(state) {
   const { harness } = state;
-  const section = el("div", { className: "cc-data" }, el("h4", {}, "Data"));
+  const section = el("section", { className: "hc-section cc-data" }, el("h4", {}, "Compaction data"));
   const switcher = el("div", { className: "cc-days" });
   for (const days of [7, 30]) {
-    const button = el("button", { type: "button", className: days === state.days ? "act active-tab" : "act" }, `${days} days`);
+    // Not .active-tab: its underline is absolutely positioned and would
+    // span the page from a button that is not a containing block.
+    const button = el("button", { type: "button", className: "act", ariaPressed: String(days === state.days) }, `${days} days`);
     button.onclick = () => { state.days = days; state.figures = null; state.paint(); return ccLoadData(state); };
     switcher.append(button);
   }
@@ -1277,28 +1285,39 @@ async function ccLoadData(state) {
   }
 }
 
-// One card's added part: the summary line, and the body it expands to. The
-// card reloads its saved row and its data each time it is expanded.
-function compactionCard(harness, card, loadError) {
-  const host = el("div", { className: "cc" });
-  if (!card) {
-    host.append(el("div", { className: "error" },
-      `Compaction settings unavailable: ${loadError?.message || "not returned"}`));
-    return host;
-  }
+// One harness card: a header (name, provider, one summary line) that
+// expands to its sections — Background conversion, then, on the compacting
+// harnesses, Compaction settings and Compaction data. The browser remembers
+// which cards are open; a compacting card reloads its saved row and its data
+// each time it is expanded.
+function harnessCard(harness, evidence, card, loadError, rerender) {
+  const compacting = CC_HARNESSES.includes(harness);
+  const host = el("div", { className: "harness-card" });
   const state = { harness, card, days: 7, open: ccExpanded().has(harness), dataBody: null };
+  const loaded = compacting && !!card;
   state.paint = (flash) => {
-    const toggle = el("button", { type: "button", className: "cc-summary", ariaExpanded: String(state.open) },
-      `${state.open ? "▾" : "▸"} ${ccSummary(state.card)}`);
-    toggle.onclick = () => {
+    const summary = el("span", { className: "hc-summary muted" },
+      evidence ? `Conversion ${evidence.tier}` : "No conversion hook");
+    if (loaded) summary.append(` · ${ccSummary(state.card)}`);
+    const head = el("button", { type: "button", className: "hc-head", ariaExpanded: String(state.open) },
+      el("span", { className: "hc-chevron", ariaHidden: "true" }, state.open ? "▾" : "▸"),
+      el("span", { className: "hc-title" }, el("strong", { className: "hc-name" }, harness),
+        ...(compacting ? [" ", el("span", { className: "muted cc-label" }, CC_LABELS[harness])] : [])),
+      summary);
+    if (compacting && !card) head.append(el("span", { className: "error hc-error" },
+      `Compaction settings unavailable: ${loadError?.message || "not returned"}`));
+    head.onclick = () => {
       state.open = !state.open; ccRemember(harness, state.open); state.paint();
-      if (state.open) return ccOpen(state);
+      if (state.open && loaded) return ccOpen(state);
     };
-    host.replaceChildren(toggle);
-    if (state.open) host.append(el("div", { className: "cc-body" }, ccSettings(state, flash), ccData(state)));
+    host.replaceChildren(head);
+    if (!state.open) return;
+    const body = el("div", { className: "hc-body" }, conversionSection(harness, evidence, rerender));
+    if (loaded) body.append(ccSettings(state, flash), ccData(state));
+    host.append(body);
   };
   state.paint();
-  if (state.open) ccLoadData(state);
+  if (state.open && loaded) ccLoadData(state);
   return host;
 }
 
@@ -1956,7 +1975,7 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
 // then the law-curated identity (read-only by design, Laws 2–4 / 7), then the
 // record. Char/token readout spans everything below it.
 function renderHarness(root, s) {
-  const conversion = el("section", { className: "conversion-status vpanel" });
+  const conversion = el("section", { className: "conversion-status" });
   root.append(conversion);
   renderConversionStatus(conversion);
   const groups = [{ title: "Operational", items: [
