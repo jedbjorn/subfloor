@@ -1354,7 +1354,11 @@ class ManualCompactBrokerTest(DispatchCase):
         self.assertEqual(outcome, "succeeded")
         [notice] = self.results(conversation_id, before)
         self.assertEqual(notice["type"], "compaction.not_reported")
-        self.assertEqual(notice["payload"], {"request_message_id": message_id})
+        # The outcome names its request's cause (spec #275).
+        self.assertEqual(
+            notice["payload"],
+            {"request_message_id": message_id, "cause": "operator"},
+        )
         self.assertEqual(self.state(conversation_id), "idle")
 
     def test_a_failed_request_owes_no_reground_line(self) -> None:
@@ -1466,7 +1470,7 @@ class CancelledRequestTest(DispatchCase):
         self.assertEqual(stopped["payload"], {
             "outcome": "cancelled", "error": "CONVERSATION_RUN_REAPED",
             "detail": "orphaned after broker death",
-            "request_message_id": message_id,
+            "request_message_id": message_id, "cause": "operator",
         })
         # On the chat, like every result.
         self.assertIsNone(stopped["run_id"])
@@ -1499,7 +1503,7 @@ class CancelledRequestTest(DispatchCase):
         self.assertEqual(stopped["type"], "compaction.failed")
         self.assertEqual(stopped["payload"], {
             "outcome": "cancelled", "error": "CONVERSATION_DISPLACED",
-            "request_message_id": message_id,
+            "request_message_id": message_id, "cause": "operator",
         })
 
 
@@ -1813,7 +1817,7 @@ class ManualCompactRouteTest(ManualCompactApiCase):
         self.assertEqual(event_message, message_id)
         self.assertEqual(json.loads(payload), {
             "message_id": message_id, "initiated_by": "engine",
-            "requested_by_user_id": 1, "harness": "codex",
+            "requested_by_user_id": 1, "harness": "codex", "cause": "operator",
         })
         # Nothing of the request is a transcript item.
         transcript = self.transcript(conversation_id)
@@ -1902,6 +1906,7 @@ class ManualCompactRouteTest(ManualCompactApiCase):
         self.assertEqual(json.loads(payload), {
             "outcome": "cancelled", "error": "CONVERSATION_CLOSING",
             "request_message_id": pressed["compaction"]["message_id"],
+            "cause": "operator",
         })
         self.assertEqual((message_id, run_id), (None, None))
         labels = [item["label"] for item in self.transcript(conversation_id)["items"]]

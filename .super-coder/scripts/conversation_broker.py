@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import active_chat_registry
+import compaction_settings
 import conversation_compaction
 import conversation_events
 import conversation_git_targets
@@ -146,6 +147,10 @@ class CompactionState:
     pending_compaction: int | None = None
     context_tokens: int | None = None
     context_window: int | None = None
+    # The harness's auto-compaction trigger in effect for this turn (saved,
+    # then environment, then default; None when auto compaction is off or
+    # the harness has no settings). Read at each dispatch: no restart.
+    trigger_tokens: int | None = None
 
 
 @dataclass
@@ -757,15 +762,23 @@ class BrokerStore:
         finally:
             con.close()
 
-    def compaction_state(self, conversation_id: str) -> CompactionState:
+    def compaction_state(
+        self,
+        conversation_id: str,
+        harness: str | None = None,
+    ) -> CompactionState:
         """Read one chat's compaction and meter state for the next dispatch.
 
         A compaction is pending while its event is newer than the last
         ``message.reground``: the line is owed once per compaction, however
-        many compactions happened since the last dispatched message.
+        many compactions happened since the last dispatched message. With
+        ``harness``, the harness's trigger in effect is read too.
         """
         con = self.connect()
+        trigger: int | None = None
         try:
+            if harness is not None:
+                trigger = compaction_settings.effective_trigger(con, harness)
             row = con.execute(
                 "SELECT "
                 "(SELECT MAX(sequence) FROM conversation_events "
@@ -791,6 +804,7 @@ class BrokerStore:
             pending_compaction=pending,
             context_tokens=meter["context_tokens"],
             context_window=meter["context_window"],
+            trigger_tokens=trigger,
         )
 
     def record_reground(self, run_id: int, compaction_sequence: int) -> int:
@@ -880,6 +894,17 @@ class BrokerStore:
                         f"run {run_id} is already {row['state']}",
                     )
                 manual = bool(row["manual_compaction"])
+                # An engine request's marker carries the request's cause; a
+                # compaction the harness made on its own is ``harness``.
+                request = (
+                    conversation_compaction.request_record(
+                        con, row["conversation_id"], int(row["trigger_message_id"])
+                    )
+                    if manual and any(
+                        event.type == "context.compacted" for event in events
+                    )
+                    else None
+                )
                 sequences = []
                 for event in events:
                     if manual and event.type not in (
@@ -916,6 +941,9 @@ class BrokerStore:
                         payload["request_message_id"] = int(
                             row["trigger_message_id"]
                         )
+                        payload.update(request or {})
+                    elif event.type == "context.compacted":
+                        payload["cause"] = conversation_compaction.CAUSE_HARNESS
                     sequences.append(
                         self._append_event(
                             con,
@@ -1158,6 +1186,20 @@ class BrokerStore:
                         message_id=None,
                         run_id=run_id,
                     )
+                # Any turn that ends, failed and unproven ones included,
+                # is checked; an operator's Stop (cancelled) is not.
+                if (
+                    outcome in ("succeeded", "failed", "unknown")
+                    and not manual
+                    and not close_after
+                    and not already_closed
+                ):
+                    self._threshold_compaction(
+                        con,
+                        str(row["conversation_id"]),
+                        run_id=run_id,
+                        trigger_message_id=int(row["trigger_message_id"]),
+                    )
                 notify_ids.add(str(row["conversation_id"]))
                 conversation_id = row["conversation_id"]
         finally:
@@ -1169,6 +1211,39 @@ class BrokerStore:
             str(conversation_id),
         )
         return True
+
+    @staticmethod
+    def _threshold_compaction(
+        con,
+        conversation_id: str,
+        *,
+        run_id: int,
+        trigger_message_id: int,
+    ) -> None:
+        """The between-turn check (spec #275 "Threshold compaction").
+
+        Runs inside the transaction that ends the turn, so the request is
+        queued before anything else can be: the compaction runs next, while
+        the cache is warm. A failure here is logged and undone on its own;
+        it never fails the turn's end.
+        """
+        con.execute("SAVEPOINT threshold_compaction")
+        try:
+            conversation_compaction.threshold_compaction(
+                con,
+                conversation_id,
+                run_id=run_id,
+                trigger_message_id=trigger_message_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - the turn's end must commit
+            con.execute("ROLLBACK TO threshold_compaction")
+            print(
+                f"conversation-broker: run {run_id} threshold compaction "
+                f"check failed: {exc}",
+                flush=True,
+            )
+        finally:
+            con.execute("RELEASE threshold_compaction")
 
     @staticmethod
     def _append_compaction_outcome(
@@ -1222,6 +1297,10 @@ class BrokerStore:
             if error_detail:
                 payload["detail"] = error_detail[:2000]
         payload["request_message_id"] = message_id
+        # The outcome names its request's cause, as the marker does.
+        payload.update(
+            conversation_compaction.request_record(con, conversation_id, message_id)
+        )
         return BrokerStore._append_event(
             con,
             conversation_id=conversation_id,
@@ -2345,12 +2424,19 @@ class ConversationBroker(threading.Thread):
                         )
                     context.checked_worktree()
                     compaction = self.store.compaction_state(
-                        run.conversation_id
+                        run.conversation_id, run.harness
                     )
                     context = replace(
                         context,
-                        compact_window=conversation_compaction.compact_window(
-                            run.harness
+                        # The trigger reaches only a harness that takes a
+                        # token count (Claude, Codex); the others are
+                        # compacted by the engine between turns.
+                        compact_window=(
+                            compaction.trigger_tokens
+                            if conversation_compaction.compact_window_native(
+                                run.harness
+                            )
+                            else None
                         ),
                         context_window=compaction.context_window,
                         context_tokens=compaction.context_tokens,
