@@ -147,6 +147,11 @@ PER_INSTANCE_TABLES = [
     # the engine's baseline; content.sql loads AFTER migrations on rebuild, so
     # the fork's edits win — without this the GUI's changes vanish on rebuild.
     "flavor_defaults",
+    # chat_compaction_settings is operator-tuned like flavor_defaults (the
+    # Harness tab cards' Auto and Idle compaction, Feature #95 spec #275):
+    # without it a saved trigger or idle wait vanishes on rebuild and the
+    # environment/defaults silently take over again.
+    "chat_compaction_settings",
     # Browser-native conversations are durable instance truth: exact harness
     # refs, message queues, recovery evidence, replay events, and pending
     # outbox work must all survive update/rebuild. Parents precede

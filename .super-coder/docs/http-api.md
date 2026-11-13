@@ -195,6 +195,7 @@ the last column. Every write additionally needs this origin's `Origin`.
 | `/api/git-state?fetch=1` | session | live git hygiene; `fetch=1` does the network fetch. `#repo` |
 | `/api/shells`, `/api/shells/{id}` | session | `{shells, repo_root}`; `404 no such shell`. `#view-shells` |
 | `/api/shell-templates`, `/api/flavor-defaults` | session | flavor catalogue and per-flavor model defaults |
+| `/api/harnesses/compaction`, `/api/harnesses/{harness}/compaction-data?days=7\|30` | session | the Harness cards' compaction settings (every compacting harness, with sources and values in effect) and one card's figures; `404` unknown harness, `400` another `days`. See [conversation-runtime.md](conversation-runtime.md#operator-routes) |
 | `/api/models?refresh=1` | session; exactly `?refresh=1` also takes a CLI credential | model catalogue. `./sc models refresh` presents the calling shell's token. Without the query, or with any other, a credential is refused |
 | `/api/skills`, `/api/skills/{id}` | session | skill catalogue with origin tags |
 | `/api/roadmap` | session | `#view-roadmap` |
@@ -221,6 +222,7 @@ the last column. Every write additionally needs this origin's `Origin`.
 |---|---|---|
 | `POST /api/flags`, `POST /api/projects`, `POST /api/shells` | session | `201` on create, `400` on validation |
 | `POST /api/flavor-defaults` | session | set a flavor's default model route |
+| `PUT /api/harnesses/{harness}/compaction` | session | save one harness's compaction settings; `422` on a refused value (trigger or idle size under 90,000, a wait not in the dropdown), `400` empty, `404` unknown harness |
 | `POST /api/analytics/sweep` | session | recompute analytics |
 | `POST /api/analytics/quota/probe` | session | force a probe (the refresh button) |
 | `POST /api/snapshot` | session | `{output}` from the snapshot render. `#snapshot` |

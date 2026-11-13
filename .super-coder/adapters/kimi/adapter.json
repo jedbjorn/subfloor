@@ -59,6 +59,14 @@
     },
     "stream": { "transport": "stdout-jsonl-with-raw-interleave" },
     "interrupt": { "mechanism": "signal", "signal": "SIGINT" },
+    "compact": {
+      "mechanism": "acp-session-prompt",
+      "command": ["acp"],
+      "prompt": "/compact",
+      "identity_source": "appended-main-wire-full_compaction.begin",
+      "completion_source": "main-wire-full_compaction.complete",
+      "checked_cli_version": "2.5.3"
+    },
     "inspect": { "mechanism": "native-session-store" },
     "permission_policy": "kimi-prompt-auto-mode",
     "execution_permissions": {

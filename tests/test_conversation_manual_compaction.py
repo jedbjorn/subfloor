@@ -1028,16 +1028,17 @@ class TriggerAvailabilityTest(unittest.TestCase):
             harness: adapter.manual_compaction
             for harness, adapter in ADAPTER_TYPES.items()
         }
+        # Kimi's trigger passed spec #275's live gate (ACP ``/compact``).
         self.assertEqual(declared, {
-            "claude": True, "codex": True, "opencode": True, "kimi": False,
+            "claude": True, "codex": True, "opencode": True, "kimi": True,
         })
 
     def test_a_harness_without_a_trigger_refuses_the_request(self) -> None:
         with self.assertRaises(AdapterError) as raised:
             ConversationAdapter.compact(
-                mock.Mock(harness="kimi"), "session", mock.Mock())
+                mock.Mock(harness="untriggered"), "session", mock.Mock())
         self.assertEqual(raised.exception.code, "HARNESS_COMPACT_UNSUPPORTED")
-        self.assertIs(KimiAdapter.compact, ConversationAdapter.compact)
+        self.assertIsNot(KimiAdapter.compact, ConversationAdapter.compact)
 
 
 # ── AC14: the broker records the request and exactly one result ─────────────
@@ -1354,7 +1355,11 @@ class ManualCompactBrokerTest(DispatchCase):
         self.assertEqual(outcome, "succeeded")
         [notice] = self.results(conversation_id, before)
         self.assertEqual(notice["type"], "compaction.not_reported")
-        self.assertEqual(notice["payload"], {"request_message_id": message_id})
+        # The outcome names its request's cause (spec #275).
+        self.assertEqual(
+            notice["payload"],
+            {"request_message_id": message_id, "cause": "operator"},
+        )
         self.assertEqual(self.state(conversation_id), "idle")
 
     def test_a_failed_request_owes_no_reground_line(self) -> None:
@@ -1466,7 +1471,7 @@ class CancelledRequestTest(DispatchCase):
         self.assertEqual(stopped["payload"], {
             "outcome": "cancelled", "error": "CONVERSATION_RUN_REAPED",
             "detail": "orphaned after broker death",
-            "request_message_id": message_id,
+            "request_message_id": message_id, "cause": "operator",
         })
         # On the chat, like every result.
         self.assertIsNone(stopped["run_id"])
@@ -1499,7 +1504,7 @@ class CancelledRequestTest(DispatchCase):
         self.assertEqual(stopped["type"], "compaction.failed")
         self.assertEqual(stopped["payload"], {
             "outcome": "cancelled", "error": "CONVERSATION_DISPLACED",
-            "request_message_id": message_id,
+            "request_message_id": message_id, "cause": "operator",
         })
 
 
@@ -1813,7 +1818,7 @@ class ManualCompactRouteTest(ManualCompactApiCase):
         self.assertEqual(event_message, message_id)
         self.assertEqual(json.loads(payload), {
             "message_id": message_id, "initiated_by": "engine",
-            "requested_by_user_id": 1, "harness": "codex",
+            "requested_by_user_id": 1, "harness": "codex", "cause": "operator",
         })
         # Nothing of the request is a transcript item.
         transcript = self.transcript(conversation_id)
@@ -1839,6 +1844,9 @@ class ManualCompactRouteTest(ManualCompactApiCase):
             ).fetchone()[0]
         self.assertEqual(count, 1)
 
+    # Kimi stands in for a harness with no confirmed trigger, as it was
+    # before spec #275's gate.
+    @mock.patch.object(KimiAdapter, "manual_compaction", False)
     def test_a_press_is_refused_whenever_the_button_is_not_live(self) -> None:
         cases = (
             (903, {"state": "running"}, "CONVERSATION_BUSY"),
@@ -1902,6 +1910,7 @@ class ManualCompactRouteTest(ManualCompactApiCase):
         self.assertEqual(json.loads(payload), {
             "outcome": "cancelled", "error": "CONVERSATION_CLOSING",
             "request_message_id": pressed["compaction"]["message_id"],
+            "cause": "operator",
         })
         self.assertEqual((message_id, run_id), (None, None))
         labels = [item["label"] for item in self.transcript(conversation_id)["items"]]
@@ -1938,6 +1947,7 @@ class CompactButtonDataTest(ManualCompactApiCase):
                 self.assertTrue(controls["available"])
                 self.assertFalse(controls["enabled"])
 
+    @mock.patch.object(KimiAdapter, "manual_compaction", False)
     def test_hidden_without_a_session_and_for_a_harness_with_no_trigger(self):
         no_session = self.controls(number=915, session=None)
         self.assertEqual(

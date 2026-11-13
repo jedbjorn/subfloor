@@ -38,6 +38,7 @@ if str(ENGINE / "api") not in sys.path:
 
 import active_chat_registry
 import browser_gate
+import compaction_settings
 import conversation_broker
 import conversation_compaction
 import conversation_events
@@ -449,6 +450,18 @@ _REGISTRY_PROCESS_JOIN = (
     " ON reg.shell_id=c.shell_id AND reg.chat_id=c.conversation_id"
 )
 
+# The harness's saved compaction settings (spec #275), joined into the chat
+# row so the transcript projection's meter reads them without a read of its
+# own. NULL columns mean "not saved": the environment and defaults apply.
+_COMPACTION_SETTINGS_COLUMNS = "".join(
+    f"ccs.{column} AS compaction_{column},"
+    for column in compaction_settings.SAVED_COLUMNS
+)
+
+_COMPACTION_SETTINGS_JOIN = (
+    " LEFT JOIN chat_compaction_settings ccs ON ccs.harness=c.harness"
+)
+
 _CLOSE_REQUESTED_AFTER_REOPEN = (
     "requested.event_type='conversation.close.requested' "
     "AND requested.sequence>COALESCE("
@@ -486,9 +499,11 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
         " AND active.state IN ('leased','starting','running') "
         " ORDER BY active.run_id DESC LIMIT 1) AS active_run_id,"
         + _REGISTRY_PROCESS_COLUMNS
+        + _COMPACTION_SETTINGS_COLUMNS
         + _SPRINT_MANAGED_COLUMN
         + " FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
         + _REGISTRY_PROCESS_JOIN
+        + _COMPACTION_SETTINGS_JOIN
         + " WHERE c.conversation_id=? AND c.owner_user_id=? "
         f"AND c.harness IN ({_BROWSER_HARNESS_SQL})",
         (conversation_id, owner_user_id, *_BROWSER_HARNESSES),
@@ -2110,113 +2125,46 @@ def _request_compaction(
     """
     _only_fields(body, set())
     key = _idempotency_key(headers)
-    request_hash = _request_hash({"compact": True})
 
     with db_driver.write_transaction(con, "conversation.compaction.create"):
-        conversation = _require_conversation(
+        # The operator check: only the chat's owner reaches the helper.
+        _require_conversation(con, conversation_id, operator["user_id"])
+        # The shared helper applies the refusals and writes the request,
+        # the same path the threshold check and the idle scheduler use.
+        result = conversation_compaction.enqueue_compaction(
             con,
             conversation_id,
-            operator["user_id"],
+            conversation_compaction.CAUSE_OPERATOR,
+            idempotency_key=key,
+            user_id=int(operator["user_id"]),
         )
-        existing = con.execute(
-            "SELECT message_id,request_hash,state FROM conversation_messages "
-            "WHERE conversation_id=? AND idempotency_key=?",
-            (conversation_id, key),
-        ).fetchone()
-        if existing is not None:
-            if existing["request_hash"] != request_hash:
-                raise ApiError(
-                    409,
-                    "MESSAGE_IDEMPOTENCY_CONFLICT",
-                    "Idempotency-Key was reused with a different request",
-                )
-            return _json(
-                202,
-                {
-                    "compaction": {
-                        "message_id": int(existing["message_id"]),
-                        "state": existing["state"],
-                    },
-                },
-            )
-        controls = _compaction_controls(conversation)
-        if not controls["supported"]:
+        if result.refusal is not None:
+            status = 404 if result.refusal == "CONVERSATION_NOT_FOUND" else 409
             raise ApiError(
-                409,
-                "COMPACTION_UNSUPPORTED",
-                f"{conversation['harness']} has no manual compaction trigger",
-            )
-        if conversation["state"] == "closed":
-            raise ApiError(
-                409, "CONVERSATION_CLOSED", "the conversation is closed"
-            )
-        if conversation["close_requested_at"] is not None:
-            raise ApiError(
-                409,
-                "CONVERSATION_CLOSING",
-                "the conversation is stopping active work before it closes",
-            )
-        if not conversation["harness_session_ref"]:
-            raise ApiError(
-                409,
-                "COMPACTION_NO_SESSION",
-                "this chat has no harness session to compact yet",
-            )
-        if controls["pending"]:
-            raise ApiError(
-                409,
-                "COMPACTION_PENDING",
-                "a compaction is already in progress for this chat",
-                {"message_id": controls["message_id"]},
-            )
-        if not controls["enabled"]:
-            raise ApiError(
-                409,
-                "CONVERSATION_BUSY",
-                "the chat is working; compact it when the turn has finished",
-            )
-        message_id = int(
-            con.execute(
-                "INSERT INTO conversation_messages "
-                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
-                "idempotency_key,request_hash,state) "
-                "VALUES (?,'engine',?,'control',?,?,?,'queued')",
+                status,
+                result.refusal,
+                result.detail or result.refusal,
                 (
-                    conversation_id,
-                    conversation_compaction.MANUAL_COMPACT_SENDER,
-                    conversation_compaction.MANUAL_COMPACT_BODY,
-                    key,
-                    request_hash,
+                    {"message_id": result.pending_message_id}
+                    if result.pending_message_id is not None
+                    else None
                 ),
-            ).lastrowid
-        )
-        con.execute(
-            "INSERT INTO conversation_outbox (conversation_id,message_id) "
-            "VALUES (?,?)",
-            (conversation_id, message_id),
-        )
-        con.execute(
-            "UPDATE conversations SET state='queued',version=version+1 "
-            "WHERE conversation_id=?",
-            (conversation_id,),
-        )
-        _append_event(
-            con,
-            conversation_id,
-            conversation_compaction.COMPACTION_REQUESTED,
+            )
+    if result.existing:
+        return _json(
+            202,
             {
-                "message_id": message_id,
-                "initiated_by": "engine",
-                "requested_by_user_id": int(operator["user_id"]),
-                "harness": conversation["harness"],
+                "compaction": {
+                    "message_id": result.message_id,
+                    "state": result.state,
+                },
             },
-            message_id=message_id,
         )
     conversation_events.notify(conversation_id)
     conversation_broker.notify_commit()
     return _json(
         202,
-        {"compaction": {"message_id": message_id, "state": "queued"}},
+        {"compaction": {"message_id": result.message_id, "state": "queued"}},
     )
 
 
@@ -2480,7 +2428,8 @@ def _short_tokens(value: int) -> str:
 def _compaction_projection(payload: dict) -> dict:
     """The marker's figures: what the harness stated, and nothing else."""
     trigger = payload.get("trigger")
-    return {
+    cause = payload.get("cause")
+    projection = {
         "trigger": (
             trigger
             if trigger in ("auto", "manual", "unknown")
@@ -2489,10 +2438,45 @@ def _compaction_projection(payload: dict) -> dict:
         "tokens_before": _token_count(payload.get("tokens_before")),
         "tokens_after": _token_count(payload.get("tokens_after")),
     }
+    # Why the chat compacted (spec #275). A marker recorded before causes
+    # existed has none, and keeps its old shape.
+    if cause in conversation_compaction.CAUSES:
+        projection["cause"] = cause
+        trigger_tokens = _token_count(payload.get("trigger_tokens"))
+        if trigger_tokens is not None:
+            projection["trigger_tokens"] = trigger_tokens
+    return projection
+
+
+# How the marker names each harness when the harness compacted on its own.
+_HARNESS_NAMES = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "kimi": "Kimi",
+    "opencode": "OpenCode",
+}
+
+
+def _compaction_cause_phrase(cause: str | None, harness: str | None) -> str:
+    """"Context compacted" plus why (spec #275 "Marker wording")."""
+    if cause == conversation_compaction.CAUSE_THRESHOLD:
+        return "Context compacted at the trigger"
+    if cause == conversation_compaction.CAUSE_IDLE:
+        return "Context compacted while idle"
+    if cause == conversation_compaction.CAUSE_HARNESS:
+        name = _HARNESS_NAMES.get(harness or "", harness or "the harness")
+        return f"Context compacted by {name}"
+    return "Context compacted"
 
 
 def _compaction_label(payload: dict, harness: str | None = None) -> str:
-    """"Context compacted · 123k → 28k · automatic"; unknown parts left out.
+    """"Context compacted while idle · 141k → 29k"; unknown parts left out.
+
+    The opening names the cause: "compacted" (the operator's button),
+    "compacted at the trigger", "compacted while idle", or "compacted by
+    <harness>". A marker recorded before causes existed keeps its old
+    wording, with "automatic" or "manual" at the end. A threshold
+    compaction that left the chat at or above its trigger says so.
 
     Claude's figure after is the summary alone (``post_tokens``): the next
     request also carries the system prompt and tools and is several times
@@ -2508,7 +2492,8 @@ def _compaction_label(payload: dict, harness: str | None = None) -> str:
     marker = _compaction_projection(payload)
     before, after = marker["tokens_before"], marker["tokens_after"]
     summary = " summary" if harness == "claude" else ""
-    parts = ["Context compacted"]
+    cause = marker.get("cause")
+    parts = [_compaction_cause_phrase(cause, harness)]
     if before is not None and after is not None and after >= before:
         parts.append(f"{_short_tokens(before)}, nothing to drop")
     elif before is not None and after is not None:
@@ -2523,10 +2508,20 @@ def _compaction_label(payload: dict, harness: str | None = None) -> str:
             if summary
             else f"now {_short_tokens(after)}"
         )
-    if marker["trigger"] == "auto":
-        parts.append("automatic")
-    elif marker["trigger"] == "manual":
-        parts.append("manual")
+    if cause is None:
+        if marker["trigger"] == "auto":
+            parts.append("automatic")
+        elif marker["trigger"] == "manual":
+            parts.append("manual")
+    elif (
+        cause == conversation_compaction.CAUSE_THRESHOLD
+        and marker.get("trigger_tokens") is not None
+        and after is not None
+        and after >= marker["trigger_tokens"]
+    ):
+        # At most one threshold compaction per turn: the next turn's end
+        # is checked again.
+        parts.append("still at or above the trigger")
     return " · ".join(parts)
 
 
@@ -3228,10 +3223,20 @@ def _transcript_projection(
             # not reported; the page shows nothing rather than a guess.
             meter = conversation_compaction.meter_reading(reversed(events))
             # The auto-compact window the engine applies to this chat's next
-            # turn: the harness setting, or None when there is none, it is
-            # off, or the model's reported window is smaller.
-            applied = conversation_compaction.compact_window(
-                conversation["harness"]
+            # turn: the harness's trigger in effect (saved, then environment,
+            # then default; spec #275), or None when auto compaction is off,
+            # the harness has no settings, or the model's reported window is
+            # smaller. It is where the engine compacts, so Kimi and OpenCode
+            # show a percentage too when a trigger is in effect for them.
+            settings = compaction_settings.from_saved(
+                conversation["harness"],
+                tuple(
+                    conversation[f"compaction_{column}"]
+                    for column in compaction_settings.SAVED_COLUMNS
+                ),
+            )
+            applied = (
+                settings.effective_trigger if settings is not None else None
             )
             if (
                 applied is not None

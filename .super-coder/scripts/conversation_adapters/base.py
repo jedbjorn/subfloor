@@ -387,6 +387,11 @@ class ConversationAdapter(abc.ABC):
     # True when the harness has a confirmed way to compact a stored session
     # on request (Feature #95). The chat shows the compact button only then.
     manual_compaction = False
+    # True when the harness accepts the auto-compaction trigger as a token
+    # count at launch (Feature #95, spec #275): the broker then passes the
+    # harness's trigger in ``ConversationContext.compact_window``. The
+    # others get nothing and are compacted by the engine between turns.
+    compact_window_native = False
 
     def __init__(self, manifest: Mapping[str, Any]) -> None:
         self.manifest = dict(manifest)

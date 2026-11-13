@@ -196,7 +196,8 @@
     "tests/test_runs_browser.py",
     ".super-coder/assets/skills/delegation/SKILL.md",
     ".super-coder/migrations/0287_seed_delegation_skill.sql",
-    "tests/test_delegation_skill.py"
+    "tests/test_delegation_skill.py",
+    ".super-coder/migrations/0289_chat_compaction_settings.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,

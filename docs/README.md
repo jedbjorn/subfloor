@@ -1651,10 +1651,51 @@ current state boundaries and Admin recovery ownership.
 
 ### Shells tab
 
-The landing tab has four sub-views. **Harness** and **Skills** are scoped to the
-selected shell; the other two are fork-wide, and the shell selector greys out on
+The landing tab has five sub-views. **Harness** and **Skills** are scoped to the
+selected shell; the other three are fork-wide, and the shell selector greys out on
 them.
 
+- **Harness** — opens on **Harnesses**, one collapsible card per shipped
+  harness, then the selected shell's own sections. The cards are
+  install-wide: they read the same whichever shell is selected. Collapsed, a
+  card shows the harness, its provider and one summary line (its
+  background-conversion tier and, where it compacts, auto compaction on or
+  off with its trigger, the idle wait, and this week's compaction count).
+  Click the header to expand its sections (the browser remembers which
+  cards are open): **Background conversion** (the GUI conversion status,
+  with Claude's **Re-verify**), then, on the Claude, Codex, Kimi and
+  OpenCode cards, browser-chat **Compaction settings** and **Compaction
+  data**. Vibe's card has no compaction.
+  - *Auto compaction* — a switch and a trigger in tokens; tooltip:
+    "Compacts a chat when its context reaches the trigger size, checked after
+    each turn."
+  - *Idle compaction* — a wait dropdown (Off, or 5 to 55 minutes, kept under
+    the harness's cache life) and an idle size; tooltip: "Compacts a large
+    chat that has gone quiet, before the provider's cache expires, so your
+    next message is cheap."
+  - Each value shows its source (*saved*, *environment* or *default*); a
+    change saves at once, says *Saved* or the refusal beside the field, and
+    applies on each chat's next turn. The trigger and idle size must be at
+    least 90,000: the engine never compacts a chat on its own below that,
+    and a value under it from the environment or an older row is shown as
+    raised to the floor. The card also states the cache life (a fixed engine
+    value) and what applies to that harness: the trigger passed to the
+    harness, compaction after a turn, idle compaction.
+  - *Data*, over 7 or 30 days, from this install's own chats: chats and
+    model requests, median context and the share of requests at or above the
+    trigger, warm share (cache reads of input), cold rate by idle gap, cold
+    returns at or above the idle size, compactions by cause (harness,
+    threshold, idle, operator), idle compactions followed by a message within
+    24 hours, and what the engine's own compaction requests cost. A figure a
+    harness does not report reads *not reported*. The Claude, Codex and Kimi
+    cards link to their Provider Quota card.
+
+  Defaults: Claude auto compaction on at 250,000, idle after 50 minutes;
+  Codex and Kimi on at 250,000, idle after 25; OpenCode both off; idle size
+  125,000 everywhere. `SC_CHAT_COMPACT_WINDOW_CLAUDE` / `_CODEX` are only a
+  fallback until a Claude or Codex value is saved ([environment](environment.md#operator-knobs)).
+  Rules and records:
+  [conversation runtime](../.super-coder/docs/conversation-runtime.md#per-harness-compaction-settings-threshold-and-idle-compaction).
 - **Skills** — read a granted skill's content with an inline grant toggle beside
   each entry. The viewer shows rendered Markdown with a **raw** toggle, plus a
   character count and token estimate. It says whether you are editing a shared
@@ -1671,6 +1712,8 @@ them.
   many configured defaults are actually runnable — each non-runnable default
   named with its reason. If it finds any of that, it says *review verification
   warnings* rather than claiming success.
+- **Runs** — the runs of every shell, as a chat's **Runs** drawer shows
+  them for one (see [Subagents](#subagents)).
 
 ### Links and keys
 
@@ -1726,3 +1769,9 @@ percentage alone, never from a provider's own severity vocabulary. A percentage
 that could not be derived renders `n/a` with no bar rather than a reassuring
 0%, and a failed probe leaves the last-known figures standing with their age
 instead of claiming anything about your account.
+
+The **Settings** drawer (header button) shows the same readings in short
+under **Tokens**: one weekly row per provider (`weekly n/a` when none was
+read), followed by a **5-hour** row wherever the provider reported a 5-hour
+window, each with its reset countdown and percent used. A provider that
+reports no 5-hour window shows the weekly row only; nothing is estimated.

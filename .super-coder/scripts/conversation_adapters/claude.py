@@ -60,6 +60,10 @@ class ClaudeAdapter(ConversationAdapter):
     # ``manual``, and ends with a ``result`` that names ``local_command``.
     manual_compaction = True
     COMPACT_PROMPT = "/compact"
+    # ``--autocompact <n>``, which Claude takes only from 100k to 1M.
+    compact_window_native = True
+    AUTOCOMPACT_MIN = 100_000
+    AUTOCOMPACT_MAX = 1_000_000
 
     def __init__(
         self,
@@ -84,6 +88,21 @@ class ClaudeAdapter(ConversationAdapter):
     def probe(self) -> ProbeResult:
         launch = self.manifest["headless"]["launch"][0]
         return self._probe_result(command_version([launch, "--version"]))
+
+    @classmethod
+    def _autocompact(cls, context: ConversationContext) -> int | None:
+        """The ``--autocompact`` value for this launch, or None.
+
+        Claude takes 100k to 1M. A trigger outside that range is not passed
+        (spec #275, a change from spec #272's pass-anything rule): the
+        engine's between-turn check compacts such a chat instead.
+        """
+        window = context.effective_compact_window()
+        if window is None:
+            return None
+        if not cls.AUTOCOMPACT_MIN <= window <= cls.AUTOCOMPACT_MAX:
+            return None
+        return window
 
     def _command(
         self,
@@ -131,10 +150,10 @@ class ClaudeAdapter(ConversationAdapter):
                     "Claude adapter cannot apply effort",
                 )
             command.extend([effort["flag"], effort_value])
-        compact_window = context.effective_compact_window()
+        compact_window = self._autocompact(context)
         if compact_window is not None:
             # The value is the window Claude compacts within, not the trigger
-            # point; it is passed through as set, with no engine floor.
+            # point, so Claude compacts a little below it.
             command.extend(["--autocompact", str(compact_window)])
         if context.permission_mode == "unrestricted":
             command.append("--dangerously-skip-permissions")
@@ -172,7 +191,7 @@ class ClaudeAdapter(ConversationAdapter):
             transcript.stat().st_size if transcript.is_file() else 0
         )
         env = merged_env(self.manifest, context)
-        if context.effective_compact_window() is not None:
+        if self._autocompact(context) is not None:
             env.pop(AUTO_COMPACT_WINDOW_ENV, None)
         process = self.runner.spawn(
             command,

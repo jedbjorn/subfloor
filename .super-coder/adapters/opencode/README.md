@@ -167,11 +167,18 @@ was not repeated; an installed 1.19.5 reports `supported`. CI still installs
   context size. **Not checked:** the engine-owned
   shared server (the check used a private one), and a large session.
 - The meter reads the assistant message's `tokens`
-  (`input` + `cache.read` + `cache.write`). OpenCode states no window there,
-  and the engine applies no compact window to it, so the chat shows the size
-  with no percentage (the meter's percentage is of the compact window).
-- OpenCode gets no compact-window setting in this delivery: its control is an
-  on/off switch, not a token count.
+  (`input` + `cache.read` + `cache.write`). OpenCode states no window there.
+  The meter's percentage is of the OpenCode trigger in effect, so a chat
+  shows the size alone while OpenCode's auto compaction is off (the default)
+  and a percentage once it is turned on.
+- **Engine compaction (spec #275).** OpenCode takes no token-count trigger at
+  launch, so nothing is passed to it. Its settings are on the OpenCode card in
+  **Shells → Harness**, one setting for every model provider behind OpenCode
+  (an `anthropic/` or `openai/` model included), and both start off: Auto
+  compaction off, Idle compaction Off. Turned on, the engine compacts an
+  OpenCode chat after a turn that ends at or above the trigger, and while
+  idle, through the manual trigger above. Its cache life is not measured, so
+  the idle wait is capped at 55 minutes. No environment variable applies.
 
 ## Subagent keys (`headless.agent`, Feature #96, spec #273)
 

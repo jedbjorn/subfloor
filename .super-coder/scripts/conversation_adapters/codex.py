@@ -260,6 +260,8 @@ class JsonLineRpcProcess:
 class CodexAdapter(ConversationAdapter):
     harness = "codex"
     manual_compaction = True
+    # ``model_auto_compact_token_limit`` on the launch and the thread config.
+    compact_window_native = True
 
     def __init__(
         self,
