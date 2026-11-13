@@ -1,28 +1,70 @@
 """Moonshot probe — GET api.kimi.com/coding/v1/usages.
 
-Credential: ~/.kimi-code/credentials/kimi-code.json → access_token, with
-expires_at for the pre-flight expiry check. Read and never written.
+Credential: the newest non-empty token in
+``$KIMI_CODE_HOME/credentials/kimi-code-env-*.json``, falling back to
+``kimi-code.json``. The default home is ``~/.kimi-code``. ``expires_at`` drives
+the pre-flight expiry check. Files are read and never written.
 
 The only provider that reports ABSOLUTE counts (used / limit / remaining), so
 its percent is derived rather than given — and derived only when the limit is
-a positive number. Identity is `user.userId`; nothing on disk identifies the
-account, so a failed probe leaves the account unidentified rather than
-guessing at a ref.
+a positive number. Identity is `user.userId`, falling back to
+`booster_wallet.userId`; nothing on disk identifies the account, so a failed
+probe leaves the account unidentified rather than guessing at a ref.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-from . import (TIME_UNIT_SECONDS, account, as_count, drift, duration_label,
-               get_json, is_expired, kind_for_seconds, norm_iso, now_iso,
-               percent_from, read_json, response_detail, status_for_http,
-               window)
+from . import (
+    TIME_UNIT_SECONDS,
+    account,
+    as_count,
+    drift,
+    duration_label,
+    get_json,
+    is_expired,
+    kind_for_seconds,
+    norm_iso,
+    now_iso,
+    percent_from,
+    read_json,
+    response_detail,
+    status_for_http,
+    window,
+)
 
 HARNESS_PROVIDER = "moonshot"
-PROBE_VERSION = "2"
+PROBE_VERSION = "3"
 
 CREDENTIALS = Path.home() / ".kimi-code/credentials/kimi-code.json"
 URL = "https://api.kimi.com/coding/v1/usages"
+
+
+def _read_credentials(log) -> dict | None:
+    root = Path(os.environ.get("KIMI_CODE_HOME") or CREDENTIALS.parent.parent)
+    directory = root / "credentials"
+    newest = None
+    newest_mtime = -1
+    try:
+        candidates = list(directory.glob("kimi-code-env-*.json"))
+    except OSError as e:
+        log(f"{HARNESS_PROVIDER}: cannot list {directory}: {e.strerror or e}")
+        candidates = []
+    for path in candidates:
+        creds = read_json(path, log, HARNESS_PROVIDER)
+        if not creds or not creds.get("access_token"):
+            continue
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError as e:
+            log(f"{HARNESS_PROVIDER}: cannot stat {path}: {e.strerror or e}")
+            continue
+        if mtime > newest_mtime:
+            newest, newest_mtime = creds, mtime
+    if newest is not None:
+        return newest
+    return read_json(directory / "kimi-code.json", log, HARNESS_PROVIDER)
 
 
 def _window_seconds(spec) -> "float | None":
@@ -139,7 +181,7 @@ def probe(log, timeout) -> list[dict]:
         return [account(provider=HARNESS_PROVIDER, probe_version=PROBE_VERSION,
                         captured_at=captured_at, **kw)]
 
-    creds = read_json(CREDENTIALS, log, HARNESS_PROVIDER)
+    creds = _read_credentials(log)
     token = (creds or {}).get("access_token")
     if not token:
         return result(status="na")
@@ -154,12 +196,15 @@ def probe(log, timeout) -> list[dict]:
         return result(status=status_for_http(code),
                       detail=response_detail(code, payload, HARNESS_PROVIDER, log))
 
-    user_id = ((payload.get("user") or {}) if isinstance(payload.get("user"), dict)
-               else {}).get("userId")
+    user = payload.get("user")
+    user_id = (user if isinstance(user, dict) else {}).get("userId")
+    if not user_id:
+        wallet = payload.get("booster_wallet")
+        user_id = (wallet if isinstance(wallet, dict) else {}).get("userId")
     ref = str(user_id) if user_id else None
     if not ref:
-        log(f"{HARNESS_PROVIDER}: no user.userId in the usages payload — this "
-            "account cannot be identified")
+        log(f"{HARNESS_PROVIDER}: no user.userId or booster_wallet.userId in "
+            "the usages payload — this account cannot be identified")
         return result(status="error", detail="no account identifier")
 
     common = dict(account_ref=ref)

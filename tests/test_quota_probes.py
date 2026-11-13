@@ -102,9 +102,9 @@ class Endpoint:
 class ProbeCase(unittest.TestCase):
     """Writes credential files into a temp HOME and points each probe at them.
 
-    Every probe module resolves its credential paths at import time, so the
-    constants are patched rather than $HOME — the same thing the real code
-    would read, without touching the operator's own files.
+    Credential path constants are patched rather than $HOME, and Kimi's
+    per-call home override points into the same temporary root — the same
+    thing the real code would read, without touching the operator's own files.
 
     HTTP IS NOT THE ONLY EXTERNAL DEPENDENCY, and stubbing only that one is
     what put 20 failures in CI (SC-170). The openai probe derives its client
@@ -125,6 +125,10 @@ class ProbeCase(unittest.TestCase):
         self.claude_profile = self.tmp / ".claude.json"
         self.codex_auth = self.tmp / ".codex/auth.json"
         self.kimi_creds = self.tmp / ".kimi-code/credentials/kimi-code.json"
+        home = mock.patch.dict(os.environ, {
+            "KIMI_CODE_HOME": str(self.tmp / ".kimi-code")})
+        home.start()
+        self.addCleanup(home.stop)
         expires = int((time.time() + 3600) * 1000)
         self.write(self.claude_creds, {"claudeAiOauth": {
             "accessToken": TOKEN, "refreshToken": "sentinel-refresh",
@@ -852,6 +856,48 @@ class MoonshotProbeTest(ProbeCase):
         self.assertEqual(acct["status"], "error")
         self.assertIn("not a JSON object", acct["detail"])
         self.assertTrue(any("shape drift" in n for n in self.notes))
+
+    def test_v2_identity_comes_from_booster_wallet(self):
+        acct, _ = self.probe(payload=fixture("moonshot_usages_v2.json"))
+        self.assertEqual(acct["status"], "ok")
+        self.assertEqual(acct["account_ref"], "placeholderuser000002")
+        self.assertEqual(set(self.by_kind(acct)),
+                         {("weekly", None), ("five_hour", None)})
+
+    def test_newest_nonempty_v2_credential_wins(self):
+        directory = self.kimi_creds.parent
+        older = directory / "kimi-code-env-older.json"
+        newer = directory / "kimi-code-env-newer.json"
+        empty = directory / "kimi-code-env-empty.json"
+        self.write(older, {"access_token": "older-token",
+                           "expires_at": int(time.time()) + 900})
+        self.write(newer, {"access_token": "newer-token",
+                           "expires_at": int(time.time()) + 900})
+        self.write(empty, {"access_token": ""})
+        os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
+        os.utime(empty, ns=(3_000_000_000, 3_000_000_000))
+        acct, ep = self.probe()
+        self.assertEqual(acct["status"], "ok")
+        self.assertEqual(ep.calls[0][1]["Authorization"], "Bearer newer-token")
+
+    def test_empty_v2_credentials_fall_back_to_legacy(self):
+        self.write(self.kimi_creds.parent / "kimi-code-env-empty.json",
+                   {"access_token": ""})
+        acct, ep = self.probe()
+        self.assertEqual(acct["status"], "ok")
+        self.assertEqual(ep.calls[0][1]["Authorization"], f"Bearer {TOKEN}")
+
+    def test_kimi_code_home_is_honored(self):
+        root = self.tmp / "configured-kimi-home"
+        configured = root / "credentials/kimi-code-env-configured.json"
+        self.write(configured, {"access_token": "configured-token",
+                                "expires_at": int(time.time()) + 900})
+        with mock.patch.dict(os.environ, {"KIMI_CODE_HOME": str(root)}):
+            acct, ep = self.probe()
+        self.assertEqual(acct["status"], "ok")
+        self.assertEqual(ep.calls[0][1]["Authorization"],
+                         "Bearer configured-token")
 
     def test_expired_token_is_reported_never_used(self):
         self.write(self.kimi_creds, {"access_token": TOKEN,
