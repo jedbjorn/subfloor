@@ -423,7 +423,7 @@ console.log(JSON.stringify({ seen }));
     assert result["seen"] == [
         {"hash": "", "tab": "shells", "shellTab": "harness"},
         {"hash": "#shells", "tab": "shells", "shellTab": "harness"},
-        {"hash": "#shells-skills", "tab": "shells", "shellTab": "skills"},
+        {"hash": "#shells-skills", "tab": "shells", "shellTab": "harness"},
         {
             "hash": "#shells-skill-assignments",
             "tab": "shells",
@@ -495,7 +495,6 @@ function setStatus() {}
 function toast() {}
 const rendered = [];
 function renderHarness() { rendered.push("harness"); }
-function renderSkillViewer() { rendered.push("skills"); }
 function renderSkillAssignments() { rendered.push("assignments"); }
 function renderDefaultModels() { rendered.push("models"); }
 function renderRunsFleet() { rendered.push("runs"); }
@@ -509,7 +508,7 @@ function all(root, predicate, found = []) {
 
 (async () => {
   const views = [];
-  for (const key of ["harness", "skills", "assignments", "models", "runs"]) {
+  for (const key of ["harness", "assignments", "models", "runs"]) {
     shellTab = key;
     const root = new FakeElement("div");
     await renderShells(root);
@@ -538,10 +537,9 @@ function all(root, predicate, found = []) {
 });
 """
     result = run_js(script)
-    labels = ["Harness", "Skills", "Skill Assignments", "Default Models", "Runs"]
+    labels = ["Harness", "Skill Assignments", "Default Models", "Runs"]
     hashes = [
         "shells",
-        "shells-skills",
         "shells-skill-assignments",
         "shells-default-models",
         "shells-runs",
@@ -551,7 +549,7 @@ function all(root, predicate, found = []) {
         assert view["active"] == [label]
         assert view["hashes"] == hashes
         assert view["rendered"] == view["key"]
-    assert result["views"][2]["paneClass"] == "shell-pane skill-assignments"
+    assert result["views"][1]["paneClass"] == "shell-pane skill-assignments"
     assert result["views"][0]["paneClass"] == "shell-pane"
 
 
@@ -619,7 +617,6 @@ function openNewShellModal() {}
 function setStatus() {}
 function toast() {}
 function renderHarness() {}
-function renderSkillViewer() {}
 function renderSkillAssignments() {}
 function renderDefaultModels() {}
 """ + SHELL_RENDER + r"""
