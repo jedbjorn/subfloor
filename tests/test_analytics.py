@@ -33,6 +33,7 @@ MIGRATIONS = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 import analytics  # noqa: E402
+import server
 from token_parsers import claude as p_claude  # noqa: E402
 from token_parsers import codex as p_codex  # noqa: E402
 from token_parsers import kimi as p_kimi  # noqa: E402
@@ -386,6 +387,79 @@ class OpencodeParserTest(unittest.TestCase):
         self.assertEqual(r["reasoning_tokens"], 20)    # split kept informationally
         self.assertEqual(r["input_tokens"], 100)
         self.assertEqual(r["provider"], "openai")
+
+
+class AnalyticsUsageTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = self.tmp / "shell_db.db"
+        build_engine_db(self.db)
+        self.con = sqlite3.connect(self.db)
+        self.con.row_factory = sqlite3.Row
+
+    def tearDown(self):
+        self.con.close()
+
+    def add_usage(self, shell_id, harness, ref, model, provider, started_at):
+        self.con.execute(
+            "INSERT INTO session_token_usage "
+            "(shell_id, harness, harness_session_ref, model, provider, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (shell_id, harness, ref, model, provider, started_at))
+
+    def favorites(self, **query):
+        q = {key: [value] for key, value in query.items()}
+        return server.get_analytics_usage(self.con, q)["favorite_models"]
+
+    def test_favorite_models_share_the_time_and_usage_filters(self):
+        for i in range(4):
+            self.add_usage(1, "codex", f"old-{i}", "gpt-old", "openai",
+                           "2026-01-01T10:00:00Z")
+        self.add_usage(1, "codex", "codex-recent", "gpt-recent", "openai",
+                       "2026-07-19T10:00:00Z")
+        for i in range(2):
+            self.add_usage(1, "kimi", f"kimi-{i}", "kimi-code/k3", "moonshot",
+                           "2026-07-19T10:00:00Z")
+        for i in range(3):
+            self.add_usage(2, "codex", f"dev-{i}", "gpt-dev", "openai",
+                           "2026-07-19T10:00:00Z")
+        self.add_usage(2, "claude", "claude-1", "claude-sonnet", "anthropic",
+                       "2026-07-19T10:00:00Z")
+        for i in range(5):
+            self.add_usage(1, "codex", f"future-{i}", "gpt-future", "openai",
+                           "2026-08-01T10:00:00Z")
+        self.con.commit()
+
+        window = {"from": "2026-07-01T00:00:00Z", "to": "2026-08-01T00:00:00Z"}
+        cases = [
+            ({}, [
+                {"flavor": "admin", "model": "gpt-future", "sessions": 5},
+                {"flavor": "dev", "model": "gpt-dev", "sessions": 3},
+            ]),
+            (window, [
+                {"flavor": "admin", "model": "kimi-code/k3", "sessions": 2},
+                {"flavor": "dev", "model": "gpt-dev", "sessions": 3},
+            ]),
+            ({**window, "harness": "codex"}, [
+                {"flavor": "admin", "model": "gpt-recent", "sessions": 1},
+                {"flavor": "dev", "model": "gpt-dev", "sessions": 3},
+            ]),
+            ({**window, "model": "kimi-code/k3"}, [
+                {"flavor": "admin", "model": "kimi-code/k3", "sessions": 2},
+            ]),
+            ({**window, "model": "claude-sonnet"}, [
+                {"flavor": "dev", "model": "claude-sonnet", "sessions": 1},
+            ]),
+            ({**window, "provider": "moonshot"}, [
+                {"flavor": "admin", "model": "kimi-code/k3", "sessions": 2},
+            ]),
+            ({**window, "shell": "2"}, [
+                {"flavor": "dev", "model": "gpt-dev", "sessions": 3},
+            ]),
+        ]
+        for query, expected in cases:
+            with self.subTest(query=query):
+                self.assertEqual(expected, self.favorites(**query))
 
 
 class CollectorTest(unittest.TestCase):

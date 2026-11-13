@@ -4323,7 +4323,7 @@ async function anTokenSection(root) {
   let filters, usage;
   try {
     [filters, usage] = await Promise.all([
-      api("/analytics/filters"), api("/analytics/usage?from=" + winFrom)]);
+      api("/analytics/filters"), api("/analytics/usage" + anQuery({ from: winFrom }))]);
     if (!anSessions.length && !anDaysLoaded) await anLoadPage(anRange);
   } catch (e) {
     root.replaceChildren(el("div", { className: "card" }, "error: " + e.message));
@@ -4386,8 +4386,8 @@ async function anTokenSection(root) {
 
   // usage panels — favorite model by flavor · peak day · features shipped ·
   // specs shipped · docs outstanding. Peak day is client-computed from the
-  // combined buckets (all classes, all models in the slice); the shipped
-  // counts are window-scoped server-side; outstanding is current-state.
+  // combined buckets (all classes, all models in the slice); favorites and
+  // shipped counts are window-scoped server-side; outstanding is current-state.
   const panelsTop = el("div", { className: "an-panels" });
   const panels = el("div", { className: "an-panels" });
   // items: strings, or {id, label} — an id renders as #id with a copy button

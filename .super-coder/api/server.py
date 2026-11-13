@@ -1503,12 +1503,15 @@ def get_analytics_tokens(con, q) -> dict:
 
 def get_analytics_usage(con, q) -> dict:
     """Behavioral reads for the Analytics tab's usage panels. `from`/`to`
-    scope the shipped counts to the UI's selected window; comparisons are at
-    DAY granularity (substr to the date part) because the source columns mix
-    `datetime('now')` (space-separated) and ISO-T formats — full-string
-    comparison across the two lies about same-day ordering."""
-    frm = (q.get("from", [""])[0] or "")[:10]
-    to = (q.get("to", [""])[0] or "")[:10]
+    scope the favorites and shipped counts to the UI's selected window;
+    shipped comparisons are at DAY granularity (substr to the date part)
+    because the source columns mix `datetime('now')` (space-separated) and
+    ISO-T formats — full-string comparison across the two lies about same-day
+    ordering."""
+    frm_param = (q.get("from", [""])[0] or "").strip()
+    to_param = (q.get("to", [""])[0] or "").strip()
+    frm = frm_param[:10]
+    to = to_param[:10]
     window, wparams = "", []
     if frm:
         window += " AND substr({col}, 1, 10) >= ?"
@@ -1518,13 +1521,22 @@ def get_analytics_usage(con, q) -> dict:
         wparams.append(to)
 
     # favorite model per shell flavor — most sessions wins, read-time only
+    fav_window, fparams = "", []
+    if frm_param:
+        fav_window += f" AND {_ANALYTICS_TS} >= ?"
+        fparams.append(frm_param)
+    if to_param:
+        fav_window += f" AND {_ANALYTICS_TS} < ?"
+        fparams.append(to_param)
+    where, params = _analytics_where(q)
     fav: dict[str, dict] = {}
     for r in con.execute(
             "SELECT s.flavor, u.model, "
             "COUNT(DISTINCT u.harness || '|' || u.harness_session_ref) AS sessions "
             "FROM session_token_usage u JOIN shells s ON s.shell_id=u.shell_id "
-            "WHERE u.model IS NOT NULL AND s.flavor IS NOT NULL "
-            "GROUP BY s.flavor, u.model"):
+            "WHERE u.model IS NOT NULL AND s.flavor IS NOT NULL"
+            f"{fav_window}{where} GROUP BY s.flavor, u.model",
+            fparams + params):
         if r["flavor"] not in fav or r["sessions"] > fav[r["flavor"]]["sessions"]:
             fav[r["flavor"]] = {"flavor": r["flavor"], "model": r["model"],
                                 "sessions": r["sessions"]}
