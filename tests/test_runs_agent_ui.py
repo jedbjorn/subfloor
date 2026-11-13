@@ -451,10 +451,12 @@ def test_the_fleet_view_filters_by_agent_and_passes_the_limits():
     assert '["job", "agent", "probe", "devkit"].map((s) => [s, s])' in FLEET
     assert "limits = result.limits;" in FLEET
     assert "{ limits, shell: shells.find((s) => String(s.shell_id) === shell.value) || null }" in FLEET
-    # The drawer states the limits for its own shell.
-    assert ("const { runs, total, limits } = await api(`/runs?shell_id=${shell.shell_id}"
-            "&limit=${LIST_LIMIT}`);") in APP
-    assert "await refreshPRs(); }, { limits, shell });" in APP
+    # The chat rail splits Jobs from Sub Agents; each lists, counts and states
+    # the limits of its own kind for its own shell.
+    assert '{ label: "Jobs", className: "jobs-drawer", filter: "exclude_kind=agent", part: "watchers"' in APP
+    assert '{ label: "Sub Agents", className: "subagents-drawer", filter: "kind=agent", part: "agents"' in APP
+    assert "api(`/runs?shell_id=${shell.shell_id}&${drawer.filter}&limit=${LIST_LIMIT}`)" in APP
+    assert "{ limits, shell, part: drawer.part, empty: drawer.empty });" in APP
     # The page offers no control that launches a run.
     assert not [line for line in APP.splitlines() if "/runs" in line and '"POST"' in line
                 and "/kill" not in line and "/attach" not in line]
