@@ -681,6 +681,9 @@ const DATA = {
 const requests = [];
 let refuse = null, settingsFail = null;
 const cardOverrides = {};
+// When set, card-data requests wait until the test opens the gate.
+let dataGate = null;
+const gate = () => { let open; const promise = new Promise((r) => { open = r; }); return { promise, open }; };
 async function api(path, method = "GET", body) {
   requests.push({ path, method, body });
   if (path === "/flavor-defaults") return { harness_status: statuses };
@@ -689,6 +692,7 @@ async function api(path, method = "GET", body) {
     return { install_wide: true, harnesses: ["claude", "codex", "kimi", "opencode"].map((h) => cardFor(h, cardOverrides[h])) };
   }
   if (path.endsWith("/conversion/verify")) return {};
+  if (path.includes("/compaction-data") && dataGate) await dataGate.promise;
   if (path.includes("/compaction-data")) return { ...DATA, harness: path.split("/")[2], days: Number(path.split("days=")[1]) };
   if (method === "PUT") {
     if (refuse) throw new Error(refuse);
@@ -850,10 +854,24 @@ def test_cards_save_on_change_and_show_saved_or_the_refusal_inline():
   await all(card("codex"), has("cc-summary"))[0].onclick();
   await flush();
   let body = all(card("codex"), has("cc-body"))[0];
+  const dataCalls = () => requests.filter((r) => r.path.startsWith("/harnesses/codex/compaction-data")).length;
+  out.dataCallsBefore = dataCalls();
   const trigger = all(body, has("cc-number"))[0];
   trigger.value = "180,000";
-  await trigger.onchange();
+  dataGate = gate();
+  const saving = trigger.onchange();
+  // Before the reload answers, the repaint still shows the loaded figures.
+  await new Promise((resolve) => setImmediate(resolve));
+  const during = all(card("codex"), has("cc-body"))[0];
+  out.duringSave = all(during, has("cc-data-body"))[0].textContent.includes("Loading") ? "loading"
+    : all(during, (n) => n.tagName === "dd").length;
+  dataGate.open(); dataGate = null;
+  await saving;
   body = all(card("codex"), has("cc-body"))[0];
+  out.dataCallsAfter = dataCalls();
+  out.figuresAfter = all(body, (n) => n.tagName === "dd").map((n) => n.textContent);
+  out.loadingAfter = all(body, has("cc-data-body"))[0].textContent.includes("Loading");
+  out.captions = all(body, has("cc-caption")).map((n) => n.textContent);
   out.put = requests.filter((r) => r.method === "PUT").map((r) => [r.path, r.body]);
   out.saved = all(body, has("cc-status")).map((n) => n.textContent).filter(Boolean);
   out.sources = all(body, has("cc-source"))[0].textContent;
@@ -870,6 +888,18 @@ def test_cards_save_on_change_and_show_saved_or_the_refusal_inline():
   out.refused = all(body, (n) => has("cc-status")(n) && has("error")(n)).map((n) => n.textContent);
 """)
     assert out["put"] == [["/harnesses/codex/compaction", {"trigger_tokens": 180000}]]
+    # The figures survive the repaint and are reloaded after the save.
+    assert out["duringSave"] == 9
+    assert out["dataCallsAfter"] == out["dataCallsBefore"] + 1
+    assert out["loadingAfter"] is False
+    assert len(out["figuresAfter"]) == 9
+    assert out["figuresAfter"][0] == "2 chats · 6 model requests"
+    assert out["captions"] == [
+        "A request is cold when under 50% of its input was read from the cache; "
+        "the gap is the time since the chat's previous request.",
+        "A request after a gap of at least the cache life; tokens re-read are its "
+        "uncached input plus cache writes.",
+    ]
     assert out["saved"] == ["Saved"]
     assert out["sources"] == "switch: default · trigger: saved"
     assert out["summary"].startswith("▾ Auto compaction on at 180k")

@@ -1157,7 +1157,10 @@ function ccSettings(state, flash) {
     try {
       const saved = await api(`/harnesses/${harness}/compaction`, "PUT", { [field]: value });
       state.card = { ...card, ...saved, week_compactions: card.week_compactions };
+      // The repaint keeps the figures already shown, then reloads them: a
+      // new trigger or idle size changes the figures read against it.
       state.paint({ field, text: "Saved" });
+      await ccLoadData(state);
     } catch (error) { line.className = "cc-status error"; line.textContent = error.message; }
   };
   const whole = (input) => {
@@ -1215,9 +1218,11 @@ function ccDataRows(d) {
     ["Warm share: cache reads of input", !d.warm_share?.reported ? "not reported"
       : d.warm_share.share == null ? "no requests" : ccPct(d.warm_share.share)],
     ["Cold rate by idle gap", !gaps.reported ? `not reported${gaps.note ? ` (${gaps.note})` : ""}`
-      : (gaps.buckets || []).map((b) => `${b.label}: ${b.rate == null ? "–" : ccPct(b.rate)} (${b.cold} of ${b.requests})`).join(" · ")],
+      : (gaps.buckets || []).map((b) => `${b.label}: ${b.rate == null ? "–" : ccPct(b.rate)} (${b.cold} of ${b.requests})`).join(" · "),
+      `A request is cold when under ${ccPct(gaps.cold_share_under ?? 0.5)} of its input was read from the cache; the gap is the time since the chat's previous request.`],
     ["Cold returns at or above the idle size", !cold.reported ? "not reported"
-      : `${cold.count} · tokens re-read ${cold.tokens_reread == null ? "not reported" : ccK(cold.tokens_reread)}`],
+      : `${cold.count} · tokens re-read ${cold.tokens_reread == null ? "not reported" : ccK(cold.tokens_reread)}`,
+      "A request after a gap of at least the cache life; tokens re-read are its uncached input plus cache writes."],
     ["Compactions by cause, median before → after", CC_CAUSES.map((cause) => {
       const c = d.compactions?.by_cause?.[cause] || { count: 0 };
       const sizes = c.count && (c.median_before != null || c.median_after != null)
@@ -1237,10 +1242,15 @@ function ccData(state) {
   const switcher = el("div", { className: "cc-days" });
   for (const days of [7, 30]) {
     const button = el("button", { type: "button", className: days === state.days ? "act active-tab" : "act" }, `${days} days`);
-    button.onclick = () => { state.days = days; state.paint(); return ccLoadData(state); };
+    button.onclick = () => { state.days = days; state.figures = null; state.paint(); return ccLoadData(state); };
     switcher.append(button);
   }
-  state.dataBody = el("div", { className: "cc-data-body muted" }, "Loading…");
+  // A repaint (after a save) shows the figures already loaded for this
+  // period rather than going back to "Loading…".
+  const shown = state.figures?.days === state.days ? state.figures.table : null;
+  state.dataBody = shown
+    ? el("div", { className: "cc-data-body" }, shown)
+    : el("div", { className: "cc-data-body muted" }, "Loading…");
   section.append(switcher, state.dataBody);
   if (CC_QUOTA[harness])
     section.append(el("a", { className: "cc-quota", href: "#analytics-quota" },
@@ -1254,7 +1264,12 @@ async function ccLoadData(state) {
     const d = await api(`/harnesses/${state.harness}/compaction-data?days=${days}`);
     if (body !== state.dataBody || days !== state.days) return;
     const table = el("dl", { className: "cc-figures" });
-    for (const [label, value] of ccDataRows(d)) table.append(el("dt", {}, label), el("dd", {}, value));
+    for (const [label, value, caption] of ccDataRows(d)) {
+      const dd = el("dd", {}, value);
+      if (caption) dd.append(el("div", { className: "muted cc-caption" }, caption));
+      table.append(el("dt", {}, label), dd);
+    }
+    state.figures = { days, table };
     body.className = "cc-data-body"; body.replaceChildren(table);
   } catch (error) {
     if (body !== state.dataBody) return;

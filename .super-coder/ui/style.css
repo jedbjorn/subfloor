@@ -1968,6 +1968,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .cc-figures { display: grid; grid-template-columns: minmax(160px, max-content) 1fr; gap: 4px 12px; margin: 0; font-size: 12px; }
 .cc-figures dt { color: var(--dim); }
 .cc-figures dd { margin: 0; overflow-wrap: anywhere; }
+.cc-caption { font-size: 11px; margin-top: 2px; }
 .cc-quota { display: inline-block; margin-top: 6px; font-size: 12px; }
 @media (max-width: 700px) { .cc-figures { grid-template-columns: 1fr; } .cc-figures dd { margin-bottom: 4px; } }
 @media (max-width: 1000px) { .shell-pane .run-row { display: block; } }
