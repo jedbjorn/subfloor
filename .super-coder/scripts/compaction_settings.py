@@ -52,9 +52,14 @@ FIELDS = (
     "idle_min_tokens",
 )
 
-# Smallest trigger and idle size the operator may save: a lower value would
-# compact a chat on nearly every turn.
-MIN_TOKENS = 10_000
+# The engine never compacts a chat on its own below this size, by threshold
+# or while idle (FnB ruling, 2026-11-13); the operator's button is not
+# bound by it. It is both the smallest trigger and idle size the operator may
+# save and, at decision time, the floor under whatever value is in effect,
+# so an environment value or an older or hand-edited row below it cannot
+# make the engine compact early.
+MIN_TOKENS = 90_000
+ENGINE_FLOOR_TOKENS = MIN_TOKENS
 
 DEFAULT_TRIGGER_TOKENS = conversation_compaction.DEFAULT_COMPACT_WINDOW
 DEFAULT_IDLE_MIN_TOKENS = 125_000
@@ -141,9 +146,18 @@ class HarnessCompactionSettings:
 
     @property
     def effective_trigger(self) -> int | None:
-        """The trigger in effect: the trigger with auto compaction on, else
-        None. A model with a smaller window is the caller's to check."""
-        return self.trigger_tokens if self.auto_enabled else None
+        """The trigger in effect: the trigger, raised to the engine floor,
+        with auto compaction on, else None. A model with a smaller window is
+        the caller's to check."""
+        if not self.auto_enabled:
+            return None
+        return max(self.trigger_tokens, ENGINE_FLOOR_TOKENS)
+
+    @property
+    def effective_idle_min_tokens(self) -> int:
+        """The idle size in effect: the idle size, raised to the engine
+        floor."""
+        return max(self.idle_min_tokens, ENGINE_FLOOR_TOKENS)
 
     @property
     def idle_enabled(self) -> bool:
@@ -165,6 +179,11 @@ class HarnessCompactionSettings:
             "saved": self.saved,
             "updated_at": self.updated_at,
             "effective_trigger": self.effective_trigger,
+            "effective_idle_min_tokens": self.effective_idle_min_tokens,
+            # True when the value in effect was raised to the engine floor.
+            "trigger_raised_to_floor": self.trigger_tokens < ENGINE_FLOOR_TOKENS,
+            "idle_min_raised_to_floor": self.idle_min_tokens < ENGINE_FLOOR_TOKENS,
+            "floor_tokens": ENGINE_FLOOR_TOKENS,
             "cache_life_minutes": CACHE_LIFE_MINUTES[self.harness],
             "cache_life_measured": CACHE_LIFE_MEASURED[self.harness],
             "idle_choices": list(idle_choices(self.harness)),
@@ -318,7 +337,7 @@ def _whole_number(value: Any) -> bool:
 def validate_changes(harness: str, changes: Mapping[str, Any]) -> dict[str, Any]:
     """The changes, checked; raises SettingsError on the first refusal.
 
-    Trigger and idle size are whole numbers of at least 10,000; the wait is
+    Trigger and idle size are whole numbers of at least 90,000; the wait is
     one of the harness's dropdown values or ``None`` (Off); auto compaction
     is a boolean. An unknown harness or field is refused.
     """

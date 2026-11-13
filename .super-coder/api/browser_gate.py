@@ -294,7 +294,7 @@ _OPERATOR_SURFACES = (
     ("/api/sprints", "the Sprint board"),
     ("/api/runs", "runs"),
     ("/api/engine-ops", "engine operations"),
-    ("/api/harnesses", "harness conversion verification"),
+    ("/api/harnesses", "harness settings and conversion verification"),
 )
 
 
