@@ -397,6 +397,9 @@ class RegistrationTest(AgentLedgerCase):
         self.assertEqual(listed[command["run_id"]]["timeout_seconds"], 90)
         only = job._api("GET", "/_sc/runs?kind=agent")
         self.assertEqual([row["run_id"] for row in only["runs"]], [agent["run_id"]])
+        rest = job._api("GET", "/_sc/runs?exclude_kind=agent")
+        self.assertEqual([row["run_id"] for row in rest["runs"]], [command["run_id"]])
+        self.assertEqual(rest["total"], 1)
         # The operator listing reads through the same projection.
         fleet = {row["run_id"]: row for row in self.store.list(None)}
         self.assertEqual(fleet[agent["run_id"]]["agent"]["requested_model"], "model-x")

@@ -831,26 +831,32 @@ function runThreads(runs) {
   return threads;
 }
 // The limits are stated once at the head of a list. A list at a limit says so in words.
-function runLimitsLine(limits, shell, shells = []) {
+// `part` limits it to the half a split drawer lists: "agents" or "watchers".
+function runLimitsLine(limits, shell, shells = [], part = null) {
   if (!limits?.agents || !limits?.watchers) return null;
-  const { agents, watchers } = limits;
+  const agents = part === "watchers" ? null : limits.agents;
+  const watchers = part === "agents" ? null : limits.watchers;
   const name = (id) => shells.find((s) => String(s.shell_id) === String(id))?.shortname || `shell ${id}`;
   const who = shell ? (shell.shortname || `shell ${shell.shell_id}`) : null;
   const facts = [], full = [];
-  if (who && agents.shell_live != null) {
-    facts.push(`Subagents: ${agents.shell_live} of ${agents.per_shell} live for ${who} · ${agents.install_live} of ${agents.per_install} on this install.`);
-    if (agents.shell_live >= agents.per_shell) full.push(`${who} is at its limit of ${agents.per_shell} live subagents.`);
-    facts.push(`Watchers: ${watchers.shell_live} of ${watchers.per_shell} live for ${who}.`);
-    if (watchers.shell_live >= watchers.per_shell) full.push(`${who} is at its limit of ${watchers.per_shell} live watchers.`);
+  if (who && limits.agents.shell_live != null) {
+    if (agents) {
+      facts.push(`Subagents: ${agents.shell_live} of ${agents.per_shell} live for ${who} · ${agents.install_live} of ${agents.per_install} on this install.`);
+      if (agents.shell_live >= agents.per_shell) full.push(`${who} is at its limit of ${agents.per_shell} live subagents.`);
+    }
+    if (watchers) {
+      facts.push(`Watchers: ${watchers.shell_live} of ${watchers.per_shell} live for ${who}.`);
+      if (watchers.shell_live >= watchers.per_shell) full.push(`${who} is at its limit of ${watchers.per_shell} live watchers.`);
+    }
   } else {
-    facts.push(`Subagents: ${agents.install_live} of ${agents.per_install} live on this install; one shell may run ${agents.per_shell}.`);
-    facts.push(`Watchers: ${watchers.install_live} live on this install; one shell may run ${watchers.per_shell}.`);
-    for (const [id, count] of Object.entries(agents.by_shell || {}))
+    if (agents) facts.push(`Subagents: ${agents.install_live} of ${agents.per_install} live on this install; one shell may run ${agents.per_shell}.`);
+    if (watchers) facts.push(`Watchers: ${watchers.install_live} live on this install; one shell may run ${watchers.per_shell}.`);
+    for (const [id, count] of Object.entries(agents?.by_shell || {}))
       if (count >= agents.per_shell) full.push(`${name(id)} is at its limit of ${agents.per_shell} live subagents.`);
-    for (const [id, count] of Object.entries(watchers.by_shell || {}))
+    for (const [id, count] of Object.entries(watchers?.by_shell || {}))
       if (count >= watchers.per_shell) full.push(`${name(id)} is at its limit of ${watchers.per_shell} live watchers.`);
   }
-  if (agents.install_live >= agents.per_install) full.push(`This install is at its limit of ${agents.per_install} live subagents.`);
+  if (agents && agents.install_live >= agents.per_install) full.push(`This install is at its limit of ${agents.per_install} live subagents.`);
   const line = el("div", { className: "run-limits" + (full.length ? " run-limits-full" : "") }, facts.join(" "));
   if (full.length) line.append(el("strong", {}, ` ${full.join(" ")} A further launch is refused until one ends.`));
   return line;
@@ -964,11 +970,11 @@ function runRow(run, shells, refresh, thread = null, folded = false) {
   row.append(actions);
   return row;
 }
-function renderRunRows(host, runs, shells, refresh, { limits = null, shell = null } = {}) {
+function renderRunRows(host, runs, shells, refresh, { limits = null, shell = null, part = null, empty = "No runs." } = {}) {
   host.replaceChildren();
-  const line = runLimitsLine(limits, shell, shells);
+  const line = runLimitsLine(limits, shell, shells, part);
   if (line) host.append(line);
-  if (!runs.length) { host.append(el("div", { className: "muted" }, "No runs.")); return; }
+  if (!runs.length) { host.append(el("div", { className: "muted" }, empty)); return; }
   for (const thread of runThreads(runs)) {
     host.append(runRow(thread.head, shells, refresh, thread));
     if (!thread.earlier.length) continue;
@@ -8269,34 +8275,50 @@ async function renderInterface(root) {
   prPanel.append(refreshPRButton);
   rail.append(prPanel);
   refreshPRs();
-  const runsDrawer = el("details", { className: "runs-drawer" });
-  const runsSummary = el("summary", {}, "Runs");
-  const runsList = el("div", { className: "run-list" });
+  // Jobs (jobs, watchers, dev-kit runs) and Sub Agents each list and count
+  // their own kind, so neither crowds the other out of the newest LIST_LIMIT.
+  const runDrawers = [
+    { label: "Jobs", className: "jobs-drawer", filter: "exclude_kind=agent", part: "watchers", empty: "No jobs." },
+    { label: "Sub Agents", className: "subagents-drawer", filter: "kind=agent", part: "agents", empty: "No subagents." },
+  ].map((drawer) => ({
+    ...drawer,
+    node: el("details", { className: `runs-drawer ${drawer.className}` }),
+    summary: el("summary", {}, drawer.label),
+    list: el("div", { className: "run-list" }),
+  }));
   const processTile = el("section", { className: "process-tile" });
   let runsRefreshInFlight = false;
   const refreshRuns = async () => {
     if (runsRefreshInFlight) return;
     runsRefreshInFlight = true;
     try {
-      const { runs, total, limits } = await api(`/runs?shell_id=${shell.shell_id}&limit=${LIST_LIMIT}`);
+      const listed = await Promise.all(runDrawers.map((drawer) =>
+        api(`/runs?shell_id=${shell.shell_id}&${drawer.filter}&limit=${LIST_LIMIT}`)));
       if (generation !== chatRenderGeneration) return;
-      runsSummary.textContent = `Runs (${countLabel(runs.length, total)})`;
-      renderRunRows(runsList, runs, shells, async () => { await refreshRuns(); await refreshPRs(); }, { limits, shell });
+      runDrawers.forEach((drawer, index) => {
+        const { runs, total, limits } = listed[index];
+        drawer.summary.textContent = `${drawer.label} (${countLabel(runs.length, total)})`;
+        renderRunRows(drawer.list, runs, shells, async () => { await refreshRuns(); await refreshPRs(); },
+          { limits, shell, part: drawer.part, empty: drawer.empty });
+      });
       if (selectedConversation && (selectedConversation.state === "running" || selectedConversation.process?.alive)) {
         const snapshot = await api(`/runs/processes?conversation_id=${encodeURIComponent(selectedConversation.conversation_id)}`);
         if (generation === chatRenderGeneration) renderProcessTile(processTile, snapshot);
       } else processTile.replaceChildren();
     } catch (error) {
       if (generation === chatRenderGeneration) {
-        runsList.replaceChildren(el("div", { className: "error" }, error.message));
+        for (const drawer of runDrawers) drawer.list.replaceChildren(el("div", { className: "error" }, error.message));
         processTile.replaceChildren(el("div", { className: "muted" }, "Process observation unavailable."));
       }
     } finally { runsRefreshInFlight = false; }
   };
-  const refreshRunsButton = el("button", { className: "act", type: "button" }, "Refresh");
-  refreshRunsButton.onclick = refreshRuns;
-  runsDrawer.append(runsSummary, refreshRunsButton, runsList);
-  rail.append(runsDrawer, processTile);
+  for (const drawer of runDrawers) {
+    const refreshButton = el("button", { className: "act", type: "button" }, "Refresh");
+    refreshButton.onclick = refreshRuns;
+    drawer.node.append(drawer.summary, refreshButton, drawer.list);
+    rail.append(drawer.node);
+  }
+  rail.append(processTile);
   refreshRuns();
 
   const paintShellIndicators = (nextShells) => {

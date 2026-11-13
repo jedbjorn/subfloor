@@ -4449,7 +4449,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not post:
                     query = parse_qs(urlparse(self.path).query)
                     owner = int(query['shell_id'][0]) if operator and query.get('shell_id') else sid
-                    filters = {'kind': query.get('kind', [None])[0], 'state': query.get('state', [None])[0]}
+                    filters = {'kind': query.get('kind', [None])[0],
+                               'exclude_kind': query.get('exclude_kind', [None])[0],
+                               'state': query.get('state', [None])[0]}
                     limit = query.get('limit', ['200'])[0]
                     listed = store.list(owner, **filters, limit=int(limit) if limit.isdecimal() else 200)
                     attention = con.execute(

@@ -122,11 +122,13 @@ def test_runs_drawer_fleet_process_and_turn_end(broker_case, native_process, mon
             page.on('pageerror', lambda error: errors.append(str(error)))
             page.route('**/api/**', route_api)
             page.goto(base + f'/#interface/SH1/{cid}')
-            page.locator('.runs-drawer summary').click()
-            page.locator('.runs-drawer .run-row').first.wait_for()
+            page.locator('.jobs-drawer > summary').click()
+            page.locator('.jobs-drawer .run-row').first.wait_for()
             page.wait_for_function('(pid) => document.querySelector(".process-tile").textContent.includes(String(pid))', arg=child_pid)
-            assert page.locator('.runs-drawer .run-row').count() == 4
-            assert 'blocked' in page.locator('.runs-drawer').inner_text()
+            assert page.locator('.jobs-drawer .run-row').count() == 4
+            assert page.locator('.jobs-drawer > summary').inner_text() == 'Jobs (4)'
+            assert page.locator('.subagents-drawer > summary').inner_text() == 'Sub Agents (0)'
+            assert 'blocked' in page.locator('.jobs-drawer').inner_text()
             if captures:
                 page.screenshot(path=str(captures / '01-drawer-live-process.png'), full_page=True)
             finish_native_turn(case, rid, process)
@@ -309,26 +311,33 @@ def test_subagents_watches_limits_and_worktree_labels(broker_case, monkeypatch):
             page.on('pageerror', lambda error: errors.append(str(error)))
             page.route('**/api/**', route_api)
 
-            # The Runs drawer of one shell's chat.
+            # One shell's chat lists its jobs and its subagents in separate drawers.
             page.goto(base + f'/#interface/SH1/{cid}')
-            page.locator('.runs-drawer summary').first.click()
-            page.locator('.runs-drawer .run-row').first.wait_for()
+            page.locator('.jobs-drawer > summary').click()
+            page.locator('.subagents-drawer > summary').click()
+            page.locator('.subagents-drawer .run-row').first.wait_for()
             page.get_by_text('Last attempt 2: exit 1 · pending at head 0a1b2c3').wait_for()
-            drawer = page.locator('.runs-drawer').inner_text()
-            assert 'Subagents: 3 of 3 live for SH1 · 3 of 6 on this install.' in drawer
-            assert 'Watchers: 1 of 10 live for SH1.' in drawer
-            assert 'SH1 is at its limit of 3 live subagents. A further launch is refused until one ends.' in drawer
-            assert f"codex · gpt-6-luna · effort low · continues run #{first['run_id']}" in drawer
-            assert 'left of 2h00m' in drawer and 'left of 1h00m' in drawer
-            assert 'claude · haiku · effort default' in drawer
+            assert page.locator('.jobs-drawer > summary').inner_text() == 'Jobs (2)'
+            assert page.locator('.subagents-drawer > summary').inner_text() == 'Sub Agents (4)'
+            agents = page.locator('.subagents-drawer').inner_text()
+            jobs = page.locator('.jobs-drawer').inner_text()
+            assert 'Subagents: 3 of 3 live for SH1 · 3 of 6 on this install.' in agents
+            assert 'Watchers:' not in agents
+            assert 'Watchers: 1 of 10 live for SH1.' in jobs
+            assert 'Subagents:' not in jobs
+            assert 'SH1 is at its limit of 3 live subagents. A further launch is refused until one ends.' in agents
+            assert f"codex · gpt-6-luna · effort low · continues run #{first['run_id']}" in agents
+            assert 'left of 2h00m' in agents and 'left of 1h00m' in agents
+            assert 'claude · haiku · effort default' in agents
             assert (f"Input + output tokens: 43000 for this thread, counted on run #{first['run_id']}"
-                    in drawer)
-            assert 'watch pr · PR #1786: checks settle (green or red), or it is merged or closed' in drawer
-            assert 'watch until · test -f ready' in drawer and 'Last attempt 4: exit 0 · ready' in drawer
-            assert 'Lost reader' not in drawer    # another shell's run
+                    in agents)
+            assert 'watch pr · PR #1786: checks settle (green or red), or it is merged or closed' in jobs
+            assert 'watch until · test -f ready' in jobs and 'Last attempt 4: exit 0 · ready' in jobs
+            assert 'Lost reader' not in agents + jobs    # another shell's run
             # Three subagent threads, two watches; the first run is folded under its continue.
-            assert page.locator('.runs-drawer .run-list > .run-row').count() == 5
-            fold = page.locator('.runs-drawer .run-thread')
+            assert page.locator('.subagents-drawer .run-list > .run-row').count() == 3
+            assert page.locator('.jobs-drawer .run-list > .run-row').count() == 2
+            fold = page.locator('.subagents-drawer .run-thread')
             assert fold.locator('summary').inner_text() == '1 earlier run of this subagent'
             # The clock of a live row moves without a refresh.
             live_clock = ('[...document.querySelectorAll(".runs-drawer .run-clock")]'
