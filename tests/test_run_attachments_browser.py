@@ -56,7 +56,7 @@ const config = JSON.parse(process.argv[2]);
   await page.locator('.chat-pr-panel summary').click();
   await page.locator('.chat-pr-row').waitFor();
   if(!(await page.locator('.chat-pr-panel').innerText()).includes('Stale:')) throw Error('stale receipt missing in PR panel');
-  await page.locator('.runs-drawer summary').click();
+  await page.locator('.jobs-drawer > summary').click();
   await page.getByRole('article',{name:`Run ${config.current}`,exact:true}).getByRole('button',{name:'Attach receipt'}).click();
   await page.getByRole('combobox',{name:'Receipt target'}).selectOption({label:'fixture/project#42'});
   await page.getByRole('button',{name:'Attach',exact:true}).click();
