@@ -777,6 +777,10 @@ class KimiAdapter(ConversationAdapter):
             run.append(raw)
         return run
 
+    def turn_prompt(self, turn: NativeTurn) -> str | None:
+        """The prompt text the main wire recorded for this exact turn."""
+        return self._prompt_text(self._run_slice(turn)[0])
+
     @staticmethod
     def _usage(records: list[Mapping[str, Any]]) -> dict[str, int | float]:
         totals: dict[str, int | float] = {}

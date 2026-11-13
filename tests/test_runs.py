@@ -27,6 +27,7 @@ ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 
+import conversation_compaction
 import job
 import run_wakes
 import runs
@@ -686,6 +687,60 @@ class RunContinuationTest(ApiFixture, ConversationBrokerCase):
         with mock.patch.object(run_wakes, "_contains_prompt") as read:
             run_wakes.reconcile(con)
             read.assert_not_called()
+
+    def test_kimi_main_wire_prompt_proves_consumption(self):
+        self._kimi_consumption(compacted=False)
+
+    def test_kimi_compacted_prompt_with_reground_line_proves_consumption(self):
+        self._kimi_consumption(compacted=True)
+
+    def _kimi_consumption(self, *, compacted):
+        self.add_conversation(state="idle", harness="kimi")
+        con = self.connect()
+        self.addCleanup(con.close)
+        row = self.terminal(self.register())
+
+        class WireTranscript(FakeAdapter):
+            def start(self, context, message):
+                if compacted:
+                    message = conversation_compaction.with_reground(message)
+                self.prompt = message
+                return super().start(context, message)
+
+            def turn_prompt(self, turn):
+                return self.prompt
+
+        adapter = WireTranscript(harness="kimi")
+        broker = self.start_broker(lambda _: adapter)
+        runtime = sprint_runtime.SprintRuntimeService(self.db_path)
+        runtime.pulse_once()
+        broker.notify()
+        wait_for(lambda: job.ledger_run(str(row["run_id"]))["wake_state"] == "consumed")
+        self.assertTrue(broker.wait_idle(3))
+        run_wakes.reconcile(con)
+        self.assertEqual(job.ledger_run(str(row["run_id"]))["wake_state"], "consumed")
+
+    def test_kimi_turn_without_the_wake_prompt_stays_unproven(self):
+        self.add_conversation(state="idle", harness="kimi")
+        con = self.connect()
+        self.addCleanup(con.close)
+        row = self.terminal(self.register())
+
+        class OtherPrompt(FakeAdapter):
+            def turn_prompt(self, turn):
+                return "an unrelated operator message"
+
+        broker = self.start_broker(lambda _: OtherPrompt(harness="kimi"))
+        runtime = sprint_runtime.SprintRuntimeService(self.db_path)
+        runtime.pulse_once()
+        mid = con.execute(
+            "SELECT conversation_message_id FROM engine_wake_receipts WHERE message_id=?",
+            (row["message_id"],),
+        ).fetchone()[0]
+        broker.notify()
+        wait_for(lambda: self._message_state(mid) == "completed")
+        run_wakes.reconcile(con)
+        self.assertEqual(job.ledger_run(str(row["run_id"]))["wake_state"], "blocked")
 
     def test_non_run_receipt_settles_and_is_never_read_again(self):
         self.add_conversation(state="idle")
