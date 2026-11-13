@@ -343,9 +343,13 @@ def _probe_windows():
     from quota_probes import anthropic, moonshot, openai
 
     fixtures = ROOT / "tests" / "fixtures" / "quota_probes"
-    load = lambda name: json.loads((fixtures / name).read_text())  # noqa: E731
-    log = lambda _line: None  # noqa: E731
-    at = "2026-07-25T20:00:00Z"
+    def load(name):
+        return json.loads((fixtures / name).read_text())
+
+    def log(_line):
+        return None
+
+    at ="2026-07-25T20:00:00Z"
     claude = load("anthropic_usage.json")
     codex = load("openai_usage.json")
     # The two-window plan shape: a 5-hour primary beside a weekly secondary.
