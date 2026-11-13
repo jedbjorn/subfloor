@@ -187,13 +187,17 @@ after the run ends, as it always has:
   quiet before it sends `/compact`. The manifest's `conversation.compact`
   block records the mechanism; `manual_compaction` is true.
 - **Run identity.** A compaction run writes no `turn.prompt` and no `end_turn`
-  step, so it is found by the `full_compaction.begin` it appends (run ref
+  step, so it is found by the `full_compaction.begin` it appends after the
+  wire boundary taken just before `/compact` is sent (anything the load
+  wrote, a compaction of Kimi's own included, is never claimed; run ref
   `kimi-<time>-<offset>`, like a turn's) and ends on `full_compaction.complete`
   (`run.completed`, with the marker and the request's own usage under scope
   `compaction`) or `full_compaction.cancel` (`run.failed`,
   `HARNESS_COMPACT_REFUSED`). No end within 15 minutes ends the run with no
   marker, which the chat shows as not reported. A recovered compaction run
-  reconciles from the same records.
+  reconciles from the same records and records the marker and the cost the
+  live stream did not; the cost names its record (`usage_ref`), so the store
+  keeps one copy of each.
 
 Kimi takes no token-count trigger at launch (`compactionTriggerRatio` is a
 ratio of the window in the user's own `config.toml`, which the engine never

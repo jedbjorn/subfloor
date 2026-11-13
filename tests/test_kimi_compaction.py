@@ -28,12 +28,14 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
 
 import conversation_compaction
 import db_driver
+import test_conversation_manual_compaction as manual_tests
 from conversation_adapters import (
     AdapterError,
     ConversationContext,
     KimiAdapter,
     NativeTurn,
 )
+from conversation_broker import BrokerStore
 from test_conversation_adapters import FakeKimiRunner
 from test_conversation_compaction import DispatchCase
 
@@ -129,22 +131,29 @@ class FakeAcp:
     compaction's records land on the main wire."""
 
     def __init__(self, wire: Path, appended: list[dict[str, Any]], *,
-                 said: str = "Context compaction started.") -> None:
+                 said: str = "Context compaction started.",
+                 on_load: list[dict[str, Any]] | None = None) -> None:
         self.wire = wire
         self.appended = appended
+        self.on_load = on_load or []
         self.said = said
         self.process = FakeAcpProcess()
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.agent_text: list[str] = ["history replayed by session/load"]
         self.closed = False
 
+    def write(self, records: list[dict[str, Any]]) -> None:
+        with self.wire.open("a", encoding="utf-8") as stream:
+            for raw in records:
+                stream.write(json.dumps(raw) + "\n")
+
     def request(self, method: str, params, timeout=None) -> Any:
         self.requests.append((method, dict(params)))
+        if method == "session/load":
+            self.write(self.on_load)
         if method == "session/prompt":
             self.agent_text.append(self.said)
-            with self.wire.open("a", encoding="utf-8") as stream:
-                for raw in self.appended:
-                    stream.write(json.dumps(raw) + "\n")
+            self.write(self.appended)
             return {"stopReason": "end_turn"}
         return {}
 
@@ -163,11 +172,13 @@ class KimiCase(DispatchCase):
         self.acps: list[FakeAcp] = []
         self.acp_records: list[dict[str, Any]] = COMPACTION
         self.acp_said = "Context compaction started."
+        self.acp_on_load: list[dict[str, Any]] = []
 
     def acp_factory(self, argv, *, cwd, env):
         self.acp_argv = (list(argv), Path(cwd))
         wire = next(self.sessions.glob(f"*/{SESSION}")) / "agents/main/wire.jsonl"
-        acp = FakeAcp(wire, self.acp_records, said=self.acp_said)
+        acp = FakeAcp(wire, self.acp_records, said=self.acp_said,
+                      on_load=self.acp_on_load)
         self.acps.append(acp)
         return acp
 
@@ -386,8 +397,43 @@ class KimiManualTriggerTest(KimiCase):
         self.assertEqual(usage["tokens"]["output_tokens"],
                          SESSION_USAGE["usage"]["output"])
         self.assertNotIn("context_tokens", usage)
+        self.assertEqual(usage["usage_ref"], f"{SESSION}@{SESSION_USAGE['time']}")
         self.assertTrue(acp.closed)
         self.assertEqual(turn.metadata["terminal"], "run.completed")
+
+    def test_a_compaction_written_by_the_load_is_never_claimed(self) -> None:
+        # Recorded records, with Kimi's own compaction landing while the
+        # session loads (source auto) and /compact appending nothing.
+        self.stored_session()
+        self.acp_on_load = [
+            {**COMPACTION[0], "source": "auto"}, *COMPACTION[1:],
+        ]
+        self.acp_records = []
+        self.acp_said = "Nothing to compact."
+        with self.assertRaises(AdapterError) as raised:
+            self.adapter().compact(SESSION, self.context())
+        self.assertEqual(raised.exception.code, "HARNESS_COMPACT_REFUSED")
+        self.assertTrue(self.acps[0].closed)
+
+    def test_a_compact_after_a_load_time_compaction_claims_only_its_own(self):
+        self.stored_session()
+        self.acp_on_load = [
+            {**COMPACTION[0], "source": "auto"}, *COMPACTION[1:],
+        ]
+        later = [
+            {**raw, "time": raw["time"] + 60_000} if "time" in raw else raw
+            for raw in COMPACTION
+        ]
+        self.acp_records = later
+        adapter = self.adapter()
+        turn = adapter.compact(SESSION, self.context())
+        self.assertEqual(turn.metadata["prompt_time"], later[0]["time"])
+        events = list(adapter.stream(turn))
+        [compacted] = [e for e in events if e.type == "context.compacted"]
+        self.assertEqual(compacted.payload["trigger"], "manual")
+        applied = next(r for r in later if r["type"] == "context.apply_compaction")
+        self.assertEqual(compacted.payload["compaction_ref"],
+                         f"{SESSION}@{applied['time']}")
 
     def test_a_cancelled_compaction_fails_with_the_harness_words(self) -> None:
         self.stored_session()
@@ -432,10 +478,14 @@ class KimiManualTriggerTest(KimiCase):
         adapter = self.adapter()
         result = adapter.reconcile(recovered, self.context())
         self.assertEqual((result.outcome, result.proven), ("succeeded", True))
-        [marker] = adapter.recovered_events(recovered, self.context())
+        marker, cost = adapter.recovered_events(recovered, self.context())
         self.assertEqual(marker.payload["tokens_after"], APPLIED["tokensAfter"])
         self.assertEqual(marker.payload["compaction_ref"],
                          f"{SESSION}@{APPLIED['time']}")
+        self.assertEqual(cost.type, "usage")
+        self.assertEqual(cost.payload["scope"], "compaction")
+        self.assertEqual(cost.payload["usage_ref"],
+                         f"{SESSION}@{SESSION_USAGE['time']}")
 
     def test_the_button_compacts_a_kimi_chat_through_the_broker(self) -> None:
         self.runner.queue(**turn_plan(TURN))
@@ -474,3 +524,87 @@ class KimiManualTriggerTest(KimiCase):
         # The next message re-grounds and still finds its own turn.
         self.deliver(broker, conversation_id, "next")
         self.assertEqual(len(self.reground_events(conversation_id)), 1)
+
+
+class RecoveredKimiCompactionTest(KimiCase):
+    """A ``/compact`` run a broker restart left running after Kimi finished
+    the compaction on the wire: reconciled, with its marker and its cost."""
+
+    running_request = manual_tests.CancelledRequestTest.running_request
+    press = manual_tests.ManualCompactBrokerTest.press
+
+    def recover(self, *, already_stored: tuple[str, ...] = ()) -> tuple[str, int, str]:
+        conversation_id, message_id, run_id = self.running_request(
+            harness="kimi", session_ref=SESSION)
+        _session, wire = self.runner.write_session(
+            self.sessions, SESSION, self.worktree, PROMPT,
+            prompt_time=TURN[0]["time"], after_prompt=[*TURN[1:], *COMPACTION],
+        )
+        offset = 0
+        for line in wire.read_bytes().splitlines(keepends=True):
+            if json.loads(line)["type"] == "full_compaction.begin":
+                break
+            offset += len(line)
+        run_ref = f"kimi-{COMPACTION[0]['time']}-{offset}"
+        con = self.connect()
+        con.execute(
+            "UPDATE conversation_runs SET harness_session_after=?,runner_ref=? "
+            "WHERE run_id=?",
+            (SESSION, run_ref, run_id),
+        )
+        con.commit()
+        con.close()
+        # A process identity nothing alive answers to: reconcile, not attach.
+        self.name_live_process(conversation_id, run_id, pid=4194305,
+                               start_ticks=9001)
+        if already_stored:
+            # Part of the live stream reached the store before the restart.
+            turn = NativeTurn(
+                harness="kimi", session_ref=SESSION, run_ref=run_ref,
+                worktree=self.worktree.resolve(),
+                metadata={"recovered": True, "compaction": True},
+            )
+            live = [
+                event for event in self.adapter().recovered_events(
+                    turn, self.context())
+                if event.type in already_stored
+            ]
+            BrokerStore(self.db_path).append_events(run_id, live)
+        broker = self.start_broker(lambda _harness: self.adapter())
+        state = self.wait_run(message_id)
+        self.assertTrue(broker.wait_idle())
+        return conversation_id, message_id, state
+
+    def assert_one_marker_and_one_cost(self, conversation_id: str,
+                                       message_id: int) -> None:
+        stored = self.events(conversation_id)
+        [marker] = [e["payload"] for e in stored if e["type"] == "context.compacted"]
+        self.assertEqual(
+            (marker["tokens_before"], marker["tokens_after"], marker["cause"]),
+            (APPLIED["tokensBefore"], APPLIED["tokensAfter"], "operator"),
+        )
+        [cost] = [e for e in stored if e["type"] == "usage"]
+        self.assertEqual(cost["payload"]["scope"], "compaction")
+        self.assertEqual(cost["message_id"], message_id)
+        self.assertEqual(cost["payload"]["tokens"]["output_tokens"],
+                         SESSION_USAGE["usage"]["output"])
+        kinds = [e["type"] for e in stored]
+        self.assertNotIn("compaction.not_reported", kinds)
+        self.assertNotIn("compaction.failed", kinds)
+
+    def test_nothing_streamed_before_the_restart(self) -> None:
+        conversation_id, message_id, state = self.recover()
+        self.assertEqual(state, "succeeded")
+        self.assert_one_marker_and_one_cost(conversation_id, message_id)
+
+    def test_the_marker_and_cost_already_stored_are_not_doubled(self) -> None:
+        conversation_id, message_id, state = self.recover(
+            already_stored=("context.compacted", "usage"))
+        self.assertEqual(state, "succeeded")
+        self.assert_one_marker_and_one_cost(conversation_id, message_id)
+
+    def test_only_the_marker_already_stored_still_gets_its_cost(self) -> None:
+        conversation_id, message_id, state = self.recover(
+            already_stored=("context.compacted",))
+        self.assertEqual(state, "succeeded")
+        self.assert_one_marker_and_one_cost(conversation_id, message_id)

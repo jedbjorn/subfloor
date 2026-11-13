@@ -998,7 +998,12 @@ class KimiAdapter(ConversationAdapter):
                     "mcpServers": [],
                 },
             )
-            self._settle_wire(wire)
+            # Only what /compact appends is this run's: anything the load
+            # wrote (its context injection, or a compaction of Kimi's own)
+            # lies before this boundary and is never claimed by the run.
+            settled = self._settle_wire(wire)
+            if settled >= start_offset:
+                start_offset = settled
             # What the agent says from here on is its answer to /compact; the
             # load replays the session's history first.
             said = getattr(client, "agent_text", None)
@@ -1354,11 +1359,20 @@ class KimiAdapter(ConversationAdapter):
                 return "cancelled"
         return None
 
-    @staticmethod
-    def _compaction_cost(records: list[Mapping[str, Any]]) -> dict[str, int | float]:
+    @classmethod
+    def _compaction_cost(
+        cls,
+        records: list[Mapping[str, Any]],
+        session_ref: str,
+    ) -> NormalizedEvent | None:
         """The tokens the compaction's own request spent (any usage scope:
-        Kimi records it as ``session``)."""
+        Kimi records it as ``session``), as one ``compaction`` usage event.
+
+        ``usage_ref`` names the record, so the store keeps one copy when a
+        recovered run replays a cost its live stream already recorded.
+        """
         totals: dict[str, int | float] = {}
+        last_time: int | None = None
         for raw in records:
             if raw.get("type") != "usage.record":
                 continue
@@ -1369,7 +1383,17 @@ class KimiAdapter(ConversationAdapter):
                 value = usage.get(native)
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     totals[normalized] = totals.get(normalized, 0) + value
-        return totals
+            last_time = cls._request_time(raw)
+        if not totals:
+            return None
+        event = usage_event(totals, "usage.record", scope="compaction")
+        if last_time is None:
+            return event
+        return NormalizedEvent(
+            event.type,
+            {**event.payload, "usage_ref": f"{session_ref}@{last_time}"},
+            event.native_type,
+        )
 
     @classmethod
     def _completion_proven(
@@ -1482,9 +1506,9 @@ class KimiAdapter(ConversationAdapter):
             return
         if outcome == "completed":
             yield from self._wire_events(records, {}, turn.session_ref)
-            cost = self._compaction_cost(records)
-            if cost:
-                yield usage_event(cost, "usage.record", scope="compaction")
+            cost = self._compaction_cost(records, turn.session_ref)
+            if cost is not None:
+                yield cost
             event = NormalizedEvent(
                 "run.completed", {"status": "completed"}, COMPACT_COMPLETE
             )
@@ -1796,8 +1820,10 @@ class KimiAdapter(ConversationAdapter):
         """The compaction a recovered ``/compact`` run wrote, if it wrote one.
 
         A recovered run whose process is gone is reconciled, not streamed,
-        so its marker is read from the main wire. One already recorded is
-        dropped by the store: the marker names its ``compaction_ref``.
+        so its marker and its own cost are read from the main wire, as the
+        live stream would have yielded them. One already recorded is dropped
+        by the store: the marker names its ``compaction_ref`` and the cost
+        its ``usage_ref``.
         """
         if not turn.metadata.get("compaction"):
             return []
@@ -1808,8 +1834,12 @@ class KimiAdapter(ConversationAdapter):
             return []
         if self._compaction_outcome(records) != "completed":
             return []
-        return [
+        events = [
             event
             for event in self._wire_events(records, {}, turn.session_ref)
             if event.type == "context.compacted"
         ]
+        cost = self._compaction_cost(records, turn.session_ref)
+        if cost is not None:
+            events.append(cost)
+        return events
