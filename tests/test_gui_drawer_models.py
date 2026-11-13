@@ -242,7 +242,7 @@ const providers = [
   // A weekly window whose percent the provider did not report.
   {provider: "openai", status: "ok", captured_at: at(-2 * 3600e3),
    windows: [win("weekly", null), win("five_hour", 97)]},
-  // Kimi: percent USED here, not the full view's "% left".
+  // Kimi uses the same percent-used direction as the full view.
   {provider: "moonshot", status: "ok", captured_at: null, windows: [win("weekly", 28)]},
   // No weekly window at all, and an unlabelled provider with no windows.
   {provider: "other", status: "unauth", windows: [win("five_hour", 96)]},
