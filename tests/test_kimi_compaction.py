@@ -83,6 +83,23 @@ def kimi_home(root: Path) -> Path:
     return home
 
 
+def past_the_floor(records: list[dict[str, Any]], extra: int = 100_000) -> list:
+    """``records`` with each turn request's cache reads raised by ``extra``.
+
+    The recorded chat is small (about 21k), under the engine's 90,000 floor
+    for its own compactions (decision #460). Automatic-compaction cases use
+    the same records with this one figure raised; nothing else changes.
+    """
+    raised = []
+    for raw in records:
+        if raw.get("type") == "usage.record" and raw.get("usageScope") == "turn":
+            usage = dict(raw["usage"])
+            usage["inputCacheRead"] = usage.get("inputCacheRead", 0) + extra
+            raw = {**raw, "usage": usage}
+        raised.append(raw)
+    return raised
+
+
 def turn_plan(records: list[dict[str, Any]]) -> dict[str, Any]:
     """A FakeKimiRunner plan that writes ``records`` as the turn's wire."""
     return {

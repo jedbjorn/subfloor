@@ -80,7 +80,8 @@ from test_conversation_manual_compaction import (
 )
 from test_conversation_ui import APP, run_js
 from test_kimi_compaction import RECORDS as KIMI_WIRE
-from test_kimi_compaction import recorded_kimi_events
+from test_kimi_compaction import TURN as KIMI_TURN
+from test_kimi_compaction import past_the_floor, recorded_kimi_events
 
 ENV_NAMES = tuple(conversation_compaction.COMPACT_WINDOW_ENV.values())
 CLEARED_ENV = {name: "" for name in ENV_NAMES}
@@ -819,26 +820,89 @@ class ThresholdRecordedStreamTest(SettingsCase):
         self.assert_one_threshold(conversation_id, run_id, 184000, 150000)
 
     def kimi_events(self, records=None) -> list[NormalizedEvent]:
-        """The real Kimi adapter's events for the recorded K3.1 turn
-        (task #924's fixture): two request readings, the last 21,425."""
-        return recorded_kimi_events(self.root, self.worktree, records)
+        """The real Kimi adapter's events for task #924's recorded K3.1 turn,
+        its cache reads raised by 100,000 so the readings sit past the
+        engine floor (decision #460): 121,282 then 121,425."""
+        raised = past_the_floor(KIMI_TURN if records is None else records)
+        return recorded_kimi_events(self.root, self.worktree, raised)
+
+    def kimi_row(self, trigger: int, idle_min: int, wait: int | None = 25) -> None:
+        """A saved Kimi row written straight to the table, as a row saved
+        before the floor existed would be: below-floor values the API now
+        refuses."""
+        con = self.connect()
+        con.execute(
+            "INSERT INTO chat_compaction_settings (harness,auto_enabled,"
+            "trigger_tokens,idle_after_minutes,idle_min_tokens) "
+            "VALUES ('kimi',1,?,?,?)", (trigger, wait, idle_min),
+        )
+        con.commit()
+        con.close()
 
     def test_kimi_turn_above_the_trigger(self) -> None:
-        self.save("kimi", trigger_tokens=20000)
+        self.save("kimi", trigger_tokens=100_000)
         conversation_id, run_id = self.turn("kimi", self.kimi_events())
-        self.assert_one_threshold(conversation_id, run_id, 21425, 20000)
+        self.assert_one_threshold(conversation_id, run_id, 121_425, 100_000)
+
+    def test_kimi_turn_at_the_floor_with_a_lower_row_compacts_at_the_floor(self):
+        self.kimi_row(trigger=20_000, idle_min=20_000)
+        conversation_id, run_id = self.turn("kimi", self.kimi_events())
+        self.assert_one_threshold(conversation_id, run_id, 121_425, 90_000)
+
+    def test_kimi_turn_below_the_floor_gets_none(self) -> None:
+        # The recorded turn as it was (21,425) under a row whose 20,000 the
+        # floor raises to 90,000: never an engine compaction.
+        self.kimi_row(trigger=20_000, idle_min=20_000)
+        conversation_id, _run_id = self.turn(
+            "kimi", recorded_kimi_events(self.root, self.worktree))
+        self.assertEqual(self.requests(conversation_id), [])
 
     def test_kimi_turn_that_compacted_gets_none(self) -> None:
-        self.save("kimi", trigger_tokens=20000)
+        self.save("kimi", trigger_tokens=100_000)
         conversation_id, _run_id = self.turn("kimi", self.kimi_events(KIMI_WIRE))
         self.assertEqual(self.requests(conversation_id), [])
 
     def test_kimi_without_a_trigger_gets_no_request(self) -> None:
-        self.save("kimi", trigger_tokens=20000)
+        self.save("kimi", trigger_tokens=100_000)
         events = self.kimi_events()
         with mock.patch.object(KimiAdapter, "manual_compaction", False):
             conversation_id, _run_id = self.turn("kimi", events)
         self.assertEqual(self.requests(conversation_id), [])
+
+    def kimi_idle_chat(self, events) -> tuple[str, datetime]:
+        """A finished Kimi turn whose readings are its last model activity,
+        and the instant 26 minutes later (past the 25-minute wait, inside
+        Kimi's 30-minute cache life)."""
+        conversation_id, _run_id = self.turn("kimi", events)
+        con = self.connect()
+        last = con.execute(
+            "SELECT MAX(created_at) FROM conversation_events "
+            "WHERE conversation_id=? AND event_type='usage'",
+            (conversation_id,),
+        ).fetchone()[0]
+        con.close()
+        moment = datetime.fromisoformat(last).replace(tzinfo=timezone.utc)
+        return conversation_id, moment + timedelta(minutes=26)
+
+    def test_kimi_idle_compaction_past_the_floor(self) -> None:
+        self.save("kimi", trigger_tokens=250_000, idle_min_tokens=100_000)
+        conversation_id, later = self.kimi_idle_chat(self.kimi_events())
+        self.assertEqual(self.requests(conversation_id), [])
+        self.assertEqual(self.heartbeat(later), [conversation_id])
+        [request] = self.requests(conversation_id)
+        self.assertEqual(
+            (request["cause"], request["context_tokens"]), ("idle", 121_425))
+
+    def test_kimi_idle_compaction_below_the_floor_gets_none(self) -> None:
+        self.kimi_row(trigger=250_000, idle_min=20_000)
+        conversation_id, later = self.kimi_idle_chat(
+            recorded_kimi_events(self.root, self.worktree))
+        self.assertEqual(self.heartbeat(later), [])
+        self.assertEqual(self.requests(conversation_id), [])
+        with closing(db_driver.connect(self.db_path)) as con:
+            verdict = conversation_compaction.idle_verdict(
+                con, conversation_id, later)
+        self.assertEqual(verdict.failed_rule, 4)
 
     def test_none_after_a_turn_that_already_compacted(self) -> None:
         self.save("codex", trigger_tokens=150000)
