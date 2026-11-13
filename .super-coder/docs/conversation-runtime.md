@@ -130,17 +130,25 @@ constructor default with no env override.
 | `SC_REAPER_KILL_GRACE_SECONDS` | `15` | `SIGTERM` → `SIGKILL` wait; `0` allowed |
 | `SC_REAPER_YOUNG_GRACE_SECONDS` | `30` | minimum run age before the ladder starts |
 | `SC_CHAT_INACTIVITY_CEILING` | `3600` | seconds of chat silence before the active chat is closed for inactivity |
-| `SC_CHAT_COMPACT_WINDOW_CLAUDE` | `250000` | auto-compact window (tokens) passed to Claude browser chats; `off` restores the harness default |
-| `SC_CHAT_COMPACT_WINDOW_CODEX` | `250000` | the same for Codex browser chats; `off` restores the harness default |
+| `SC_CHAT_COMPACT_WINDOW_CLAUDE` | `250000` | fallback for Claude's auto-compaction trigger (tokens) in browser chats, used only until a value is saved on the Claude Harness card; `off` turns auto compaction off, never idle compaction |
+| `SC_CHAT_COMPACT_WINDOW_CODEX` | `250000` | the same fallback for Codex |
 | `SC_CHAT_COLD_RETURN_TOKENS` | `60000` | context size (tokens) at or above which an idle chat gets the cold-return notice |
 | `SC_CHAT_COLD_RETURN_MINUTES` | `60` | minutes since the chat's last activity after which that notice is due |
 
-The two compact-window settings are read at each dispatch, so a restart of the
-server process is what picks up a change; an open chat then takes it on its
-next turn. A value that is neither a positive whole number nor `off` logs a
-warning and uses the default. Kimi and OpenCode have no window setting. The
-two cold-return settings are read whenever a chat is projected; a value that
-is not a positive whole number logs a warning and uses the default.
+The two compact-window variables are fallbacks for the per-harness
+compaction settings (see [Per-harness compaction
+settings](#per-harness-compaction-settings-threshold-and-idle-compaction)): a
+value saved on the harness's card replaces the variable for that harness, and
+the order is saved, then the variable, then the default 250,000. `off` turns
+that harness's auto compaction off and leaves idle compaction to the card's
+dropdown. A value below 90,000 is raised to 90,000 when the engine decides.
+They are read from the server environment at each dispatch, so a restart of
+the server process is what picks up a change to a variable; an open chat then
+takes it on its next turn. A value that is neither a positive whole number nor
+`off` logs a warning and uses the default. Only Claude and Codex read one;
+Kimi and OpenCode are set on their cards alone. The two cold-return settings
+are read whenever a chat is projected; a value that is not a positive whole
+number logs a warning and uses the default.
 
 ### Setting the four chat-compaction variables
 
@@ -196,29 +204,37 @@ harness's own compaction earlier and visible.
   rebuilt context (its instructions plus the summary) and exceeds the few
   thousand tokens the chat held. The event keeps both figures as stated, the
   rule is the same for every harness, and the meter moves to the next
-  request's own figure as soon as that request reports. Claude, Codex and OpenCode are mapped; Kimi is not (see each
-  adapter's README).
+  request's own figure as soon as that request reports. Claude, Codex,
+  Kimi and OpenCode are mapped (see each adapter's README). Since spec #275
+  the event also carries `cause` (see [Why a chat
+  compacted](#why-a-chat-compacted)).
 - **`usage`** now says what it measures. `scope: request` is one model request
   of the chat and carries `context_tokens` (uncached input, cache read and
   cache write together) and, where the harness states it, `context_window`.
   `scope: turn` is a whole-turn total and `scope: subagent` is a delegated
-  agent's request; neither is the size of the chat's context. An event with no
-  scope (recorded earlier, or from Kimi) still labels its reply as before but
-  never drives the meter.
+  agent's request; neither is the size of the chat's context.
+  `scope: compaction` is the engine's own compaction request, a cost and never
+  a reading. An event with no scope (recorded before scopes existed) still
+  labels its reply as before but never drives the meter. Kimi's wire is read
+  after the run ends, so each Kimi `request` reading also carries
+  `requested_at`, the request's own time in epoch milliseconds.
 - **The meter** is the latest `request` reading, or the size a newer
   compaction left behind. The transcript projection returns it as `context`
   (`context_tokens`, `context_window`, `measured_at`, `sequence`), each `null`
   when unknown. Nothing is estimated. `context.compact_window` is the
-  auto-compact window the engine applies to that chat (`null` when the
-  harness has none, the setting is `off`, or the model's window is smaller).
+  trigger in effect for that chat's harness: its saved, environment or
+  default trigger, raised to 90,000 if lower (`null` when auto compaction is
+  off for the harness, or the model's window is smaller).
 - **The percentage is of the compact window**, not of the model's window
   (decision #451), so 100% is where the harness compacts:
   `Context 95k · 38% of 250k compact window` on a Claude Haiku chat with a
   1,000,000-token model window, `Context 84k · 34% of 250k compact window`
   on a Codex chat with a 258,400-token one. It is shown only when
-  `compact_window` is set; a Kimi or OpenCode chat, a setting of `off`, or a
-  model whose window is smaller than the setting shows the size alone, and
-  the tooltip says no auto-compact window applies. The percentage is not
+  `compact_window` is set, which since spec #275 includes Kimi and OpenCode
+  chats whenever their harness's auto compaction is on (OpenCode's is off by
+  default); auto compaction off, or a model whose window is smaller than the
+  trigger, shows the size alone, and the tooltip says no auto-compact window
+  applies. The percentage is not
   capped: a context past the window reads above 100% (for example `125%`),
   which says the harness has not compacted at the size the engine asked for,
   and the tooltip says so. Claude compacts within its window, so it fires
@@ -300,6 +316,104 @@ button sits at the bottom left of the composer, beside the meter.
 | `COMPACTION_NO_SESSION` | the chat has not had a turn yet, so there is nothing to compact |
 | `COMPACTION_PENDING` | an earlier press is still in flight; one compaction runs |
 | `CONVERSATION_BUSY` | a turn is queued, running or waiting; press again when it has finished |
+
+## Per-harness compaction settings, threshold and idle compaction
+
+Feature #95, spec #275. Each harness that runs browser chats and can be
+compacted (Claude, Codex, Kimi, OpenCode) has two settings, kept in the
+engine database (`chat_compaction_settings`, migration 0289, one row per
+harness, kept across rebuilds) and edited on that harness's card in
+**Shells → Harness**. A saved value applies on each chat's next turn and the
+next idle heartbeat, with no restart. They apply to browser chats only, and
+to every shell's browser chats on the install. Vibe has no browser chats and
+no settings.
+
+| Setting | Fields | Claude | Codex | Kimi | OpenCode |
+|---|---|---|---|---|---|
+| **Auto compaction** | `auto_enabled`, `trigger_tokens` | on, 250,000 | on, 250,000 | on, 250,000 | **off**, 250,000 |
+| **Idle compaction** | `idle_after_minutes` (`null` is Off), `idle_min_tokens` | 50 min, 125,000 | 25 min, 125,000 | 25 min, 125,000 | **Off**, 125,000 |
+| Cache life (fixed, not a setting) | | 60 min | 45 min | 30 min | 60 min, not measured |
+
+- **Precedence.** A saved row wins. With none, `SC_CHAT_COMPACT_WINDOW_CLAUDE`
+  or `SC_CHAT_COMPACT_WINDOW_CODEX`, when set, supplies that harness's trigger
+  (`off` turns its auto compaction off); otherwise the default applies. The
+  environment never touches idle compaction or any other harness. A save
+  writes the whole row, copying every value it does not change from what was
+  in effect (an environment trigger or `off` included), so after the first
+  save for a harness its variable is ignored. Each value reports its source:
+  `saved`, `environment` or `default`.
+- **Validation.** The trigger and the idle size are whole numbers of at least
+  90,000. The wait is Off or one of 5, 10 … 55 minutes below the harness's
+  cache life (Claude and OpenCode to 55, Codex to 40, Kimi to 25). A refused
+  value is answered `422` (`COMPACTION_SETTING_INVALID` or
+  `COMPACTION_SETTING_UNKNOWN`), an empty change `400`, an unknown harness
+  `404`, and the saved row is left as it was. The last save wins.
+- **The 90,000 floor** (decision #460). The engine never compacts a chat on
+  its own below 90,000 tokens. The trigger in effect is the trigger raised to
+  90,000 when lower, and so is the idle size; the threshold check, the idle
+  rule, the pass-through and the meter read only these values, so an
+  environment value or an older row below 90,000 cannot compact early. The
+  manual button has no floor.
+- **Auto compaction off** means only that the engine does not compact
+  earlier. The harness's own compaction near the model's full window still
+  happens; the engine never turns that off.
+
+**Threshold compaction** has two parts, both on the trigger in effect.
+The trigger is passed to a harness that takes a token count: Claude as
+`--autocompact <n>`, only from 100,000 to 1,000,000; Codex as
+`model_auto_compact_token_limit`. Neither gets it when the chat's model
+window is smaller, and Kimi and OpenCode get nothing. Then, when a turn ends
+(succeeded, failed or unproven; not one the operator stopped, and not one
+followed by a close), the broker checks the chat in the same transaction: with
+auto compaction on, no `context.compacted` from that turn, and the meter at
+or above the trigger, it queues one compaction with `cause: threshold` (key
+`threshold:<run_id>`, so at most one per turn). It runs next, while the cache
+is warm, and a message sent meanwhile waits behind it.
+
+**Idle compaction** is a step of each conversation reaper heartbeat
+(`SC_REAPER_HEARTBEAT_SECONDS`, 60 s by default), so a wait is honoured to
+about a minute. A chat is compacted with `cause: idle` when all of these
+hold: its harness's wait is not Off and the harness has a manual trigger;
+the chat is open; no turn is running or queued; its meter is at or above the
+idle size in effect; its last model activity is at least the wait old and
+less than the cache life old; and no idle compaction was requested since that
+activity, whatever its outcome. Last model activity here is the newest
+`usage` or `context.compacted` that is not an engine compaction's own record
+(`scope: compaction` usage, or a marker with cause `operator`, `threshold` or
+`idle`). An idle compaction therefore runs once per idle period and is not
+retried until a new turn opens another. Every rule is read from the database,
+so a restart resumes where it was. A failure in the step is logged and never
+stops the reaper's orphan ladder.
+
+### Why a chat compacted
+
+The button, the threshold check and the idle step all queue through one
+helper with the button's refusals, sender (`compact-button`) and body
+(`/compact`). `compaction.requested` carries `cause` (`operator`,
+`threshold` or `idle`; `requested_by_user_id` only with `operator`), and the
+broker copies it onto the outcome: `context.compacted`, `compaction.failed`
+or `compaction.not_reported`. A compaction the harness made on its own is
+`cause: harness`. The marker opens with the cause:
+
+| `cause` | Marker opening |
+|---|---|
+| `operator` | `Context compacted` |
+| `threshold` | `Context compacted at the trigger` (adds `still at or above the trigger` when the size after is not below it) |
+| `idle` | `Context compacted while idle` |
+| `harness` | `Context compacted by <harness>` |
+
+A marker recorded before causes existed keeps `automatic` / `manual`.
+
+### Operator routes
+
+All three are session-only `/api` routes from the GUI's own origin; a
+Bearer credential gets `403 fnb_operator_required`.
+
+| Route | Answer |
+|---|---|
+| `GET /api/harnesses/compaction` | every compacting harness's settings in card order: values, `sources`, the values in effect and whether each was raised to the floor, cache life, dropdown choices, what applies to the harness, and this week's compaction count |
+| `PUT /api/harnesses/{harness}/compaction` | save one or more of `auto_enabled`, `trigger_tokens`, `idle_after_minutes`, `idle_min_tokens`; answers the card as saved |
+| `GET /api/harnesses/{harness}/compaction-data?days=7\|30` | the card's figures, computed on request from this install's chats (`400` for another `days`) |
 
 ## The cold-return notice
 

@@ -203,6 +203,11 @@ Kimi takes no token-count trigger at launch (`compactionTriggerRatio` is a
 ratio of the window in the user's own `config.toml`, which the engine never
 edits), so `compact_window_native` is false: the engine compacts Kimi chats
 between turns when the meter reaches the harness's trigger, and while idle.
+Both are set on the Kimi card in **Shells → Harness**: Auto compaction on at
+250,000 and Idle compaction after 25 minutes by default, the wait capped at
+25 because Kimi's measured cache life is about 30 minutes. Neither acts
+below 90,000 tokens. No environment variable applies to Kimi. The chat's
+meter shows a percentage of the trigger in effect once it has a reading.
 
 ## Subagent keys (`headless.agent`, Feature #96, spec #273)
 
