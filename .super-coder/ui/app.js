@@ -3646,7 +3646,8 @@ async function renderWorktrees(root, opts = {}) {
 // Each renderer is assigned onto its DRAWER_SECTIONS entry, so the section
 // order and labels stay with the drawer and only the bodies live here.
 
-// Tokens: how close each provider is to its WEEKLY limit, as percent used.
+// Tokens: how close each provider is to its WEEKLY limit, and to its 5-HOUR
+// limit where it reports one, as percent used.
 // One GET of the same route the Analytics → Provider Quota view reads. The
 // server answers from the stored reading, first re-probing the providers
 // itself when its last attempt is older than its 60s TTL — so opening the
@@ -3664,22 +3665,46 @@ const drawerQuotaClass = (pct) => {
   return shown >= 90 ? " red" : shown >= 75 ? " amber" : "";
 };
 const DRAWER_WEEKLY_KINDS = ["weekly", "weekly_scoped"];
+// The 5-hour window, by the kind each probe stores it under. Codex and Kimi
+// expose a duration, so an 18000-second window lands as `five_hour`.
+// Claude's usage endpoint exposes none: its 5-hour window arrives as
+// limits[kind=session], which carries the same percent and reset as the same
+// payload's own `five_hour` block, and is absent exactly when that block is
+// null (no window open). `session` is read only when the provider stored no
+// `five_hour`, so one window never shows twice.
+const DRAWER_FIVE_HOUR_KINDS = ["five_hour", "session"];
+function drawerFiveHourWindows(windows) {
+  for (const kind of DRAWER_FIVE_HOUR_KINDS) {
+    const found = windows.filter((w) => w.window_kind === kind);
+    if (found.length) return found;
+  }
+  return [];
+}
 // One row per weekly window, and every provider gets at least one row: a
-// provider with no weekly window reads "n/a", never 0% and never a missing
-// line. Percent is always percent USED — Kimi included — so the column means
-// one thing and the thresholds apply to it directly.
-function drawerWeeklyRows(providers) {
+// provider with no weekly window reads "weekly n/a", never 0% and never a
+// missing line. A 5-hour row follows only where the provider REPORTED a 5-hour
+// window; a provider without one shows weekly only, and nothing is estimated.
+// Percent is always percent USED — Kimi included — so the column means one
+// thing and the thresholds apply to it directly.
+function drawerQuotaRows(providers) {
   const rows = [];
   for (const prov of providers || []) {
     const name = AN_PROVIDER_LABEL[prov.provider] || prov.provider;
-    const weekly = (prov.windows || [])
+    const windows = prov.windows || [];
+    const weekly = windows
       .filter((w) => DRAWER_WEEKLY_KINDS.includes(w.window_kind))
       .sort((a, b) => anWindowRank(a) - anWindowRank(b));
-    if (!weekly.length) { rows.push({ name, pct: null, resets_at: null }); continue; }
+    if (!weekly.length) rows.push({ name: name + " · weekly", pct: null, resets_at: null });
     for (const w of weekly) {
       const scope = w.scope || (w.window_kind === "weekly_scoped" ? "scoped" : "");
       rows.push({
-        name: name + (scope ? " · " + scope : ""),
+        name: name + " · weekly" + (scope ? " · " + scope : ""),
+        pct: w.used_percent ?? null, resets_at: w.resets_at || null,
+      });
+    }
+    for (const w of drawerFiveHourWindows(windows)) {
+      rows.push({
+        name: name + " · 5-hour" + (w.scope ? " · " + w.scope : ""),
         pct: w.used_percent ?? null, resets_at: w.resets_at || null,
       });
     }
@@ -3702,14 +3727,14 @@ function renderDrawerTokens(mount, { close }) {
     const providers = data.providers || [];
     const table = el("div", { className: "drawer-quota" });
     table.append(
-      el("span", { className: "drawer-quota-head" }, "Weekly limit"),
+      el("span", { className: "drawer-quota-head" }, "Limit"),
       el("span", { className: "drawer-quota-head" }, "Resets"),
       el("span", { className: "drawer-quota-head drawer-quota-pct" }, "Used"));
-    for (const r of drawerWeeklyRows(providers)) {
+    for (const r of drawerQuotaRows(providers)) {
       const reset = el("span", { className: "drawer-quota-reset" }, anCountdown(r.resets_at));
       if (r.resets_at) reset.title = "resets " + r.resets_at;
       table.append(
-        el("span", { className: "drawer-quota-name" }, r.name), reset,
+        el("span", { className: "drawer-quota-name", title: r.name }, r.name), reset,
         el("span", { className: "drawer-quota-pct" + drawerQuotaClass(r.pct) }, anPct(r.pct)));
     }
     const shown = [table];

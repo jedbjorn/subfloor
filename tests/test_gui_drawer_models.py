@@ -230,12 +230,13 @@ const at = (ms) => new Date(NOW + ms).toISOString();
 
 
 @needs_node
-def test_token_section_renders_weekly_percent_used_per_provider_from_one_get():
+def test_token_section_renders_weekly_and_reported_5_hour_percent_used_from_one_get():
     script = FAKE_DOM + FIXED_CLOCK + API + QUOTA_HELPERS + TOKENS + r"""
 const calls = [];
 const win = (window_kind, used_percent, extra = {}) => ({window_kind, used_percent, ...extra});
 const providers = [
-  // Two weekly windows, listed out of order, beside non-weekly ones.
+  // Two weekly windows listed out of order, a 5-hour window, and a session
+  // window the reported five_hour supersedes (one window never shows twice).
   {provider: "anthropic", status: "ok", captured_at: at(-5 * 60e3),
    windows: [win("weekly_scoped", 91.26, {scope: "opus"}), win("five_hour", 99),
              win("weekly", 74.94, {resets_at: at(3 * 3600e3 + 10 * 60e3)}), win("session", 100)]},
@@ -244,7 +245,7 @@ const providers = [
    windows: [win("weekly", null), win("five_hour", 97)]},
   // Kimi uses the same percent-used direction as the full view.
   {provider: "moonshot", status: "ok", captured_at: null, windows: [win("weekly", 28)]},
-  // No weekly window at all, and an unlabelled provider with no windows.
+  // No weekly window but a 5-hour one, and an unlabelled provider with none.
   {provider: "other", status: "unauth", windows: [win("five_hour", 96)]},
   {provider: "idle", status: "na"},
 ];
@@ -273,15 +274,19 @@ globalThis.fetch = async (url, init) => {
         "calls": [["GET", "/api/analytics/quota"]],
         "loading": "Loading…",
         "tableClass": "drawer-quota",
-        "cells": ["Weekly limit", "Resets", "Used",
-                  "Claude", "in 3h 10m", "74.9%",
-                  "Claude · opus", "—", "91.3%",
-                  "Codex", "—", "n/a",
-                  "Kimi", "—", "28%",
-                  "other", "—", "n/a",
-                  "idle", "—", "n/a"],
-        "pctClasses": ["drawer-quota-pct", "drawer-quota-pct red", "drawer-quota-pct",
-                       "drawer-quota-pct", "drawer-quota-pct", "drawer-quota-pct"],
+        "cells": ["Limit", "Resets", "Used",
+                  "Claude · weekly", "in 3h 10m", "74.9%",
+                  "Claude · weekly · opus", "—", "91.3%",
+                  "Claude · 5-hour", "—", "99%",
+                  "Codex · weekly", "—", "n/a",
+                  "Codex · 5-hour", "—", "97%",
+                  "Kimi · weekly", "—", "28%",
+                  "other · weekly", "—", "n/a",
+                  "other · 5-hour", "—", "96%",
+                  "idle · weekly", "—", "n/a"],
+        "pctClasses": ["drawer-quota-pct", "drawer-quota-pct red", "drawer-quota-pct red",
+                       "drawer-quota-pct", "drawer-quota-pct red", "drawer-quota-pct",
+                       "drawer-quota-pct", "drawer-quota-pct red", "drawer-quota-pct"],
         # The oldest reading's age stands for the whole section.
         "note": "as of 2h ago", "sections": 3,
         "href": "#analytics-quota", "linkText": "Open full analytics →", "closed": 1,
@@ -305,26 +310,107 @@ console.log(JSON.stringify(cases.map((pct) => [anPct(pct), drawerQuotaClass(pct)
 
 
 @needs_node
-def test_drawer_weekly_rows_label_scopes_and_never_invent_a_number():
+def test_drawer_quota_rows_label_scopes_and_never_invent_a_number():
     script = FAKE_DOM + QUOTA_HELPERS + TOKENS + r"""
-const rows = drawerWeeklyRows([
+const rows = drawerQuotaRows([
   {provider: "anthropic", windows: [
     {window_kind: "weekly_scoped", used_percent: 80}, {window_kind: "weekly", used_percent: 0},
     {window_kind: "weekly", used_percent: 12, scope: "sonnet", resets_at: "2026-03-04T12:00:00Z"}]},
   {provider: "moonshot", windows: [{window_kind: "short", used_percent: 50}]},
   {provider: "openai", windows: [{window_kind: "weekly"}]},
 ]);
-console.log(JSON.stringify({rows, none: drawerWeeklyRows(undefined)}));
+console.log(JSON.stringify({rows, none: drawerQuotaRows(undefined)}));
 """
     assert run_js(script) == {
         "rows": [
-            {"name": "Claude", "pct": 0, "resets_at": None},
-            {"name": "Claude · sonnet", "pct": 12, "resets_at": "2026-03-04T12:00:00Z"},
-            {"name": "Claude · scoped", "pct": 80, "resets_at": None},
-            {"name": "Kimi", "pct": None, "resets_at": None},
-            {"name": "Codex", "pct": None, "resets_at": None},
+            {"name": "Claude · weekly", "pct": 0, "resets_at": None},
+            {"name": "Claude · weekly · sonnet", "pct": 12, "resets_at": "2026-03-04T12:00:00Z"},
+            {"name": "Claude · weekly · scoped", "pct": 80, "resets_at": None},
+            # A short window is not a 5-hour one: weekly n/a, and nothing else.
+            {"name": "Kimi · weekly", "pct": None, "resets_at": None},
+            {"name": "Codex · weekly", "pct": None, "resets_at": None},
         ],
         "none": [],
+    }
+
+
+def _probe_windows():
+    """Each provider's windows exactly as its real probe normalizer stores them,
+    from the sanitized captures in tests/fixtures/quota_probes/."""
+    import copy
+    import sys
+    sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
+    from quota_probes import anthropic, moonshot, openai
+
+    fixtures = ROOT / "tests" / "fixtures" / "quota_probes"
+    def load(name):
+        return json.loads((fixtures / name).read_text())
+
+    def log(_line):
+        return None
+
+    at ="2026-07-25T20:00:00Z"
+    claude = load("anthropic_usage.json")
+    codex = load("openai_usage.json")
+    # The two-window plan shape: a 5-hour primary beside a weekly secondary.
+    codex_5h = copy.deepcopy(codex)
+    codex_5h["rate_limit"]["secondary_window"] = codex_5h["rate_limit"]["primary_window"]
+    codex_5h["rate_limit"]["primary_window"] = {
+        "used_percent": 41, "limit_window_seconds": 18000, "reset_at": 1785020400}
+    kimi = load("moonshot_usages.json")
+    kimi_weekly_only = {k: v for k, v in kimi.items() if k != "limits"}
+    return {
+        # Live shape on 2026-11-13: `five_hour` null and no session entry.
+        "claude_idle": anthropic._windows(
+            [i for i in claude["limits"] if i["kind"] != "session"], at, log),
+        "claude": anthropic._windows(claude["limits"], at, log),
+        "codex": openai._windows(codex["rate_limit"], codex, at, log),
+        "codex_5h": openai._windows(codex_5h["rate_limit"], codex_5h, at, log),
+        "kimi": moonshot._windows(kimi, at, log),
+        "kimi_weekly_only": moonshot._windows(kimi_weekly_only, at, log),
+    }
+
+
+@needs_node
+def test_drawer_shows_a_5_hour_row_only_where_each_probe_reported_one():
+    shapes = _probe_windows()
+    # Claude's 5-hour window is limits[kind=session]; the capture's own
+    # five_hour block carries the same percent and reset.
+    claude = json.loads((ROOT / "tests/fixtures/quota_probes/anthropic_usage.json").read_text())
+    session = next(i for i in claude["limits"] if i["kind"] == "session")
+    assert claude["five_hour"]["utilization"] == session["percent"]
+    assert claude["five_hour"]["resets_at"] == session["resets_at"]
+    provider = {"claude_idle": "anthropic", "claude": "anthropic", "codex": "openai",
+                "codex_5h": "openai", "kimi": "moonshot", "kimi_weekly_only": "moonshot"}
+    script = FAKE_DOM + QUOTA_HELPERS + TOKENS + f"""
+const shapes = {json.dumps(shapes)};
+const provider = {json.dumps(provider)};
+const out = {{}};
+for (const [shape, windows] of Object.entries(shapes))
+  out[shape] = drawerQuotaRows([{{provider: provider[shape], windows}}])
+    .map((r) => [r.name, anPct(r.pct), r.resets_at]);
+console.log(JSON.stringify(out));
+"""
+    assert run_js(script) == {
+        "claude_idle": [
+            ["Claude · weekly", "36%", "2026-08-01T06:00:00Z"],
+            ["Claude · weekly · Fable", "47%", "2026-08-01T05:59:59Z"]],
+        "claude": [
+            ["Claude · weekly", "36%", "2026-08-01T06:00:00Z"],
+            ["Claude · weekly · Fable", "47%", "2026-08-01T05:59:59Z"],
+            ["Claude · 5-hour", "47%", "2026-07-25T23:10:00Z"]],
+        "codex": [
+            ["Codex · weekly", "2%", "2026-08-01T22:18:28Z"],
+            ["Codex · weekly · GPT-5.3-Codex-Spark", "0%", "2026-08-01T22:58:31Z"]],
+        "codex_5h": [
+            ["Codex · weekly", "2%", "2026-08-01T22:18:28Z"],
+            ["Codex · weekly · GPT-5.3-Codex-Spark", "0%", "2026-08-01T22:58:31Z"],
+            ["Codex · 5-hour", "41%", "2026-07-25T23:00:00Z"]],
+        "kimi": [
+            ["Kimi · weekly", "97%", "2026-07-29T11:38:20Z"],
+            ["Kimi · 5-hour", "0%", "2026-07-26T00:38:20Z"]],
+        "kimi_weekly_only": [
+            ["Kimi · weekly", "97%", "2026-07-29T11:38:20Z"]],
     }
 
 
@@ -357,8 +443,9 @@ globalThis.fetch = async () => fail
     assert run_js(script) == {
         # Rows and the link only: with no reading there is no "as of" line.
         "unread": ["drawer-quota", "drawer-link"],
-        "cells": ["Weekly limit", "Resets", "Used",
-                  "Claude", "—", "n/a", "Codex", "—", "n/a", "Kimi", "—", "n/a"],
+        "cells": ["Limit", "Resets", "Used",
+                  "Claude · weekly", "—", "n/a", "Codex · weekly", "—", "n/a",
+                  "Kimi · weekly", "—", "n/a"],
         "coloured": [],
         "failed": ["quota error: db locked", "Open full analytics →"],
     }
