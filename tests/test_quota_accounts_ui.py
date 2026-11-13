@@ -388,14 +388,12 @@ def test_a_real_zero_percent_still_draws_a_measured_zero():
     assert r["pct"] == ["0%"] and r["width"] == "0%"
 
 
-def test_kimi_matches_provider_remaining_quota_without_fake_absolute_counts():
-    """Kimi's official usage UI reports quota remaining, while its endpoint
-    commonly normalizes limit/used onto a 100-point scale. The card must match
-    that direction and must not present 28/100 as an absolute request budget.
+def test_kimi_reports_percent_used_without_fake_absolute_counts():
+    """Kimi's endpoint commonly normalizes limit/used onto a 100-point scale.
+    The card shows percent used like every other provider, but must not present
+    96/100 as an absolute request budget.
 
-    The fill and label are both asserted so the display cannot say 72% left
-    while drawing the inverse 28% bar. The source used_percent stays intact for
-    the provider-blind warning threshold, pinned by the red class at 96% used.
+    The fill and label are both asserted so neither can invert the reading.
     """
     r = run_js("""
       const r0 = root(); anDrawQuota(r0, PAYLOAD);
@@ -406,8 +404,8 @@ def test_kimi_matches_provider_remaining_quota_without_fake_absolute_counts():
             body: card.textContent });
     """, payload([provider("moonshot", windows=[
         window(pct=96.0, used=96, limit_value=100)])]))
-    assert r["pct"] == ["4% left"]
-    assert r["width"] == "4%"
+    assert r["pct"] == ["96%"]
+    assert r["width"] == "96%"
     assert "red" in r["tone"], "warning colour still follows 96% used"
     assert "96 / 100" not in r["body"]
 

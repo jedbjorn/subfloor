@@ -4465,7 +4465,8 @@ async function anTokenSection(root) {
 }
 
 // ── Provider Quota — harness quota (spec doc #57, superseding #49) ────────────
-// Token Analytics answers *what did we spend*; this answers *how much is left*.
+// Token Analytics answers *what did we spend*; this answers *how much of each
+// provider's limit has been used*.
 // ONE CARD PER PROVIDER, showing that provider's most recent reading and the
 // age of the reading. Nothing about who is signed in — decision #75.
 //
@@ -4493,7 +4494,7 @@ async function anTokenSection(root) {
 // those apart.
 const AN_PROVIDER_LABEL = { anthropic: "Claude", openai: "Codex", moonshot: "Kimi" };
 // Where the operator goes to manage the account itself. This panel deliberately
-// stops at "how much is left" — the FnB's ruling that retired account identity
+// stops at usage against each limit — the FnB's ruling that retired account identity
 // rests on the provider's own page being one click away, so the link is part of
 // the design and not a convenience. Each URL is taken from the harness CLI's own
 // binary rather than guessed; Kimi links straight to its membership quota tab.
@@ -4549,26 +4550,17 @@ function anAge(iso) {
 
 function anWindowRow(w, provider) {
   const pct = w.used_percent;
-  // Kimi's own usage surface presents quota remaining. Its endpoint commonly
-  // normalizes limit/used to a 100-point scale, so rendering `28 / 100` looks
-  // like an absolute request allowance and inverts the 72%-left figure the
-  // operator sees on Kimi. Keep used_percent as the threshold source, but make
-  // Kimi's presentation match the provider: remaining bar + explicit label,
-  // and no count-like rendering of percentage-normalized values.
   const isKimi = provider === "moonshot";
-  const displayPct = isKimi && pct != null
-    ? Math.max(0, Math.min(100, 100 - pct)) : pct;
-  const pctText = isKimi && pct != null ? anPct(displayPct) + " left" : anPct(pct);
   const row = el("div", { className: "an-win" });
   row.append(el("div", { className: "an-win-head" },
     el("span", { className: "an-win-name" }, anWindowName(w)),
-    el("span", { className: "an-win-pct" + anQuotaClass(pct) }, pctText)));
+    el("span", { className: "an-win-pct" + anQuotaClass(pct) }, anPct(pct))));
   const meter = el("div", { className: "an-meter" });
   if (pct != null) {
     // Clamped: a provider reporting over 100 fills the track, it does not
     // overflow it. NULL draws no fill at all — an empty track is honest.
     const fill = el("div", { className: "an-meter-fill" + anQuotaClass(pct) });
-    fill.style.width = Math.max(0, Math.min(100, displayPct)) + "%";
+    fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
     meter.append(fill);
   }
   row.append(meter);
