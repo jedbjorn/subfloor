@@ -356,7 +356,7 @@ def _probe_windows():
     codex_5h = copy.deepcopy(codex)
     codex_5h["rate_limit"]["secondary_window"] = codex_5h["rate_limit"]["primary_window"]
     codex_5h["rate_limit"]["primary_window"] = {
-        "used_percent": 41, "limit_window_seconds": 18000, "reset_at": 1785622708}
+        "used_percent": 41, "limit_window_seconds": 18000, "reset_at": 1785020400}
     kimi = load("moonshot_usages.json")
     kimi_weekly_only = {k: v for k, v in kimi.items() if k != "limits"}
     return {
@@ -405,7 +405,7 @@ console.log(JSON.stringify(out));
         "codex_5h": [
             ["Codex · weekly", "2%", "2026-08-01T22:18:28Z"],
             ["Codex · weekly · GPT-5.3-Codex-Spark", "0%", "2026-08-01T22:58:31Z"],
-            ["Codex · 5-hour", "41%", "2026-08-01T22:18:28Z"]],
+            ["Codex · 5-hour", "41%", "2026-07-25T23:00:00Z"]],
         "kimi": [
             ["Kimi · weekly", "97%", "2026-07-29T11:38:20Z"],
             ["Kimi · 5-hour", "0%", "2026-07-26T00:38:20Z"]],
