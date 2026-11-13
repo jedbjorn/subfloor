@@ -4146,6 +4146,22 @@ class ConversationAdapterTest(unittest.TestCase):
             "a later usage record must not complete the recovered run",
         )
 
+    def test_kimi_turn_prompt_reads_this_turns_main_wire_prompt(self) -> None:
+        adapter, runner = self.build("kimi")
+        runner.queue(
+            prompt_time=7100,
+            after_prompt=[
+                {
+                    "type": "turn.prompt",
+                    "input": [{"type": "text", "text": "later"}],
+                    "time": 7101,
+                },
+            ],
+        )
+        turn = adapter.start(self.context, "## wake_message #7 current")
+
+        self.assertEqual(adapter.turn_prompt(turn), "## wake_message #7 current")
+
     def test_kimi_inspect_and_reconcile_use_only_main_exact_run_slice(
         self,
     ) -> None:
