@@ -1041,14 +1041,24 @@ async function renderRunsFleet(host, shells, badge) {
 }
 async function renderConversionStatus(host) {
   host.replaceChildren(el("div", { className: "muted" }, "Loading harness conversion status…"));
+  // The compaction settings of the four compacting harnesses come from one
+  // added call (spec #275); its failure shows inside each card and never
+  // hides the conversion content.
+  const compaction = api("/harnesses/compaction").then(
+    (value) => ({ value }), (error) => ({ error }));
   try {
     const { harness_status: statuses = {} } = await api("/flavor-defaults");
     if (!host.isConnected) return;
+    const { value: settings, error: settingsError } = await compaction;
+    if (!host.isConnected) return;
+    const cards = Object.fromEntries((settings?.harnesses || []).map((card) => [card.harness, card]));
     host.replaceChildren(el("h3", {}, "GUI background conversion"));
     const explanations = { rewrite: "Background calls become durable jobs.", "deny-only": "Background calls are refused; use sc job.", disarmed: "Conversion is off; use sc job manually." };
     for (const [harness, status] of Object.entries(statuses)) {
       const evidence = status.conversion;
-      const row = el("div", { className: "run-row" }, el("strong", {}, harness));
+      const compacting = CC_HARNESSES.includes(harness);
+      const row = el("div", { className: compacting ? "run-row harness-card" : "run-row" }, el("strong", {}, harness));
+      if (compacting) row.append(" ", el("span", { className: "muted cc-label" }, CC_LABELS[harness]));
       if (!evidence) row.append(el("div", { className: "muted" }, "No conversion hook; use sc job for durable GUI work."));
       else {
         row.append(el("div", {}, `${evidence.version || "version unverified"} · ${evidence.tier}`),
@@ -1063,9 +1073,231 @@ async function renderConversionStatus(host) {
         };
         row.append(verify);
       }
+      if (compacting) row.append(compactionCard(harness, cards[harness], settingsError));
       host.append(row);
     }
   } catch (error) { host.replaceChildren(el("div", { className: "error" }, error.message)); }
+}
+
+// ── Harness cards: compaction settings and data (Feature #95, spec #275) ─────
+// The Claude, Codex, Kimi and OpenCode cards above gain a summary line and,
+// expanded, Settings then Data. Vibe's card is untouched. Settings are
+// install-wide and save on change; data is computed by the engine on request.
+const CC_HARNESSES = ["claude", "codex", "kimi", "opencode"];
+const CC_LABELS = {
+  claude: "Claude (Anthropic)",
+  codex: "Codex (OpenAI)",
+  kimi: "Kimi (Moonshot)",
+  opencode: "One setting for every model provider behind OpenCode",
+};
+// The Analytics view's quota card per provider; OpenCode has none.
+const CC_QUOTA = { claude: "anthropic", codex: "openai", kimi: "moonshot" };
+const CC_TIPS = {
+  auto: "Compacts a chat when its context reaches the trigger size, checked after each turn.",
+  idle: "Compacts a large chat that has gone quiet, before the provider's cache expires, so your next message is cheap.",
+};
+const CC_CAUSES = ["harness", "threshold", "idle", "operator"];
+const CC_EXPANDED_KEY = "sc.harness-cards.expanded";
+
+function ccExpanded() {
+  try { return new Set(JSON.parse(globalThis.localStorage.getItem(CC_EXPANDED_KEY) || "[]")); }
+  catch { return new Set(); }
+}
+function ccRemember(harness, open) {
+  try {
+    const set = ccExpanded();
+    if (open) set.add(harness); else set.delete(harness);
+    globalThis.localStorage.setItem(CC_EXPANDED_KEY, JSON.stringify([...set]));
+  } catch { /* the browser refused storage: the card still works */ }
+}
+const ccK = (n) => n == null ? "not reported" : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
+const ccPct = (x) => `${Math.round(x * 100)}%`;
+
+function ccSummary(card) {
+  const auto = card.auto_enabled ? `Auto compaction on at ${ccK(card.effective_trigger ?? card.trigger_tokens)}` : "Auto compaction off";
+  const idle = card.idle_after_minutes == null ? "Idle compaction off" : `Idle compaction after ${card.idle_after_minutes} min`;
+  const count = card.week_compactions ?? 0;
+  return `${auto} · ${idle} · ${count} compaction${count === 1 ? "" : "s"} this week`;
+}
+
+// A focusable info control beside a setting's name: the tooltip opens on
+// hover and on keyboard focus (style.css .cc-info).
+function ccInfo(harness, key, name) {
+  const id = `cc-tip-${harness}-${key}`;
+  return el("span", { className: "cc-info", tabIndex: 0, role: "button",
+    ariaLabel: `About ${name}`, title: CC_TIPS[key] },
+  "i", el("span", { className: "cc-tip", role: "tooltip", id }, CC_TIPS[key]));
+}
+
+function ccSources(card, fields) {
+  return el("span", { className: "muted cc-source" },
+    fields.map(([field, label]) => `${label}: ${card.sources?.[field] || "default"}`).join(" · "));
+}
+
+// The engine never compacts on its own below its floor (90,000 tokens): a
+// value under it, from the environment or an older row, is raised to it.
+function ccFloorNote(card, field) {
+  const raised = field === "trigger_tokens" ? card.trigger_raised_to_floor : card.idle_min_raised_to_floor;
+  if (!raised) return null;
+  return el("span", { className: "cc-floor" },
+    `In effect: ${ccK(card.floor_tokens)}, raised to the engine floor (the engine never compacts below ${ccK(card.floor_tokens)})`);
+}
+
+function ccSettings(state, flash) {
+  const { harness, card } = state;
+  const section = el("div", { className: "cc-settings" }, el("h4", {}, "Settings"),
+    el("div", { className: "muted" }, "Applies to every shell's browser chats on this install."));
+  const off = !card.manual_trigger;
+  if (off) section.append(el("div", { className: "cc-unavailable" }, card.unavailable_reason));
+  const statuses = {};
+  const status = (field) => (statuses[field] = el("span", { className: "cc-status", ariaLive: "polite" }));
+  const save = async (field, value) => {
+    const line = statuses[field];
+    line.className = "cc-status"; line.textContent = "Saving…";
+    try {
+      const saved = await api(`/harnesses/${harness}/compaction`, "PUT", { [field]: value });
+      state.card = { ...card, ...saved, week_compactions: card.week_compactions };
+      state.paint({ field, text: "Saved" });
+    } catch (error) { line.className = "cc-status error"; line.textContent = error.message; }
+  };
+  const whole = (input) => {
+    const raw = String(input.value).replace(/[,_\s]/g, "");
+    return /^\d+$/.test(raw) ? Number(raw) : input.value;
+  };
+
+  const autoSwitch = el("input", { type: "checkbox", className: "cc-switch", checked: !!card.auto_enabled, disabled: off });
+  autoSwitch.onchange = () => save("auto_enabled", !!autoSwitch.checked);
+  const trigger = el("input", { type: "number", className: "cc-number", min: card.min_tokens, step: 1000, value: String(card.trigger_tokens), disabled: off });
+  trigger.onchange = () => save("trigger_tokens", whole(trigger));
+  section.append(el("div", { className: "cc-setting cc-auto" },
+    el("span", { className: "cc-name" }, "Auto compaction"), ccInfo(harness, "auto", "Auto compaction"),
+    el("label", {}, autoSwitch, " On"), status("auto_enabled"),
+    el("label", {}, "Trigger ", trigger, " tokens"), status("trigger_tokens"),
+    ...[ccFloorNote(card, "trigger_tokens")].filter(Boolean),
+    ccSources(card, [["auto_enabled", "switch"], ["trigger_tokens", "trigger"]])));
+
+  const wait = el("select", { className: "cc-wait", disabled: off });
+  wait.append(el("option", { value: "" }, "Off"));
+  for (const minutes of card.idle_choices || []) wait.append(el("option", { value: String(minutes) }, `${minutes} min`));
+  wait.value = card.idle_after_minutes == null ? "" : String(card.idle_after_minutes);
+  wait.onchange = () => save("idle_after_minutes", wait.value === "" ? null : Number(wait.value));
+  const size = el("input", { type: "number", className: "cc-number", min: card.min_tokens, step: 1000, value: String(card.idle_min_tokens), disabled: off });
+  size.onchange = () => save("idle_min_tokens", whole(size));
+  section.append(el("div", { className: "cc-setting cc-idle" },
+    el("span", { className: "cc-name" }, "Idle compaction"), ccInfo(harness, "idle", "Idle compaction"),
+    el("label", {}, "Wait ", wait), status("idle_after_minutes"),
+    el("label", {}, "Idle size ", size, " tokens"), status("idle_min_tokens"),
+    ...[ccFloorNote(card, "idle_min_tokens")].filter(Boolean),
+    ccSources(card, [["idle_after_minutes", "wait"], ["idle_min_tokens", "idle size"]])));
+
+  section.append(el("div", { className: "muted cc-life" },
+    `Cache life: ${card.cache_life_minutes} min${card.cache_life_measured ? "" : " (cache life not measured)"}; a fixed engine value, not a setting.`));
+  const applies = el("ul", { className: "cc-applies" });
+  for (const part of card.applies || [])
+    applies.append(el("li", { className: part.available ? "" : "muted" }, `${part.label}: ${part.note}`));
+  section.append(el("div", { className: "cc-name" }, "What applies to this harness"), applies);
+  if (flash && statuses[flash.field]) statuses[flash.field].textContent = flash.text;
+  return section;
+}
+
+function ccDataRows(d) {
+  const ctx = d.context || {};
+  const trigger = d.settings?.trigger_tokens;
+  const gaps = d.cold_by_gap || {};
+  const cold = d.cold_returns || {};
+  const cost = d.compaction_cost || {};
+  const payoff = d.idle_payoff || {};
+  return [
+    ["Chats, model requests", `${d.chats} chats · ${d.requests} model requests`],
+    ["Median context per request", ctx.median_tokens == null ? "no readings" : ccK(ctx.median_tokens)],
+    [`Requests at or above the trigger (${ccK(trigger)})`, ctx.share_at_or_above_trigger == null ? "no readings"
+      : `${ccPct(ctx.share_at_or_above_trigger)} (${ctx.at_or_above_trigger} of ${ctx.readings})`],
+    ["Warm share: cache reads of input", !d.warm_share?.reported ? "not reported"
+      : d.warm_share.share == null ? "no requests" : ccPct(d.warm_share.share)],
+    ["Cold rate by idle gap", !gaps.reported ? `not reported${gaps.note ? ` (${gaps.note})` : ""}`
+      : (gaps.buckets || []).map((b) => `${b.label}: ${b.rate == null ? "–" : ccPct(b.rate)} (${b.cold} of ${b.requests})`).join(" · ")],
+    ["Cold returns at or above the idle size", !cold.reported ? "not reported"
+      : `${cold.count} · tokens re-read ${cold.tokens_reread == null ? "not reported" : ccK(cold.tokens_reread)}`],
+    ["Compactions by cause, median before → after", CC_CAUSES.map((cause) => {
+      const c = d.compactions?.by_cause?.[cause] || { count: 0 };
+      const sizes = c.count && (c.median_before != null || c.median_after != null)
+        ? ` (${ccK(c.median_before)} → ${ccK(c.median_after)})` : "";
+      return `${cause} ${c.count}${sizes}`;
+    }).join(" · ")],
+    ["Idle compactions that paid off", `${payoff.followed ?? 0} followed by a message within 24 h · ${payoff.not_followed ?? 0} not followed`
+      + (payoff.pending ? ` · ${payoff.pending} still within 24 h` : "")],
+    ["Compaction cost", !cost.reported ? "not reported" : !cost.requests ? "none"
+      : `${ccK(cost.total)} tokens over ${cost.requests} engine compaction request${cost.requests === 1 ? "" : "s"}`],
+  ];
+}
+
+function ccData(state) {
+  const { harness } = state;
+  const section = el("div", { className: "cc-data" }, el("h4", {}, "Data"));
+  const switcher = el("div", { className: "cc-days" });
+  for (const days of [7, 30]) {
+    const button = el("button", { type: "button", className: days === state.days ? "act active-tab" : "act" }, `${days} days`);
+    button.onclick = () => { state.days = days; state.paint(); return ccLoadData(state); };
+    switcher.append(button);
+  }
+  state.dataBody = el("div", { className: "cc-data-body muted" }, "Loading…");
+  section.append(switcher, state.dataBody);
+  if (CC_QUOTA[harness])
+    section.append(el("a", { className: "cc-quota", href: "#analytics-quota" },
+      `Provider quota (${CC_QUOTA[harness]}) on the Analytics view →`));
+  return section;
+}
+
+async function ccLoadData(state) {
+  const body = state.dataBody, days = state.days;
+  try {
+    const d = await api(`/harnesses/${state.harness}/compaction-data?days=${days}`);
+    if (body !== state.dataBody || days !== state.days) return;
+    const table = el("dl", { className: "cc-figures" });
+    for (const [label, value] of ccDataRows(d)) table.append(el("dt", {}, label), el("dd", {}, value));
+    body.className = "cc-data-body"; body.replaceChildren(table);
+  } catch (error) {
+    if (body !== state.dataBody) return;
+    body.className = "cc-data-body error"; body.textContent = error.message;
+  }
+}
+
+// One card's added part: the summary line, and the body it expands to. The
+// card reloads its saved row and its data each time it is expanded.
+function compactionCard(harness, card, loadError) {
+  const host = el("div", { className: "cc" });
+  if (!card) {
+    host.append(el("div", { className: "error" },
+      `Compaction settings unavailable: ${loadError?.message || "not returned"}`));
+    return host;
+  }
+  const state = { harness, card, days: 7, open: ccExpanded().has(harness), dataBody: null };
+  state.paint = (flash) => {
+    const toggle = el("button", { type: "button", className: "cc-summary", ariaExpanded: String(state.open) },
+      `${state.open ? "▾" : "▸"} ${ccSummary(state.card)}`);
+    toggle.onclick = () => {
+      state.open = !state.open; ccRemember(harness, state.open); state.paint();
+      if (state.open) return ccOpen(state);
+    };
+    host.replaceChildren(toggle);
+    if (state.open) host.append(el("div", { className: "cc-body" }, ccSettings(state, flash), ccData(state)));
+  };
+  state.paint();
+  if (state.open) ccLoadData(state);
+  return host;
+}
+
+// Expanding reloads the saved row (another tab may have saved since), then
+// the data for the selected period.
+async function ccOpen(state) {
+  try {
+    const { harnesses = [] } = await api("/harnesses/compaction");
+    const fresh = harnesses.find((card) => card.harness === state.harness);
+    if (fresh) state.card = fresh;
+  } catch { /* the settings already shown stand; the next expand retries */ }
+  if (!state.open) return;
+  state.paint();
+  await ccLoadData(state);
 }
 
 async function renderShells(root) {

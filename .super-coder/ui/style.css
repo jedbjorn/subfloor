@@ -1944,6 +1944,32 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .run-filters select { width: auto; flex: 1; min-width: 130px; }
 .shell-pane .run-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(220px, 1fr) auto; align-items: center; gap: 12px; }
 .shell-pane .conversion-status .run-row { display: block; }
+/* Harness cards: compaction summary line, Settings then Data (spec #275). */
+.harness-card .cc { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 6px; }
+.cc-summary { background: none; border: 0; padding: 2px 0; color: var(--ink); cursor: pointer; text-align: left; font: inherit; }
+.cc-summary:focus-visible { box-shadow: var(--focus-ring); outline: none; }
+.cc-body { display: grid; gap: 12px; margin-top: 8px; }
+.cc-body h4 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); }
+.cc-setting { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin: 6px 0; }
+.cc-name { font-weight: 600; }
+.cc-number { width: 9em; }
+.cc-wait { width: auto; }
+.cc-status { font-size: 12px; color: var(--dim); }
+.cc-status.error { color: var(--danger); }
+.cc-source { flex-basis: 100%; font-size: 12px; }
+.cc-unavailable { color: var(--warn); margin: 4px 0; }
+.cc-floor { flex-basis: 100%; font-size: 12px; color: var(--warn); }
+.cc-applies { margin: 4px 0 0 18px; padding: 0; font-size: 12px; }
+.cc-info { position: relative; display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; border: 1px solid var(--line); font-size: 11px; cursor: help; }
+.cc-info:focus-visible { box-shadow: var(--focus-ring); outline: none; }
+.cc-tip { display: none; position: absolute; left: 50%; bottom: calc(100% + 6px); transform: translateX(-50%); z-index: 20; width: max-content; max-width: 280px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); font-size: 12px; font-weight: 400; line-height: 1.4; white-space: normal; }
+.cc-info:hover .cc-tip, .cc-info:focus .cc-tip, .cc-info:focus-within .cc-tip { display: block; }
+.cc-days { display: flex; gap: 6px; margin-bottom: 6px; }
+.cc-figures { display: grid; grid-template-columns: minmax(160px, max-content) 1fr; gap: 4px 12px; margin: 0; font-size: 12px; }
+.cc-figures dt { color: var(--dim); }
+.cc-figures dd { margin: 0; overflow-wrap: anywhere; }
+.cc-quota { display: inline-block; margin-top: 6px; font-size: 12px; }
+@media (max-width: 700px) { .cc-figures { grid-template-columns: 1fr; } .cc-figures dd { margin-bottom: 4px; } }
 @media (max-width: 1000px) { .shell-pane .run-row { display: block; } }
 /* Subagent and watcher facts, the limits line, and a continued subagent's earlier runs. */
 .run-body { min-width: 0; }
