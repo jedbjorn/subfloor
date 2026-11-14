@@ -444,8 +444,10 @@
     ".super-coder/docs/sprint-pr-watcher.md",
     "docs/environment.md",
     ".super-coder/migrations/0278_developer_bounded_probes.sql",
+    ".super-coder/migrations/0291_skill_seat.sql",
     "tests/test_job_probe.py",
     ".super-coder/scripts/run_attachments.py",
+    ".super-coder/scripts/run_seat.py",
     "tests/test_run_attachments.py",
     "tests/test_run_attachments_browser.py"
   ],
@@ -913,7 +915,7 @@
       ".super-coder/scripts/dispatch.sh": [
         "./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)",
         "sprint)       sc_python_probe; sc_project_env; exec \"$PY\" \"$S/sprint_cli.py\" \"$@\" ;;",
-        "Memory & catalogue    mem · context · skill · search · models · job · pr · sprint · token · analytics"
+        "Memory & catalogue    mem · context · skill · search · models · job · sprint · token · analytics"
       ],
       "docs/README.md": [
         "merge authority. Start with one manual handoff; use [Sprints](#sprints) when",
