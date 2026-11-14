@@ -133,12 +133,17 @@ class RunAttachments:
                               'WHERE p.subscription_id=?)', (pr[0], pr[0]), head)
 
     def prs(self, owner: int) -> dict:
-        """Open PRs first, then newest; capped at PR_LIMIT with the owner's full total."""
-        rows = self.con.execute('SELECT p.*,t.normalized_state,t.observed_head_sha,t.observed_at FROM pr_subscriptions p '
-                               'LEFT JOIN pr_subscription_transitions t ON t.transition_id=(SELECT MAX(transition_id) '
-                               'FROM pr_subscription_transitions WHERE subscription_id=p.subscription_id) '
-                               "WHERE p.owner_shell_id=? ORDER BY COALESCE(t.normalized_state IN ('merged','closed'),0), "
-                               'p.subscription_id DESC LIMIT ?', (owner, PR_LIMIT)).fetchall()
-        total = self.con.execute('SELECT count(*) FROM pr_subscriptions WHERE owner_shell_id=?', (owner,)).fetchone()[0]
+        """The owner's open PRs, newest first; capped at PR_LIMIT with the open total.
+
+        Open = not observed merged or closed (an unobserved PR is open). Merged
+        and closed PRs are history the sidebar does not list.
+        """
+        latest = ('FROM pr_subscriptions p LEFT JOIN pr_subscription_transitions t ON t.transition_id='
+                  '(SELECT MAX(transition_id) FROM pr_subscription_transitions WHERE subscription_id=p.subscription_id) '
+                  "WHERE p.owner_shell_id=? AND COALESCE(t.normalized_state,'') NOT IN ('merged','closed') ")
+        rows = self.con.execute('SELECT p.*,t.normalized_state,t.observed_head_sha,t.observed_at,'
+                                "json_extract(t.evidence,'$.title') AS title " + latest
+                                + 'ORDER BY p.subscription_id DESC LIMIT ?', (owner, PR_LIMIT)).fetchall()
+        total = self.con.execute('SELECT count(*) ' + latest, (owner,)).fetchone()[0]
         return {'prs': [dict(r, receipts=self.pr_receipts(r['repository'], r['pr_number'], r['observed_head_sha']))
                         for r in rows], 'total': total}

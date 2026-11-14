@@ -1993,7 +1993,17 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .run-receipts { display: grid; gap: .5rem; margin-top: .5rem; }
 .run-receipt { display: grid; gap: .2rem; font-size: .8rem; overflow-wrap: anywhere; }
 .chat-pr-panel { margin-top: .75rem; padding: .5rem; border-top: 1px solid var(--border); }
-.chat-pr-row { padding: .6rem 0; overflow-wrap: anywhere; }
+.chat-pr-list { display: grid; gap: 3px; margin: .4rem 0; }
+.chat-pr-row {
+  padding: .45rem .55rem; overflow-wrap: anywhere; background: var(--panel2);
+  border-left: 4px solid var(--warn); border-radius: 0 var(--r-sm) var(--r-sm) 0;
+}
+.chat-pr-row.pr-green { border-left-color: var(--ok); }
+.chat-pr-row.pr-red { border-left-color: var(--danger-strong); }
+.chat-pr-link { display: flex; gap: .4rem; align-items: baseline; color: var(--ink); text-decoration: none; }
+.chat-pr-link:hover .chat-pr-title { text-decoration: underline; }
+.chat-pr-number { color: var(--dim); font: 11px ui-monospace, monospace; flex: none; }
+.chat-pr-title { font-size: .8rem; min-width: 0; }
 
 /* ── Drawer contents and model refresh (spec 270) ─────────────────────────
    Tokens and Models sections of the settings drawer, and the Configure

@@ -4974,6 +4974,7 @@ const CHAT_FLAVOR_ORDER = [
 const CHAT_CONFIGURE_ROUTE = "configure";
 const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__";
 const CHAT_HISTORY_POLL_MS = 2000;
+const CHAT_PR_POLL_MS = 15000;   // PR discovery itself runs once a minute
 const CHAT_MODES = ["chat", "diff"];
 const CHAT_TRANSCRIPT_PAGE_TURNS = 20;
 const CHAT_TRANSCRIPT_MAX_PAGES = 5;
@@ -8540,16 +8541,31 @@ async function renderInterface(root) {
   const prList = el("div", { className: "chat-pr-list" });
   const prSummary = el("summary", {}, "Pull requests");
   prPanel.append(prSummary, prList);
+  // Open PRs only. The card's left bar is its GitHub state: green, red, or
+  // amber for anything not yet settled (pending, created, unobserved). The
+  // state stays in the tooltip; the card itself opens the PR.
+  let prsRefreshedAt = 0;
   const refreshPRs = async () => {
+    prsRefreshedAt = Date.now();
     try {
       const { prs, total } = await api(`/runs/prs?shell_id=${shell.shell_id}`);
       if (generation !== chatRenderGeneration) return;
       prSummary.textContent = `Pull requests (${countLabel(prs.length, total)})`;
-      prList.replaceChildren(...(prs || []).map((pr) => el("article", { className: "chat-pr-row" },
-        el("a", { href: `https://github.com/${pr.repository}/pull/${pr.pr_number}`, target: "_blank", rel: "noopener" }, `${pr.repository}#${pr.pr_number}`),
-        el("div", {}, `GitHub: ${pr.normalized_state || "unobserved"} · ${(pr.observed_head_sha || "unknown head").slice(0, 12)}`),
-        el("div", { className: "muted" }, `Observed: ${pr.observed_at || "not yet"}`), receiptRows(pr.receipts))));
-      if (!prs?.length) prList.append(el("div", { className: "muted" }, "No registered PRs."));
+      prList.replaceChildren(...(prs || []).map((pr) => {
+        const state = pr.normalized_state || "unobserved";
+        const tone = { green: "green", red: "red" }[state] || "amber";
+        return el("article", { className: `chat-pr-row pr-${tone}` },
+          el("a", {
+            className: "chat-pr-link", href: `https://github.com/${pr.repository}/pull/${pr.pr_number}`,
+            target: "_blank", rel: "noopener",
+            title: `${pr.repository}#${pr.pr_number} · ${state}`
+              + (pr.observed_head_sha ? ` at ${pr.observed_head_sha.slice(0, 12)}` : ""),
+          },
+          el("span", { className: "chat-pr-number" }, `#${pr.pr_number}`),
+          el("span", { className: "chat-pr-title" }, pr.title || pr.repository)),
+          ...(pr.receipts?.length ? [receiptRows(pr.receipts)] : []));
+      }));
+      if (!prs?.length) prList.append(el("div", { className: "muted" }, "No open PRs."));
     } catch (error) { if (generation === chatRenderGeneration) prList.replaceChildren(el("div", { className: "error" }, error.message)); }
   };
   const refreshPRButton = el("button", { className: "act", type: "button" }, "Refresh PRs");
@@ -8946,6 +8962,7 @@ async function renderInterface(root) {
         chatPaintShellState(button, nextOpenByShell.get(shellId));
       paintShellIndicators(nextShells);
       await refreshRuns();
+      if (Date.now() - prsRefreshedAt >= CHAT_PR_POLL_MS) await refreshPRs();
     } catch { /* The next poll retries without disrupting the open chat. */ }
     finally { historyPollInFlight = false; }
   };
