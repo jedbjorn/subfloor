@@ -450,12 +450,24 @@ def render_connections(con) -> str:
     return "\n".join(lines)
 
 
-def render_skills(con, shell_id: int) -> str:
+# WAKES names where seat timing lives; a seatless (Admin) boot keeps the
+# one-sentence launch fallback instead.
+SEAT_WAKE_POINTER = "When and how wakes reach you: SEAT."
+SEATLESS_WAKE_FALLBACK = (
+    "A shell with no SEAT section (Admin) goes by how it was launched: a\n"
+    "session the FnB types into is a terminal seat; a chat the engine opened is a\n"
+    "headless one."
+)
+
+
+def render_skills(con, shell_id: int, seat: str | None = None) -> str:
+    """The boot's skill list: one launch's, so only its seat's skills."""
+    seat_clause = " AND (s.seat IS NULL OR s.seat=?)" if seat else ""
     rows = con.execute(
         "SELECT s.name, s.description FROM skills s "
         "JOIN resolved_shell_skills ss ON ss.skill_id = s.skill_id "
-        "WHERE ss.shell_id=? AND s.is_deleted=0 ORDER BY s.name",
-        (shell_id,),
+        f"WHERE ss.shell_id=? AND s.is_deleted=0{seat_clause} ORDER BY s.name",
+        (shell_id, seat) if seat else (shell_id,),
     ).fetchall()
     if not rows:
         return "(none)"
@@ -630,8 +642,14 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     )
     template = template.replace(
         "{{execution_context}}", render_execution_context(flavor, launch_mode)
-        + run_seat.boot_block(flavor, seat, conversion)
     )
+    seat_block = run_seat.boot_block(flavor, seat, conversion)
+    if seat_block:
+        template = template.replace("{{seat}}", seat_block + "\n\n---")
+        template = template.replace("{{wake_seat}}", SEAT_WAKE_POINTER)
+    else:
+        template = template.replace("{{seat}}\n\n", "")
+        template = template.replace("{{wake_seat}}", SEATLESS_WAKE_FALLBACK)
     dev_tools_block = render_dev_tools(flavor, dev_tools)
     if dev_tools_block:
         template = template.replace("{{dev_tools}}", dev_tools_block)
@@ -753,7 +771,8 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         "", "---", "",
         "## ACTIVE PROJECTS", "", render_projects(con, shell_id),
         "", "---", "",
-        "## SKILLS", "", render_skills(con, shell_id),
+        "## SKILLS", "", render_skills(
+            con, shell_id, None if flavor == "admin" else seat),
         "", "---", "",
         "## API", "", render_api(api_port, api_key),
         "", "---", "",

@@ -17,6 +17,10 @@ value is still taken whole. The stored description is one stripped line, and
 every managed projection renders exactly that string, quoted where a YAML
 reader needs it.
 
+An optional `seat: gui|tui` marks a skill usable in only one launch seat; the
+boot list and harness skill roots then omit it in the other seat. Grants are
+unaffected. A later `put` without the key clears the tag.
+
 The lane is chosen by identity, not by whether the DB happens to open. A
 launched shell (it carries SC_API_TOKEN) always goes through the authenticated
 `/_sc/skills/*` routes on the review API, which run the same validation and
@@ -44,7 +48,7 @@ The list is re-applied after every seed sync/heal/rebuild, so it rides
 (inert) so `unretire` restores who-had-what.
 
 Usage:
-    ./sc skill list                        catalogue: origin, common, grants
+    ./sc skill list                        catalogue: origin, common, seat, grants
     ./sc skill put --file <SKILL.md>       create/update a DB-canonical LOCAL skill
     ./sc skill grant  <name> <target>...   grant to a shell's pack or flavor:<name>
     ./sc skill revoke <name> <target>...   revoke from a shell's pack or flavor:<name>
@@ -73,7 +77,7 @@ import snapshot
 ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH: Path | None = None  # resolved in connect(); tests pin it
 MAX_SKILL_FILE_BYTES = 128 * 1024
-LOCAL_FRONTMATTER_FIELDS = {"name", "description", "category", "command", "common"}
+LOCAL_FRONTMATTER_FIELDS = {"name", "description", "category", "command", "common", "seat"}
 
 
 def connect():
@@ -441,6 +445,13 @@ def parse_local_skill_spec(text: str) -> dict:
             )
         raise DraftValidationError("frontmatter `common` must be true or false")
 
+    seat = meta.get("seat") or None
+    if seat not in seed_skills.SKILL_SEATS:
+        raise DraftValidationError(
+            f"frontmatter `seat` must be gui or tui (or absent for both seats); "
+            f"got {seat!r}"
+        )
+
     body = "\n".join(lines[boundary + 1:]).strip()
     if not body:
         raise DraftValidationError("draft must include a non-empty procedure body")
@@ -449,6 +460,9 @@ def parse_local_skill_spec(text: str) -> dict:
         "description": description,
         "common": 0,
         "content": body,
+        # Unlike category/command, an absent seat clears: a stale tag would
+        # hide the skill from a whole seat.
+        "seat": seat,
     }
     # The managed projection renders name + description only, so an omitted
     # `category`/`command` means "keep the stored value" rather than clear it
@@ -507,17 +521,18 @@ def print_catalogue(rows: list[dict]) -> int:
         deleted = row["is_deleted"]
         origin = "engine" if row.get("origin") == "engine" else "local "
         tag = "common" if common else "opt-in"
+        seat = row.get("seat") or "both"
         category = row.get("category") or "-"
         dead = ("  [retired]" if row.get("retired") else "  [deleted]") if deleted else ""
         scopes = ", ".join(row.get("grant_scopes") or []) or "(ungranted)"
-        print(f"{name:<{w}}  {origin}  {tag}  {category:<{cw}}  → {scopes}{dead}")
+        print(f"{name:<{w}}  {origin}  {tag}  {seat:<4}  {category:<{cw}}  → {scopes}{dead}")
     return 0
 
 
 def cmd_list(con) -> int:
     rows = [dict(row) for row in con.execute(
         "SELECT s.skill_id, s.name, s.description, s.category, s.common, "
-        "s.is_deleted FROM skills s ORDER BY s.is_deleted, s.name").fetchall()]
+        "s.seat, s.is_deleted FROM skills s ORDER BY s.is_deleted, s.name").fetchall()]
     for row in rows:
         row["grant_scopes"] = grant_scopes(con, row["skill_id"])
     return print_catalogue(annotate_catalogue(rows))
@@ -658,25 +673,27 @@ def _put_spec(con, spec: dict) -> str:
     if existing is None:
         con.execute(
             "INSERT INTO skills (name, description, category, command, common, "
-            "content, is_deleted) VALUES (?, ?, ?, ?, 0, ?, 0)",
+            "content, seat, is_deleted) VALUES (?, ?, ?, ?, 0, ?, ?, 0)",
             (
                 name,
                 spec["description"],
                 spec.get("category"),
                 spec.get("command"),
                 spec["content"],
+                spec.get("seat"),
             ),
         )
         verb = "created"
     else:
         con.execute(
             "UPDATE skills SET description=?, category=?, command=?, common=0, "
-            "content=?, is_deleted=0 WHERE skill_id=?",
+            "content=?, seat=?, is_deleted=0 WHERE skill_id=?",
             (
                 spec["description"],
                 spec.get("category", existing[2]),
                 spec.get("command", existing[3]),
                 spec["content"],
+                spec.get("seat"),
                 existing[0],
             ),
         )

@@ -60,33 +60,28 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
         self.assertIn(SHARED_HOST_BOUNDARY, focus)
         posture = focus.split(POLICY_HEADING, 1)[1].split("## ", 1)[0]
         self.assertIn("`spec_execution`", posture)
-        # Seat-conditional, matching boot WAKES: the headless seat never sets
-        # up its own watchers; the terminal seat follows BOUNDED PROBES.
-        self.assertIn(
-            "On a headless seat do not set up independent watchers; "
-            "a terminal seat follows BOUNDED PROBES.",
-            posture,
-        )
+        # Spec #276: seat-specific waiting lives in the boot SEAT section.
+        self.assertIn("Wait on a long check the way your SEAT section says.", posture)
         probes = focus.split("## BOUNDED PROBES", 1)[1].split("## ", 1)[0]
+        self.assertIn("Its completion wakes you;", probes)
         self.assertIn(
-            "Headless seat: the engine's wakes are the watcher for a PR you own",
+            "the PR watcher sends the shell that opened a PR its red, green, "
+            "closed and merged facts",
             probes,
         )
-        # Spec #273: a shell never loops on `gh`; a bounded watch is the
-        # engine's, and the Developer's own PR facts still come from the PR watcher.
-        self.assertIn(
-            "never loop on `gh` in your turn or replace those wakes with a "
-            "polling job.",
-            probes,
-        )
+        self.assertIn("do not replace those with a polling job.", probes)
         self.assertIn("`sc job watch pr --pr <n>` is one bounded watch", probes)
         self.assertIn("`sc job watch timer --after <seconds>`", probes)
         self.assertIn("it grants no merge authority", probes)
         self.assertIn(
-            "Terminal seat: no wake reaches a running session, so set up your "
-            "own bounded monitors",
+            "How these wakes reach you, and when you watch for yourself instead: SEAT.",
             probes,
         )
+        for split in ("headless seat", "terminal seat"):
+            self.assertNotIn(split, focus.lower())
+        # Spec #273: a shell never loops on `gh`; that rule now rides SEAT — GUI.
+        seat = " ".join((ENGINE / "scripts" / "run_seat.py").read_text().split())
+        self.assertIn("Never loop on `gh` in your turn.", seat)
 
         skill = ASSETS / "spec_execution" / "SKILL.md"
         detail = " ".join(skill.read_text().split())

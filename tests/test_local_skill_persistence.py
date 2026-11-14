@@ -39,7 +39,8 @@ import snapshot as snapshot_mod
 SKILLS_DDL = (
     "CREATE TABLE skills (skill_id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, "
     "description TEXT, category TEXT, content TEXT, command TEXT, "
-    "common INTEGER NOT NULL DEFAULT 1, is_deleted INTEGER NOT NULL DEFAULT 0)")
+    "common INTEGER NOT NULL DEFAULT 1, is_deleted INTEGER NOT NULL DEFAULT 0, "
+    "seat TEXT CHECK (seat IN ('gui','tui')))")
 SHELLS_DDL = (
     "CREATE TABLE shells (shell_id INTEGER PRIMARY KEY, shortname TEXT, "
     "display_name TEXT, flavor TEXT, api_key TEXT, is_deleted INTEGER DEFAULT 0)")
@@ -622,9 +623,11 @@ class LocalSkillPersistenceIntegrationTest(unittest.TestCase):
 
     # schema.sql is the partial core baseline; these columns arrive with the
     # migrations this fixture does not run (api_key from 0027, the retirement
-    # trio from 0268). Add them by hand so the fixture matches a migrated DB.
+    # trio from 0268, the skill seat from 0291). Add them by hand so the
+    # fixture matches a migrated DB.
     MIGRATED_COLUMNS = (
         "ALTER TABLE shells ADD COLUMN api_key TEXT",
+        "ALTER TABLE skills ADD COLUMN seat TEXT CHECK (seat IN ('gui','tui'))",
         "ALTER TABLE documents ADD COLUMN retired INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE documents ADD COLUMN retired_date TEXT",
         "ALTER TABLE documents ADD COLUMN superseded_by INTEGER",

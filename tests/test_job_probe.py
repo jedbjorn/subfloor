@@ -194,8 +194,10 @@ class ProbeGuidanceTest(unittest.TestCase):
                     boot = compose.compose_boot(con, shell, user, 'test', 1, work_dir=Path(tmp), seat='gui')
                 self.assertIn(block, boot)
                 flat = ' '.join(boot.split())
-                self.assertIn("Headless seat: the engine's wakes are the watcher", flat)
-                self.assertIn('Terminal seat: no wake reaches a running session', flat)
+                # The role prompt says what to watch; the GUI SEAT says how.
+                self.assertIn('How these wakes reach you, and when you watch for yourself instead: SEAT.', flat)
+                self.assertIn("The engine's wakes are your watcher", flat)
+                self.assertNotIn('Terminal seat', flat)
                 self.assertIn('remote build finishing', boot)
 
 

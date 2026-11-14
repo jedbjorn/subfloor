@@ -21,8 +21,8 @@ both work on either seat.
 - Big work that needs several shells, review and a merge is a Sprint, not a
   subagent.
 - A question for the FnB is not delegated. Ask the FnB.
-- On a terminal seat your harness's native agents remain available; see the
-  seat note at the end.
+- Whether your harness's native agents are an alternative depends on your
+  launch seat: see your boot SEAT section.
 
 ## You are accountable
 
@@ -40,8 +40,8 @@ both work on either seat.
 
 ## Who may launch
 
-- Every non-Admin flavor may launch a subagent, on the GUI seat and on a
-  terminal seat. Admin is refused.
+- Every non-Admin flavor may launch a subagent, on either seat. Admin is
+  refused.
 - Inside an armed or paused Sprint, Developers and the Planner may launch. A
   Reviewer of that Sprint may not: a review verdict must not rest on a reader
   nobody assigned. A Reviewer outside a Sprint may launch.
@@ -92,9 +92,9 @@ sc job agent --harness <name> --model <selector> [--effort <level>] \
   that new branch at the base; use it when the subagent is to commit.
 - A refusal registers nothing, creates no worktree and starts no process.
 - The verb prints the run id, the resolved harness, model and effort, the time
-  limit and the worktree. One launch per tool call. Then end your turn: the
-  wake is the signal. On a terminal seat the result waits in your inbox for
-  your next boot; `sc job wait <id>` is a bounded foreground wait.
+  limit and the worktree. One launch per tool call. The run's end wakes you
+  once; how that wake reaches you, and whether to end your turn now, is in
+  your boot SEAT section. `sc job wait <id>` is a bounded foreground wait.
 - `sc job list --kind agent` shows your live subagents with the time each has
   left, and the input + output tokens of each once a usage sweep has read them
   (cache reads and writes are not counted there; the Analytics tab counts
@@ -216,10 +216,9 @@ Before you report the work done:
 - Record the outcome in `sc mem`: state, a narrative line, flags and task
   status. Those writes are yours.
 
-## Seat note
+## Seat
 
-On the GUI seat native background agents die when your turn ends, so
-`sc job agent` is the way to delegate. On a terminal seat your harness's
-native agents remain available and `sc job agent` is optional. What it adds
-there is a launch on another harness built by the engine, a ledger row, and a
-run the operator can see and stop.
+Whether `sc job agent` is your way to delegate or an option beside your
+harness's native agents is set by your boot SEAT section. On any seat it adds
+a launch on another harness built by the engine, a ledger row, and a run the
+operator can see and stop.

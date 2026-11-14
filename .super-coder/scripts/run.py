@@ -689,17 +689,20 @@ def emit_adapter(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
 
 
 def render_harness_skills(con: sqlite3.Connection, shell_id: int,
-                          work_dir: Path, adapter: dict) -> dict:
+                          work_dir: Path, adapter: dict,
+                          seats: "frozenset[str] | None" = None) -> dict:
     """Render exact shell grants into every skill directory consumed by the
     selected harness. Adapters default to the Claude-compatible path and may
-    add a native path where compatibility discovery is incomplete."""
+    add a native path where compatibility discovery is incomplete. `seats`
+    (run_seat.launch_seats) narrows them to the launch seat plus the seats of
+    the shell's other live sessions; None projects every grant."""
     skill_dirs = list(dict.fromkeys([
         ".claude/skills",
         *(adapter.get("skill_dirs") or []),
     ]))
     try:
         summary = skill_projection.reconcile_shell(
-            con, shell_id, work_dir, ensure_dirs=skill_dirs
+            con, shell_id, work_dir, ensure_dirs=skill_dirs, seats=seats
         )
     except skill_projection.ProjectionError as exc:
         raise LaunchError(str(exc)) from exc
@@ -1998,7 +2001,8 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
             seat=seat, conversion=conversion),
     )
     render_harness_skills(
-        con, full["shell_id"], work_dir, adapter
+        con, full["shell_id"], work_dir, adapter,
+        seats=run_seat.launch_seats(chosen["shortname"], chosen["flavor"], seat),
     )
     con.close()
     if boot is None:
@@ -2537,7 +2541,8 @@ def main() -> None:
         # Render this shell's granted skills to every directory declared by the
         # selected harness — gitignored and rebuilt per boot.
         skills = render_harness_skills(
-            con, full["shell_id"], work_dir, adapter
+            con, full["shell_id"], work_dir, adapter,
+            seats=run_seat.launch_seats(chosen["shortname"], chosen["flavor"], seat),
         )
         con.close()
 

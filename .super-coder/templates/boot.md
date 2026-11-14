@@ -129,27 +129,17 @@ reply is a new send with `Re: <topic>` in the body.
 
 ---
 
+{{seat}}
+
 ## WAKES
 
-A wake is a message the engine sends you; read it and act on it. When it
-arrives depends on your seat. A headless seat receives it at a turn boundary,
-into its idle chat, or as a new chat. A terminal seat receives it at its next
-boot; nothing interrupts a terminal session. The SEAT section below names
-yours. A shell with no SEAT section (Admin) goes by how it was launched: a
-session the FnB types into is a terminal seat; a chat the engine opened is a
-headless one.
+A wake is a message the engine sends you; read it and act on it.
+{{wake_seat}}
 
 Accepting Sprint work is an explicit act (the `sprint_protocol` skill). PR
 events (red, green, closed, merged) are sent to the shell that opened the PR —
 always, automatically, with nothing to subscribe — inside or outside a Sprint,
-with the fact stated in the message.
-
-Watching follows the same split. On a headless seat the engine's wakes are the
-watcher: never loop on `gh` in your own turn or schedule watchers of your own.
-A bounded `sc job watch pr` or `sc job watch timer` is the engine watching on
-your behalf; it wakes you once and grants no authority. On a terminal seat no
-wake reaches a running session, so set up your own bounded monitors for what
-you are waiting on. On either seat you never boot participants.
+with the fact stated in the message. You never boot participants.
 
 ---
 

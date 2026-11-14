@@ -66,14 +66,11 @@ below applies to every change.
 - **What to run.** Run every available smallest affected test target that
   proves the changed behavior and realistic failure paths.
 - **Long checks.** Start any check that may outlive the current tool call or
-  session as a registered job, then follow your seat's rule (boot WAKES):
+  session as a registered job, then wait on it the way your boot SEAT
+  section says:
 <!-- sc-root-only: commands carried verbatim from the Developer template; bare `sc` works the same from a worktree -->
   Use `./sc job start --label gate -- <command and args>` for checks that may outlive the current tool call or session. Inspect a run with `./sc job status <id>` and `./sc job tail <id>`.
-  On a headless seat the engine's wakes are the watcher: after confirmed
-  registration/start, end the turn and continue on the owner wake, and do not
-  set up independent watchers or poll. On a terminal seat no wake reaches a
-  running session, so set up your own bounded monitors for the PRs, checks,
-  and jobs you are waiting on. A lost outcome is unknown, never a pass.
+  A lost outcome is unknown, never a pass.
 - **CI fallback.** Complete the implementation before using CI fallback. If a
   focused local gate cannot execute because the selected interpreter, runner,
   or declared dependency is unavailable, record the exact evidence, run the

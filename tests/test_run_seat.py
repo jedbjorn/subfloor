@@ -34,11 +34,13 @@ def test_explicit_launch_seat_overrides_inherited_seat(flavor, headless, expecte
     block = run_seat.boot_block(flavor, seat)
     assert ("## SEAT" in block) == (expected is not None)
     if expected == "tui":
-        assert "native background tools freely" in block
-        assert "next boot" in block
-        assert "set up your own bounded monitors" in block
+        assert block.startswith("## SEAT — CLI\n")
+        assert "native background tools and subagents" in block
+        assert "messages wait\n  for your next boot" in block
+        assert "Set up your own bounded monitors" in block
     if expected == "gui":
-        assert "Long work goes through `sc job`" in block
+        assert block.startswith("## SEAT — GUI\n")
+        assert "Run long work with `sc job start`" in block
         assert "Do not schedule in-session timers" in block
         assert "your own bounded monitors" not in block
 
@@ -110,6 +112,9 @@ def test_render_only_launch_plan_matches_boot(mode, flavor, expected, tmp_path, 
     assert ("## SEAT" in plan.boot_content) == (expected is not None)
     assert (tmp_path / "AGENTS.md").read_text() == plan.boot_content
     if expected is not None:
-        assert plan.boot_content.index("## EXECUTION CONTEXT") < plan.boot_content.index("## SEAT") < plan.boot_content.index("## ACTIVE SESSION")
+        # SEAT is the section directly before WAKES.
+        assert plan.boot_content.index("## SEAT") < plan.boot_content.index("## WAKES")
+        between = plan.boot_content.split("## SEAT", 1)[1].split("## WAKES", 1)[0]
+        assert between.count("\n## ") == 0
     if expected == "gui":
         assert "conversion is disarmed" in plan.boot_content

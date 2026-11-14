@@ -32,15 +32,15 @@ unavailable infrastructure; a lost outcome is unknown, never a pass. When the
 repository declares an authoritative full-suite CI gate, do not run the
 repository-wide suite locally merely to duplicate CI.
 Never start a competing repository-wide suite on a shared host.
-On a headless seat do not set up independent watchers; a terminal seat
-follows BOUNDED PROBES.
+Wait on a long check the way your SEAT section says.
 Long checks, CI fallback, and the pending/red/green rules: `spec_execution`.
 
 ## BOUNDED PROBES
 
-For a condition outside Sprint and GitHub, start a bounded polling job:
-`sc job start --until "<shell command>" --every 30 --timeout 3600`. On a
-headless seat, end the turn after starting it; its completion wakes you.
+For a condition outside Sprint and GitHub, a bounded polling job is the
+engine-run probe: `sc job start --until "<shell command>" --every 30 --timeout 3600`.
+Its completion wakes you; whether to use it or a monitor of your own, and what
+to do after starting it: SEAT.
 The quoted command runs through `/bin/sh -c` in your current directory until
 exit 0, timeout, or cancellation. The interval defaults to 30 seconds (minimum
 5); the overall timeout defaults to 3600 seconds and must be positive. Each
@@ -52,16 +52,13 @@ a file appearing (`--until 'test -f build/ready'`), or a remote build finishing
 (`--until 'ssh builder test -f build/complete'`). Choose a probe whose exit 0
 means the condition you need is met.
 
-GitHub PR state follows your seat, as in boot WAKES. Headless seat: the
-engine's wakes are the watcher for a PR you own — the PR watcher sends you its
-red, green, closed and merged facts; never loop on `gh` in your turn or replace
-those wakes with a polling job. For a PR you do not own,
-`sc job watch pr --pr <n>` is one bounded watch the engine runs for you: it
-wakes you once when the checks settle (green or red) or the PR is merged or
-closed, and it grants no merge authority. `sc job watch timer --after <seconds>`
-wakes you once after a delay. Terminal seat: no wake reaches a running session,
-so set up your own bounded monitors for the PRs and checks you are waiting on,
-and stop them when you finish.
+GitHub PR state: the PR watcher sends the shell that opened a PR its red,
+green, closed and merged facts (boot WAKES); do not replace those with a
+polling job. For a PR you do not own, `sc job watch pr --pr <n>` is one bounded
+watch the engine runs for you: it wakes you once when the checks settle (green
+or red) or the PR is merged or closed, and it grants no merge authority.
+`sc job watch timer --after <seconds>` wakes you once after a delay. How these
+wakes reach you, and when you watch for yourself instead: SEAT.
 
 ## RUN RECEIPTS
 

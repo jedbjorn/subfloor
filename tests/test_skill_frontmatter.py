@@ -183,6 +183,8 @@ class EmitParseTest(unittest.TestCase):
                 "command": meta.get("command"),
                 "common": 1 if common else 0,
                 "content": body.strip(),
+                # New with skills.seat (0291); absent stays NULL.
+                "seat": meta.get("seat") or None,
             }
 
         paths = sorted(seed_skills.SKILLS_DIR.glob("*/SKILL.md"))

@@ -97,7 +97,11 @@ class RebuildIntegrityTest(unittest.TestCase):
                 expected = (
                     values
                     if customization
-                    else tuple(desired[field] for field in seed_skills.SEED_FIELDS)
+                    else tuple(
+                        desired[field]
+                        for field in seed_skills.SEED_FIELDS
+                        if field != "seat"
+                    )
                     + (0,)
                 )
                 self.assertEqual(actual, expected)

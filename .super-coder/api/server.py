@@ -594,7 +594,7 @@ def get_delivery_audit(con) -> dict:
 def get_cli_skills(con) -> dict:
     """Exact read projection used by authenticated ``sc skill list`` calls."""
     skills = rows(con.execute(
-        "SELECT skill_id, name, description, category, common, is_deleted "
+        "SELECT skill_id, name, description, category, common, seat, is_deleted "
         "FROM skills ORDER BY is_deleted, name"
     ))
     scopes: dict[int, list[str]] = {}
