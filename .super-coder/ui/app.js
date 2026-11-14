@@ -3944,6 +3944,20 @@ function engineOperationLine(operation) {
     + (operation.error ? ` · ${operation.error}` : "");
 }
 
+// The Update engine button's badge: amber when `./sc update` would move the
+// engine, green when it would not, nothing when the check could not be made.
+function engineUpdateBadge(check) {
+  if (check?.state === "available")
+    return el("span", { className: "pill warn engine-update-badge",
+      title: `Upstream ${check.branch} is at ${check.upstream.slice(0, 12)}`
+        + `; installed ${check.installed.slice(0, 12)}.` }, "Update available");
+  if (check?.state === "current")
+    return el("span", { className: "pill ok engine-update-badge",
+      title: `Installed ${check.installed.slice(0, 12)} matches upstream ${check.branch}.` },
+      "Up to date");
+  return null;
+}
+
 function renderDrawerEngine(mount) {
   const facts = el("div", { className: "engine-facts" });
   const harnesses = el("div", { className: "engine-harnesses" });
@@ -3957,9 +3971,16 @@ function renderDrawerEngine(mount) {
   let waitTimer = null, wake = null;
   const alive = () => !closed;
   let following = false;
+  let updateCheck = null;
+  let painted = null;   // the last paint's arguments, to repaint the badge
+  const checkForUpdate = () => api("/engine-ops/update-check").then((check) => {
+    updateCheck = check;
+    if (alive() && painted && !following) paint(...painted);
+  }, () => { /* no badge: the check is advisory */ });
 
   const paint = (state, note = null) => {
     if (closed) return;
+    painted = [state, note];
     const view = engineView(state);
     facts.replaceChildren(
       el("span", { className: "engine-k" }, "Engine ref"),
@@ -3993,6 +4014,8 @@ function renderDrawerEngine(mount) {
       });
       button.onclick = () => request(op, label, view);
       const row = el("div", { className: "engine-control" }, button);
+      const badge = op === "update" ? engineUpdateBadge(updateCheck) : null;
+      if (badge) row.append(badge);
       if (!view.up) row.append(el("code", { className: "engine-cli" }, view.ops[op].cli));
       return row;
     }));
@@ -4055,6 +4078,7 @@ function renderDrawerEngine(mount) {
     following = false;
     if (!alive()) return;
     paint(state, outcome);
+    if (op === "update" && outcome.tone === "ok") checkForUpdate();
   };
 
   // Closing the drawer withdraws a confirmation that has not been sent yet:
@@ -4100,6 +4124,7 @@ function renderDrawerEngine(mount) {
       follow(state, state.status.operation.op, null);
     else paint(state);
   });
+  checkForUpdate();
   // Harness versions: the browser-surface status the Configure form already
   // reads, plus the version the model catalogue last verified, when it has one.
   Promise.all([

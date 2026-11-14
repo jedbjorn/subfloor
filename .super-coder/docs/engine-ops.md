@@ -260,6 +260,24 @@ server starts, which is why `./sc launch` pins the port first.
 
 The review API runs none of the verbs and has no route that does.
 
+It does say whether `./sc update` would move the engine — the badge on the
+Update engine button (amber "Update available", green "Up to date", none
+when unknown):
+
+    GET /api/engine-ops/update-check   (browser operator)
+
+    {"state": "available", "mode": "fork", "branch": "main",
+     "installed": "<sha>", "upstream": "<sha>", "checked_at": "..."}
+
+A fork compares its pin (`.sc-state/engine.ref`) with `main` at the recorded
+`.sc-state/engine.source`; the source repo compares `HEAD` with its `@{u}`
+branch. The upstream head comes from `git ls-remote` — nothing is fetched.
+Installed at or ahead of upstream is `current`. Any failure is `unknown` with a
+`reason`. Answers are cached for ten minutes per installed ref (one minute for
+a failure), so a finished update is re-checked at once. This check runs in the
+review API, not the engine-ops service: it reads checkout files a sandbox can
+write, which the service never decides from.
+
 ## Routes
 
 On the service, all JSON:

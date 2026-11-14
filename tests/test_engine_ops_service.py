@@ -2189,6 +2189,16 @@ class ReviewApiDiscoveryTest(unittest.TestCase):
         self.assertEqual(status, 403, out)
         self.assertEqual(out["error"]["code"], "fnb_operator_required")
 
+    def test_update_check_is_the_operators_and_served_as_checked(self):
+        answer = {"state": "available", "installed": "a" * 40, "upstream": "b" * 40}
+        with mock.patch.object(server.engine_update, "check", return_value=answer) as check:
+            status, out = self.get("/api/engine-ops/update-check")
+            self.assertEqual((status, out), (200, answer))
+            status, out = self.get("/api/engine-ops/update-check", token="shell-token")
+            self.assertEqual(status, 403, out)
+            self.assertEqual(out["error"]["code"], "fnb_operator_required")
+        check.assert_called_once_with()
+
     def test_review_api_runs_no_engine_operation(self):
         for method, path in (("POST", "/api/engine/ops/update"),
                              ("POST", "/api/engine-ops/update"),

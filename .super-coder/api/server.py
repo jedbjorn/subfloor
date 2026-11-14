@@ -127,6 +127,7 @@ import sprint_pr_watcher  # noqa: E402  (engine-wide PR subscription observation
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import route_bindings  # noqa: E402  (shared durable model-route freshness gate)
 import engine_ops  # noqa: E402  (where the host-side engine-ops service is)
+import engine_update  # is an engine update available — the drawer badge
 import browser_gate  # noqa: E402  (the sign-in gate: default deny, Feature #94)
 import cli_credential  # noqa: E402  (the engine CLI credential for sc verbs)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
@@ -6014,6 +6015,12 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 return self._send(200, engine_ops.discovery(
                     in_container() or bool(os.environ.get("SC_SANDBOX"))))
+            if path == "/api/engine-ops/update-check":
+                # Whether `./sc update` would move the engine: the Engine
+                # drawer's update badge. Read-only git, cached per ref.
+                if not self._require_browser_operator(con, "engine operations"):
+                    return
+                return self._send(200, engine_update.check())
             if path == "/api/web-search":
                 # Status only — configured / provider / last-four hint / when.
                 # The key itself never crosses this boundary (doc #215).
