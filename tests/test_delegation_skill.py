@@ -21,6 +21,7 @@ ENGINE = ROOT / ".super-coder"
 ASSETS = ENGINE / "assets" / "skills"
 PACKS = ENGINE / "templates" / "shells"
 RESEED = ENGINE / "migrations" / "0287_seed_delegation_skill.sql"
+SEAT_RESEED = ENGINE / "migrations" / "0291_skill_seat.sql"
 NON_ADMIN = {"planner", "dev", "reviewer", "devops", "cartographer"}
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "render"))
@@ -108,6 +109,8 @@ class DelegationSkillTest(unittest.TestCase):
         self.assertEqual(first, con.execute("SELECT * FROM skills ORDER BY name").fetchall())
         self.assertEqual(
             grants, con.execute("SELECT * FROM flavor_skills ORDER BY 1,2").fetchall())
+        # 0291 carries both bodies forward to their seat-neutral form.
+        con.executescript(SEAT_RESEED.read_text())
         for name in ("delegation", "cli_orchestration"):
             parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
             self.assertEqual(con.execute(
@@ -157,7 +160,7 @@ class DelegationSkillTest(unittest.TestCase):
             "`--harness` and `--model` are required. `--effort` is optional",
             "never substitute another model silently",
             # who may launch
-            "Every non-Admin flavor may launch a subagent, on the GUI seat and on a terminal seat",
+            "Every non-Admin flavor may launch a subagent, on either seat",
             "Developers and the Planner may launch. A Reviewer of that Sprint may not",
             "A subagent cannot launch or continue a subagent",
             # the worktree rule
@@ -174,8 +177,9 @@ class DelegationSkillTest(unittest.TestCase):
             # watchers
             'sc job start --until "<shell command>"', "sc job watch pr --pr <n>",
             "sc job watch timer --after <seconds>", "green is not a directive",
-            # one launch per call, then end the turn
-            "One launch per tool call. Then end your turn",
+            # one launch per call; the seat says whether to end the turn
+            "One launch per tool call. The run's end wakes you once",
+            "your boot SEAT section",
         ):
             with self.subTest(rule=rule):
                 self.assertIn(rule, body)
@@ -200,9 +204,13 @@ class DelegationSkillTest(unittest.TestCase):
             with self.subTest(row=row):
                 self.assertIn(row, body)
 
-    def test_cli_orchestration_points_a_gui_seat_at_delegation_and_resumes_kimi(self):
+    def test_cli_orchestration_is_cli_only_and_resumes_kimi(self):
+        # A GUI shell never receives it (skills.seat), so it carries no gate.
+        self.assertEqual(
+            seed_skills.parse_skill(ASSETS / "cli_orchestration" / "SKILL.md")["seat"],
+            "tui")
         body = flat("cli_orchestration")
-        self.assertIn("Load the `delegation` skill instead", body)
+        self.assertNotIn("## Seat gate", body)
         self.assertNotIn("Tell the FnB that this work needs a terminal session", body)
         self.assertIn('kimi -m <alias> -S <session_id> -p "<follow-up>"', body)
         self.assertNotIn("start a fresh child", body)
@@ -256,12 +264,13 @@ class RefusalTextTest(unittest.TestCase):
             self.assertIsNone(seat_convert.convert(event, "deny-only"))
 
     def test_the_gui_seat_block_sends_subagents_and_watches_through_sc_job(self):
-        block = run_seat.boot_block("dev", "gui")
+        block = " ".join(run_seat.boot_block("dev", "gui").split())
         self.assertIn(
-            "Long work goes through `sc job`, and so do subagents (`sc job agent`) "
-            "and bounded watches (`sc job watch`)", block)
+            "Run long work with `sc job start`, subagents with `sc job agent` "
+            "(`delegation` skill), and bounded waits with `sc job start --until`, "
+            "`sc job watch pr`, or `sc job watch timer`", block)
         self.assertIn("Do not schedule in-session timers", block)
-        self.assertNotIn("sc job agent", run_seat.boot_block("dev", "tui"))
+        self.assertIn("**Orchestration.** Delegate through `sc job agent`.", block)
         self.assertEqual(run_seat.boot_block("admin", "gui"), "")
 
     def test_the_registration_refusals_name_what_they_prevent(self):

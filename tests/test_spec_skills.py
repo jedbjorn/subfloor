@@ -149,13 +149,8 @@ class SpecSkillTest(unittest.TestCase):
             "that may outlive the current tool call or session.",
             "`./sc job status <id>` and `./sc job tail <id>`",
             "A lost outcome is unknown, never a pass.",
-            # The watcher rule follows the seat, as boot WAKES states it.
-            "On a headless seat the engine's wakes are the watcher",
-            "end the turn and continue on the owner wake",
-            "do not set up independent watchers",
-            "On a terminal seat no wake reaches a running session, so set up "
-            "your own bounded monitors for the PRs, checks, and jobs you are "
-            "waiting on",
+            # How to wait is the seat's rule, held only in the boot SEAT section.
+            "then wait on it the way your boot SEAT section says",
             "Complete the implementation before using CI fallback",
             "pending -> wait; red -> diagnose, fix, and push; green -> review readiness",
             "incomplete code is a failure",
@@ -211,7 +206,7 @@ class SingleHomeTest(unittest.TestCase):
         self.assertIn("not a standing grant or a third form", body)
         self.assertIn("report the PR as ready and wait", body)
         self.assertIn("## Monitors", body)
-        self.assertIn("On the terminal seat, set up your own monitors", body)
+        self.assertIn("Set up your own monitors", body)
 
     def test_first_sentence_of_each_description_says_what_and_when(self):
         """The boot listing shows only the first sentence, cut at the first

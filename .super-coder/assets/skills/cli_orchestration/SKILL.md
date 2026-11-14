@@ -3,6 +3,7 @@ name: cli_orchestration
 description: Planner-run delivery from a terminal seat; load when the FnB assigns work in this chat for you to orchestrate with CLI agents. You stay the oversight layer while native or cross-harness agents verify the spec, build, review, deploy to Dev, and verify. Covers the kickoff contract, agent launch per harness (Claude, Codex, Kimi), terminal-seat PR/CI monitors, the FnB's merge and deploy directives, acceptance review, and cleanup.
 category: workflow
 common: false
+seat: tui
 ---
 
 # cli_orchestration — run a delivery from the terminal
@@ -11,16 +12,6 @@ Use when the FnB assigns a spec, task set, or work unit "in this chat" and
 wants you to orchestrate it with your harness's own agents. You are the
 oversight layer: you brief, launch, monitor, verify handoffs, and surface
 questions. Agents do the work. Keep your context window for the FnB and you.
-
-## Seat gate
-
-The launch and monitor commands below need a terminal seat: boot `## SEAT`
-says "You hold a terminal". On the GUI seat your native background agents and
-commands die when your turn ends, so do not use them there. Load the
-`delegation` skill instead: `sc job agent` launches each agent on any harness
-and wakes you when it ends, and `sc job watch pr` replaces the PR monitors.
-Your lane, the kickoff contract, the lane order, the brief and the close in
-this skill still apply.
 
 ## Your lane
 
@@ -164,10 +155,8 @@ Each brief is self-contained. It contains:
 
 ## Monitors
 
-On the terminal seat, set up your own monitors: no engine service watches a
-PR for you here. This is specific to this loop on this seat. On the GUI seat
-and inside a Sprint the engine delivers PR facts as wakes, and your boot's
-"never poll GitHub" rule holds.
+Set up your own monitors: no engine service watches a PR for you in this
+session. Inside a Sprint the engine delivers PR facts as wakes instead.
 
 - **PR checks:** `gh pr checks <n> --watch --interval 60` as a background
   command; it exits when the checks settle. Read the result with

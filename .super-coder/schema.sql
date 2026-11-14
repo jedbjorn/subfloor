@@ -307,6 +307,7 @@ CREATE TABLE skills (
     command     TEXT,
     common      INTEGER NOT NULL DEFAULT 1,
     is_deleted  INTEGER NOT NULL DEFAULT 0
+    -- seat (gui|tui|NULL = both) is owned by migrations/0291_skill_seat.sql.
 );
 
 CREATE TABLE shell_skills (

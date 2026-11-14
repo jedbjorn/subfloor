@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import artifact_policy
+import run_seat
 import seed_skills
 import skill_frontmatter
 
@@ -63,15 +64,46 @@ def _bounded_root(checkout: Path, relative: Path) -> Path:
     return root
 
 
-def _skill_rows(con, shell_id: int | None) -> list:
+def _skill_rows(con, shell_id: int | None, seats: Iterable[str] | None = None) -> list:
+    """Granted skills for one shell, narrowed to a seat set when one is known.
+
+    A skill is kept when it is untagged or its seat is in `seats`; None or an
+    empty set means unknown, which projects the full grant set.
+    """
     if shell_id is None:
         return []
+    seats = sorted(set(seats or ()))
+    seat_clause = ""
+    if seats:
+        marks = ",".join("?" for _ in seats)
+        seat_clause = f" AND (s.seat IS NULL OR s.seat IN ({marks}))"
     return con.execute(
         "SELECT s.name, s.description, s.content FROM skills s "
         "JOIN resolved_shell_skills ss ON ss.skill_id=s.skill_id "
-        "WHERE ss.shell_id=? AND s.is_deleted=0 ORDER BY s.name",
-        (shell_id,),
+        f"WHERE ss.shell_id=? AND s.is_deleted=0{seat_clause} ORDER BY s.name",
+        (shell_id, *seats),
     ).fetchall()
+
+
+def live_seat_resolver():
+    """Return `resolve(shortname, flavor)` -> that shell's live seat set or None.
+
+    For reconciles outside a launch: one liveness scan, taken on first use and
+    shared by every shell the reconcile visits.
+    """
+    snapshot: dict | None = None
+
+    def resolve(shortname: str | None, flavor: str | None) -> frozenset[str] | None:
+        nonlocal snapshot
+        if flavor == "admin" or not shortname:
+            return None
+        if snapshot is None:
+            import shell_liveness
+
+            snapshot = shell_liveness.compute()
+        return run_seat.live_seats(shortname, flavor, snapshot=snapshot) or None
+
+    return resolve
 
 
 def _skill_body(row) -> str:
@@ -125,14 +157,15 @@ def _remove_managed_tree(path: Path, managed_names: set[str]) -> bool:
 
 
 def reconcile_root(
-    con, shell_id: int | None, checkout: Path, relative: Path, *, create: bool
+    con, shell_id: int | None, checkout: Path, relative: Path, *, create: bool,
+    seats: Iterable[str] | None = None,
 ) -> dict:
     """Render one exact managed root without following filesystem symlinks."""
     root = _bounded_root(checkout, relative)
     if not root.exists() and not create:
         return {"written": [], "skipped": [], "deleted": []}
 
-    rows = _skill_rows(con, shell_id)
+    rows = _skill_rows(con, shell_id, seats)
     if shell_id is None:
         current = {
             row[0].strip().lower().replace(" ", "-")
@@ -176,9 +209,13 @@ def reconcile_root(
 
 
 def reconcile_shell(
-    con, shell_id: int | None, checkout: Path, *, ensure_dirs: Iterable[Path | str] = ()
+    con, shell_id: int | None, checkout: Path, *, ensure_dirs: Iterable[Path | str] = (),
+    seats: Iterable[str] | None = None,
 ) -> dict:
-    """Converge all existing managed roots, creating only explicitly used roots."""
+    """Converge all existing managed roots, creating only explicitly used roots.
+
+    `seats` is the seat set whose skills the roots carry (see `_skill_rows`).
+    """
     managed = managed_skill_dirs()
     ensured = {_validated_relative(str(path)) for path in ensure_dirs}
     unknown = ensured - set(managed)
@@ -201,7 +238,8 @@ def reconcile_shell(
         ):
             continue
         summary = reconcile_root(
-            con, shell_id, checkout, relative, create=relative in ensured
+            con, shell_id, checkout, relative, create=relative in ensured,
+            seats=seats,
         )
         written.extend(summary["written"])
         skipped.extend(summary["skipped"])
@@ -296,12 +334,16 @@ def _reconcile_shell_rows(con, rows, *, repo_root: Path) -> dict:
     deleted: list[Path] = []
     checkouts: list[Path] = []
     seen: set[Path] = set()
+    live_seats = live_seat_resolver()
     for row in rows:
         checkout = shell_checkout(row["shortname"], row["flavor"], repo_root)
         if checkout in seen or not checkout.is_dir():
             continue
         seen.add(checkout)
-        summary = reconcile_shell(con, row["shell_id"], checkout)
+        summary = reconcile_shell(
+            con, row["shell_id"], checkout,
+            seats=live_seats(row["shortname"], row["flavor"]),
+        )
         written.extend(summary["written"])
         skipped.extend(summary["skipped"])
         deleted.extend(summary["deleted"])
@@ -362,10 +404,13 @@ def reconcile_existing_checkouts(con, *, repo_root: Path = REPO_ROOT) -> dict:
     written: list[Path] = []
     skipped: list[Path] = []
     deleted: list[Path] = []
+    live_seats = live_seat_resolver()
     for checkout in checkouts:
         row = by_checkout.get(checkout)
         summary = reconcile_shell(
-            con, row["shell_id"] if row is not None else None, checkout
+            con, row["shell_id"] if row is not None else None, checkout,
+            seats=(live_seats(row["shortname"], row["flavor"])
+                   if row is not None else None),
         )
         written.extend(summary["written"])
         skipped.extend(summary["skipped"])

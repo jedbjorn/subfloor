@@ -14,6 +14,7 @@ Source of truth for a skill = `assets/skills/<name>/SKILL.md`:
     category: substrate          # optional
     command: ./sc snapshot       # optional
     common: true                 # optional (default true)
+    seat: tui                    # optional: gui | tui (absent = both seats)
     ---
     <markdown body → skills.content>
 
@@ -271,7 +272,7 @@ def reconcile_dev_kit_starter(con) -> bool:
     desired = parse_skill(DEV_KIT_STARTER)
     changed = con.execute(
         "UPDATE skills SET description=?,category=?,command=?,common=?,"
-        "content=?,is_deleted=0 WHERE name='dev_kit'",
+        "content=?,seat=?,is_deleted=0 WHERE name='dev_kit'",
         tuple(desired[field] for field in SEED_FIELDS),
     ).rowcount
     if changed:
@@ -302,6 +303,10 @@ def parse_skill(path: Path) -> dict:
     if "name" not in meta:
         sys.exit(f"seed_skills: {path} frontmatter missing `name`")
     common = meta.get("common", "true").lower() not in ("false", "0", "no")
+    seat = meta.get("seat") or None
+    if seat not in SKILL_SEATS:
+        sys.exit(f"seed_skills: {path} frontmatter `seat` must be gui or tui, "
+                 f"or absent for both seats; got {seat!r}")
     return {
         "name": meta["name"],
         "description": meta.get("description"),
@@ -309,12 +314,15 @@ def parse_skill(path: Path) -> dict:
         "command": meta.get("command"),
         "common": 1 if common else 0,
         "content": body.strip(),
+        "seat": seat,
     }
 
 
 # Fields the seed UPSERT owns (seed_skills `main`'s ON CONFLICT DO UPDATE SET).
 # A live row that differs from its asset on any of these is stale.
-SEED_FIELDS = ("description", "category", "command", "common", "content")
+SEED_FIELDS = ("description", "category", "command", "common", "content", "seat")
+# A skill's launch seat (skills.seat): None = both seats.
+SKILL_SEATS = (None, "gui", "tui")
 
 
 def engine_skill_specs() -> list[dict]:
@@ -450,7 +458,7 @@ def stale_engine_skills(con, specs: list[dict] | None = None) -> list[str]:
     stale: list[str] = []
     for want in (_engine_specs() if specs is None else specs):
         row = con.execute(
-            "SELECT description, category, command, common, content "
+            "SELECT description, category, command, common, content, seat "
             "FROM skills WHERE name=?", (want["name"],),
         ).fetchone()
         if row is None:                       # engine skill missing from the DB
@@ -486,13 +494,13 @@ def sync_engine_skills(con, specs: list[dict] | None = None) -> list[str]:
         s = by_name[name]
         con.execute(
             "INSERT INTO skills (name, description, category, command, common, "
-            "content, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 0) "
+            "content, seat, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, 0) "
             "ON CONFLICT(name) DO UPDATE SET "
             "description=excluded.description, category=excluded.category, "
             "command=excluded.command, common=excluded.common, "
-            "content=excluded.content, is_deleted=0",
+            "content=excluded.content, seat=excluded.seat, is_deleted=0",
             (s["name"], s["description"], s["category"], s["command"],
-             s["common"], s["content"]),
+             s["common"], s["content"], s["seat"]),
         )
     if stale:
         con.commit()
@@ -591,6 +599,9 @@ def main(argv: list[str] | None = None) -> int:
         "BEGIN;",
         "",
     ]
+    # `seat` is deliberately absent: 0001 runs before the migration that adds
+    # skills.seat on a fresh rebuild. That migration reseeds the tagged skills,
+    # and sync_engine_skills owns the column on every later heal.
     for s in skills:
         lines.append(
             "INSERT INTO skills (name, description, category, command, common, content, is_deleted) "

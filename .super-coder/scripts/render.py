@@ -116,6 +116,9 @@ def main(argv: list[str]) -> int:
                 shell["shell_id"],
                 checkout,
                 ensure_dirs=skill_projection.managed_skill_dirs(),
+                seats=skill_projection.live_seat_resolver()(
+                    shell["shortname"], shell["flavor"]
+                ),
             )
             _report(f"skills[{argv[1]}]", summary)
         else:

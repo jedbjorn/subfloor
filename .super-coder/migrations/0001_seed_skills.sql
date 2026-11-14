@@ -20,16 +20,6 @@ wants you to orchestrate it with your harness''s own agents. You are the
 oversight layer: you brief, launch, monitor, verify handoffs, and surface
 questions. Agents do the work. Keep your context window for the FnB and you.
 
-## Seat gate
-
-The launch and monitor commands below need a terminal seat: boot `## SEAT`
-says "You hold a terminal". On the GUI seat your native background agents and
-commands die when your turn ends, so do not use them there. Load the
-`delegation` skill instead: `sc job agent` launches each agent on any harness
-and wakes you when it ends, and `sc job watch pr` replaces the PR monitors.
-Your lane, the kickoff contract, the lane order, the brief and the close in
-this skill still apply.
-
 ## Your lane
 
 - Do not write code or propose fixes. Route findings to the agent that owns
@@ -172,10 +162,8 @@ Each brief is self-contained. It contains:
 
 ## Monitors
 
-On the terminal seat, set up your own monitors: no engine service watches a
-PR for you here. This is specific to this loop on this seat. On the GUI seat
-and inside a Sprint the engine delivers PR facts as wakes, and your boot''s
-"never poll GitHub" rule holds.
+Set up your own monitors: no engine service watches a PR for you in this
+session. Inside a Sprint the engine delivers PR facts as wakes instead.
 
 - **PR checks:** `gh pr checks <n> --watch --interval 60` as a background
   command; it exits when the checks settle. Read the result with
@@ -346,8 +334,8 @@ both work on either seat.
 - Big work that needs several shells, review and a merge is a Sprint, not a
   subagent.
 - A question for the FnB is not delegated. Ask the FnB.
-- On a terminal seat your harness''s native agents remain available; see the
-  seat note at the end.
+- Whether your harness''s native agents are an alternative depends on your
+  launch seat: see your boot SEAT section.
 
 ## You are accountable
 
@@ -365,8 +353,8 @@ both work on either seat.
 
 ## Who may launch
 
-- Every non-Admin flavor may launch a subagent, on the GUI seat and on a
-  terminal seat. Admin is refused.
+- Every non-Admin flavor may launch a subagent, on either seat. Admin is
+  refused.
 - Inside an armed or paused Sprint, Developers and the Planner may launch. A
   Reviewer of that Sprint may not: a review verdict must not rest on a reader
   nobody assigned. A Reviewer outside a Sprint may launch.
@@ -417,9 +405,9 @@ sc job agent --harness <name> --model <selector> [--effort <level>] \
   that new branch at the base; use it when the subagent is to commit.
 - A refusal registers nothing, creates no worktree and starts no process.
 - The verb prints the run id, the resolved harness, model and effort, the time
-  limit and the worktree. One launch per tool call. Then end your turn: the
-  wake is the signal. On a terminal seat the result waits in your inbox for
-  your next boot; `sc job wait <id>` is a bounded foreground wait.
+  limit and the worktree. One launch per tool call. The run''s end wakes you
+  once; how that wake reaches you, and whether to end your turn now, is in
+  your boot SEAT section. `sc job wait <id>` is a bounded foreground wait.
 - `sc job list --kind agent` shows your live subagents with the time each has
   left, and the input + output tokens of each once a usage sweep has read them
   (cache reads and writes are not counted there; the Analytics tab counts
@@ -541,13 +529,12 @@ Before you report the work done:
 - Record the outcome in `sc mem`: state, a narrative line, flags and task
   status. Those writes are yours.
 
-## Seat note
+## Seat
 
-On the GUI seat native background agents die when your turn ends, so
-`sc job agent` is the way to delegate. On a terminal seat your harness''s
-native agents remain available and `sc job agent` is optional. What it adds
-there is a launch on another harness built by the engine, a ledger row, and a
-run the operator can see and stop.',
+Whether `sc job agent` is your way to delegate or an option beside your
+harness''s native agents is set by your boot SEAT section. On any seat it adds
+a launch on another harness built by the engine, a ledger row, and a run the
+operator can see and stop.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -2129,14 +2116,11 @@ below applies to every change.
 - **What to run.** Run every available smallest affected test target that
   proves the changed behavior and realistic failure paths.
 - **Long checks.** Start any check that may outlive the current tool call or
-  session as a registered job, then follow your seat''s rule (boot WAKES):
+  session as a registered job, then wait on it the way your boot SEAT
+  section says:
 <!-- sc-root-only: commands carried verbatim from the Developer template; bare `sc` works the same from a worktree -->
   Use `./sc job start --label gate -- <command and args>` for checks that may outlive the current tool call or session. Inspect a run with `./sc job status <id>` and `./sc job tail <id>`.
-  On a headless seat the engine''s wakes are the watcher: after confirmed
-  registration/start, end the turn and continue on the owner wake, and do not
-  set up independent watchers or poll. On a terminal seat no wake reaches a
-  running session, so set up your own bounded monitors for the PRs, checks,
-  and jobs you are waiting on. A lost outcome is unknown, never a pass.
+  A lost outcome is unknown, never a pass.
 - **CI fallback.** Complete the implementation before using CI fallback. If a
   focused local gate cannot execute because the selected interpreter, runner,
   or declared dependency is unavailable, record the exact evidence, run the

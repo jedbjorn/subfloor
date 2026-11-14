@@ -162,6 +162,10 @@ class SkillLifecycleConvergenceTest(unittest.TestCase):
     ) -> None:
         with closing(sqlite3.connect(self.fixture.database)) as con, \
                 mock.patch.object(seed_skills, "apply_retired", return_value=[]):
+            # Boot heals a migrated floor (update migrates before it reconciles);
+            # the 0153-era fixture only lacks the seat column the heal now reads.
+            con.execute(
+                "ALTER TABLE skills ADD COLUMN seat TEXT CHECK (seat IN ('gui','tui'))")
             seed_skills.sync_engine_skills(con)
         self.assert_converged()
 
