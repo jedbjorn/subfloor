@@ -3474,6 +3474,48 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'wake',
+  'Wake another shell''s active chat outside a Sprint; load only when the FnB says "send a wake" or "--wake". Never on your own initiative. Also says how to treat a wake you receive.',
+  'workflow',
+  NULL,
+  0,
+  '# wake — an FnB-directed wake outside a Sprint
+
+A normal message waits in the recipient''s inbox. A wake goes straight into
+the recipient''s active chat as its next turn.
+
+## When
+
+- Only when the FnB tells you to: "send a wake" or "--wake". Urgency, a
+  workflow step, or wanting a fast answer is not a direction.
+- Inside an armed Sprint, use `sc sprint send`, not this.
+
+## Send
+
+```bash
+sc mem message send <shortname> "<body>" --wake
+```
+
+- Give the recipient and the body; the engine routes it. You choose no model,
+  harness, or wake type.
+- No active chat -> refused. Tell the FnB; send a normal message only if the
+  FnB says so.
+- The printed receipt (`wake #N queued`) is the proof. Never resend, and never
+  ask the recipient to confirm.
+
+## Receive
+
+A wake arrives headed `Wake from <SHORTNAME>, sent on the FnB''s direction`.
+Act on it. Do not reply just to acknowledge; reply only when the body asks a
+question or you are blocked, and then with a normal message, never a wake.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'web_search',
   'Search the web through the engine (`sc search`, Tavily). Use when a task needs current facts, docs, release notes, or error text you cannot find in the repo or your own knowledge. The key lives on the host; you only need your shell token.',
   'substrate',

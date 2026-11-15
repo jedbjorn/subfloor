@@ -92,7 +92,7 @@ class MemMessageHelpContractTest(unittest.TestCase):
             for option in action.option_strings
         }
         self.assertEqual(
-            options, {"-h", "--help", "--kind", "--body-file", "--json"})
+            options, {"-h", "--help", "--kind", "--body-file", "--json", "--wake"})
 
         rendered = send.format_help()
         synopsis = (
@@ -791,6 +791,72 @@ class ApiMemTest(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             self.assertEqual(self.run_mem("message", "sent"), 0)
         self.assertIn("outbound proof", buf.getvalue())
+
+    # ── messaging: --wake — an FnB-directed wake into the ACTIVE chat only ────
+    def _activate_peer_chat(self) -> None:
+        if self.q("SELECT 1 FROM active_shell_chats WHERE shell_id=2"):
+            return
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,title,"
+            "creation_idempotency_key,creation_request_hash) "
+            "VALUES ('cv_' || hex(randomblob(16)),2,1,'claude','/fixture','Peer',"
+            "'peer-chat','hash:peer-chat')")
+        con.execute(
+            "INSERT INTO active_shell_chats (shell_id,chat_id) "
+            "SELECT 2, conversation_id FROM conversations "
+            "WHERE creation_idempotency_key='peer-chat'")
+        con.commit()
+        con.close()
+
+    def test_message_wake_a_refused_without_an_active_chat(self):
+        rc, _out, err = self.fails("message", "send", "peer", "wake nobody", "--wake")
+        self.assertEqual(rc, 1)
+        self.assertIn("peer has no active chat", err)
+        self.assertIn("drop --wake", err)
+        self.assertIsNone(self.q("SELECT 1 FROM wake_message WHERE body LIKE '%wake nobody%'"))
+        self.assertIsNone(self.q("SELECT 1 FROM shell_messages WHERE body='wake nobody'"))
+
+    def test_message_wake_b_queues_for_the_active_chat_and_writes_no_inbox_row(self):
+        self._activate_peer_chat()
+        rc, out = self.run_json("message", "send", "peer", "start the sprint", "--wake")
+        self.assertEqual(rc, 0)
+        self.assertIs(out["wake"], True)
+        row = self.q(
+            "SELECT m.sender_shell_id,m.receiver_shell_id,m.declared_type,m.sprint_id,"
+            "m.body,o.state FROM wake_message m "
+            "JOIN sprint_wake_messages j ON j.message_id=m.message_id "
+            "JOIN sprint_wake_outbox o ON o.wake_id=j.wake_id "
+            "WHERE m.message_id=?", out["message_id"])
+        self.assertEqual(
+            (row["sender_shell_id"], row["receiver_shell_id"],
+             row["declared_type"], row["sprint_id"], row["state"]),
+            (1, 2, "re-enter", None, "pending"))
+        self.assertTrue(row["body"].startswith(
+            "Wake from tc, sent on the FnB's direction. Act on it; "
+            "do not reply just to acknowledge.\n\nstart the sprint"))
+        self.assertIsNone(self.q("SELECT 1 FROM shell_messages WHERE body='start the sprint'"))
+
+    def test_message_wake_c_repeat_key_returns_the_original(self):
+        self._activate_peer_chat()
+        payload = {"to": "peer", "body": "once only", "wake": True,
+                   "dedupe_key": "wake-dk-1"}
+        first = mem._api("POST", "/_sc/mem/messages", payload)
+        again = mem._api("POST", "/_sc/mem/messages", payload)
+        self.assertEqual(
+            (again["message_id"], again["wake_id"]),
+            (first["message_id"], first["wake_id"]))
+        self.assertTrue(again["duplicate"])
+        self.assertEqual(self.q(
+            "SELECT COUNT(*) FROM wake_message WHERE body LIKE '%once only'")[0], 1)
+
+    def test_message_wake_d_refuses_a_kind(self):
+        self._activate_peer_chat()
+        rc, _out, err = self.fails(
+            "message", "send", "peer", "typed wake", "--wake", "--kind", "task")
+        self.assertEqual(rc, 1)
+        self.assertIn("drop --kind", err)
 
     # ── engine DB busy → 503 + Retry-After, and the client retries (#331) ─────
     def test_busy_write_maps_to_503_and_client_retries(self):

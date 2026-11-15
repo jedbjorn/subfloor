@@ -16,6 +16,7 @@
     "sprint_prep",
     "sprint_pln",
     "cli_orchestration",
-    "delegation"
+    "delegation",
+    "wake"
   ]
 }

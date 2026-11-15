@@ -11,6 +11,7 @@
     "harness_readiness",
     "sprint_protocol",
     "sprint_dev",
-    "delegation"
+    "delegation",
+    "wake"
   ]
 }
