@@ -1304,7 +1304,8 @@ def test_engine_section_shows_facts_and_enables_controls_when_the_service_answer
     assert result["serviceRequests"] == [
         {"path": "/auth/status", "method": "GET", "credentials": "include", "headers": [], "body": None},
         {"path": "/status", "method": "GET", "credentials": "include", "headers": [], "body": None}]
-    assert result["apiRequests"] == ["/api/engine-ops", "/api/flavor-defaults"]
+    assert result["apiRequests"] == [
+        "/api/engine-ops", "/api/engine-ops/update-check", "/api/flavor-defaults"]
 
 
 @needs_node
