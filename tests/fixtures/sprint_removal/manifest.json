@@ -446,6 +446,8 @@
     "docs/environment.md",
     ".super-coder/migrations/0278_developer_bounded_probes.sql",
     ".super-coder/migrations/0291_skill_seat.sql",
+    ".super-coder/migrations/0292_seed_wake_skill.sql",
+    ".super-coder/assets/skills/wake/SKILL.md",
     "tests/test_job_probe.py",
     ".super-coder/scripts/run_attachments.py",
     ".super-coder/scripts/run_seat.py",
