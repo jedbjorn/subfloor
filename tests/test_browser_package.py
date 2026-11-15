@@ -254,17 +254,36 @@ def test_managed_lifecycle_two_processes_and_cleanup(package, tmp_path, monkeypa
         "armed": True,
     }
     ports.update({"browser": config})
+    monkeypatch.delenv("SC_API_TOKEN", raising=False)
+    monkeypatch.delenv("SC_SANDBOX", raising=False)
+    monkeypatch.setattr(browser.guard, "check", lambda config: None)
     try:
         up = browser.operate("up")
         assert up["server"] and up["proxy"], up
+        original = {name: browser.process_receipt(name)["pid"] for name in ("server", "proxy")}
+        provisioned = browser.set_extension_token("fixture-provisioned-token")
+        assert provisioned["approval_mode"] == "token"
+        for name in ("server", "proxy"):
+            pid = browser.process_receipt(name)["pid"]
+            assert pid != original[name]
+            environment = Path(f"/proc/{pid}/environ").read_bytes()
+            assert (b"PLAYWRIGHT_MCP_EXTENSION_TOKEN=fixture-provisioned-token" in environment) == (name == "server")
+        assert "fixture-provisioned-token" not in json.dumps(provisioned)
         stopped = browser.operate("disarm")
         assert not stopped["server"] and stopped["proxy"]
+        assert stopped["approval_mode"] == "token"
         assert browser.operate("arm")["server"]
+        assert browser.set_extension_token("fixture-rotated-token")["approval_mode"] == "token"
+        removed = browser.set_extension_token(None)
+        assert removed["server"] and removed["proxy"]
+        assert removed["approval_mode"] == "manual"
         down = browser.operate("down")
         assert not down["server"] and not down["proxy"]
         assert ports.resolve()["browser"]["armed"] is True
+        assert not browser.set_extension_token("fixture-again")["server"]
         browser.operate("disable")
         assert "browser" not in ports.resolve()
+        assert not (private / browser.TOKEN_FILE).exists()
     finally:
         browser.stop_process("proxy")
         browser.stop_process("server")

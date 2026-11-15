@@ -184,6 +184,7 @@ def test_action_errors_preserve_observed_connection_and_approved_session(
             "active_shells": ["DEV5"],
             "extension": "connected",
             "protocol_errors": [],
+            "connection_errors": [],
         }
         assert gate.sessions[sid]["upstream"] == upstream
     gate.tool_response = None
@@ -226,6 +227,22 @@ def test_explicit_connection_errors_clear_observed_status(gates, text):
     assert observed["extension"] == "not connected"
     assert observed["protocol_errors"] == ([text] if "protocol version" in text else [])
     assert not gate.deleted.is_set()
+
+
+def test_token_timeout_is_uncertain_and_clears_after_success(gates):
+    gate, _, _ = gates
+    sid, _, _ = request(gate, "DEV5", "initialize")
+    gate.tool_response = {"result": {"isError": True, "content": [{
+        "type": "text", "text": "### Error\nError: Playwright extension did not connect within 30s after opening the connect page."
+    }]}}
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+    observed = status(gate)
+    assert observed["active_shells"] == []
+    assert observed["connection_errors"] == [proxy.TOKEN_CONNECTION_FAILED]
+    gate.tool_response = None
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+    assert status(gate)["connection_errors"] == []
+    assert status(gate)["active_shells"] == ["DEV5"]
 
 
 @pytest.mark.parametrize("backend_restarted", [False, True])

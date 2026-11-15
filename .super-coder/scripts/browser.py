@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Opt-in host browser lifecycle. Private packages, two processes, no credentials."""
+"""Opt-in host browser lifecycle and operator-provisioned extension access."""
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import getpass
 import json
 import os
 import re
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import urllib.request
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -42,6 +45,9 @@ EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm"
 TIMEOUT = 30
 UNSUPPORTED_SEAT = "unsupported seat: browser requires bare metal"
 SUPPORTED = ("claude", "codex", "opencode")
+TOKEN_FILE = "extension-token.json"
+TOKEN_ENV = "PLAYWRIGHT_MCP_EXTENSION_TOKEN"
+TOKEN_LIMIT = 4096
 FIELDS = {
     "executable",
     "channel",
@@ -129,6 +135,109 @@ def write_private(path: Path, value: dict) -> None:
         os.replace(name, path)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+def valid_token(value: object) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[!-~]{1,4096}", value))
+
+
+def extension_token(config: dict) -> tuple[str, str | None]:
+    """Return a value-free state and, only when usable, the private credential.
+
+    Never include filesystem/parser exceptions in a public error: malformed
+    credential files may contain secrets in any field.
+    """
+    try:
+        fd = os.open(
+            private() / TOKEN_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+        with os.fdopen(fd) as source:
+            info = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or info.st_size > 16384
+            ):
+                return "invalid", None
+            raw = source.read(16385)
+            if len(raw) > 16384:
+                return "invalid", None
+            value = json.loads(raw)
+        if not isinstance(value, dict) or not valid_token(value.get("token")):
+            return "invalid", None
+        if any(
+            value.get(key) != config.get(key)
+            for key in ("user_data_dir", "profile_dir_name")
+        ):
+            return "profile_mismatch", None
+        return "configured", value["token"]
+    except FileNotFoundError:
+        return "absent", None
+    except (OSError, ValueError, UnicodeError):
+        return "invalid", None
+
+
+def approval_status(config: dict) -> dict:
+    credential, _ = extension_token(config)
+    mode = (
+        "manual"
+        if credential == "absent"
+        else ("token" if credential == "configured" else "unavailable")
+    )
+    return {
+        "approval_mode": mode,
+        "credential_state": credential,
+        "approval": {
+            "manual": "FnB approval required for every new connection",
+            "token": "Operator-provisioned token; fresh connections need no approval click",
+            "unavailable": "Stored browser credential is unusable; operator must replace or remove it",
+        }[mode],
+    }
+
+
+def require_token_operator() -> None:
+    require_bare_metal()
+    if os.environ.get("SC_API_TOKEN"):
+        raise ValueError(
+            "Browser credentials are owned by the FnB; use the operator's host terminal"
+        )
+
+
+def set_extension_token(token: str | None) -> dict:
+    """Replace/remove this install's copy; never rotate browser-owned state."""
+    require_token_operator()
+    if token is not None and not valid_token(token):
+        raise ValueError(
+            "Extension token must be 1..4096 printable ASCII characters without whitespace"
+        )
+    with lifecycle_lock():
+        config = read()
+        credential = None
+        if token is not None:
+            if not config:
+                raise ValueError(
+                    "Link the Subfloor profile before provisioning its token"
+                )
+            guard.check(config)
+            credential = {
+                "token": token,
+                "user_data_dir": config["user_data_dir"],
+                "profile_dir_name": config["profile_dir_name"],
+            }
+        running = bool(process_receipt("server"))
+        # End every old connection, including sessions approved manually.
+        stop_process("proxy")
+        stop_process("server")
+        path = private() / TOKEN_FILE
+        if credential is None:
+            path.unlink(missing_ok=True)
+        else:
+            write_private(path, credential)
+    if running and config and config["armed"]:
+        return operate("up")
+    return status()
 
 
 @contextmanager
@@ -416,7 +525,7 @@ def open_profile(*, harness: str | None = None, sandbox: bool = False) -> dict:
     return {
         **status(harness=harness, sandbox=sandbox),
         "launch_requested": True,
-        "detail": "Subfloor launch requested; approve the Playwright Extension connection when prompted",
+        "detail": "Subfloor launch requested; see approval_mode for connection approval",
     }
 
 
@@ -467,6 +576,12 @@ def link(value: dict, *, save: bool = True) -> dict:
     with lifecycle_lock():
         stop_process("proxy")
         stop_process("server")
+        previous = read()
+        if previous and any(
+            previous[key] != config[key]
+            for key in ("user_data_dir", "profile_dir_name")
+        ):
+            (private() / TOKEN_FILE).unlink(missing_ok=True)
         ports.update({"browser": config})
     return operate("up")
 
@@ -558,6 +673,14 @@ def start_process(name: str, command: list[str], config: dict) -> None:
             "DBUS_SESSION_BUS_ADDRESS",
         }
     }
+    if name == "server":
+        credential, token = extension_token(config)
+        if credential not in ("absent", "configured"):
+            raise ValueError(
+                "Stored browser credential is unusable; operator must replace or remove it"
+            )
+        if token is not None:
+            env[TOKEN_ENV] = token
     env["SC_BROWSER_GUARD_CONFIG"] = str(private() / "guard.json")
     write_private(private() / "guard.json", config)
     sessions = private() / "sessions"
@@ -565,8 +688,10 @@ def start_process(name: str, command: list[str], config: dict) -> None:
     sessions.chmod(0o700)
     ready_read, ready_write = os.pipe()
     env["SC_BROWSER_READY_FD"] = str(ready_write)
+    # Upstream diagnostics can include the token-bearing browser launch URL.
+    # Keep its stdout/stderr out of retained logs in token mode.
     log_fd = os.open(
-        private() / (name + ".log"),
+        os.devnull if TOKEN_ENV in env else private() / (name + ".log"),
         os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
         0o600,
     )
@@ -650,6 +775,9 @@ def status(*, harness: str | None = None, sandbox: bool = False) -> dict:
         state = "failed"
     if live.get("protocol_errors"):
         state = "failed"
+    approval = approval_status(config)
+    if config["armed"] and approval["approval_mode"] == "unavailable":
+        state = "failed"
     if not config["armed"] or not server or not checks["profile"]:
         live = {"active_shells": [], "extension": "not connected"}
     return {
@@ -660,7 +788,7 @@ def status(*, harness: str | None = None, sandbox: bool = False) -> dict:
         "proxy": proxy,
         "checks": checks,
         "connection_ready": bool(live.get("active_shells")),
-        "approval": "FnB approval required for every new connection",
+        **approval,
         **live,
     }
 
@@ -695,6 +823,7 @@ def operate(action: str) -> dict:
             stop_process("proxy")
             stop_process("server")
             if action == "disable":
+                (private() / TOKEN_FILE).unlink(missing_ok=True)
                 ports.update({}, remove=("browser",))
             return status()
         if not config:
@@ -755,12 +884,29 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="sc browser")
     parser.add_argument(
         "action",
-        choices=["status", "open", "up", "down", "doctor", "arm", "disarm", "setup"],
+        choices=[
+            "status",
+            "open",
+            "up",
+            "down",
+            "doctor",
+            "arm",
+            "disarm",
+            "setup",
+            "token-set",
+            "token-remove",
+        ],
     )
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--executable")
     parser.add_argument("--user-data-dir")
+    parser.add_argument(
+        "--token-stdin",
+        action="store_true",
+        help="read token-set input from stdin instead of a hidden terminal prompt",
+    )
     args = parser.parse_args(argv)
+    result: dict | None
     try:
         config = {
             key: value
@@ -769,7 +915,35 @@ def main(argv: list[str]) -> int:
         }
         if config and args.action != "setup":
             raise ValueError("path options are only valid with browser setup")
-        if os.environ.get("SC_API_TOKEN"):
+        if args.token_stdin and args.action != "token-set":
+            raise ValueError("--token-stdin is only valid with token-set")
+        if args.action in ("token-set", "token-remove"):
+            require_token_operator()  # refuse before reading any secret input
+            token = None
+            if args.action == "token-set":
+                if args.token_stdin:
+                    token = (
+                        sys.stdin.read(TOKEN_LIMIT + 3)
+                        .removesuffix("\n")
+                        .removesuffix("\r")
+                    )
+                elif sys.stdin.isatty():
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", getpass.GetPassWarning)
+                        try:
+                            token = getpass.getpass(
+                                "Playwright extension token (hidden): "
+                            )
+                        except getpass.GetPassWarning:
+                            raise ValueError(
+                                "Hidden terminal input is unavailable; use --token-stdin"
+                            ) from None
+                else:
+                    raise ValueError(
+                        "Use a terminal prompt or --token-stdin; never put the token in argv"
+                    )
+            result = set_extension_token(token)
+        elif os.environ.get("SC_API_TOKEN"):
             import mem
 
             mem._require_api()
@@ -788,6 +962,8 @@ def main(argv: list[str]) -> int:
             result = operate(args.action)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         result = {"state": "failed", "ok": False, "error": str(exc)}
+    if result is None:
+        result = {"state": "failed", "ok": False, "error": "Browser API returned no status"}
     print(json.dumps(result, indent=2) if args.json else json.dumps(result))
     return 1 if result.get("ok") is False or result.get("state") == "failed" else 0
 

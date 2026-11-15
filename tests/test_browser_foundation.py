@@ -85,6 +85,7 @@ def test_guard_exec_preserves_argv(config, tmp_path, monkeypatch):
     path = tmp_path / "guard.json"
     path.write_text(json.dumps(config))
     monkeypatch.setenv("SC_BROWSER_GUARD_CONFIG", str(path))
+    monkeypatch.setenv("PLAYWRIGHT_MCP_EXTENSION_TOKEN", "fixture-secret")
     monkeypatch.setattr(guard, "check", lambda config: None)
     called = []
     monkeypatch.setattr(os, "execv", lambda *args: called.append(args))
@@ -93,6 +94,7 @@ def test_guard_exec_preserves_argv(config, tmp_path, monkeypatch):
         "chrome-extension://extension/connect.html?a=b",
     ]
     assert guard.main(args) == 0
+    assert "PLAYWRIGHT_MCP_EXTENSION_TOKEN" not in os.environ
     assert called == [
         (
             config["executable"],
@@ -408,6 +410,7 @@ def test_setup_detects_profile_and_bootstraps_without_extension(
         lambda **kwargs: installed.append(kwargs) or {"ok": True},
     )
     monkeypatch.setattr(browser, "stop_process", lambda name: None)
+    monkeypatch.setattr(browser, "read", lambda: None)
     monkeypatch.setattr(
         browser.ports, "update", lambda changes: saved.append(changes["browser"])
     )

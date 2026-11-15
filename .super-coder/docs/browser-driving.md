@@ -3,9 +3,10 @@
 Browser driving is an opt-in, bare-metal engine capability for Claude, Codex,
 and OpenCode. Kimi, Vibe, and container seats are unsupported. It targets an
 existing Chromium profile displayed as **Subfloor**, with the Playwright
-Extension installed by the operator. Each new shell connection requires
-operator approval. The engine does not create profiles, sign in, approve
-connections, or store an extension credential.
+Extension installed by the operator. By default, each new shell connection
+requires operator approval. The operator can opt in to automatic connections
+by provisioning that profile's extension token. The engine does not create
+profiles, sign in, or click approval controls.
 
 ## Setup and use
 
@@ -26,6 +27,60 @@ connections, or store an extension credential.
    `sc browser open --json` to open the linked profile, then connect through
    the managed MCP and work in `Playwright · Subfloor <SHORTNAME>`.
    Approve that connection in the extension yourself.
+
+## Optional automatic connections
+
+In the linked Subfloor profile, open the Playwright Extension's management page
+and copy its `PLAYWRIGHT_MCP_EXTENSION_TOKEN`. From your own host terminal run:
+
+```sh
+sc browser token-set
+sc browser status --json
+```
+
+The command prompts with echo disabled. Do not paste the token into chat or a
+command argument. For a secret manager, pipe its output to
+`sc browser token-set --token-stdin`; do not put a literal token in shell
+history. Launched shells cannot provision or remove credentials through these
+commands or the API. There is no GUI/API secret input or DB/config field.
+
+The private `browser/extension-token.json` file has mode 0600 in the existing
+0700 browser directory and binds the token to the linked user-data directory
+and profile directory. Only the managed Playwright server receives it in its
+environment; ambient `PLAYWRIGHT_*` overrides are still stripped. The proxy
+receives no token environment value. Status exposes `approval_mode` (`manual`,
+`token`, or `unavailable`) and `credential_state` (`absent`, `configured`,
+`invalid`, or `profile_mismatch`), never the token. Provisioned does not mean
+verified: only a successful managed tool call establishes `connection_ready`.
+
+To rotate, use the extension's own token rotation control, then run `token-set`
+again with the new value. To return this install to manual approval:
+
+```sh
+sc browser token-remove
+```
+
+Replacement/removal ends all managed connections. A previously running, armed
+service restarts; a stopped or disarmed service stays stopped until the operator
+starts/arms it. `disarm` retains the saved token while stopping browser access;
+feature disable removes it. Relinking to another profile discards it. Neither
+command edits browser-owned extension state. Removing this install's copy is
+not global revocation: rotate in the extension to invalidate other copies, and
+disconnect unwanted clients there.
+
+**Upstream limitation:** Playwright puts the token in its extension connect URL
+passed to Chromium's process arguments. This opt-in accepts that same-user host
+exposure; it is not a guarantee that the token never enters process argv. The
+launch guard removes the token environment variable before executing Chromium.
+Upstream stdout/stderr are discarded in token mode because diagnostics could
+include that URL; managed status and proxy audit outcomes remain available.
+See [Playwright's token documentation](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md#bypassing-the-connection-approval-dialog).
+
+A token connection timeout cannot prove a mismatched credential: an unavailable
+extension produces the same upstream error. `connection_errors` reports both
+possibilities. Check the linked profile/extension, then replace the token if
+needed. An absent credential explicitly selects manual approval; an invalid or
+wrong-profile credential refuses server startup until replaced or removed.
 
 A live window is not a prerequisite. Local State is used only to identify the
 existing dedicated profile, never as live-window evidence. Closing a window
@@ -95,7 +150,8 @@ Two persistent processes run on loopback: Playwright MCP and a stdlib HTTP proxy
 browser executable/launcher, user-data and profile directories, ports, optional
 blocked origins, and armed state. There is no maintained upstream patch,
 headless/CDP fallback, or unrestricted-file-access flag. The MCP process inherits
-a small environment allowlist without upstream token/config overrides.
+a small environment allowlist plus the explicitly provisioned profile token,
+when present; it never inherits ambient upstream token/config overrides.
 
 The proxy exposes `/mcp/<SHORTNAME>`, substitutes `Subfloor <SHORTNAME>` in
 clientInfo, and binds sessions to that path. Tool calls refuse while disarmed or
@@ -114,7 +170,8 @@ target, and outcome in private `browser/audit.jsonl` (0600). URL queries,
 fragments, credentials, and typed text are omitted. Screenshots/session files
 remain in private `browser/sessions` (0700); page bodies never enter the memory
 DB. Per-shell URLs provide attribution, not host-process authentication.
-Loopback access still requires armed state and extension approval. Site account
+Loopback access still requires armed state and either extension approval or the
+operator's provisioned profile token. Site account
 reach belongs to the dedicated profile; signing out/revoking sessions removes
 it. Origin blocklists provide friction, not a security boundary.
 
@@ -141,3 +198,28 @@ The real extension approval remains an operator acceptance check after updating:
 
 Verified on: **not yet run**. Record Chromium/extension versions and the doctor
 receipt with the dated operator result; CI does not prove a real approval click.
+
+### Token acceptance after update
+
+Source tests prove private storage, redacted status, environment selection,
+credential replacement/removal, disarm/disable, API refusal, and timeout
+diagnostics. They do not prove a real extension connection. On the updated
+operator host, with the dedicated profile and extension installed:
+
+- [ ] Record Chromium, extension, and package versions without secret values.
+- [ ] Provision the extension token with `sc browser token-set`; status says
+      `approval_mode: token` without exposing the value.
+- [ ] Connect two fresh managed shell sessions under a named task (for example,
+      navigate to `about:blank` and snapshot). Neither shows an approval prompt;
+      each gets its own named tab group. Record the value-free doctor receipt.
+- [ ] Rotate in the extension and replace with `token-set`. Old managed sessions
+      end; reconnect both shells without approval prompts.
+- [ ] `token-remove` ends both connections. A fresh connection now requires
+      manual approval. No stored token remains in this install.
+- [ ] Provision again, disarm, and confirm open/tool calls refuse. Arm and
+      verify a fresh connection succeeds. Disarm retains the credential.
+- [ ] Check permissions and value-free status/audit/log receipts locally;
+      never attach the credential file or token-bearing process arguments.
+
+Token acceptance verified on: **not yet run**; requires operator-host cutover
+and the real extension. No live profile was changed by the source test suite.

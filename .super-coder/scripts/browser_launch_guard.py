@@ -89,6 +89,9 @@ def main(argv: list[str]) -> int:
     except (OSError, ValueError, KeyError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    # Upstream's connect URL carries the token in argv. Do not additionally
+    # retain the managed server's credential in Chromium's environment.
+    os.environ.pop("PLAYWRIGHT_MCP_EXTENSION_TOKEN", None)
     os.execv(config["executable"], command(config, argv))
     return 0
 

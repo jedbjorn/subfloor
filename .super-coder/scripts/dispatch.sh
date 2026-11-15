@@ -2110,6 +2110,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)
                              caller identity is resolved by the engine; report and review bodies use files, and mutating retries carry stable keys where required
   ./sc browser <verb>      setup/status/open/up/down/doctor/arm/disarm — opt-in Chromium profile driving
+  ./sc browser token-set   provision/replace the profile token via hidden input (--token-stdin for a pipe)
+  ./sc browser token-remove  end managed connections and return to manual approval
   ./sc token               retired — the review GUI signs in with a password and an authenticator code;
                              see ./sc auth (user add, user reset, sessions)
   sc engine-ref            print the full engine pin from the canonical live checkout — safe from any shell

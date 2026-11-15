@@ -1,0 +1,56 @@
+-- 0293 — opt-in managed browser token guidance (issue #1822).
+-- Preserve skill identity and feature-owned grants on existing installs.
+BEGIN;
+UPDATE skills SET content='# drive_browser
+
+Use only under an FnB directive naming the task, site/app, and allowed actions.
+Restate that reach before the first browser call. If no directive exists, ask.
+Do not expand it to other accounts or sites. Credential/account changes,
+payments, public posting, and downloads outside the output directory require
+explicit coverage in the directive. Never enter credentials when a site asks
+to sign in; stop and report.
+
+Run `sc browser status --json`. If absent, disarmed, unsupported, or failed,
+report the returned state and stop. Use the managed MCP connection; never edit
+harness configuration, start a substitute server, or arm the feature yourself.
+The returned `proxy_url` is yours and the tab group is
+`Playwright · Subfloor <SHORTNAME>`.
+
+Run `sc browser open --json` to launch the linked, existing Subfloor profile.
+No live window is required. Check `approval_mode`: `manual` requires the FnB
+to approve each new connection in the extension; `token` uses the credential
+the FnB provisioned for this profile. Never click an approval control yourself
+or read/provision the token. Work only in your tab group, without moving or
+touching other groups'' tabs.
+
+Snapshot before acting, preferring accessibility snapshots over screenshots.
+Save screenshots/downloads only in the returned output directory. Close the
+tabs you opened unless directed to leave them. Report the result, tab group,
+the session path returned by Playwright, and anything left open.
+
+`extension not connected` means the extension is unavailable or the connection
+is unapproved; it does not prove the profile window is closed. A token connection
+timeout can mean an unavailable extension or a mismatched token; status reports
+that uncertainty in `connection_errors`. An unusable stored credential requires
+the FnB to replace or remove it. Report and stop;
+never retry in a loop. The proxy sets no action deadline — it waits for
+Playwright''s own action or navigation result and keeps the approved session
+alive, so a slow action is still running: wait for its result rather than
+replaying it. Actions are never retried, and overlapping requests on one
+session refuse rather than queue. Confirmed transport loss ends the connection
+and is reported as such. `disarmed` requires the FnB to arm it.
+
+Admin diagnosis/repair stays under the operator''s named assignment. The FnB''s
+host terminal can run `sc browser setup --json` to detect and link the existing
+profile, or `doctor`, `up`, `down`, `arm`, and `disarm`. The operator can opt in
+to automatic connections with `sc browser token-set` (hidden terminal input),
+replace it after rotating the token in the extension, or return to manual
+approval with `sc browser token-remove`. Never request the secret in chat.
+Launched shell credentials
+permit `status` and (with this grant) `open`; they cannot set paths or arm. Doctor
+checks actual package capabilities and repairs missing or incompatible private
+packages without version pins. It reports `setup_ready` separately from
+`connection_ready`; `ok` requires both and running, armed services. Creating profiles, installing the extension, logins,
+and approval clicks remain human steps. See the engine''s
+`.super-coder/docs/browser-driving.md` for the setup and live acceptance record.' WHERE name='drive_browser' AND is_deleted=0;
+COMMIT;
