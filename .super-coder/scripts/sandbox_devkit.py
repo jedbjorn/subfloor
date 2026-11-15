@@ -7,6 +7,7 @@ native capability never make the proven core engine baseline unavailable.
 from __future__ import annotations
 
 import base64
+import csv
 import fcntl
 import hashlib
 import io
@@ -61,6 +62,26 @@ EXTENSION_LABELS = (
     "sc.package_layer_id",
 )
 MOUNT_MARKER = "SC_DEVKIT_MOUNTS"
+# The host paths under the operator's home that `./sc launch` bind-mounts,
+# writable, into the sandbox: harness state homes and the Claude profile file.
+# This is the ONLY list. The dispatcher's `docker run` names them through
+# HOME_MOUNT_MARKER, expanded in `docker_run` below, and host-side code that
+# must stay out of the sandbox's reach (api/engine_ops.py) excludes exactly
+# these. Add a mount here and both follow.
+HOME_BIND_MOUNTS = (
+    ".claude",
+    ".claude.json",
+    ".config/opencode",
+    ".local/share/opencode",
+    ".codex",
+    ".vibe",
+    ".kimi-code",
+)
+HOME_MOUNT_MARKER = "SC_HOME_MOUNTS"
+# Where the session-hash directory (`auth_sessions_dir`) appears inside the
+# sandbox. A fixed path, so the in-container review server needs no state-home
+# derivation of its own; mounted read-only by `docker_run`, and by nothing else.
+AUTH_SESSIONS_TARGET = "/run/super-coder/auth-sessions"
 GITHUB_HOST_TRUST = Path("assets/github_known_hosts")
 
 
@@ -1754,6 +1775,487 @@ def _mount_value(value: str) -> str:
     return f'"{escaped}"'
 
 
+def home_bind_paths(home: str | os.PathLike[str] | None = None) -> tuple[Path, ...]:
+    """Absolute host paths of every home bind mount the launcher makes."""
+    base = Path(home if home is not None else os.environ.get("HOME") or Path.home())
+    return tuple(base / relative for relative in HOME_BIND_MOUNTS)
+
+
+def _owner_state_home(environ: dict[str, str] | None = None) -> Path:
+    """The owner's XDG state home, from the environment given."""
+    env = os.environ if environ is None else environ
+    configured = (env.get("XDG_STATE_HOME") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    base = (env.get("HOME") or "").strip()
+    return (Path(base) if base else Path.home()) / ".local" / "state"
+
+
+def install_key(repo_root: str | os.PathLike[str]) -> str:
+    """`<repo name>-<hash of the checkout path>`: this install's name in the
+    owner's state home. From the checkout's own path, never a file in it."""
+    root = Path(repo_root)
+    key = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", root.name) or "repo"
+    return f"{name}-{key}"
+
+
+def engine_ops_state_dir(
+    repo_root: str | os.PathLike[str],
+    environ: dict[str, str] | None = None,
+) -> Path:
+    """Where the engine-ops service of the install at `repo_root` keeps its
+    host-private state (api/engine_ops.py), the sign-in credential store
+    (api/host_auth.py) included. A pure path: nothing is created.
+
+    Named from the checkout's own path under the owner's state home, so no
+    file in the checkout takes part in choosing it.
+    """
+    return (_owner_state_home(environ) / "subfloor" / "engine-ops"
+            / install_key(repo_root))
+
+
+def auth_sessions_dir(
+    repo_root: str | os.PathLike[str],
+    environ: dict[str, str] | None = None,
+) -> Path:
+    """Where the host auth authority publishes the session-hash list of the
+    install at `repo_root` for the review server (api/auth_sessions.py).
+
+    A sibling of the engine-ops state collection, never inside it: this
+    directory is the ONE thing of the authority's that is mounted into the
+    sandbox (read-only, at AUTH_SESSIONS_TARGET), and it holds no secret.
+    A pure path: nothing is created.
+    """
+    return (_owner_state_home(environ) / "subfloor" / "auth-sessions"
+            / install_key(repo_root))
+
+
+def paths_overlap(first: str | os.PathLike[str], second: str | os.PathLike[str]) -> bool:
+    """Whether two paths, links resolved, are the same or one contains the other."""
+    a = Path(os.path.realpath(first))
+    b = Path(os.path.realpath(second))
+    return a == b or a in b.parents or b in a.parents
+
+
+# ── The launcher's `docker run` grammar ───────────────────────────────────────
+# Every option the launcher passes to `docker run`, and whether it takes a
+# value. This is a grammar for ONE caller family — the dispatcher's sandbox
+# launch, the GitHub-auth expansion (sandbox_github_auth.py), the resource
+# arguments (sandbox_resources.py), and the mounts added in `docker_run` — not
+# an emulation of Docker's command line. The mount guard walks the option
+# region with it, so an option it does not know cannot be skipped over:
+# it is refused. A launcher change that needs a new option adds it here, and
+# tests/test_sandbox_devkit_images.py fails until it does.
+#
+# Only these exact spellings are accepted. `--opt=value`, attached short
+# values (`-vSRC:DST`), short-flag clusters (`-dv`), and `--` are all refused:
+# the launcher emits none of them, and each is a way for an argument to mean
+# something to Docker that it does not mean here.
+RUN_OPTIONS: dict[str, bool] = {
+    "-d": False,
+    "--init": False,
+    "--name": True,
+    "--restart": True,
+    "--network": True,
+    "--user": True,
+    "-e": True,
+    "-w": True,
+    "-p": True,
+    "--tmpfs": True,
+    "--memory": True,
+    "--memory-swap": True,
+    "-v": True,
+    "--mount": True,
+}
+# `--mount` types Docker knows. Only `bind` names a host path.
+_MOUNT_TYPES = frozenset({"bind", "volume", "tmpfs", "npipe", "cluster", "image"})
+_MOUNT_SOURCE_KEYS = ("source", "src")
+_MOUNT_TARGET_KEYS = ("target", "dst", "destination")
+_MOUNT_BARE_KEYS = frozenset({
+    "readonly", "ro", "volume-nocopy", "bind-nonrecursive", "bind-create-src",
+    "tmpfs-noexec",
+})
+_VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# A `--mount` value may say each thing once. Docker reads fields in order and
+# lets a later one override an earlier one, and it takes several spellings for
+# the same field; a value that uses that is refused rather than interpreted,
+# so this reader and Docker cannot come to different conclusions about it.
+_MOUNT_ALIASES = (
+    ("type",), _MOUNT_SOURCE_KEYS, _MOUNT_TARGET_KEYS, ("readonly", "ro"))
+# The only fields a bind may carry here: what the launcher writes.
+_BIND_KEYS = frozenset(key for group in _MOUNT_ALIASES for key in group)
+# The only `-v` options accepted, and each at most once.
+_VOLUME_OPTIONS = frozenset({"ro", "rw"})
+
+
+def _refuse(reason: str) -> SandboxImageError:
+    return SandboxImageError(
+        f"refusing to launch: {reason}, so the mounts cannot be checked "
+        "against the engine-ops service's private state directory."
+    )
+
+
+def _host_path(source: str, cwd: str | os.PathLike[str], what: str) -> str:
+    """A bind source as an absolute host path; relative ones are against `cwd`."""
+    if not source or source != source.strip() or any(ord(c) < 32 for c in source):
+        raise _refuse(f"{what} has an empty, padded, or unprintable source")
+    path = Path(source)
+    if not path.is_absolute():
+        path = Path(cwd) / path
+    return os.path.normpath(path)
+
+
+def _truthy(content: str) -> bool:
+    return content.strip().lower() in ("true", "1")
+
+
+def _mount_bind(
+    value: str, cwd: str | os.PathLike[str],
+) -> tuple[str, bool, str] | None:
+    """`(host path, read-only, target)` of one `--mount` value, or None when
+    it binds no host path.
+
+    Docker trims the whole value, reads it as one CSV record of `key=value`
+    fields (or a few bare words), lowercases keys and the type, takes `src`
+    for `source`, and defaults the type to `volume`. This does the same and
+    refuses whatever it cannot read that way.
+    """
+    what = f"--mount {value!r}"
+    value = value.strip()
+    try:
+        records = list(csv.reader([value], strict=True))
+    except csv.Error as exc:
+        raise _refuse(f"{what} is not a readable mount") from exc
+    if len(records) != 1 or not records[0]:
+        raise _refuse(f"{what} is not a readable mount")
+    fields: dict[str, str] = {}
+    bare: list[str] = []
+    repeated: list[str] = []
+    for field in records[0]:
+        key, separator, content = field.partition("=")
+        key = key.strip().lower()
+        if not separator:
+            bare.append(key)
+        if key in fields:
+            repeated.append(key)
+        fields[key] = content
+    # Said once, in one spelling. Docker would take the last of a repeated
+    # field and has its own order among aliases; nothing is decided from a
+    # value that leans on either.
+    if "type" in repeated:
+        raise _refuse(f"{what} names its type more than once")
+    explicit = bool(fields.get("type", "").strip())
+    kind = fields.get("type", "").strip().lower() or "volume"
+    if kind not in _MOUNT_TYPES:
+        raise _refuse(f"{what} has an unknown type")
+    if explicit and kind != "bind":
+        # Stated not to be a bind: it names no host path, whatever else the
+        # value carries (the dev-kit volumes are spelled this way).
+        return None
+    # A bind, or a value that leaves the type to the default: it must read
+    # cleanly. Docker takes a few options as bare words and requires a
+    # target; anything else is an error there, and here.
+    if any(key not in _MOUNT_BARE_KEYS for key in bare):
+        raise _refuse(f"{what} has a field that is not key=value")
+    if repeated:
+        raise _refuse(f"{what} repeats the field {repeated[0]!r}")
+    for group in _MOUNT_ALIASES:
+        if sum(1 for key in group if key in fields) > 1:
+            raise _refuse(
+                f"{what} gives {' and '.join(key for key in group if key in fields)}, "
+                "two spellings of one field")
+    if not any(fields.get(key) for key in _MOUNT_TARGET_KEYS):
+        raise _refuse(f"{what} has no target")
+    if kind != "bind":
+        return None
+    unknown = sorted(key for key in fields if key not in _BIND_KEYS)
+    if unknown:
+        raise _refuse(
+            f"{what} carries the field {unknown[0]!r}, which is not one a bind "
+            "mount of the launcher's has")
+    sources = [fields[key] for key in _MOUNT_SOURCE_KEYS if key in fields]
+    if len(sources) != 1:
+        raise _refuse(f"{what} does not name exactly one source")
+    # Read-only only when it plainly says so: the bare word, or a true value.
+    # (At most one of the two spellings is present, once.)
+    readonly = any(
+        key in fields and (key in bare or _truthy(fields[key]))
+        for key in ("readonly", "ro"))
+    target = next(fields[key] for key in _MOUNT_TARGET_KEYS if fields.get(key))
+    return _host_path(sources[0], cwd, what), readonly, target
+
+
+def _mount_source(value: str, cwd: str | os.PathLike[str]) -> str | None:
+    """The host path of one `--mount` value, or None when it binds none."""
+    bind = _mount_bind(value, cwd)
+    return None if bind is None else bind[0]
+
+
+def _volume_bind(
+    value: str, cwd: str | os.PathLike[str],
+) -> tuple[str, bool, str] | None:
+    """`(host path, read-only, target)` of one `-v` value, or None when it
+    binds no host path.
+
+    Docker's rule: `SRC:DST[:opts]`; a source that starts with `/` or `.` is a
+    host path (a relative one is against the working directory), a source that
+    is a volume name is a named volume, and a value with no `:` is an anonymous
+    volume at an absolute container path. Anything else is refused.
+    """
+    what = f"-v {value!r}"
+    parts = value.split(":")
+    if len(parts) == 1:
+        if not value.startswith("/") or value != value.strip():
+            raise _refuse(f"{what} is neither SRC:DST nor a container path")
+        return None
+    source = parts[0]
+    if source.startswith(("/", ".")):
+        # `SRC:DST` or `SRC:DST:opts`, nothing after. The options are `ro` or
+        # `rw`, one of them, once: a list that says both, or says one twice,
+        # or names anything else, is refused rather than interpreted.
+        if len(parts) > 3:
+            raise _refuse(f"{what} has more than SRC:DST:opts")
+        options = parts[2].split(",") if len(parts) > 2 else []
+        if len(options) > 1 or any(option not in _VOLUME_OPTIONS for option in options):
+            raise _refuse(f"{what} has options other than one of ro or rw")
+        if not parts[1].startswith("/"):
+            raise _refuse(f"{what} has a target that is not an absolute path")
+        return _host_path(source, cwd, what), options == ["ro"], parts[1]
+    if _VOLUME_NAME.match(source):
+        return None
+    raise _refuse(f"{what} has a source that is neither a path nor a volume name")
+
+
+def _volume_source(value: str, cwd: str | os.PathLike[str]) -> str | None:
+    """The host path of one `-v` value, or None when it binds none."""
+    bind = _volume_bind(value, cwd)
+    return None if bind is None else bind[0]
+
+
+def run_options(arguments: Sequence[str]) -> list[tuple[str, str | None]]:
+    """The options of a `docker run` argument list, read with RUN_OPTIONS.
+
+    Walks the option region only: from the start (after a leading `docker
+    run`) up to the image, which is the first argument that is not an option
+    or an option's value. Everything from the image on is the container's
+    command and is never inspected. An option that is not in RUN_OPTIONS, in
+    exactly its spelling there, raises SandboxImageError naming it.
+    """
+    arguments = list(arguments)
+    index = 2 if arguments[:2] == ["docker", "run"] else 0
+    options: list[tuple[str, str | None]] = []
+    while index < len(arguments):
+        argument = arguments[index]
+        if not argument.startswith("-"):
+            break                               # the image: the options end here
+        if argument not in RUN_OPTIONS:
+            raise _refuse(
+                f"the docker run option {argument!r} is not in the launcher's "
+                "option table (sandbox_devkit.RUN_OPTIONS; add it there with "
+                "whether it takes a value — joined `--opt=value`, attached, "
+                "and clustered spellings are not accepted)")
+        index += 1
+        if not RUN_OPTIONS[argument]:
+            options.append((argument, None))
+            continue
+        if index >= len(arguments):
+            raise _refuse(f"the docker run option {argument!r} has no value")
+        options.append((argument, arguments[index]))
+        index += 1
+    return options
+
+
+def bind_mounts(
+    arguments: Sequence[str],
+    cwd: str | os.PathLike[str] | None = None,
+) -> list[tuple[str, bool, str]]:
+    """Every bind mount of a `docker run` argument list, as
+    `(absolute host path, read-only, container target)`.
+
+    Read from the option region with the launcher's grammar (`run_options`).
+    Raises SandboxImageError for an option outside the grammar or a mount
+    value that cannot be classified.
+    """
+    base = os.getcwd() if cwd is None else cwd
+    mounts: list[tuple[str, bool, str]] = []
+    for option, value in run_options(arguments):
+        if option == "-v":
+            bind = _volume_bind(value, base)
+        elif option == "--mount":
+            bind = _mount_bind(value, base)
+        else:
+            continue
+        if bind is not None:
+            mounts.append(bind)
+    return mounts
+
+
+def bind_sources(
+    arguments: Sequence[str],
+    cwd: str | os.PathLike[str] | None = None,
+) -> list[str]:
+    """Every host path a `docker run` argument list bind-mounts, absolute.
+
+    Read-only binds count: a read still leaks. Raises SandboxImageError for an
+    option outside the grammar or a mount value that cannot be classified.
+    """
+    return [source for source, _readonly, _target in bind_mounts(arguments, cwd)]
+
+
+def guard_engine_ops_state(
+    arguments: Sequence[str],
+    repo_root: str | os.PathLike[str],
+    environ: dict[str, str] | None = None,
+) -> None:
+    """Refuse a `docker run` that would put the engine-ops state in a sandbox,
+    or let a sandbox write the session-hash list.
+
+    The engine-ops service (api/engine_ops.py) decides which GUI origin may
+    start `./sc update` / `restart`, and who is signed in, from files in its
+    private directory, so a sandbox must be able to neither write nor read
+    them. This is checked here because this is the one place that sees the
+    final argument list: every bind, however it was built (the checkout, the
+    instance state, interpreter mounts, the home mounts, anything added
+    later), is resolved and compared with that directory in both directions.
+    A mount that contains it, lies inside it, or is one of its files stops the
+    launch.
+
+    The session-hash directory (`auth_sessions_dir`) is the opposite case: it
+    is meant to be in the sandbox, so that the review server there can
+    recognise a signed-in browser. It may be reached by exactly one mount: the
+    directory itself, read-only, at AUTH_SESSIONS_TARGET. Any other mount that
+    overlaps it (a writable one, a parent, a file in it, another target) stops
+    the launch: a sandbox that could write that list could sign itself in to
+    the review API. And the two directories must not overlap each other.
+    """
+    state = engine_ops_state_dir(repo_root, environ)
+    sessions = auth_sessions_dir(repo_root, environ)
+    if paths_overlap(state, sessions):
+        raise SandboxImageError(
+            f"refusing to launch: the session-hash directory {sessions} "
+            f"(→ {os.path.realpath(sessions)}) overlaps the engine-ops "
+            f"service's private state directory {state} "
+            f"(→ {os.path.realpath(state)}). The first is mounted into the "
+            "sandbox and the second must never be."
+        )
+    canonical = auth_sessions_mount_value(repo_root, environ)
+    reached = 0
+    base = os.getcwd()
+    for option, value in run_options(arguments):
+        if option == "-v":
+            bind = _volume_bind(value, base)
+        elif option == "--mount":
+            bind = _mount_bind(value, base)
+        else:
+            continue
+        if bind is None:
+            continue
+        source, _readonly, _target = bind
+        if paths_overlap(source, state):
+            raise SandboxImageError(
+                f"refusing to launch: the mount {source} "
+                f"(→ {os.path.realpath(source)}) overlaps the engine-ops "
+                f"service's private state directory {state} "
+                f"(→ {os.path.realpath(state)}). That directory holds the GUI "
+                "origin allowed to start engine update/restart and the "
+                "operator's sign-in credentials, and must stay "
+                "out of the sandbox. Move the mounted path, or set "
+                "XDG_STATE_HOME to a directory outside every sandbox mount."
+            )
+        if not paths_overlap(source, sessions):
+            continue
+        # Allowed in exactly one form, the launcher's own argument, character
+        # for character, and once. Nothing about it is left to how a mount
+        # value is read: any other spelling that reaches the directory is
+        # refused, equivalent or not.
+        reached += 1
+        if option != "--mount" or value != canonical or reached > 1:
+            raise SandboxImageError(
+                f"refusing to launch: the mount {source} "
+                f"(→ {os.path.realpath(source)}) overlaps the session-hash "
+                f"directory {sessions} (→ {os.path.realpath(sessions)}). "
+                "The sandbox may see that directory only as the launcher's "
+                f"own read-only mount, once, written exactly `--mount "
+                f"{canonical}`; a sandbox "
+                "that could write it could sign itself in to the review API. "
+                "Move the mounted path, or set XDG_STATE_HOME to a directory "
+                "outside every sandbox mount."
+            )
+
+
+def ensure_auth_sessions_dir(
+    repo_root: str | os.PathLike[str],
+    environ: dict[str, str] | None = None,
+) -> Path:
+    """Create the session-hash directory (owner-only) and return it.
+
+    Docker creates a missing bind source itself, as root; the launcher makes
+    it first so that it is the operator's. Each level it creates is 0700, and
+    the leaf must be a real directory owned by this user.
+    """
+    target = auth_sessions_dir(repo_root, environ)
+    home = _owner_state_home(environ)
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        path = home
+        for part in target.relative_to(home).parts:
+            path = path / part
+            try:
+                os.mkdir(path, 0o700)
+            except FileExistsError:
+                pass
+        info = os.lstat(target)
+    except OSError as exc:
+        raise SandboxImageError(
+            f"cannot create the session-hash directory {target}: {exc}") from exc
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise SandboxImageError(
+            f"the session-hash directory {target} is not a directory owned "
+            "by this user")
+    if info.st_mode & 0o077:
+        os.chmod(target, 0o700)
+    return target
+
+
+def auth_sessions_mount(
+    repo_root: str | os.PathLike[str],
+    environ: dict[str, str] | None = None,
+) -> list[str]:
+    """The one mount that shows the session-hash directory to the sandbox.
+
+    The source is written as one CSV field, quoted whole when it holds a comma
+    or a quote, which is how Docker and this module's own reader take it.
+    """
+    ensure_auth_sessions_dir(repo_root, environ)
+    return ["--mount", auth_sessions_mount_value(repo_root, environ)]
+
+
+def auth_sessions_mount_value(
+    repo_root: str | os.PathLike[str],
+    environ: dict[str, str] | None = None,
+) -> str:
+    """The `--mount` value of that one mount: the canonical form, and the
+    only one the guard lets reach the session-hash directory. A pure string;
+    nothing is created."""
+    source = f"src={auth_sessions_dir(repo_root, environ)}"
+    if any(character in source for character in ',"'):
+        source = '"' + source.replace('"', '""') + '"'
+    return f"type=bind,{source},dst={AUTH_SESSIONS_TARGET},readonly"
+
+
+def expand_home_mounts(arguments: Sequence[str]) -> list[str]:
+    """Replace HOME_MOUNT_MARKER with one `-v path:path` per home bind mount."""
+    expanded: list[str] = []
+    for argument in arguments:
+        if argument != HOME_MOUNT_MARKER:
+            expanded.append(argument)
+            continue
+        for path in home_bind_paths():
+            expanded.extend(("-v", f"{path}:{path}"))
+    return expanded
+
+
 def docker_run(
     plan: ImagePlan,
     arguments: Sequence[str],
@@ -1765,6 +2267,7 @@ def docker_run(
         raise SandboxImageError(
             f"docker-run arguments must contain one {MOUNT_MARKER} marker"
         )
+    arguments = expand_home_mounts(arguments)
     volumes = ensure_volumes(plan, runner=runner)
     marker = arguments.index(MOUNT_MARKER)
     mount_arguments = []
@@ -1792,8 +2295,16 @@ def docker_run(
         *arguments[:marker],
         *resource_arguments,
         *mount_arguments,
+        # The session-hash list the in-sandbox review server verifies browser
+        # sessions against: read-only, and the only thing of the host auth
+        # authority's that the sandbox sees.
+        *auth_sessions_mount(plan.engine.parent),
         *arguments[marker + 1 :],
     )
+    # The final argument list, every mount in it: nothing reaches a sandbox
+    # that overlaps the engine-ops service's private state, and the
+    # session-hash directory is reached only by the read-only mount above.
+    guard_engine_ops_state(command, plan.engine.parent)
     # `docker run -d` prints only the container ID.  Suppress that transport
     # detail here so callers can leave provisioning output visible.
     _run(command, runner=runner, capture=True)

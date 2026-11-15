@@ -27,17 +27,17 @@ import run_seat
 # map that is *wrong* rather than newly-grown. Substituted into the
 # `{{map_discrepancy}}` slot in boot.md; stripped clean for the cartographer.
 MAP_DISCREPANCY_BLOCK = (
-    "**If the map is wrong, report it — you don't map.** Surface the gap to "
-    "the FnB. Open any blocking map-quality flag first; retain its numeric ID "
-    "+ display name. Then send one notice to `cartographer` "
+    "**If the map is wrong, report it — you don't map.** Open any blocking "
+    "map-quality flag first and retain its numeric ID + display name, tell "
+    "the FnB to boot the Cartographer, and send "
+    "`cartographer` one notice in exactly this shape "
     "(`sc mem message send cartographer \"…\"`):\n\n"
     "```text\n"
     "shape: <what is wrong> — paths: <region/>; ref: <feature/doc/PR>\n"
     "flags: <numeric_id>=<SC-name>[, <numeric_id>=<SC-name>] | none\n"
     "curate; verify and close each flag; mark this notice read last.\n"
     "```\n\n"
-    "Use `flags: none` when no flag exists. Tell the FnB to boot the "
-    "Cartographer; pass = its scoped map checks pass + every named flag is "
+    "Pass = the Cartographer's scoped map checks pass + every named flag is "
     "resolved + the notice is read. Keep working from what the map does show."
 )
 # PROJECT vs ENGINE renders by repo position (`{{project_vs_engine}}` slot).
@@ -54,37 +54,27 @@ PROJECT_VS_ENGINE_FORK = (
 )
 PROJECT_VS_ENGINE_SOURCE = (
     "**This repo IS the engine source — you are upstream.** `.super-coder/` is\n"
-    "tracked here and is your work surface: engine changes are authored in this\n"
-    "repo, land via branch → PR → merge, and reach every fork through *their*\n"
-    "`./sc update`. There is no upstream above you — engine fixes come from\n"
-    "here.\n"
+    "tracked here and is your work surface: engine changes land via branch → PR\n"
+    "→ merge and reach forks through *their* `./sc update`.\n"
+    "There is no upstream above you. Engine skills speak fork-language: where\n"
+    "one says \"never edit `.super-coder/`\" or \"report it upstream\", author\n"
+    "the fix here instead.\n"
+    "After an engine change merges, sync with main, run `./sc update`, and\n"
+    "restart your session to boot onto it.\n"
     "\n"
-    "Getting your own updates: after an engine change merges, sync with main\n"
-    "and run `./sc update` — in this repo it reconciles the tracked engine and\n"
-    "its managed catalogue in place. Restart your session to boot onto the new\n"
-    "floor.\n"
-    "\n"
-    "Engine skills speak fork-language. Where a skill says \"never edit\n"
-    "`.super-coder/`\" or \"report/file it upstream\", that guidance is for\n"
-    "forks — author the fix directly here.\n"
-    "\n"
-    "**You are operating on the engine you are running — surgery on a moving\n"
-    "car.** Four standing consequences, all of which have produced wrong\n"
-    "answers in this repo:\n"
+    "You are changing the engine you are running. Four standing consequences:\n"
     "\n"
     "1. **Your `./sc` runs the engine CODE of the MAIN CHECKOUT, not your\n"
-    "   worktree** (the root `sc` finds it through git's common dir). That tree\n"
-    "   runs the managed service; being current in your worktree says nothing\n"
-    "   about it. The `floor:` line in ACTIVE SESSION reports exactly that.\n"
-    "   Project PATHS do not: project verbs (`sc test`, `sc context`, `sc job`)\n"
-    "   resolve from the worktree you call them in, and a relative file\n"
-    "   argument from the directory you typed it in (`sc map` is the exception:\n"
-    "   it always indexes the main line, never your worktree).\n"
+    "   worktree.** The `floor:` line in ACTIVE SESSION reports that tree's\n"
+    "   freshness; yours says nothing about it. Project PATHS differ: project\n"
+    "   verbs (`sc test`, `sc context`, `sc job`) resolve from the worktree you\n"
+    "   call them in, and a relative file argument from your current directory\n"
+    "   (`sc map` is the exception: it always indexes the main line).\n"
     "2. **Verify claims about engine code against the remote, not your\n"
     "   tree** — `git show origin/main:<path>`. A stale checkout answers\n"
-    "   confidently, and a command that reads it inherits the staleness.\n"
+    "   confidently.\n"
     "3. **Pull after every merge; reconcile before restarting.** A restart\n"
-    "   kills live sessions, so the operator owns that boundary.\n"
+    "   kills live sessions, so the FnB owns that boundary.\n"
     "4. **Tracked engine source is your work surface; live instance state is\n"
     "   Admin-maintained.** Author source changes on a branch and use the named\n"
     "   maintenance procedure for any live-state cutover.\n"
@@ -460,35 +450,57 @@ def render_connections(con) -> str:
     return "\n".join(lines)
 
 
-def render_skills(con, shell_id: int) -> str:
+# WAKES names where seat timing lives; a seatless (Admin) boot keeps the
+# one-sentence launch fallback instead.
+SEAT_WAKE_POINTER = "When and how wakes reach you: SEAT."
+SEATLESS_WAKE_FALLBACK = (
+    "A shell with no SEAT section (Admin) goes by how it was launched: a\n"
+    "session the FnB types into is a terminal seat; a chat the engine opened is a\n"
+    "headless one."
+)
+
+
+def render_skills(con, shell_id: int, seat: str | None = None) -> str:
+    """The boot's skill list: one launch's, so only its seat's skills."""
+    seat_clause = " AND (s.seat IS NULL OR s.seat=?)" if seat else ""
     rows = con.execute(
         "SELECT s.name, s.description FROM skills s "
         "JOIN resolved_shell_skills ss ON ss.skill_id = s.skill_id "
-        "WHERE ss.shell_id=? AND s.is_deleted=0 ORDER BY s.name",
-        (shell_id,),
+        f"WHERE ss.shell_id=? AND s.is_deleted=0{seat_clause} ORDER BY s.name",
+        (shell_id, seat) if seat else (shell_id,),
     ).fetchall()
     if not rows:
         return "(none)"
     # Each granted skill's full procedure is rendered to a flat file at
     # `.claude/skills/<slug>/SKILL.md` (see flat.render_skill_md), rebuilt at
-    # every boot for whichever shell launches. These are SEPARATE from and
-    # ADDITIONAL to whatever native skills your harness ships (codex's `.system`
-    # set, claude plugins, …; vibe ships none). Below: name, one-line
-    # description, and the on-disk path to each skill's full procedure — a file
-    # read, never a DB query.
+    # every boot for whichever shell launches. Harnesses with a native skill
+    # root list these themselves, but not every adapter declares one (vibe has
+    # none), so the boot keeps a one-line description as the backstop and
+    # states the path pattern once instead of per skill.
     lines = [
-        "Substrate skills granted to you — **in addition to** any native skills "
-        "your harness provides. Each skill's full procedure is on disk at the "
-        "path under it; read that file to load the procedure — never query the "
-        "DB directly:",
+        "Skills granted to you, in addition to any your harness ships. Load "
+        "one by reading `.claude/skills/<name>/SKILL.md` — a file read, never "
+        "a DB query:",
         "",
     ]
     for r in rows:
-        desc = (r["description"] or "").strip().splitlines()[0] if r["description"] else ""
         slug = r["name"].strip().lower().replace(" ", "-")
-        lines.append(f"- **{r['name']}** — {desc}")
-        lines.append(f"  - full procedure: `.claude/skills/{slug}/SKILL.md`")
+        desc = _skill_summary(r["description"])
+        label = f"**{r['name']}**" if slug == r["name"] else f"**{r['name']}** (`{slug}`)"
+        lines.append(f"- {label} — {desc}" if desc else f"- {label}")
     return "\n".join(lines)
+
+
+SKILL_SUMMARY_CHARS = 200
+
+
+def _skill_summary(description: "str | None") -> str:
+    """First sentence of a skill description, capped for the boot listing."""
+    line = (description or "").strip().splitlines()[0] if (description or "").strip() else ""
+    line = line.partition(". ")[0].rstrip(".")
+    if len(line) > SKILL_SUMMARY_CHARS:
+        line = line[:SKILL_SUMMARY_CHARS].rsplit(" ", 1)[0] + "…"
+    return line
 
 
 def render_api(port: "int | None", api_key: "str | None") -> str:
@@ -630,8 +642,14 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     )
     template = template.replace(
         "{{execution_context}}", render_execution_context(flavor, launch_mode)
-        + run_seat.boot_block(flavor, seat, conversion)
     )
+    seat_block = run_seat.boot_block(flavor, seat, conversion)
+    if seat_block:
+        template = template.replace("{{seat}}", seat_block + "\n\n---")
+        template = template.replace("{{wake_seat}}", SEAT_WAKE_POINTER)
+    else:
+        template = template.replace("{{seat}}\n\n", "")
+        template = template.replace("{{wake_seat}}", SEATLESS_WAKE_FALLBACK)
     dev_tools_block = render_dev_tools(flavor, dev_tools)
     if dev_tools_block:
         template = template.replace("{{dev_tools}}", dev_tools_block)
@@ -753,7 +771,8 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         "", "---", "",
         "## ACTIVE PROJECTS", "", render_projects(con, shell_id),
         "", "---", "",
-        "## SKILLS", "", render_skills(con, shell_id),
+        "## SKILLS", "", render_skills(
+            con, shell_id, None if flavor == "admin" else seat),
         "", "---", "",
         "## API", "", render_api(api_port, api_key),
         "", "---", "",

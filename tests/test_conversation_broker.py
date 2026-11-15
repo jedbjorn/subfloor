@@ -28,6 +28,7 @@ import active_chat_registry  # noqa: E402
 import conversation_boot  # noqa: E402
 from conversation_adapters import (  # noqa: E402
     AdapterError,
+    ClaudeAdapter,
     ConversationContext,
     InterruptResult,
     KimiAdapter,
@@ -2723,6 +2724,84 @@ class ServiceContractTest(ConversationBrokerCase):
         self.assertTrue(broker.wait_idle())
         self.assertEqual(adapter.attached, [])
         self.assertEqual(adapter.reconciled, 1)
+
+    def recover_dead_claude_run(self, *, own_reply: bool) -> tuple[int, dict]:
+        """Recover a Claude run whose process is gone, through the broker."""
+        session_ref = "77777777-7777-4777-8777-000000000001"
+        conversation_id, _message_id, run_id = self.add_live_run(
+            state="running",
+            session_after=session_ref,
+            runner_ref="claude-run",
+            harness="claude",
+        )
+        adapter = ClaudeAdapter(config_dir=self.root / "claude-config")
+        worktree = self.worktree.resolve()
+        transcript = adapter._session_path(session_ref, worktree)
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+
+        def entry(kind: str, content) -> str:
+            return json.dumps(
+                {
+                    "type": kind,
+                    "session_id": session_ref,
+                    "cwd": str(worktree),
+                    "message": {"content": content},
+                }
+            ) + "\n"
+
+        transcript.write_text(
+            entry("user", "first")
+            + entry("assistant", [{"type": "text", "text": "stale reply"}])
+            + json.dumps({"type": "cost-state", "sessionId": session_ref})
+            + "\n"
+        )
+        offset = transcript.stat().st_size
+        if own_reply:
+            with transcript.open("a") as stream:
+                stream.write(
+                    entry("user", "second")
+                    + entry("assistant", [{"type": "text", "text": "own reply"}])
+                )
+        self.name_live_process(
+            conversation_id,
+            run_id,
+            pid=4194305,
+            start_ticks=9001,
+            transcript_path=str(transcript),
+            transcript_offset=offset,
+        )
+        seen: dict = {}
+        reconcile = adapter.reconcile
+
+        def recording(turn, context):
+            seen.update(turn.metadata)
+            return reconcile(turn, context)
+
+        adapter.reconcile = recording
+        broker = self.start_broker(lambda _harness: adapter)
+        self.wait_run_state(run_id, "succeeded" if own_reply else "unknown")
+        self.assertTrue(broker.wait_idle())
+        self.assertEqual(seen["transcript_offset"], offset)
+        self.assertEqual(seen["transcript_path"], str(transcript))
+        self.assertNotIn("process_pid", seen)
+        return run_id, seen
+
+    def test_dead_claude_run_is_not_closed_by_the_previous_reply(self) -> None:
+        run_id, _seen = self.recover_dead_claude_run(own_reply=False)
+
+        con = self.connect()
+        row = con.execute(
+            "SELECT state,error_code FROM conversation_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        con.close()
+        self.assertEqual(
+            (row["state"], row["error_code"]),
+            ("unknown", "HARNESS_OUTCOME_UNKNOWN"),
+        )
+
+    def test_dead_claude_run_is_closed_by_its_own_reply(self) -> None:
+        self.recover_dead_claude_run(own_reply=True)
 
     def test_opencode_blocking_message_is_interruptible_after_identity(
         self,

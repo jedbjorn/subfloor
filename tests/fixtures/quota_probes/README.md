@@ -8,23 +8,25 @@ Recorded payload shapes for the three provider quota endpoints, used by
 |---|---|
 | `anthropic_usage.json` | `GET api.anthropic.com/api/oauth/usage` |
 | `openai_usage.json` | `GET chatgpt.com/backend-api/codex/usage` |
-| `moonshot_usages.json` | `GET api.kimi.com/coding/v1/usages` |
+| `moonshot_usages.json` | `GET api.kimi.com/coding/v1/usages` (legacy identity shape) |
+| `moonshot_usages_v2.json` | `GET api.kimi.com/coding/v1/usages` (Kimi Code 2.x identity shape) |
 
-## Provenance — these are real captures
+## Provenance
 
-All three were captured live from this host's own credentials on **2026-07-25**
-(spec doc #57), each by issuing exactly the request its probe issues and keeping
-the response body verbatim.
+The original three fixtures were captured live from this host's own credentials
+on **2026-07-25** (spec doc #57), each by issuing exactly the request its probe
+issues and keeping the response body verbatim.
 
 | File | How it was taken |
 |---|---|
 | `anthropic_usage.json` | `GET` with `Authorization: Bearer <accessToken from ~/.claude/.credentials.json>` and `anthropic-beta: oauth-2025-04-20`. |
 | `openai_usage.json` | `GET` with the token and `chatgpt-account-id` from `~/.codex/auth.json`, **plus the codex client identity** (`User-Agent: codex_cli_rs/0.145.0`, `originator: codex_cli_rs`, `version: 0.145.0`). Without those three headers the endpoint answers `403` with an HTML anti-bot page and there is no payload to capture at all — flag #196. |
 | `moonshot_usages.json` | `GET` with the access token from `~/.kimi-code/credentials/kimi-code.json`, captured inside the **900-second** window after the operator booted Kimi. No refresh was performed to obtain it, and none may be: Kimi rotates its refresh token on every refresh, so a refresh by anything other than the Kimi CLI strands the CLI with an invalidated token and signs the operator out of the provider this panel monitors. To re-capture: ask the operator to boot Kimi, then capture within 15 minutes. |
+| `moonshot_usages_v2.json` | Redacted Kimi Code 2.x shape from flag #746: `user{}` is absent, identity moves to `booster_wallet.userId`, and the optional `usages.limit_5h` / `limit_7d` blocks are present. The unchanged counts and windows retain the sanitized legacy capture's values. |
 
-**They replaced transcriptions.** The previous fixtures were written from spec
-doc #49's observed-field tables rather than from the wire, because the task
-scoped that unit to "capture fixtures from the spec's documented response
+**The live captures replaced transcriptions.** The previous fixtures were written
+from spec doc #49's observed-field tables rather than from the wire, because the
+task scoped that unit to "capture fixtures from the spec's documented response
 shapes" rather than re-probe. Where those tables were wrong the probes were
 built wrong and every test agreed with them (flag #198). Six field-level
 defects — four in moonshot, one in openai, one in anthropic — were found only by
@@ -32,14 +34,16 @@ capturing, and two of them were in the payloads nobody suspected.
 
 ### Sanitization
 
-Identifiers are replaced with placeholders. **Nothing else is touched** — no
-tidying, no normalizing, no filling in of "obviously missing" fields:
+Identifiers in the live captures are replaced with placeholders. **Nothing else
+is touched** — no tidying, no normalizing, no filling in of "obviously missing"
+fields:
 
 | File | Replaced |
 |---|---|
 | `anthropic_usage.json` | nothing — this payload carries no identifier of any kind |
 | `openai_usage.json` | `email`, `account_id`, `user_id` |
 | `moonshot_usages.json` | `user.userId`, `parallel.details[]` |
+| `moonshot_usages_v2.json` | `booster_wallet.userId`, `parallel.details[]` |
 
 Three properties in particular are **exactly as the wire sent them**, because
 each is something a transcription got wrong:

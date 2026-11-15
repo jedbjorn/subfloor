@@ -29,6 +29,8 @@ sys.path.insert(0, str(ENGINE / "api"))
 
 import server  # noqa: E402
 import transport as transport_mod  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from signin_fixture import sign_in  # noqa: E402
 
 
 class ServedAssetTestCase(unittest.TestCase):
@@ -47,8 +49,17 @@ class ServedAssetTestCase(unittest.TestCase):
         self.ui = Path(self.tmp.name)
         (self.ui / "app.js").write_text("console.log('v1');\n")
         (self.ui / "style.css").write_text("body { color: red; }\n")
+        (self.ui / "theme.js").write_text("document.documentElement.dataset.theme = 'dark';\n")
         (self.ui / "index.html").write_text("<!doctype html><title>v1</title>")
         patch = mock.patch.object(server, "UI_DIR", self.ui)
+        patch.start()
+        self.addCleanup(patch.stop)
+        # Static files are served to a signed-in browser (Feature #94): every
+        # request this fixture makes carries the session cookie. There is no
+        # engine DB here, so the gate's lookup of the session's user is
+        # answered directly.
+        self.browser = sign_in(self)
+        patch = mock.patch.object(server, "_active_user", return_value=True)
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -82,7 +93,8 @@ class ServedAssetTestCase(unittest.TestCase):
     def request(self, method, path, headers=None):
         con = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         try:
-            con.request(method, path, headers=headers or {})
+            con.request(method, path, headers={
+                "Cookie": self.browser.cookie, **(headers or {})})
             resp = con.getresponse()
             return resp.status, dict(resp.getheaders()), resp.read()
         finally:
@@ -98,7 +110,7 @@ class ServedAssetFreshnessTest(ServedAssetTestCase):
     # -- the validator exists at all -----------------------------------------
 
     def test_every_served_asset_carries_a_validator_and_must_revalidate(self):
-        for path in ("/", "/index.html", "/app.js", "/style.css"):
+        for path in ("/", "/index.html", "/app.js", "/theme.js", "/style.css"):
             with self.subTest(path=path):
                 status, headers, body = self.get(path)
                 self.assertEqual(status, 200)
@@ -151,6 +163,7 @@ class ServedAssetFreshnessTest(ServedAssetTestCase):
         rewrites a file byte-identically must not force a re-download."""
         _, first, _ = self.get("/style.css")
         (self.ui / "style.css").write_text("body { color: red; }\n")
+        (self.ui / "theme.js").write_text("document.documentElement.dataset.theme = 'dark';\n")
         status, _, _ = self.get("/style.css",
                                 {"If-None-Match": first["ETag"]})
         self.assertEqual(status, 304)

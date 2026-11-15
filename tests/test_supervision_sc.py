@@ -164,6 +164,28 @@ class SupervisionFixture:
         )
         for name in ("vm", "ts", "pm2", "dbq"):
             (self.scripts / f"{name}.py").write_text(broker)
+        # The engine-ops helper the dispatcher calls (api/engine_ops.py): a
+        # stand-in that records each call and answers as a healthy service,
+        # or as a missing one when SC_TEST_ENGINE_OPS_FAIL is set.
+        (self.engine / "api").mkdir(exist_ok=True)
+        (self.engine / "api" / "engine_ops.py").write_text(textwrap.dedent(
+            """\
+            import os
+            import sys
+
+            command = sys.argv[1] if len(sys.argv) > 1 else ""
+            with open(os.environ["SC_TEST_LOG"], "a") as log:
+                log.write("engine_ops " + " ".join(sys.argv[1:]) + "\\n")
+            if command == "port":
+                print(18802)
+            elif os.environ.get("SC_TEST_ENGINE_OPS_FAIL") and command in ("up", "alive"):
+                raise SystemExit(1)
+            elif command == "up":
+                print("→ engine-ops up (fixture)")
+            elif command == "down":
+                print("→ engine-ops stopped (fixture)")
+            """
+        ))
 
     def _write_fake_commands(self) -> None:
         self._write_executable(
@@ -756,6 +778,91 @@ class RestrictedLaunchTests(unittest.TestCase):
         self.assertIn("  db-broker: restarted (systemd)", result.stdout)
         self.assertIn("  postgres: skipped (unconfigured)", result.stdout)
         self.assertNotIn("watch-daemon", result.stdout)
+
+    def test_restart_reports_engine_ops_without_changing_its_exit_code(self):
+        result = self.fx.run("restart", "--yes", "--no-build")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("  engine-ops: running", result.stdout)
+
+        # The engine-ops service failing to come back is a warning, never a
+        # failed restart: the verb's exit code is what it was before the
+        # service existed.
+        self.fx.env["SC_TEST_ENGINE_OPS_FAIL"] = "1"
+        result = self.fx.run("restart", "--yes", "--no-build")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("  sandbox: restarted", result.stdout)
+        self.assertIn("  engine-ops: not answering (advisory", result.stdout)
+        self.assertNotIn("engine-ops: failed", result.stdout)
+
+    def test_launch_and_down_drive_the_engine_ops_service(self):
+        launched = self.fx.run("launch", "--no-build")
+        self.assertEqual(launched.returncode, 0, launched.stdout + launched.stderr)
+        calls = self.fx.calls()
+        # The port is pinned before the sandbox (and its CSP) starts, and the
+        # port is never published into the container.
+        port_call = calls.index("engine_ops port")
+        run_call = next(i for i, line in enumerate(calls)
+                        if line.startswith("docker run ")
+                        and "serve --port" in line)
+        self.assertLess(port_call, run_call)
+        self.assertNotIn("18802", calls[run_call])
+        # The harness homes and the Claude profile are still mounted, now from
+        # the one shared list (sandbox_devkit.HOME_BIND_MOUNTS).
+        self.assertNotIn("SC_HOME_MOUNTS", calls[run_call])
+        home = self.fx.home
+        for relative in (".claude", ".claude.json", ".config/opencode",
+                         ".local/share/opencode", ".codex", ".vibe", ".kimi-code"):
+            self.assertIn(f" -v {home}/{relative}:{home}/{relative} ",
+                          calls[run_call], relative)
+        # Of the host auth authority's state the sandbox gets exactly one
+        # thing: the session-hash directory, read-only, at its fixed place.
+        # The launcher made it, as the operator's, before Docker could. The
+        # private state beside it (credentials, sessions) is not mounted.
+        sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
+        import sandbox_devkit
+
+        sessions = sandbox_devkit.auth_sessions_dir(self.fx.root, {"HOME": str(home)})
+        self.assertIn(
+            f" --mount type=bind,src={sessions},dst=/run/super-coder/auth-sessions,"
+            "readonly ", calls[run_call])
+        self.assertEqual(calls[run_call].count("auth-sessions"), 2)
+        self.assertNotIn("/subfloor/engine-ops", calls[run_call])
+        self.assertTrue(sessions.is_dir())
+        self.assertEqual(sessions.stat().st_mode & 0o777, 0o700)
+        self.assertGreater(calls.index("engine_ops up"), run_call)
+        self.assertIn("→ engine-ops up (fixture)", launched.stdout)
+
+        down = self.fx.run("down")
+        self.assertEqual(down.returncode, 0, down.stdout + down.stderr)
+        self.assertIn("engine_ops down", self.fx.calls())
+        # Nothing of the service's is kept in the bind-mounted run directory.
+        self.assertFalse(list((self.fx.engine / "run").glob("engine-ops*")))
+
+    def test_launch_refuses_a_mount_that_overlaps_the_engine_ops_state(self):
+        sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
+        import sandbox_devkit
+
+        state = sandbox_devkit.engine_ops_state_dir(
+            self.fx.root, {"HOME": str(self.fx.home)})
+        state.mkdir(parents=True)
+        (state / "config.json").write_text("{}")
+        profile = self.fx.home / ".claude.json"
+        profile.unlink(missing_ok=True)
+        profile.symlink_to(state / "config.json")
+
+        result = self.fx.run("launch", "--no-build")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("refusing to launch", result.stdout + result.stderr)
+        self.assertIn(str(state), result.stdout + result.stderr)
+        self.assertFalse(any(
+            line.startswith("docker run ") and "serve --port" in line
+            for line in self.fx.calls()))
+
+        # Without the overlap the same launch goes through, state or no state.
+        profile.unlink()
+        ok = self.fx.run("launch", "--no-build")
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
 
     def test_restart_aggregates_health_failure_and_returns_nonzero(self):
         self.fx.env["SC_TEST_CONFIGURED"] = "vm"

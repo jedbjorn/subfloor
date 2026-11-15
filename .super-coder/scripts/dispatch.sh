@@ -230,6 +230,17 @@ sc_refuse_linked() {
   exit 1
 }
 
+# $1 = the command as the operator typed it. For verbs that manage host-only
+# state: inside the sandbox there is nothing for them to act on.
+sc_refuse_sandbox() {
+  [ -n "${SC_SANDBOX:-}" ] || return 0
+  {
+    echo "✗ ./sc $1 refused: this is the sandbox, and ./sc $1 manages state that is kept on the HOST, outside every sandbox mount."
+    echo "  Nothing was read or changed. Run it in a host terminal, from the main checkout."
+  } >&2
+  exit 1
+}
+
 port() { "$PY" "$S/ports.py" port; }
 devport() { "$PY" "$S/ports.py" devport; }
 
@@ -263,6 +274,8 @@ sc_host_server_pid() {
 sc_host_server_alive() { sc_host_server_pid >/dev/null; }
 sc_host_server_up() {
   "$PY" "$S/ports.py" ensure >/dev/null
+  # The review server names this port in its CSP when it starts.
+  sc_engine_ops_port >/dev/null 2>&1 || true
   host_port="$(port)"
   if sc_host_server_alive; then
     echo "→ host review server already running (pid $(sc_host_server_pid)) · http://127.0.0.1:$host_port"
@@ -292,9 +305,15 @@ sc_host_server_up() {
   # The transient unit starts from the user manager's environment, not this
   # one. A non-default XDG_STATE_HOME selects where this install's private
   # engine state lives, so carry it across or the server resolves a different
-  # (or missing) instance than the launcher that started it.
+  # (or missing) instance than the launcher that started it. The browser-chat
+  # compaction settings are read by that server, so each one that is set here
+  # is carried across the same way; an unset one is left to its default.
   if ! systemd-run --user --quiet --collect --unit "$HOST_SERVER_UNIT" \
-      ${XDG_STATE_HOME:+"--setenv=XDG_STATE_HOME=$XDG_STATE_HOME"} -- \
+      ${XDG_STATE_HOME:+"--setenv=XDG_STATE_HOME=$XDG_STATE_HOME"} \
+      ${SC_CHAT_COMPACT_WINDOW_CLAUDE:+"--setenv=SC_CHAT_COMPACT_WINDOW_CLAUDE=$SC_CHAT_COMPACT_WINDOW_CLAUDE"} \
+      ${SC_CHAT_COMPACT_WINDOW_CODEX:+"--setenv=SC_CHAT_COMPACT_WINDOW_CODEX=$SC_CHAT_COMPACT_WINDOW_CODEX"} \
+      ${SC_CHAT_COLD_RETURN_TOKENS:+"--setenv=SC_CHAT_COLD_RETURN_TOKENS=$SC_CHAT_COLD_RETURN_TOKENS"} \
+      ${SC_CHAT_COLD_RETURN_MINUTES:+"--setenv=SC_CHAT_COLD_RETURN_MINUTES=$SC_CHAT_COLD_RETURN_MINUTES"} -- \
       /bin/sh -c 'printf "%s\n" "$$$$" > "$1"; exec env SC_BIND=127.0.0.1 PYTHONUNBUFFERED=1 "$2" "$3" --port "$4" >> "$5" 2>&1' \
       sc-host-server "$HOST_SERVER_PID" "$PY" "$ENGINE/api/server.py" "$host_port" "$HOST_SERVER_LOG"; then
     echo "✗ host-runtime: systemd could not start $HOST_SERVER_UNIT" >&2
@@ -709,7 +728,12 @@ sc_vm_broker_alive() {
 }
 sc_vm_broker_up() {
   if ! "$PY" "$S/vm.py" configured; then
-    echo "→ vm-broker: no VM or remotes linked — nothing to serve"; return 0
+    # Not a failure (launch calls this on every fork), but not a start either:
+    # say that the broker is NOT running and what links a seat, so a caller
+    # sent here by a status hint is not left with a no-op.
+    echo "→ vm-broker: NOT started — no VM or remotes linked, so there is nothing to serve"
+    echo "  link a seat first: ./sc vm adopt --domain <domain> --ssh-user <user> · ./sc vm init … · ./sc remote add <name> …"
+    return 0
   fi
   if sc_vm_broker_alive; then echo "→ vm-broker already serving $("$PY" "$S/vm.py" sock)"; return 0; fi
   sc_broker_preflight vm-broker "$VM_BROKER_PID" "$ENGINE/run/vm-broker.log" "$("$PY" "$S/vm.py" sock)" || return 1
@@ -787,7 +811,9 @@ sc_ts_broker_alive() {
 }
 sc_ts_broker_up() {
   if ! "$PY" "$S/ts.py" configured; then
-    echo "→ ts-broker: no tailnet linked (instance.json has no \`ts\` block) — nothing to serve"; return 0
+    echo "→ ts-broker: NOT started — no tailnet linked (instance.json has no \`ts\` block), so there is nothing to serve"
+    echo "  link one first: ./sc ts init --ssh-user <user> --allowed-host <host>"
+    return 0
   fi
   if sc_ts_broker_alive; then echo "→ ts-broker already serving $("$PY" "$S/ts.py" sock)"; return 0; fi
   sc_broker_preflight ts-broker "$TS_BROKER_PID" "$ENGINE/run/ts-broker.log" "$("$PY" "$S/ts.py" sock)" || return 1
@@ -911,6 +937,31 @@ sc_pm2_broker_uninstall() {
   systemctl --user daemon-reload
   echo "→ pm2-broker systemd unit removed ($PM2_BROKER_UNIT)"
 }
+
+# ── Engine-ops service (HOST-side; runs update / restart / update-harnesses) ──
+# Sibling of the brokers above with a different boundary. The review GUI's
+# engine controls need a host process to run `./sc update`, `./sc restart`, and
+# `./sc update-harnesses`: under docker the review API is inside the sandbox and
+# cannot drive the host's docker, and under the host runtime it would be
+# stopping itself. Because these verbs replace the engine, this service does
+# NOT listen on a unix socket in the bind-mounted engine dir (every sandboxed
+# shell can reach that). It listens on its own host loopback TCP port, which a
+# sandbox has no route to; the browser calls it directly. Refuses to run in the
+# sandbox (engine_ops_service.py guards on SC_SANDBOX). It needs no linked
+# block: `launch` always brings it up and `down` stops it. `down` stops only
+# a process proven to be this service; an operation it started runs detached
+# from it and finishes regardless. See .super-coder/docs/engine-ops.md.
+# Its pid, port, accepted GUI origin, status, and logs are host-private state
+# outside the bind mount (api/engine_ops.py), so the helpers below ask that
+# module rather than reading a pidfile or port from the checkout.
+sc_engine_ops() { "$PY" "$ENGINE/api/engine_ops.py" "$@"; }
+sc_engine_ops_port() { sc_engine_ops port; }
+sc_engine_ops_alive() { sc_engine_ops alive >/dev/null 2>&1; }
+sc_engine_ops_up() { sc_engine_ops up; }
+# Inside `./sc down` and `./sc restart` a failed stop is reported on stderr
+# and never fails the verb: those verbs' exit codes are what they were before
+# this service existed.
+sc_engine_ops_down() { sc_engine_ops down || true; }
 
 # ── db broker (HOST-side; read-only diagnostic access to the LIVE app DB) ─────
 # A host-side broker that shells out to `psql` where the live DSN + route
@@ -1208,6 +1259,15 @@ sc_restart_health_summary() {
   sc_restart_broker "db-broker" \
     sc_db_broker_configured sc_db_broker_alive sc_db_broker_up \
     sc_db_broker_down "$DB_BROKER_PID" "$DB_BROKER_UNIT"
+  # Advisory only: the engine-ops service serves the GUI's engine controls
+  # and is not part of what restart promises, so it never changes the exit
+  # code — the same tolerance launch gives it.
+  sc_engine_ops_alive || sc_engine_ops_up >/dev/null 2>&1 || true
+  if sc_wait_until sc_engine_ops_alive; then
+    echo "  engine-ops: running"
+  else
+    echo "  engine-ops: not answering (advisory — GUI engine controls are unavailable; ./sc engine-ops-up)"
+  fi
   if sc_pg_configured; then
     if sc_wait_until sc_pg_healthy; then
       echo "  postgres: restarted"
@@ -1237,7 +1297,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|engine-ops|engine-ops-up|engine-ops-down|engine-ops-port|engine-ops-pin|auth|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1339,9 +1399,15 @@ case "$cmd" in
   # --file, --command-file) read them from the invocation cwd; they are
   # otherwise clients of the live instance.
   mem)          sc_project_env; exec "$PY" "$S/mem.py" "$@" ;;
-  pr)           exec "$PY" "$S/pr_cli.py" "$@" ;;
   sprint)       sc_python_probe; sc_project_env; exec "$PY" "$S/sprint_cli.py" "$@" ;;
-  token)        exec "$PY" "$S/operator_token.py" "$@" ;;
+  # Retired (Feature #94). It printed an Admin shell token as a "browser
+  # sign-in token" for a paste-a-token flow that no longer exists; the GUI
+  # signs in with a password and an authenticator code, and no token a CLI can
+  # print is a browser session. Kept as a refusal so an old habit is told why.
+  token)        echo "sc token: retired — the review GUI signs in with a password and an authenticator code." >&2
+                echo "  create the GUI user:  ./sc auth user add <username>   (host terminal)" >&2
+                echo "  lost the authenticator or password:  ./sc auth user reset <username>" >&2
+                exit 2 ;;
   engine-ref)   sc_engine_ref_path="$LIVE_ROOT/.sc-state/engine.ref"
                 if [ ! -r "$sc_engine_ref_path" ]; then
                   echo "✗ sc engine-ref: no readable engine pin at $sc_engine_ref_path" >&2
@@ -1493,6 +1559,32 @@ case "$cmd" in
   pm2-broker-sock)    exec "$PY" "$S/pm2.py" sock ;;
   pm2-broker-install)   sc_pm2_broker_install ;;
   pm2-broker-uninstall) sc_pm2_broker_uninstall ;;
+  # ── engine-ops service (HOST-side — runs update / restart / update-harnesses
+  # for the GUI). A linked worktree has no instance of its own, and this
+  # service would run the LIVE instance's lifecycle verbs, so every form but
+  # the port read refuses there.
+  engine-ops)         sc_refuse_linked engine-ops "the engine-ops service of $LIVE_ROOT"
+                      exec "$PY" "$ENGINE/api/engine_ops_service.py" "$@" ;;
+  engine-ops-up)      sc_refuse_linked engine-ops-up "the engine-ops service of $LIVE_ROOT"
+                      sc_engine_ops_up ;;
+  # Asked for by name, so its own result is the verb's: non-zero when the
+  # service could not be stopped safely. (`down` and `restart` only report it.)
+  engine-ops-down)    sc_refuse_linked engine-ops-down "the engine-ops service of $LIVE_ROOT"
+                      sc_engine_ops down ;;
+  engine-ops-port)    sc_refuse_linked engine-ops-port "the engine-ops service of $LIVE_ROOT"
+                      sc_engine_ops_port ;;
+  # The first name of `./sc auth origin`, kept as an alias.
+  engine-ops-pin)     sc_refuse_linked engine-ops-pin "the engine-ops service of $LIVE_ROOT"
+                      sc_refuse_sandbox engine-ops-pin
+                      exec "$PY" "$ENGINE/api/host_auth.py" origin "$@" ;;
+  # ── GUI sign-in (HOST-side — spec #271). Users, claim codes, sessions and
+  # the GUI origin are kept by the engine-ops service in host-private state,
+  # and these verbs are the operator's side of it: a host terminal in the main
+  # checkout. Refused from a linked worktree (it has no instance of its own)
+  # and inside the sandbox (the state is not there, and must not be).
+  auth)               sc_help_form "$@" || sc_refuse_linked auth "the sign-in state of $LIVE_ROOT"
+                      sc_help_form "$@" || sc_refuse_sandbox auth
+                      exec "$PY" "$ENGINE/api/host_auth.py" "$@" ;;
   # ── db broker (HOST-side primitive — runs where the live DSN + route live) ──
   db-broker)         exec "$PY" "$ENGINE/api/db_broker.py" "$@" ;;
   db-broker-up)      sc_db_broker_up ;;
@@ -1546,6 +1638,9 @@ case "$cmd" in
       shift
     done
     sc_harness_cleanup
+    # Land the engine pin on the fork's default branch (decision #459): warns,
+    # never blocks. Host restart re-enters here through `"$0" launch`.
+    "$PY" "$S/fork_repin.py" sync || true
     if sc_host_runtime; then
       [ -z "$no_build" ] || echo "→ runtime host: --no-build is implied (there is no image)"
       sc_host_server_up || exit 1
@@ -1555,6 +1650,7 @@ case "$cmd" in
       sc_ts_broker_up || true
       sc_pm2_broker_up || true
       sc_db_broker_up || true
+      sc_engine_ops_up || true
       # The Postgres sidecar is a docker container even under the host runtime
       # (app-only, opt-in); it is started only when the fork linked it.
       if sc_pg_configured; then sc_pg_up || true; fi
@@ -1564,6 +1660,9 @@ case "$cmd" in
     if [ -n "$no_build" ]; then dimage_preflight; else dbuild; fi
     dcreds
     "$PY" "$S/ports.py" ensure >/dev/null
+    # The review server names this port in its CSP when it starts. It is not
+    # published into the container: the sandbox must have no route to it.
+    sc_engine_ops_port >/dev/null 2>&1 || true
     p="$(port)"
     dp="$(devport)"
     dnet
@@ -1576,6 +1675,15 @@ case "$cmd" in
     [ -n "${MISTRAL_API_KEY:-}" ] && mistral_env="-e MISTRAL_API_KEY=${MISTRAL_API_KEY}"
     disabled_harnesses_env=""
     [ -n "${SC_DISABLED_HARNESSES:-}" ] && disabled_harnesses_env="-e SC_DISABLED_HARNESSES"
+    # The browser-chat compaction settings are read by the review server, which
+    # runs inside the container: forward each one that is set, by name, so the
+    # value comes from the launch environment like SC_DISABLED_HARNESSES. An
+    # unset one is left out and the server uses its default.
+    chat_settings_env=""
+    [ -n "${SC_CHAT_COMPACT_WINDOW_CLAUDE:-}" ] && chat_settings_env="$chat_settings_env -e SC_CHAT_COMPACT_WINDOW_CLAUDE"
+    [ -n "${SC_CHAT_COMPACT_WINDOW_CODEX:-}" ] && chat_settings_env="$chat_settings_env -e SC_CHAT_COMPACT_WINDOW_CODEX"
+    [ -n "${SC_CHAT_COLD_RETURN_TOKENS:-}" ] && chat_settings_env="$chat_settings_env -e SC_CHAT_COLD_RETURN_TOKENS"
+    [ -n "${SC_CHAT_COLD_RETURN_MINUTES:-}" ] && chat_settings_env="$chat_settings_env -e SC_CHAT_COLD_RETURN_MINUTES"
     # Forward DATABASE_URL into the sandbox when a pg sidecar is configured, so
     # the fork's APP can connect to it. Default tracks the sidecar's container
     # name + baked sc/sc/sc creds (one source of truth); SC_DATABASE_URL overrides
@@ -1670,19 +1778,13 @@ case "$cmd" in
         SC_GITHUB_AUTH_ARGS \
         -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
         -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
-        $mistral_env $disabled_harnesses_env $pg_env \
+        $mistral_env $disabled_harnesses_env $chat_settings_env $pg_env \
         -w "$here" \
         -v "$here:$here" \
         $state_namespace_mounts \
         $state_mount \
         $py_mount \
-        -v "$HOME/.claude:$HOME/.claude" \
-        -v "$HOME/.claude.json:$HOME/.claude.json" \
-        -v "$HOME/.config/opencode:$HOME/.config/opencode" \
-        -v "$HOME/.local/share/opencode:$HOME/.local/share/opencode" \
-        -v "$HOME/.codex:$HOME/.codex" \
-        -v "$HOME/.vibe:$HOME/.vibe" \
-        -v "$HOME/.kimi-code:$HOME/.kimi-code" \
+        SC_HOME_MOUNTS \
         -p "127.0.0.1:$p:$p" \
         -p "127.0.0.1:$dp:$dp" \
         SC_DEVKIT_MOUNTS \
@@ -1724,6 +1826,9 @@ case "$cmd" in
     # Same for the read-only DB broker — it was previously omitted from the
     # sandbox lifecycle, so a restart could leave configured diagnostics down.
     sc_db_broker_up || true
+    # The engine-ops service runs the GUI's update / restart / harness update
+    # on the host; it needs no linked block, so it always comes up.
+    sc_engine_ops_up || true
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
   enter)
@@ -1775,6 +1880,7 @@ case "$cmd" in
                   sc_ts_broker_down
                   sc_pm2_broker_down
                   sc_db_broker_down
+                  sc_engine_ops_down
                   if sc_pg_configured; then sc_pg_down || down_rc=1; fi
                   exit "$down_rc"
                 fi
@@ -1783,6 +1889,7 @@ case "$cmd" in
                 sc_ts_broker_down
                 sc_pm2_broker_down
                 sc_db_broker_down
+                sc_engine_ops_down
                 sc_pg_down ;;
   # restart is a hard bounce — down runs `docker rm -f`, which SIGKILLs every
   # live session inside the sandbox along with whatever those sessions had not
@@ -1839,6 +1946,7 @@ case "$cmd" in
       sc_restart_health_summary "$launch_rc"
       exit $?
     fi
+    "$PY" "$S/fork_repin.py" sync || true
     dcheck
     if [ -n "$no_build" ]; then
       dimage_preflight
@@ -1897,7 +2005,24 @@ case "$cmd" in
     exec docker logs -f "$CNAME" ;;
   verify)
     exec "$PY" -B "$S/verify.py" ;;
-  health)       curl -s "http://127.0.0.1:$(port)/api/health" && echo "" ;;
+  health)
+    # Exit status carries the answer: a refused connection keeps curl's own
+    # status, and an HTTP error is nonzero too — `curl -s` alone exits 0 on a
+    # 500, so a caller gating on `sc health` read a failing server as healthy.
+    health_url="http://127.0.0.1:$(port)/api/health"
+    # curl appends the status code as a last line; tail/sed split it off.
+    # This file runs under /bin/sh — no bash-only $'\n' expansion here.
+    health_out="$(curl -s -w '\n%{http_code}' "$health_url")" || {
+      health_rc=$?
+      echo "sc health: no answer from $health_url (curl exit $health_rc)" >&2
+      exit "$health_rc"
+    }
+    health_code="$(printf '%s\n' "$health_out" | tail -n 1)"
+    printf '%s\n' "$health_out" | sed '$d'
+    case "$health_code" in
+      2??) ;;
+      *) echo "sc health: $health_url answered HTTP $health_code" >&2; exit 1 ;;
+    esac ;;
   clean-db)     database="$(sc_engine_db)"
                 sc_refuse_linked clean-db "$database"
                 rm -f "$database" "$database-wal" "$database-shm" && echo "removed $database (rebuild with: ./sc rebuild)" ;;
@@ -1924,11 +2049,12 @@ Subfloor — forkable shell substrate for one repository
   Install & upkeep      install · init · doctor · ensure-harness · update-harnesses · harness-status
                         harness-cleanup · docker-cache-gc · rollback · runtime · feature · sandbox-memory
                         persist · alias · make-cleanup · actions-artifacts · remove · eject
-  Memory & catalogue    mem · context · skill · search · models · job · pr · sprint · token · analytics
+  Memory & catalogue    mem · context · skill · search · models · job · sprint · token · analytics
                         map · map-setup · map-sql · map-schema · map-extractor
   Engine (Admin)        rebuild · migrate · migration · snapshot · render · render-check · verify
                         seed-skills · engine-ref · artifact-mode · clean-db
   Host brokers          browser · vm · remote · ts · vm-broker-* · ts-broker-* · pm2-broker-* · db-broker-*
+                        engine-ops-* · auth
                         db-init · pg-*
   Primitives            serve · boot · run · deps · lint · typecheck · build · logs · health · ports
                         preview · visual-qa
@@ -1979,18 +2105,30 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (which/get/state/seed/lns/curated/retire/decision/
                              flag/roadmap/project/task/doc/narrative/message/oriented/delivery-audit);
                              already wired to this launched shell, identity resolved by the engine — no DB path, no direct-DB fallback. `./sc mem which` to orient
-  ./sc pr subscribe --repository <owner/name> --pr <number>
-                           subscribe the authenticated Developer shell to engine-wide PR event wakes
+                             reads are `mem get <surface> [<id>]`; every write takes --json (one object, ids included) and
+                             text bodies take --body-file PATH|- ; `./sc mem --help` carries the exit-status table
   ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)
                              caller identity is resolved by the engine; report and review bodies use files, and mutating retries carry stable keys where required
   ./sc browser <verb>      setup/status/open/up/down/doctor/arm/disarm — opt-in Chromium profile driving
-  ./sc token               print the browser sign-in operator token — an Admin/operator recovery capability;
-                             stdout carries only the token and failure names the supported service action
+  ./sc token               retired — the review GUI signs in with a password and an authenticator code;
+                             see ./sc auth (user add, user reset, sessions)
   sc engine-ref            print the full engine pin from the canonical live checkout — safe from any shell
                              worktree; stdout is the 40-character SHA only
   ./sc job start -- <cmd>  run a long local command (suite/bench/build) detached + supervised — it
                              survives your session; completion lands in YOUR inbox as a result row
                              (--label <slug> names it, --timeout <s> kills the wedged process group)
+  ./sc job start --until "<probe>" [--every <s>]
+                           repeat a quoted /bin/sh probe until it exits 0, then wake you (--every: delay
+                             between attempts, default 30, minimum 5; probes time out after 3600s by default)
+  ./sc job agent --harness <h> --model <m> [--effort <e>] (--brief-file <path> | --brief "<text>")
+                           run one subagent on any headless harness in its own worktree, acting as you
+                             under your brief; completion wakes you. result <id> reads its final message,
+                             continue <id> resumes its session, clean <id> removes a kept worktree
+                             (./sc job --help lists every option and limit)
+  ./sc job watch pr --pr <n> [--repository <owner/name>] · watch timer --after <s>
+                           one bounded watch that wakes you once; it grants no merge authority
+  ./sc job attach <id> (--pr <n> [--repository <owner/name>] | --work-unit <n>)
+                           link a finished run to a PR or work unit as supporting evidence
   ./sc job wait <id>       bounded foreground wait — exit 0 done · 2 still running; --for <s> sets the
                              slice (default 300, cap 550) and you drain your inbox between slices;
                              list/status/tail/kill complete the set
@@ -2087,9 +2225,11 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc vm init --domain DOMAIN --snapshot NAME
        --ssh-host HOST --ssh-user USER --ssh-key-path PATH
        [--libvirt-uri URI] [--ssh-port N] [--mcp-port N]
-       [--workspace 'C:\SubfloorTest'] [--known-hosts-path PATH]
+       [--workspace 'C:\SubfloorTest'] [--known-hosts-path PATH] [--no-verify]
                            hand-link an already-prepared guest: write only the vm
-                           block and report broker health
+                           block, start the broker and test the link (domain, ssh,
+                           snapshot, declared checks) with pass/fail per check;
+                           --no-verify saves without testing (offline setup)
   ./sc vm status [--json] read broker, VM, SSH, and MCP-tunnel state without mutation;
                            includes relay, endpoint, and active-adapter state
   ./sc vm start [--json]  start only when off, then wait within a bounded SSH-readiness budget
@@ -2127,7 +2267,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              against libvirt in this process, with no broker in the path.
                              Use `./sc vm bake` normally (broker route, shell-legal); use
                              this when the broker is down. Host-only, never in the sandbox.
-  ./sc vm-broker-up        start it in the background (nohup + pidfile); self-skips if unlinked/already up
+  ./sc vm-broker-up        start it in the background (nohup + pidfile); starts nothing and
+                             says so when no VM or remote is linked
   ./sc vm-broker-down      stop the backgrounded broker
   ./sc vm-broker-sock      print the broker's socket path
   ./sc vm-broker-install   supervise via a systemd --user unit (survives logout/reboot)
@@ -2138,7 +2279,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              `./sc vm mcp up` brings the endpoint online
 
   Named remotes (SSH and key material stay behind the host vm-broker):
-  ./sc remote add NAME --host HOST --user USER --key-path ABSOLUTE [OPTIONS]
+  ./sc remote add NAME --host HOST --user USER --key-path ABSOLUTE [OPTIONS] [--no-verify]
+                           save the remote, start the broker and test the link over SSH
   ./sc remote remove NAME | ./sc remote list | ./sc remote status NAME
   ./sc remote exec NAME [--command-file FILE] [--json] -- COMMAND...
   ./sc remote push NAME SRC DEST | ./sc remote pull NAME SRC DEST
@@ -2148,9 +2290,17 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   See .super-coder/docs/tailscale-broker.md). `launch` brings it up when a tailnet is linked:
   ./sc ts status|exec HOST -- COMMAND
                            observe the tailnet or run a policy-checked diagnostic command
-  ./sc ts init             write the ts block from flags and show broker health
+  ./sc ts init [--ssh-user U] [--allowed-host [USER@]HOST]... [--readonly-host [USER@]HOST]...
+       [--replace-hosts] [--no-verify]
+                           write the ts block; named hosts are ADDED to the saved lists
+                           (--replace-hosts replaces them), then the broker is started and
+                           the link tested with pass/fail per check
+  ./sc ts add-host [USER@]HOST [--readonly] [--no-verify]
+  ./sc ts remove-host HOST
+                           declare or drop one host without touching the others
   ./sc ts-broker           run the broker in the foreground (unix socket)
-  ./sc ts-broker-up        start it in the background (nohup + pidfile); self-skips if unlinked/already up
+  ./sc ts-broker-up        start it in the background (nohup + pidfile); starts nothing and
+                             says so when no tailnet is linked
   ./sc ts-broker-down      stop the backgrounded broker
   ./sc ts-broker-sock      print the broker's socket path
   ./sc ts-broker-install   supervise via a systemd --user unit (survives logout/reboot)
@@ -2166,6 +2316,34 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc pm2-broker-sock     print the broker's socket path
   ./sc pm2-broker-install  supervise via a systemd --user unit (survives logout/reboot)
   ./sc pm2-broker-uninstall remove the systemd unit
+
+  engine-ops service (run on the HOST — runs update, restart, and
+  update-harnesses for the review GUI's engine controls, under both runtimes.
+  Host loopback TCP only, never a socket in the engine dir; the sandbox has no
+  route to it. See .super-coder/docs/engine-ops.md). `launch` always brings it up:
+  ./sc engine-ops          run the service in the foreground
+  ./sc engine-ops-up       start it in the background; no-op if already up
+  ./sc engine-ops-down     stop the backgrounded service (a running operation finishes)
+  ./sc engine-ops-port     print (pinning once) its host loopback port
+  ./sc engine-ops-pin      the first name of `./sc auth origin` (below); kept as an alias
+
+  GUI sign-in (run on the HOST, in the main checkout — the review GUI asks for a
+  password and an authenticator code; users, sessions and the GUI origin are kept
+  by the engine-ops service in host-private state. See .super-coder/docs/auth.md):
+  ./sc auth user add <username>   create the GUI user for an engine user: prints a
+                           one-time claim code for first sign-in in the GUI and asks
+                           you to confirm the review GUI's port (or: --port <port>).
+                           Until a user exists the GUI shows only this instruction.
+  ./sc auth user reset <username> clear the password, the authenticator and every
+                           session; prints a new claim code (lost-device recovery)
+  ./sc auth user list      each GUI user's state
+  ./sc auth sessions       signed-in devices · auth sessions revoke <id> | --all
+  ./sc auth sessions mint --label <text> [--user <username>] [--json]
+                           give a host-side tool a labelled operator session;
+                           prints its cookie once; listed and revoked like any
+  ./sc auth unlock         clear the delay that follows repeated failed sign-ins
+  ./sc auth origin         confirm the ONE GUI origin the host accepts (asks you to
+                           type the review port; or: auth origin <port> · --show)
 
   db broker (run on the HOST — read-only diagnostic reads of the fork's LIVE app
   DB for a sandboxed shell, without handing it a DSN or a route. Shells out to
@@ -2194,7 +2372,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              (recreate via pg-down→pg-up to change --shm-size / SC_PG_SHM)
 
   ./sc verify              candidate-only rebuild + flat render + render-only boot; live memory untouched
-  ./sc health              curl the review layer's /api/health
+  ./sc health              curl the review layer's /api/health; exits nonzero when it is down or answers an HTTP error
   ./sc ports               show this fork's derived port
   ./sc url                 print this fork's review GUI + dev-server URLs (derived, never a fixed 8800)
                              — the recall path when the boot summary has scrolled away (subfloor url)

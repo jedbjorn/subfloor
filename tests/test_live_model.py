@@ -579,6 +579,24 @@ class WorktreeIsolation(ProbeCase):
                             self.probe("opencode", OC_BACK)["last_model"])
 
 
+class KimiStateV2(ProbeCase):
+    """Kimi Code 2.x writes state.json version 2: `workDir` became `cwd`."""
+
+    def test_kimi_v2_state_matches_the_worktree_by_cwd(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        sess = tmp / "sessions" / "wd_v2_0" / "session_v2"
+        (sess / "agents" / "main").mkdir(parents=True)
+        (sess / "state.json").write_text(json.dumps(
+            {"id": "session_v2", "version": 2, "cwd": "/tmp/lm-v2/kimi"}))
+        (sess / "agents" / "main" / "wire.jsonl").write_text(json.dumps(
+            {"type": "llm.request", "provider": "openai", "model": "k3.1-pro",
+             "modelAlias": "kimi-code/k3.1-pro", "time": 1794517874258}) + "\n")
+        p_kimi.DATA_DIR = tmp / "sessions"
+        r = self.probe("kimi", "/tmp/lm-v2/kimi")
+        self.assertEqual(r["last_model"], "kimi-code/k3.1-pro")
+
+
 class CurrentSessionSelection(ProbeCase):
     """Several sessions in ONE worktree — the probe must answer with the
     CURRENT one (REV2 SC-166).

@@ -22,13 +22,15 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 import active_chat_registry
+import compaction_settings
+import conversation_compaction
 import conversation_events
 import conversation_git_targets
 import db_driver
@@ -113,6 +115,10 @@ class BrokerRun:
     process_group_id: int | None = None
     transcript_path: str | None = None
     transcript_offset: int | None = None
+    # True when the trigger is the engine's manual compact request: the run
+    # asks the harness to compact the stored session instead of sending a
+    # message (Feature #95).
+    compaction: bool = False
 
     def context(self) -> ConversationContext:
         # Browser conversations run with worktree command access.
@@ -132,6 +138,21 @@ class BrokerRun:
         )
 
 
+@dataclass(frozen=True)
+class CompactionState:
+    """What one chat's event log says about its context, read at dispatch."""
+
+    # Sequence of a ``context.compacted`` event no dispatched message has
+    # been re-grounded for yet, or None when there is nothing to say.
+    pending_compaction: int | None = None
+    context_tokens: int | None = None
+    context_window: int | None = None
+    # The harness's auto-compaction trigger in effect for this turn (saved,
+    # then environment, then default; None when auto compaction is off or
+    # the harness has no settings). Read at each dispatch: no restart.
+    trigger_tokens: int | None = None
+
+
 @dataclass
 class _ActiveRun:
     run: BrokerRun
@@ -140,6 +161,10 @@ class _ActiveRun:
     interrupt_requested: bool = False
     interrupt_sent: bool = False
     continuation_run_id: int | None = None
+    # The native run reference the run row currently names. A harness that
+    # learns its turn id only after dispatch (a Codex manual compaction)
+    # changes ``turn.run_ref``; the row follows so recovery finds the turn.
+    runner_ref: str | None = None
 
     @property
     def run_id(self) -> int:
@@ -240,6 +265,41 @@ class BrokerStore:
         return int(sequence)
 
     @staticmethod
+    def _compaction_recorded(con, conversation_id: str, event) -> bool:
+        """True when this exact compaction is already in the chat's log.
+
+        A harness that names its compaction (Claude's boundary ``uuid``) is
+        seen twice when a turn is recovered: once on the pipe before the
+        restart and again when the transcript is replayed from the turn's
+        start. The second reading is dropped so the chat shows one marker.
+        A compaction request's cost that names its record (Kimi's
+        ``usage_ref``) is kept once in the same way.
+        """
+        key = {
+            "context.compacted": "compaction_ref",
+            "usage": "usage_ref",
+        }.get(event.type)
+        if key is None:
+            return False
+        ref = event.payload.get(key)
+        if not isinstance(ref, str) or not ref:
+            return False
+        rows = con.execute(
+            "SELECT payload FROM conversation_events "
+            "WHERE conversation_id=? AND event_type=? "
+            "ORDER BY sequence DESC LIMIT 50",
+            (conversation_id, event.type),
+        ).fetchall()
+        for row in rows:
+            try:
+                recorded = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(recorded, dict) and recorded.get(key) == ref:
+                return True
+        return False
+
+    @staticmethod
     def _route_from_row(
         row,
     ) -> tuple[int, dict[str, Any] | None, str | None]:
@@ -311,6 +371,7 @@ class BrokerStore:
             process_group_id=row["process_group_id"],
             transcript_path=row["transcript_path"],
             transcript_offset=row["transcript_offset"],
+            compaction=bool(row["manual_compaction"]),
         )
 
     @staticmethod
@@ -323,6 +384,8 @@ class BrokerStore:
             "r.state AS run_state,c.harness,c.provider,c.model,c.effort,"
             "c.route_contract_version,c.route_binding,"
             "c.worktree,c.title,m.body,"
+            + conversation_compaction.manual_compact_sql("m")
+            + " AS manual_compaction,"
             "1+(SELECT COUNT(*) FROM conversation_events reopened "
             " WHERE reopened.conversation_id=r.conversation_id "
             " AND reopened.event_type='conversation.reopened') AS lifecycle_epoch,"
@@ -351,6 +414,8 @@ class BrokerStore:
                     "c.shell_id,c.harness,c.provider,c.model,c.effort,"
                     "c.route_contract_version,c.route_binding,c.worktree,"
                     "c.title,c.harness_session_ref,m.body,m.state AS message_state,"
+                    + conversation_compaction.manual_compact_sql("m")
+                    + " AS manual_compaction,"
                     "1+(SELECT COUNT(*) FROM conversation_events reopened "
                     " WHERE reopened.conversation_id=c.conversation_id "
                     " AND reopened.event_type='conversation.reopened') AS lifecycle_epoch "
@@ -462,6 +527,7 @@ class BrokerStore:
                     route_binding=binding,
                     binding_digest=binding_digest,
                     lifecycle_epoch=int(row["lifecycle_epoch"]),
+                    compaction=bool(row["manual_compaction"]),
                 )
         except db_driver.IntegrityError as exc:
             # A second broker can race the eligibility read. BEGIN IMMEDIATE
@@ -702,12 +768,96 @@ class BrokerStore:
         finally:
             con.close()
 
+    def compaction_state(
+        self,
+        conversation_id: str,
+        harness: str | None = None,
+    ) -> CompactionState:
+        """Read one chat's compaction and meter state for the next dispatch.
+
+        A compaction is pending while its event is newer than the last
+        ``message.reground``: the line is owed once per compaction, however
+        many compactions happened since the last dispatched message. With
+        ``harness``, the harness's trigger in effect is read too.
+        """
+        con = self.connect()
+        trigger: int | None = None
+        try:
+            if harness is not None:
+                trigger = compaction_settings.effective_trigger(con, harness)
+            row = con.execute(
+                "SELECT "
+                "(SELECT MAX(sequence) FROM conversation_events "
+                " WHERE conversation_id=? AND event_type='context.compacted') "
+                "AS compacted,"
+                "(SELECT MAX(sequence) FROM conversation_events "
+                " WHERE conversation_id=? AND event_type='message.reground') "
+                "AS regrounded",
+                (conversation_id, conversation_id),
+            ).fetchone()
+            meter = conversation_compaction.read_meter(con, conversation_id)
+        finally:
+            con.close()
+        compacted = row["compacted"] if row is not None else None
+        regrounded = row["regrounded"] if row is not None else None
+        pending = (
+            int(compacted)
+            if compacted is not None
+            and (regrounded is None or int(compacted) > int(regrounded))
+            else None
+        )
+        return CompactionState(
+            pending_compaction=pending,
+            context_tokens=meter["context_tokens"],
+            context_window=meter["context_window"],
+            trigger_tokens=trigger,
+        )
+
+    def record_reground(self, run_id: int, compaction_sequence: int) -> int:
+        """Record that this run's dispatched text carried the re-ground line.
+
+        The stored message body is never changed: this event is the record
+        that the engine, not the operator, added the line.
+        """
+        con = self.connect()
+        try:
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.record_reground",
+            ):
+                row = con.execute(
+                    "SELECT conversation_id,trigger_message_id "
+                    "FROM conversation_runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
+                sequence = self._append_event(
+                    con,
+                    conversation_id=row["conversation_id"],
+                    event_type="message.reground",
+                    payload={
+                        "added_by": "engine",
+                        "text": conversation_compaction.REGROUND_LINE,
+                        "compaction_sequence": int(compaction_sequence),
+                    },
+                    message_id=row["trigger_message_id"],
+                    run_id=run_id,
+                )
+                conversation_id = row["conversation_id"]
+        finally:
+            con.close()
+        conversation_events.notify(conversation_id)
+        return sequence
+
     def append_event(
         self,
         run_id: int,
         event: NormalizedEvent,
     ) -> int:
-        return self.append_events(run_id, [event])[0]
+        # A compaction already in the log is not written twice; 0 says so.
+        sequences = self.append_events(run_id, [event])
+        return sequences[0] if sequences else 0
 
     def append_events(
         self,
@@ -733,8 +883,12 @@ class BrokerStore:
                 row = con.execute(
                     "SELECT r.conversation_id,r.trigger_message_id,r.state,"
                     "c.shell_id,c.harness,c.provider,c.model,c.title,c.created_at,"
-                    "c.harness_session_ref FROM conversation_runs r "
+                    "c.harness_session_ref,"
+                    + conversation_compaction.manual_compact_sql("m")
+                    + " AS manual_compaction FROM conversation_runs r "
                     "JOIN conversations c ON c.conversation_id=r.conversation_id "
+                    "JOIN conversation_messages m "
+                    " ON m.message_id=r.trigger_message_id "
                     "WHERE r.run_id=?",
                     (run_id,),
                 ).fetchone()
@@ -745,21 +899,67 @@ class BrokerStore:
                         "CONVERSATION_RUN_TERMINAL",
                         f"run {run_id} is already {row['state']}",
                     )
+                manual = bool(row["manual_compaction"])
+                # An engine request's marker carries the request's cause; a
+                # compaction the harness made on its own is ``harness``.
+                request = (
+                    conversation_compaction.request_record(
+                        con, row["conversation_id"], int(row["trigger_message_id"])
+                    )
+                    if manual and any(
+                        event.type == "context.compacted" for event in events
+                    )
+                    else None
+                )
                 sequences = []
                 for event in events:
+                    if manual and event.type not in (
+                        conversation_compaction.MANUAL_COMPACT_RUN_EVENTS
+                    ):
+                        # A manual compaction records that the harness
+                        # compacted, never the summary it streamed.
+                        continue
+                    if self._compaction_recorded(
+                        con, row["conversation_id"], event
+                    ):
+                        continue
                     payload = dict(event.payload)
+                    if manual and event.type == "usage":
+                        # The summarising request's tokens are a cost of the
+                        # chat, kept under their own scope so they never read
+                        # as the size of its context.
+                        payload = conversation_compaction.compaction_usage_payload(
+                            payload
+                        )
+                        if payload is None:
+                            continue
                     if event.native_type:
                         payload["native_type"] = event.native_type
                     if event.interrupt_evidence:
                         payload["interrupt_evidence"] = event.interrupt_evidence
+                    marker = manual and event.type == "context.compacted"
+                    if marker:
+                        # The engine asked for this one, whatever the harness
+                        # states. It is recorded on the chat, not on the
+                        # request's run: the transcript lists operator turns,
+                        # and the marker has to show without one.
+                        payload["trigger"] = "manual"
+                        payload["request_message_id"] = int(
+                            row["trigger_message_id"]
+                        )
+                        payload.update(request or {})
+                    elif event.type == "context.compacted":
+                        payload["cause"] = conversation_compaction.CAUSE_HARNESS
                     sequences.append(
                         self._append_event(
                             con,
                             conversation_id=row["conversation_id"],
                             event_type=event.type,
                             payload=payload,
-                            message_id=row["trigger_message_id"],
-                            run_id=run_id,
+                            message_id=(
+                                None if marker else row["trigger_message_id"]
+                            ),
+                            run_id=None if marker else run_id,
                         )
                     )
                 con.execute(
@@ -815,6 +1015,11 @@ class BrokerStore:
                 row = con.execute(
                     "SELECT r.state,r.conversation_id,r.trigger_message_id,"
                     "c.state AS conversation_state,c.shell_id,"
+                    "(SELECT "
+                    + conversation_compaction.manual_compact_sql("m")
+                    + " FROM conversation_messages m "
+                    " WHERE m.message_id=r.trigger_message_id) "
+                    "AS manual_compaction,"
                     "EXISTS(SELECT 1 FROM conversation_events closing "
                     " WHERE closing.conversation_id=r.conversation_id "
                     " AND closing.event_type='conversation.close.requested' "
@@ -879,6 +1084,12 @@ class BrokerStore:
                             "AND state IN ('pending','claimed')",
                             queued_ids,
                         )
+                        conversation_compaction.settle_cancelled_requests(
+                            con,
+                            str(row["conversation_id"]),
+                            queued_ids,
+                            error_code="CONVERSATION_CLOSING",
+                        )
                 pending = (
                     con.execute(
                         "SELECT 1 FROM conversation_outbox "
@@ -888,9 +1099,12 @@ class BrokerStore:
                     ).fetchone()
                     is not None
                 )
+                manual = bool(row["manual_compaction"])
+                # A manual compaction that failed leaves the session as it
+                # was: the chat is not in error, it just was not compacted.
                 conversation_target = (
                     "error"
-                    if outcome in {"failed", "unknown"}
+                    if outcome in {"failed", "unknown"} and not manual
                     else "queued"
                     if pending
                     else "idle"
@@ -949,6 +1163,15 @@ class BrokerStore:
                     message_id=row["trigger_message_id"],
                     run_id=run_id,
                 )
+                if manual:
+                    self._append_compaction_outcome(
+                        con,
+                        conversation_id=row["conversation_id"],
+                        message_id=int(row["trigger_message_id"]),
+                        outcome=outcome,
+                        error_code=error_code,
+                        error_detail=error_detail,
+                    )
                 if close_after and not already_closed:
                     require_transition(
                         "conversation",
@@ -969,6 +1192,20 @@ class BrokerStore:
                         message_id=None,
                         run_id=run_id,
                     )
+                # Any turn that ends, failed and unproven ones included,
+                # is checked; an operator's Stop (cancelled) is not.
+                if (
+                    outcome in ("succeeded", "failed", "unknown")
+                    and not manual
+                    and not close_after
+                    and not already_closed
+                ):
+                    self._threshold_compaction(
+                        con,
+                        str(row["conversation_id"]),
+                        run_id=run_id,
+                        trigger_message_id=int(row["trigger_message_id"]),
+                    )
                 notify_ids.add(str(row["conversation_id"]))
                 conversation_id = row["conversation_id"]
         finally:
@@ -980,6 +1217,104 @@ class BrokerStore:
             str(conversation_id),
         )
         return True
+
+    @staticmethod
+    def _threshold_compaction(
+        con,
+        conversation_id: str,
+        *,
+        run_id: int,
+        trigger_message_id: int,
+    ) -> None:
+        """The between-turn check (spec #275 "Threshold compaction").
+
+        Runs inside the transaction that ends the turn, so the request is
+        queued before anything else can be: the compaction runs next, while
+        the cache is warm. A failure here is logged and undone on its own;
+        it never fails the turn's end.
+        """
+        con.execute("SAVEPOINT threshold_compaction")
+        try:
+            conversation_compaction.threshold_compaction(
+                con,
+                conversation_id,
+                run_id=run_id,
+                trigger_message_id=trigger_message_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - the turn's end must commit
+            con.execute("ROLLBACK TO threshold_compaction")
+            print(
+                f"conversation-broker: run {run_id} threshold compaction "
+                f"check failed: {exc}",
+                flush=True,
+            )
+        finally:
+            con.execute("RELEASE threshold_compaction")
+
+    @staticmethod
+    def _append_compaction_outcome(
+        con,
+        *,
+        conversation_id: str,
+        message_id: int,
+        outcome: str,
+        error_code: str | None,
+        error_detail: str | None,
+    ) -> int | None:
+        """Close one manual compact request with exactly one visible result.
+
+        The marker (``context.compacted``) is written while the run streams.
+        When the run ends without one, this writes the other result: the
+        error line for a run that did not succeed, or the notice that the
+        harness finished without reporting a compaction. Both sit on the
+        chat, not on the request's run, like the marker. Nothing is written
+        when a result is already in the log, so a request has one.
+        """
+        requested = con.execute(
+            "SELECT COALESCE(MAX(sequence),0) FROM conversation_events "
+            "WHERE conversation_id=? AND message_id=? AND event_type=?",
+            (
+                conversation_id,
+                message_id,
+                conversation_compaction.COMPACTION_REQUESTED,
+            ),
+        ).fetchone()[0]
+        settled = con.execute(
+            "SELECT 1 FROM conversation_events "
+            "WHERE conversation_id=? AND sequence>? "
+            "AND event_type IN ('context.compacted',?,?) LIMIT 1",
+            (
+                conversation_id,
+                int(requested),
+                conversation_compaction.COMPACTION_FAILED,
+                conversation_compaction.COMPACTION_NOT_REPORTED,
+            ),
+        ).fetchone()
+        if settled is not None:
+            return None
+        if outcome == "succeeded":
+            event_type = conversation_compaction.COMPACTION_NOT_REPORTED
+            payload: dict[str, Any] = {}
+        else:
+            event_type = conversation_compaction.COMPACTION_FAILED
+            payload = {"outcome": outcome}
+            if error_code:
+                payload["error"] = error_code
+            if error_detail:
+                payload["detail"] = error_detail[:2000]
+        payload["request_message_id"] = message_id
+        # The outcome names its request's cause, as the marker does.
+        payload.update(
+            conversation_compaction.request_record(con, conversation_id, message_id)
+        )
+        return BrokerStore._append_event(
+            con,
+            conversation_id=conversation_id,
+            event_type=event_type,
+            payload=payload,
+            message_id=None,
+            run_id=None,
+        )
 
     def open_continuation(self, run_id: int, owner: str) -> int | None:
         """Reopen a lingering turn as the next attempt of the same message.
@@ -1079,6 +1414,23 @@ class BrokerStore:
             con.close()
         conversation_events.notify(conversation_id)
         return continuation_id
+
+    def set_runner_ref(self, run_id: int, runner_ref: str) -> bool:
+        """Name the native turn a live run turned out to be."""
+        con = self.connect()
+        try:
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.set_runner_ref",
+            ):
+                changed = con.execute(
+                    "UPDATE conversation_runs SET runner_ref=? "
+                    "WHERE run_id=? AND state IN ('starting','running')",
+                    (runner_ref, run_id),
+                ).rowcount
+                return changed == 1
+        finally:
+            con.close()
 
     def release_process_link(self, run_id: int) -> bool:
         """Clear the registry link a lingering finish deliberately kept.
@@ -1620,6 +1972,21 @@ class ConversationBroker(threading.Thread):
             "transcript_offset": run.transcript_offset or 0,
         }
 
+    @staticmethod
+    def _transcript_metadata(run: BrokerRun) -> dict[str, Any]:
+        """Where the run's own transcript entries begin, live process or not.
+
+        Reconcile needs this most when the process is gone: without the
+        offset a transcript-reading adapter cannot tell this run's reply from
+        the previous turn's.
+        """
+        if run.transcript_path is None:
+            return {}
+        return {
+            "transcript_path": run.transcript_path,
+            "transcript_offset": run.transcript_offset or 0,
+        }
+
     def _open_continuation(self, active: _ActiveRun) -> int | None:
         persisted, continuation_id = self._retry_busy(
             partial(self.store.open_continuation, active.run_id, self.owner),
@@ -1717,6 +2084,22 @@ class ConversationBroker(threading.Thread):
                 except queue.Empty:
                     item = None
 
+                if (
+                    active.runner_ref is not None
+                    and turn.run_ref != active.runner_ref
+                ):
+                    # The harness named the turn after dispatch. A failed
+                    # write is retried on the next pass.
+                    adopted = turn.run_ref
+                    persisted, _changed = self._retry_busy(
+                        partial(
+                            self.store.set_runner_ref, active.run_id, adopted
+                        ),
+                        wait=False,
+                    )
+                    if persisted:
+                        active.runner_ref = adopted
+
                 if isinstance(item, NormalizedEvent):
                     silent_since = time.monotonic()
                     if item.type in TERMINAL_EVENTS:
@@ -1804,8 +2187,8 @@ class ConversationBroker(threading.Thread):
             if not self._flush_all(active, pending):
                 return False
             if pending_terminal is not None:
-                from run_wakes import observe_codex_transcript
-                observe_codex_transcript(self.store, active.run, adapter, turn)
+                from run_wakes import observe_native_transcript
+                observe_native_transcript(self.store, active.run, adapter, turn)
                 returncode = turn.metadata.get("returncode")
                 return self._finish_adapter_event(
                     active,
@@ -1906,6 +2289,36 @@ class ConversationBroker(threading.Thread):
             wait=True,
         )
 
+    def _record_recovered_events(
+        self,
+        active: _ActiveRun,
+        adapter: ConversationAdapter,
+        turn: NativeTurn,
+        context: ConversationContext,
+    ) -> None:
+        recover = getattr(adapter, "recovered_events", None)
+        if not callable(recover):
+            return
+        try:
+            events = [
+                event
+                for event in recover(turn, context)
+                if event.type not in TERMINAL_EVENTS
+            ]
+            if events:
+                self._retry_busy(
+                    partial(self.store.append_events, active.run_id, events),
+                    wait=True,
+                )
+        except Exception as exc:
+            # The run is finished either way; without the marker its result
+            # line says the compaction was not reported.
+            print(
+                f"conversation-broker: run {active.run_id} recovered events "
+                f"not recorded: {exc}",
+                flush=True,
+            )
+
     def _reconcile_loop(
         self,
         active: _ActiveRun,
@@ -1965,6 +2378,11 @@ class ConversationBroker(threading.Thread):
                 self._stop_event.wait(self.recovery_seconds)
                 continue
             outcome = result.outcome if result.proven else "unknown"
+            if active.run.compaction:
+                # A reconciled manual compaction was never streamed, so its
+                # marker has to be read back before the run is finished and
+                # its result line decided.
+                self._record_recovered_events(active, adapter, turn, context)
             terminal_payload = {
                 "reconciled": True,
                 "proven": result.proven,
@@ -2011,8 +2429,31 @@ class ConversationBroker(threading.Thread):
                             archive_id,
                         )
                     context.checked_worktree()
+                    compaction = self.store.compaction_state(
+                        run.conversation_id, run.harness
+                    )
+                    context = replace(
+                        context,
+                        # The trigger reaches only a harness that takes a
+                        # token count (Claude, Codex); the others are
+                        # compacted by the engine between turns.
+                        compact_window=(
+                            compaction.trigger_tokens
+                            if conversation_compaction.compact_window_native(
+                                run.harness
+                            )
+                            else None
+                        ),
+                        context_window=compaction.context_window,
+                        context_tokens=compaction.context_tokens,
+                    )
                     adapter = self.adapter_factory(run.harness)
                     active.adapter = adapter
+                    if run.compaction and not run.session_before:
+                        raise BrokerError(
+                            "COMPACTION_NO_SESSION",
+                            "this chat has no harness session to compact yet",
+                        )
                 except Exception as exc:
                     # A shell still running this chat's previous process has
                     # not failed this turn; every other refusal here is proven.
@@ -2025,13 +2466,34 @@ class ConversationBroker(threading.Thread):
                 with self._active_lock:
                     self._deferrals.pop(run.run_id, None)
 
+                # A resumed session that was compacted since its last message
+                # is told once to re-read its durable state. The line goes on
+                # the dispatched text only; ``run.body`` is the stored message.
+                # A manual compact request is not a message: nothing is added
+                # to it and no line is spent on it, so the first real message
+                # after it still carries the re-ground line.
+                reground = (
+                    compaction.pending_compaction
+                    if run.session_before and not run.compaction
+                    else None
+                )
+                dispatched = (
+                    conversation_compaction.with_reground(run.body)
+                    if reground is not None
+                    else run.body
+                )
                 self.store.mark_starting(run.run_id, self.owner)
                 try:
-                    turn = (
-                        adapter.resume(run.session_before, context, run.body)
-                        if run.session_before
-                        else adapter.start(context, run.body)
-                    )
+                    if run.compaction:
+                        turn = adapter.compact(run.session_before, context)
+                    else:
+                        turn = (
+                            adapter.resume(
+                                run.session_before, context, dispatched
+                            )
+                            if run.session_before
+                            else adapter.start(context, dispatched)
+                        )
                 except Exception as exc:
                     # The adapter may have sent the prompt before its transport
                     # failed. Starting is the explicit uncertain crash window.
@@ -2039,6 +2501,18 @@ class ConversationBroker(threading.Thread):
                     return
                 active.turn = turn
                 self.store.mark_native_started(run.run_id, self.owner, turn)
+                active.runner_ref = turn.run_ref
+                if reground is not None:
+                    try:
+                        self.store.record_reground(run.run_id, reground)
+                    except Exception as exc:
+                        # The turn is already running; a missed record only
+                        # means the next message repeats the line.
+                        print(
+                            f"conversation-broker: run {run.run_id} re-ground "
+                            f"record failed: {exc}",
+                            flush=True,
+                        )
                 self._deliver_interrupt(active)
 
                 if self._consume_stream(active, adapter, turn):
@@ -2068,8 +2542,16 @@ class ConversationBroker(threading.Thread):
                 run_ref=run.runner_ref,
                 worktree=run.worktree.resolve(),
                 process_ref=str(run.process_pid) if attach else None,
-                metadata={"recovered": True, **attach},
+                metadata={
+                    "recovered": True,
+                    # A recovered manual compaction is still one: the adapter
+                    # reads its outcome differently from a turn's reply.
+                    **({"compaction": True} if run.compaction else {}),
+                    **self._transcript_metadata(run),
+                    **attach,
+                },
             )
+            active.runner_ref = run.runner_ref
             self._deliver_interrupt(active)
             recovery = getattr(self.launch_preparer, "recovery", None)
             context = recovery(run) if callable(recovery) else run.context()

@@ -18,6 +18,12 @@ The manifest advertises terminal support only: `one_shot`, `browser` and
 `sprint` are false. No controlled effort or conversation-resume contract is
 provided. Use the configured native model for terminal work.
 
+`sc job` subagents are not available on Vibe: the manifest declares no
+`headless` block, so `sc job agent --harness vibe` is refused by name before
+anything is registered or started. A shell that runs on Vibe may still launch
+a subagent on another installed harness, and may use `sc job start --until`,
+`sc job watch pr` and `sc job watch timer`.
+
 ## Branch guard — no in-line block (by harness limitation)
 
 Vibe has **no pre-tool hook** and no programmatic, branch-aware tool gate — its

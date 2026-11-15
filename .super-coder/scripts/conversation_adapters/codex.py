@@ -6,6 +6,7 @@ import json
 import queue
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
@@ -25,13 +26,33 @@ from .base import (
     SessionInspection,
     cleanup_owned_process,
     command_version,
+    compaction_event,
     ensure_exact_session,
     ensure_nonempty_message,
     load_manifest,
     managed_mcp_launch_args,
     merged_env,
     terminal_outcome,
+    token_count,
+    usage_event,
 )
+
+# The Codex config key for the token count at which it compacts a thread.
+# The engine states it twice, and both were accepted by codex-cli 0.167.1:
+# as a ``-c`` override on the app-server launch (``config/read`` then reports
+# it with origin ``sessionFlags``) and in the ``config`` object of
+# ``thread/start`` / ``thread/resume`` (parsed as thread configuration: a
+# non-integer value is refused with "failed to load configuration").
+AUTO_COMPACT_KEY = "model_auto_compact_token_limit"
+COMPACTION_ITEM = "contextCompaction"
+# The manual request (0.167.1): ``thread/compact/start`` on a resumed thread
+# answers ``{}`` at once, then the app-server runs the compaction as a turn of
+# its own: ``turn/started`` with a new turn id, the ``contextCompaction``
+# item, ``turn/completed``. The waits for that turn are bounded.
+COMPACT_METHOD = "thread/compact/start"
+COMPACT_START_SECONDS = 30.0
+COMPACT_WAIT_SECONDS = 300.0
+COMPACT_POLL_SECONDS = 0.25
 
 
 class RpcTransport(Protocol):
@@ -212,6 +233,24 @@ class JsonLineRpcProcess:
                 raise message
             yield message
 
+    def next_notification(self, timeout: float) -> Mapping[str, Any] | None:
+        """The next notification, or None when ``timeout`` passes without one."""
+        try:
+            message = self._notifications.get(timeout=max(0.0, timeout))
+        except queue.Empty:
+            return None
+        if message is None:
+            # Keep the end marker for any later reader of the stream.
+            self._notifications.put(None)
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE",
+                "Codex app-server stream closed",
+                retryable=True,
+            )
+        if isinstance(message, AdapterError):
+            raise message
+        return message
+
     def close(self) -> None:
         if self.process.poll() is not None:
             return
@@ -220,15 +259,45 @@ class JsonLineRpcProcess:
 
 class CodexAdapter(ConversationAdapter):
     harness = "codex"
+    manual_compaction = True
+    # ``model_auto_compact_token_limit`` on the launch and the thread config.
+    compact_window_native = True
 
     def __init__(
         self,
         *,
         rpc: RpcTransport | None = None,
         manifest: Mapping[str, Any] | None = None,
+        compact_start_seconds: float = COMPACT_START_SECONDS,
+        compact_wait_seconds: float = COMPACT_WAIT_SECONDS,
     ) -> None:
         super().__init__(manifest or load_manifest(self.harness))
         self._rpc = rpc
+        self.compact_start_seconds = compact_start_seconds
+        self.compact_wait_seconds = compact_wait_seconds
+        self._notification_source: Iterator[Mapping[str, Any]] | None = None
+        # Set by the caller that asked Codex to compact (the manual request);
+        # the next compaction recorded is then ``manual``. The item itself
+        # carries no trigger, so everything else is ``auto``.
+        self.compaction_requested = False
+        # (size, total, estimate) of the latest token-usage updates: ``size``
+        # is the meter reading, ``total`` adds that request's output, and
+        # ``estimate`` marks Codex's post-compaction figure (no input side).
+        self._reading: tuple[int, int, bool] | None = None
+        self._compaction: dict[str, Any] | None = None
+
+    @staticmethod
+    def _compact_launch_args(context: ConversationContext) -> list[str]:
+        window = context.effective_compact_window()
+        if window is None:
+            return []
+        return ["-c", f"{AUTO_COMPACT_KEY}={window}"]
+
+    def _seed_reading(self, context: ConversationContext) -> None:
+        """Start from the chat's last recorded size, when one is recorded."""
+        size = token_count(context.context_tokens)
+        self._reading = (size, size, False) if size else None
+        self._compaction = None
 
     def _transport(self, context: ConversationContext) -> RpcTransport:
         if self._rpc is None:
@@ -237,6 +306,7 @@ class CodexAdapter(ConversationAdapter):
                 argv=[
                     launch,
                     *managed_mcp_launch_args(self.manifest, context),
+                    *self._compact_launch_args(context),
                     "app-server",
                     "--stdio",
                 ],
@@ -277,6 +347,9 @@ class CodexAdapter(ConversationAdapter):
                     "sandbox": "danger-full-access",
                 }
             )
+        window = context.effective_compact_window()
+        if window is not None:
+            params["config"] = {AUTO_COMPACT_KEY: window}
         return params
 
     @staticmethod
@@ -346,6 +419,7 @@ class CodexAdapter(ConversationAdapter):
     def start(self, context: ConversationContext, message: str) -> NativeTurn:
         message = ensure_nonempty_message(message)
         rpc = self._transport(context)
+        self._reading = self._compaction = None
         started = rpc.request("thread/start", self._thread_params(context))
         thread = started.get("thread") if isinstance(started, dict) else None
         session_ref = thread.get("id") if isinstance(thread, dict) else None
@@ -369,7 +443,23 @@ class CodexAdapter(ConversationAdapter):
         message: str,
     ) -> NativeTurn:
         message = ensure_nonempty_message(message)
+        rpc = self._resume_thread(session_ref, context)
+        return self._start_turn(
+            rpc,
+            session_ref,
+            context,
+            message,
+            resumed=True,
+        )
+
+    def _resume_thread(
+        self,
+        session_ref: str,
+        context: ConversationContext,
+    ) -> RpcTransport:
+        """Load the exact stored thread into this app-server."""
         rpc = self._transport(context)
+        self._seed_reading(context)
         params = self._thread_params(context)
         params["threadId"] = session_ref
         try:
@@ -392,12 +482,40 @@ class CodexAdapter(ConversationAdapter):
                 "HARNESS_WORKTREE_MISMATCH",
                 "Codex thread belongs to a different worktree",
             )
-        return self._start_turn(
-            rpc,
-            session_ref,
-            context,
-            message,
-            resumed=True,
+        return rpc
+
+    def compact(
+        self,
+        session_ref: str,
+        context: ConversationContext,
+    ) -> NativeTurn:
+        """Resume the thread, then ask the app-server to compact it."""
+        rpc = self._resume_thread(session_ref, context)
+        # The item carries no trigger: this flag is what makes the next
+        # compaction ``manual``.
+        self.compaction_requested = True
+        try:
+            rpc.request(COMPACT_METHOD, {"threadId": session_ref})
+        except AdapterError as exc:
+            self.compaction_requested = False
+            if exc.code == "HARNESS_PROTOCOL_ERROR":
+                raise AdapterError("HARNESS_COMPACT_REFUSED", exc.detail) from exc
+            raise
+        process = getattr(rpc, "process", None)
+        pid = getattr(process, "pid", None)
+        # The compaction's turn id is not known until ``turn/started``.
+        run_ref = f"compact-{uuid.uuid4()}"
+        return NativeTurn(
+            harness=self.harness,
+            session_ref=session_ref,
+            run_ref=run_ref,
+            worktree=context.checked_worktree(),
+            process_ref=(
+                str(pid)
+                if isinstance(pid, int) and pid > 0
+                else f"app-server:{run_ref}"
+            ),
+            metadata={"resumed": True, "compaction": True},
         )
 
     @staticmethod
@@ -435,6 +553,72 @@ class CodexAdapter(ConversationAdapter):
             ref if isinstance(ref, str) else None,
         )
 
+    @staticmethod
+    def _usage_reading(
+        source: Mapping[str, Any],
+    ) -> tuple[int, int, bool] | None:
+        """(size, total, estimate) of one token-usage breakdown.
+
+        ``inputTokens`` already counts the cached part, so it alone is the
+        input side of the request. Right after a compaction Codex reports no
+        input side at all and puts its estimate of the new context in
+        ``totalTokens``; that figure is then the reading.
+        """
+
+        def read(camel: str, snake: str) -> int | None:
+            value = token_count(source.get(camel))
+            return token_count(source.get(snake)) if value is None else value
+
+        input_side = read("inputTokens", "input_tokens")
+        total = read("totalTokens", "total_tokens")
+        if input_side:
+            return input_side, max(input_side, total or 0), False
+        if total:
+            return total, total, True
+        return None
+
+    def _open_compaction(self, ref: str | None) -> dict[str, Any]:
+        """Begin tracking one ``contextCompaction`` item.
+
+        The item carries no counts; they are read from the token-usage
+        updates around it. The app-server order is: the last request's
+        usage, ``item/started``, a usage update with no input side whose
+        total is the reduced context (sometimes sent twice), then
+        ``item/completed``. So the size before is the last reading at
+        ``item/started``, fixed here, and the size after is the zero-input
+        update that arrives while the item is open.
+        """
+        latest = self._reading
+        self._compaction = {
+            "ref": ref,
+            "before": latest[1] if latest else None,
+            "after": None,
+            "completed": False,
+        }
+        return self._compaction
+
+    def _emit_compaction(self, native_type: str) -> list[NormalizedEvent]:
+        compaction, self._compaction = self._compaction, None
+        if compaction is None:
+            return []
+        trigger = "manual" if self.compaction_requested else "auto"
+        self.compaction_requested = False
+        return [
+            compaction_event(
+                trigger=trigger,
+                tokens_before=compaction["before"],
+                tokens_after=compaction["after"],
+                compaction_ref=compaction["ref"],
+                native_type=native_type,
+            )
+        ]
+
+    def _flush_compaction(self, native_type: str) -> list[NormalizedEvent]:
+        """Record a finished compaction whose ``after`` never arrived."""
+        if self._compaction is None or not self._compaction["completed"]:
+            return []
+        return self._emit_compaction(native_type)
+
     def _normalize(
         self,
         raw: Mapping[str, Any],
@@ -444,6 +628,10 @@ class CodexAdapter(ConversationAdapter):
         if not isinstance(method, str) or not isinstance(params, dict):
             return []
         if method == "thread/started":
+            return []
+        if method == "thread/compacted":
+            # Deprecated in the installed protocol. The ``contextCompaction``
+            # item is the one signal; reading both would record it twice.
             return []
         if method == "turn/started":
             return [
@@ -468,17 +656,36 @@ class CodexAdapter(ConversationAdapter):
             kind, ref = self._item_kind(params)
             if kind in {None, "agentMessage", "reasoning"}:
                 return []
+            if kind == COMPACTION_ITEM:
+                # Not a tool: the compaction is recorded once, on completion.
+                flushed = self._flush_compaction(method)
+                self._open_compaction(ref)
+                return flushed
             return [
+                *self._flush_compaction(method),
                 NormalizedEvent(
                     "tool.started",
                     {"tool_ref": ref, "name": kind},
                     method,
-                )
+                ),
             ]
         if method == "item/completed":
             kind, ref = self._item_kind(params)
             if kind in {None, "agentMessage", "reasoning"}:
                 return []
+            if kind == COMPACTION_ITEM:
+                compaction = self._compaction
+                if compaction is None or compaction["completed"]:
+                    flushed = self._flush_compaction(method)
+                    compaction = self._open_compaction(ref)
+                else:
+                    flushed = []
+                compaction["completed"] = True
+                if compaction["after"] is None:
+                    # No size arrived while the item was open; the next
+                    # token-usage update is the first reading after it.
+                    return flushed
+                return [*flushed, *self._emit_compaction(method)]
             item = params.get("item")
             status = item.get("status") if isinstance(item, dict) else None
             return [
@@ -540,9 +747,34 @@ class CodexAdapter(ConversationAdapter):
                 for key, value in source.items()
                 if isinstance(value, (int, float)) and not isinstance(value, bool)
             }
-            return [
-                NormalizedEvent("usage", {"tokens": usage}, method)
-            ] if usage else []
+            if not usage:
+                return []
+            reading = self._usage_reading(source)
+            events: list[NormalizedEvent] = []
+            if reading is not None:
+                self._reading = reading
+                compaction = self._compaction
+                if compaction is not None and compaction["completed"]:
+                    compaction["after"] = reading[0]
+                    events.extend(self._emit_compaction(method))
+                elif compaction is not None and reading[2]:
+                    # The zero-input update inside the item. A repeat of it
+                    # only restates the same figure: one marker, no more.
+                    compaction["after"] = reading[0]
+            events.append(
+                usage_event(
+                    usage,
+                    method,
+                    scope="request",
+                    context_tokens=reading[0] if reading else None,
+                    context_window=(
+                        token_usage.get("modelContextWindow")
+                        if isinstance(token_usage, dict)
+                        else None
+                    ),
+                )
+            )
+            return events
         if method == "turn/completed":
             turn = params.get("turn")
             status = turn.get("status") if isinstance(turn, dict) else None
@@ -553,6 +785,7 @@ class CodexAdapter(ConversationAdapter):
             }.get(status, "run.failed")
             error = turn.get("error") if isinstance(turn, dict) else None
             return [
+                *self._flush_compaction(method),
                 NormalizedEvent(
                     event_type,
                     {"status": status or "failed", "error": error},
@@ -577,6 +810,9 @@ class CodexAdapter(ConversationAdapter):
             },
             "thread.start-or-resume",
         )
+        if turn.metadata.get("compaction"):
+            yield from self._stream_compaction(turn)
+            return
         for raw in self._rpc.notifications():
             params = raw.get("params")
             if isinstance(params, dict) and not self._matches(turn, params):
@@ -595,9 +831,129 @@ class CodexAdapter(ConversationAdapter):
                 if event.type in TERMINAL_EVENTS:
                     return
 
+    def _next_notification(
+        self,
+        deadline: float,
+        stopped: Any = None,
+    ) -> Mapping[str, Any] | None:
+        """One notification, or None once ``deadline`` passes, none remain,
+        or ``stopped()`` turns true. The wait is taken in short slices so a
+        Stop is seen promptly."""
+        pull = getattr(self._rpc, "next_notification", None)
+        if callable(pull):
+            while True:
+                if stopped is not None and stopped():
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                raw = pull(min(remaining, COMPACT_POLL_SECONDS))
+                if raw is not None:
+                    return raw
+        if stopped is not None and stopped():
+            return None
+        if self._notification_source is None:
+            self._notification_source = iter(self._rpc.notifications())
+        return next(self._notification_source, None)
+
+    def _stream_compaction(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
+        """Follow a requested compaction to its terminal, within a bound.
+
+        The request was accepted before this runs. The app-server then starts
+        a turn of its own for the compaction; its id is adopted from
+        ``turn/started`` so the exact-turn checks apply from there on. A
+        thread that never starts that turn, or a turn that outlives the wait,
+        ends the run without a compaction: the caller reports that the
+        harness did not say it compacted. A Stop before the turn id is known
+        cannot be sent to Codex (there is no turn to name), so it ends the
+        wait here and the run is interrupted; the app-server is closed with
+        the run. Codex states no token usage for the compaction request: the
+        updates around it are the last turn's, replayed, and its estimate of
+        the new context, so none is passed on as this run's usage.
+        """
+        deadline = time.monotonic() + self.compact_start_seconds
+        adopted = False
+
+        def stopped() -> bool:
+            return not adopted and bool(turn.metadata.get("interrupt_requested"))
+
+        while True:
+            raw = self._next_notification(deadline, stopped)
+            if raw is None:
+                break
+            params = raw.get("params")
+            if not isinstance(params, dict):
+                continue
+            if adopted:
+                if not self._matches(turn, params):
+                    continue
+            else:
+                thread_ref = params.get("threadId")
+                if thread_ref is not None and thread_ref != turn.session_ref:
+                    continue
+                native = params.get("turn")
+                native_ref = native.get("id") if isinstance(native, dict) else None
+                if (
+                    raw.get("method") == "turn/started"
+                    and isinstance(native_ref, str)
+                    and native_ref
+                ):
+                    adopted = True
+                    # The broker persists the changed reference, so recovery
+                    # and Stop name the real turn from here on.
+                    turn.run_ref = native_ref
+                    turn.metadata["adopted"] = True
+                    deadline = time.monotonic() + self.compact_wait_seconds
+                    if turn.metadata.get("interrupt_requested"):
+                        # Stop arrived as the turn started: pass it on now.
+                        try:
+                            self._rpc.request(
+                                "turn/interrupt",
+                                {"threadId": turn.session_ref, "turnId": native_ref},
+                            )
+                        except AdapterError:
+                            pass
+            for event in self._normalize(raw):
+                if event.type == "usage":
+                    continue
+                if event.type in TERMINAL_EVENTS:
+                    turn.metadata["terminal"] = event.type
+                    if event.interrupt_evidence:
+                        turn.metadata["interrupt_evidence"] = (
+                            event.interrupt_evidence
+                        )
+                yield event
+                if event.type in TERMINAL_EVENTS:
+                    return
+        # The tag is cleared only after a finished compaction is flushed, so
+        # that marker is still ``manual``.
+        yield from self._flush_compaction("compaction.wait")
+        self.compaction_requested = False
+        if stopped():
+            turn.metadata["terminal"] = "run.interrupted"
+            turn.metadata["interrupt_evidence"] = "operator"
+            yield NormalizedEvent(
+                "run.interrupted",
+                {"status": "cancelled"},
+                "operator.interrupt",
+                "operator",
+            )
+            return
+        turn.metadata["terminal"] = "run.completed"
+        yield NormalizedEvent(
+            "run.completed",
+            {"status": "completed", "compaction_wait": "elapsed"},
+            "compaction.wait",
+        )
+
     def interrupt(self, turn: NativeTurn) -> InterruptResult:
         if self._rpc is None:
             return InterruptResult(False, "Codex app-server is not connected")
+        if turn.metadata.get("compaction") and not turn.metadata.get("adopted"):
+            # A requested compaction has no turn id until Codex starts it.
+            # The stream sees this flag and ends the wait.
+            turn.metadata["interrupt_requested"] = True
+            return InterruptResult(True)
         self._rpc.request(
             "turn/interrupt",
             {"threadId": turn.session_ref, "turnId": turn.run_ref},

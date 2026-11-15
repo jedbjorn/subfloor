@@ -29,6 +29,7 @@ NORMALIZED_EVENTS = {
     "permission.requested",
     "input.requested",
     "usage",
+    "context.compacted",
     "run.completed",
     "run.failed",
     "run.interrupted",
@@ -170,7 +171,7 @@ class ConversationCapabilityContractTest(unittest.TestCase):
             {
                 "minimum_cli_version": "0.30.0",
                 "verified_cli_version": "0.33.0",
-                "maximum_cli_version_exclusive": "0.34.0",
+                "maximum_cli_version_exclusive": "2.6.0",
             },
         )
         self.assertEqual(
@@ -185,7 +186,7 @@ class ConversationCapabilityContractTest(unittest.TestCase):
             {
                 "minimum_cli_version": "0.30.0",
                 "verified_cli_version": "0.33.0",
-                "maximum_cli_version_exclusive": "0.34.0",
+                "maximum_cli_version_exclusive": "2.6.0",
             },
         )
         self.assertEqual(conversation["driver"], "kimi-print")

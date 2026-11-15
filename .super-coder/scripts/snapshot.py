@@ -30,6 +30,7 @@ import urllib.request
 from pathlib import Path
 
 import artifact_policy
+import cli_credential
 import db_driver
 import instance_state
 import map_db
@@ -146,6 +147,11 @@ PER_INSTANCE_TABLES = [
     # the engine's baseline; content.sql loads AFTER migrations on rebuild, so
     # the fork's edits win — without this the GUI's changes vanish on rebuild.
     "flavor_defaults",
+    # chat_compaction_settings is operator-tuned like flavor_defaults (the
+    # Harness tab cards' Auto and Idle compaction, Feature #95 spec #275):
+    # without it a saved trigger or idle wait vanishes on rebuild and the
+    # environment/defaults silently take over again.
+    "chat_compaction_settings",
     # Browser-native conversations are durable instance truth: exact harness
     # refs, message queues, recovery evidence, replay events, and pending
     # outbox work must all survive update/rebuild. Parents precede
@@ -166,6 +172,9 @@ PER_INSTANCE_TABLES = [
     # survive update/rebuild together.
     *SPRINT_INSTANCE_TABLES,
     "runs",
+    # A subagent run's facts (harness, model, worktree, session) are part of
+    # the run; without them a rebuilt agent row would name no harness.
+    "run_agents",
     "engine_wake_receipts",
     "engine_wake_failures",
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
@@ -681,13 +690,25 @@ def _snapshot_via_runtime_api() -> str | None:
             "serializing this checkout offline instead"
         )
         return None
+    # The review API answers `/api/*` only to a signed-in browser or to a
+    # credential it accepts (Feature #94). This verb presents the engine CLI
+    # credential THIS checkout's runtime published for the port being called,
+    # never another port's and never an ambient `SC_API_TOKEN`, which may
+    # belong to another installation (see above).
+    # No credential on disk means a runtime from before sign-in, which asks
+    # for none.
     request = urllib.request.Request(
-        base + "/api/scripts/snapshot", data=b"", method="POST"
+        base + "/api/scripts/snapshot", data=b"", method="POST",
+        headers=cli_credential.authorization(port),
     )
     try:
         with urllib.request.urlopen(request, timeout=185) as response:
             raw_payload = response.read()
     except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise SystemExit(
+                "snapshot: " + cli_credential.refused(port, exc.code)
+            ) from exc
         try:
             payload = json.loads(exc.read())
             detail = payload.get("output") or payload.get("error") or str(exc)

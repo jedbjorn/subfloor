@@ -127,18 +127,32 @@ class AttachmentsTest(ApiFixture, unittest.TestCase):
         self.assertTrue(receipt['evidence_pruned'])
         self.assertEqual(receipt['summary']['passed'], 3)
 
-    def test_pr_list_shows_open_first_and_caps_with_total(self):
+    def test_pr_list_shows_only_open_prs_newest_first_capped_with_open_total(self):
         self.observe(self.head)
-        for number in range(100, 100 + run_attachments.PR_LIMIT + 2):
+        def add(number, state=None, title=None):
             sub = self.con.execute("INSERT INTO pr_subscriptions(owner_shell_id,repository,pr_number) VALUES(1,'fixture/project',?)",
                                    (number,)).lastrowid
-            self.con.execute("INSERT INTO pr_subscription_transitions(subscription_id,normalized_state,transition_key) "
-                             "VALUES(?,'merged',?)", (sub, f'merged-{number}'))
+            if state:
+                self.con.execute("INSERT INTO pr_subscription_transitions(subscription_id,normalized_state,transition_key,evidence) "
+                                 "VALUES(?,?,?,?)", (sub, state, f'{state}-{number}', json.dumps({'title': title} if title else {})))
+        for number in range(100, 103):
+            add(number, 'merged')
+        add(103, 'closed')
+        add(104, 'red', 'Fix the thing')
+        add(105)                                    # discovered, not yet observed: open
         self.con.commit()
         listed = self.attachments.prs(1)
-        # The oldest PR is the only open one, so it leads despite 22 newer merged PRs.
-        self.assertEqual(listed['prs'][0]['pr_number'], 42)
+        self.assertEqual([pr['pr_number'] for pr in listed['prs']], [105, 104, 42])
+        self.assertEqual([pr['normalized_state'] for pr in listed['prs']], [None, 'red', 'green'])
+        self.assertEqual(listed['prs'][1]['title'], 'Fix the thing')
+        self.assertIsNone(listed['prs'][0]['title'])
+        self.assertEqual(listed['total'], 3)
+        for number in range(200, 200 + run_attachments.PR_LIMIT):
+            add(number, 'pending')
+        self.con.commit()
+        listed = self.attachments.prs(1)
         self.assertEqual(len(listed['prs']), run_attachments.PR_LIMIT)
+        self.assertEqual(listed['prs'][0]['pr_number'], 200 + run_attachments.PR_LIMIT - 1)
         self.assertEqual(listed['total'], run_attachments.PR_LIMIT + 3)
 
     def test_receipts_and_run_list_return_newest_within_limit(self):

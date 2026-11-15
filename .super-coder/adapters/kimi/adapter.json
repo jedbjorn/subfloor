@@ -22,13 +22,28 @@
     "launch": ["kimi"],
     "prompt_flag": "-p",
     "model_flag": "-m",
-    "effort": { "env": "KIMI_MODEL_THINKING_EFFORT" }
+    "effort": { "env": "KIMI_MODEL_THINKING_EFFORT" },
+    "agent": {
+      "brief": { "delivery": "argument" },
+      "result": {
+        "flags": ["--output-format", "stream-json"],
+        "source": "stdout_jsonl",
+        "select": { "role": "assistant" },
+        "field": "content"
+      },
+      "session": {
+        "source": "event",
+        "select": { "type": "session.resume_hint" },
+        "field": "session_id"
+      },
+      "resume": { "flag": "-S" }
+    }
   },
   "conversation": {
     "contract_version": 1,
     "minimum_cli_version": "0.30.0",
     "verified_cli_version": "0.33.0",
-    "maximum_cli_version_exclusive": "0.34.0",
+    "maximum_cli_version_exclusive": "2.6.0",
     "driver": "kimi-print",
     "session_ref": {
       "source": "native-session-store",
@@ -44,6 +59,14 @@
     },
     "stream": { "transport": "stdout-jsonl-with-raw-interleave" },
     "interrupt": { "mechanism": "signal", "signal": "SIGINT" },
+    "compact": {
+      "mechanism": "acp-session-prompt",
+      "command": ["acp"],
+      "prompt": "/compact",
+      "identity_source": "appended-main-wire-full_compaction.begin",
+      "completion_source": "main-wire-full_compaction.complete",
+      "checked_cli_version": "2.5.3"
+    },
     "inspect": { "mechanism": "native-session-store" },
     "permission_policy": "kimi-prompt-auto-mode",
     "execution_permissions": {
@@ -60,6 +83,7 @@
       "permission.requested",
       "input.requested",
       "usage",
+      "context.compacted",
       "run.completed",
       "run.failed",
       "run.interrupted"

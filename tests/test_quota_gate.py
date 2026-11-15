@@ -49,6 +49,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -145,11 +146,14 @@ class GateCase(unittest.TestCase):
         self.claude_profile = self.tmp / ".claude.json"
         self.codex_auth = self.tmp / ".codex/auth.json"
         self.kimi_creds = self.tmp / ".kimi-code/credentials/kimi-code.json"
+        home = mock.patch.dict(os.environ, {
+            "KIMI_CODE_HOME": str(self.tmp / ".kimi-code")})
+        home.start()
+        self.addCleanup(home.stop)
         self.write_credentials()
 
-        # Paths resolve at import time, so the constants are patched rather
-        # than $HOME — the same read the real code performs, without ever
-        # touching the operator's own files.
+        # Credential paths and Kimi's per-call home override point into the
+        # temporary root, without ever touching the operator's own files.
         self.patch(p_anthropic, CREDENTIALS=self.claude_creds,
                    PROFILE=self.claude_profile)
         self.patch(p_openai, CREDENTIALS=self.codex_auth)

@@ -5125,9 +5125,11 @@ class SprintWorkUnitStore:
             f"All planned delivery work for Sprint {sprint_id} is terminal "
             f"({total} units: {int(state['completed'])} completed, "
             f"{int(state['cancelled'])} cancelled). Begin whole-Sprint "
-            "conformance per sprint_rev — compile the evidence packet, judge "
-            "integrated main, then send the Planner either a re-enter decision "
-            "or your conclude decision."
+            "conformance per sprint_rev — compile the evidence packet and judge "
+            "integrated main. Clean or post-Sprint-only findings -> close with "
+            "`sc sprint record-conformance` and send no conclude message; "
+            "in-Sprint patching needed -> send the Planner a Sprint-level "
+            "re-enter decision instead."
         )
         from sprint_message_delivery import SprintMessageStore
 

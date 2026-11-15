@@ -14,10 +14,13 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tests"))
+from signin_fixture import server_argv, sign_in  # noqa: E402
 
 
 class FreshForkInstallTest(unittest.TestCase):
@@ -189,8 +192,9 @@ class FreshForkInstallTest(unittest.TestCase):
             timeout=120,
         )
 
-    def fetch_json(self, url: str) -> dict:
-        with urllib.request.urlopen(url, timeout=2) as response:
+    def fetch_json(self, url: str, headers: dict | None = None) -> dict:
+        request = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(request, timeout=2) as response:
             self.assertEqual(response.status, 200)
             return json.loads(response.read())
 
@@ -200,13 +204,13 @@ class FreshForkInstallTest(unittest.TestCase):
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
         with tempfile.TemporaryFile(mode="w+") as log:
+            # The review API answers `/api/*` to a signed-in browser only
+            # (Feature #94). The fresh install has no GUI user yet, so the
+            # test publishes one session where this server is told to look.
+            self.sessions = Path(tempfile.mkdtemp(prefix="sc-install-signin-"))
+            self.addCleanup(shutil.rmtree, self.sessions, True)
             process = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(repo / ".super-coder/api/server.py"),
-                    "--port",
-                    str(port),
-                ],
+                server_argv(repo, self.sessions, "--port", str(port)),
                 cwd=repo,
                 env={
                     **os.environ,
@@ -385,7 +389,17 @@ class FreshForkInstallTest(unittest.TestCase):
                 )
 
             with self.live_api(repo, home) as base:
-                shells = self.fetch_json(f"{base}/api/shells")["shells"]
+                # Before anyone signs in: locked, and it says so.
+                with self.assertRaises(urllib.error.HTTPError) as refused:
+                    self.fetch_json(f"{base}/api/shells")
+                self.assertEqual(refused.exception.code, 401)
+                status = self.fetch_json(f"{base}/api/auth/status")
+                self.assertEqual(
+                    (status["enrolled"], status["signed_in"]), (False, False))
+                browser = sign_in(directory=self.sessions,
+                                  host=base.removeprefix("http://"))
+                signed = browser.headers(origin=False)
+                shells = self.fetch_json(f"{base}/api/shells", signed)["shells"]
                 self.assertEqual(len(shells), 10)
                 self.assertEqual(
                     {shell["shortname"] for shell in shells},
@@ -403,7 +417,7 @@ class FreshForkInstallTest(unittest.TestCase):
                     },
                 )
                 conversations = self.fetch_json(
-                    f"{base}/api/conversations?open=true&limit=100"
+                    f"{base}/api/conversations?open=true&limit=100", signed
                 )
                 self.assertEqual(
                     conversations,

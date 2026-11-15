@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -27,6 +28,8 @@ MIGRATIONS = (
     ENGINE / "migrations" / "0261_dev_long_job_guidance.sql",
     ENGINE / "migrations" / "0262_reseed_sprint_resume_reentry.sql",
     ENGINE / "migrations" / "0280_remove_sprint_followups.sql",
+    ENGINE / "migrations" / "0282_skills_dedupe_posture.sql",
+    ENGINE / "migrations" / "0284_reseed_sprint_consistency.sql",
 )
 sys.path.insert(0, str(ENGINE / "scripts"))
 
@@ -42,25 +45,58 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
     def test_fresh_developer_template_carries_the_complete_boundary(self):
         # F72: the posture lives in the dev flavor's procedure body, rendered
         # into the system prompt after the JSON focus.
-        focus = (ENGINE / "templates" / "shells" / "dev.md").read_text()
+        # The boot keeps the boundary every Developer turn needs and names
+        # `spec_execution`; the long-job, CI-fallback and check-state rules
+        # live in that skill.
+        focus = " ".join(
+            (ENGINE / "templates" / "shells" / "dev.md").read_text().split()
+        )
 
         self.assertEqual(focus.count(POLICY_HEADING), 1)
         self.assertIn("every available smallest affected test target", focus)
-        self.assertIn("Complete the implementation before using CI fallback", focus)
+        self.assertIn("incomplete code is a failure", focus)
+        self.assertIn("a lost outcome is unknown, never a pass", focus)
+        self.assertIn(FULL_SUITE_BOUNDARY, focus)
+        self.assertIn(SHARED_HOST_BOUNDARY, focus)
+        posture = focus.split(POLICY_HEADING, 1)[1].split("## ", 1)[0]
+        self.assertIn("`spec_execution`", posture)
+        # Spec #276: seat-specific waiting lives in the boot SEAT section.
+        self.assertIn("Wait on a long check the way your SEAT section says.", posture)
+        probes = focus.split("## BOUNDED PROBES", 1)[1].split("## ", 1)[0]
+        self.assertIn("Its completion wakes you;", probes)
+        self.assertIn(
+            "the PR watcher sends the shell that opened a PR its red, green, "
+            "closed and merged facts",
+            probes,
+        )
+        self.assertIn("do not replace those with a polling job.", probes)
+        self.assertIn("`sc job watch pr --pr <n>` is one bounded watch", probes)
+        self.assertIn("`sc job watch timer --after <seconds>`", probes)
+        self.assertIn("it grants no merge authority", probes)
+        self.assertIn(
+            "How these wakes reach you, and when you watch for yourself instead: SEAT.",
+            probes,
+        )
+        for split in ("headless seat", "terminal seat"):
+            self.assertNotIn(split, focus.lower())
+        # Spec #273: a shell never loops on `gh`; that rule now rides SEAT — GUI.
+        seat = " ".join((ENGINE / "scripts" / "run_seat.py").read_text().split())
+        self.assertIn("Never loop on `gh` in your turn.", seat)
+
+        skill = ASSETS / "spec_execution" / "SKILL.md"
+        detail = " ".join(skill.read_text().split())
+        self.assertIn("Complete the implementation before using CI fallback", detail)
         self.assertIn(
             "Required checks pending -> wait; red -> diagnose, fix, and push; "
             "green -> review readiness",
-            focus,
+            detail,
         )
-        self.assertIn("incomplete code is a failure", focus)
-        self.assertIn("no trustworthy seat remains", focus)
-        self.assertIn("browser-capability skip is informational and non-failing", focus)
-        self.assertIn(LONG_JOB_BOUNDARY, focus)
-        self.assertIn("end the turn and continue on the owner wake", focus)
-        self.assertIn("A lost outcome is unknown, never a pass.", focus)
-        self.assertIn("Do not set up independent watchers.", focus)
-        self.assertIn(FULL_SUITE_BOUNDARY, focus)
-        self.assertIn(SHARED_HOST_BOUNDARY, focus)
+        self.assertIn("no trustworthy seat remains", detail)
+        self.assertIn(
+            "browser-capability skip is informational and non-failing", detail
+        )
+        self.assertIn(LONG_JOB_BOUNDARY, detail)
+        self.assertIn("A lost outcome is unknown, never a pass.", detail)
 
     def test_role_guidance_keeps_ci_fallback_and_authority_boundaries(self):
         bodies = {
@@ -74,23 +110,44 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
         bodies["dev"] = (ENGINE / "templates" / "shells" / "dev.md").read_text()
 
         normalized = {name: " ".join(body.split()) for name, body in bodies.items()}
+        dev_pack = json.loads(
+            (ENGINE / "templates" / "shells" / "dev.json").read_text())
+        planner_pack = json.loads(
+            (ENGINE / "templates" / "shells" / "planner.json").read_text())
         self.assertIn("TESTING POSTURE", normalized["sprint_dev"])
-        self.assertIn("follows TESTING POSTURE", normalized["dev"])
+        self.assertIn("Verification follows TESTING POSTURE", normalized["dev"])
         self.assertIn("Verification", normalized["dev"])
 
         self.assertIn(
             "Register complete code even when a local gate is unavailable",
             normalized["sprint_dev"],
         )
-        for state in (
-            "pending ->",
-            "red ->",
-            "green ->",
-            "none or untrustworthy watcher",
-        ):
+        # The full pending/red/green rule and the failure definitions have one
+        # home, `spec_execution` (granted to the Developer pack); sprint_dev
+        # keeps only the Sprint-specific actions and points there.
+        self.assertIn("spec_execution", dev_pack["skills"])
+        self.assertIn("TESTING POSTURE's (`spec_execution`)", normalized["sprint_dev"])
+        for state in ("pending -> stop for the native wake",
+                      "green -> judge, then request review",
+                      "blocked gate -> report it to the Planner as a blocker"):
             self.assertIn(state, normalized["sprint_dev"])
-        self.assertIn("incomplete code = failure", normalized["sprint_dev"])
-        self.assertIn("Optional browser skip = non-failing", normalized["sprint_dev"])
+        for moved in ("incomplete code = failure",
+                      "Optional browser skip = non-failing"):
+            self.assertNotIn(moved, normalized["sprint_dev"])
+        posture = " ".join(
+            (ASSETS / "spec_execution" / "SKILL.md").read_text().split())
+        for rule in (
+            "Required checks pending -> wait; red -> diagnose, fix, and push; "
+            "green -> review readiness.",
+            "red CI result, or incomplete code is a failure",
+            "No configured checks or an untrustworthy watcher after one bounded "
+            "read -> block",
+            "browser-capability skip is informational and non-failing",
+        ):
+            self.assertIn(rule, posture)
+        # The Planner pack has no `spec_execution`, so sprint_pln keeps its own
+        # statement (asserted below).
+        self.assertNotIn("spec_execution", planner_pack["skills"])
 
         self.assertIn("## Canonical states", bodies["dev_kit"])
         self.assertIn("`deps`, `test`, `lint`, and `typecheck`", normalized["dev_kit"])
@@ -191,10 +248,16 @@ class FocusedDeveloperVerificationMigrationTest(unittest.TestCase):
         )
         self.assertEqual(first_prompts[2].count(POLICY_HEADING), 1)
         self.assertEqual(first_prompts[3], original_planner)
+        # These migrations wrote the full posture into every Developer prompt.
+        # The template has since shortened it to a trigger for `spec_execution`
+        # and `refresh_standard_prompts` converges live rows on the template,
+        # so prove here that both migrated rows agree and carry the boundary.
+        migrated_policy = self._testing_posture(first_prompts[1])
+        self.assertEqual(self._testing_posture(first_prompts[2]), migrated_policy)
+        for boundary in (FULL_SUITE_BOUNDARY, SHARED_HOST_BOUNDARY, LONG_JOB_BOUNDARY):
+            self.assertIn(boundary, migrated_policy)
         source_focus = (ENGINE / "templates" / "shells" / "dev.md").read_text()
-        source_policy = self._testing_posture(source_focus)
-        self.assertEqual(self._testing_posture(first_prompts[1]), source_policy)
-        self.assertEqual(self._testing_posture(first_prompts[2]), source_policy)
+        self.assertEqual(source_focus.count(POLICY_HEADING), 1)
 
         paths = {
             name: ASSETS / name / "SKILL.md"

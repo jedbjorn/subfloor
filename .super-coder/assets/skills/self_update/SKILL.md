@@ -1,6 +1,6 @@
 ---
 name: self_update
-description: Update this fork's Subfloor engine in place — fetch + materialize new code + migrations, all memory intact; sound rollback. The shell hands off to its own next boot. Use when a Subfloor update is available.
+description: Update the Subfloor engine in place with sc update; use when an update is available or an engine change just merged in the source repo. In a fork it fetches + materializes new code + migrations; in the source repo it reconciles the tracked engine. All memory intact; sound rollback. The shell hands off to its own next boot.
 category: substrate
 command: sc update
 common: false
@@ -14,6 +14,17 @@ touches no data; a schema change applies as an in-place migration, never a
 destructive rebuild. `current_state`, narrative, decisions, flags, seed, and
 L&S all carry across. This is succession for the substrate: you handing off to
 you.
+
+## In the source repo
+
+The procedure below is written for a tracking fork. In the Subfloor source
+repo (your boot's PROJECT vs ENGINE section says you are upstream) the engine
+is tracked source, so there is nothing to fetch, materialize, or pin: after an
+engine change merges, sync the main checkout with `origin/main`, then run
+`sc update`, which reconciles the tracked engine and its managed catalogue in
+place. Steps 1, 3, 4, and 6 apply as written; step 5 has nothing to commit,
+because the engine arrived by merge and `.sc-state/engine.ref` is not the
+delivery unit here.
 
 ## When
 
@@ -50,11 +61,14 @@ you.
 4. **Record the crossing.** Append a narrative entry — identity event for a
    shell that updates its own floor. Note what changed + write the handoff.
 
-5. **Commit only the public update.**
-   Stage `.sc-state/engine.ref` (the pin), the root `sc` dispatcher if it
-   changed, and other deliberately authored public files. Snapshot SQL and
-   `_sc` renders remain ignored beneath `.sc-state/local/`; never force-add
-   them. `.super-coder/` and `engine.ref.prev` are also gitignored in forks.
+5. **Let the engine land the repin.** In a fork, `sc update` (and every
+   `sc launch` / `sc restart`) commits the engine-managed files — `sc`,
+   `.sc-state/engine.ref`, `.sc-state/engine.source`, the managed `.gitignore`
+   block — to the `subfloor/repin` PR, merges it and fast-forwards main. Never
+   stage those by hand; a `⚠ repin:` warning names what to fix and the next
+   launch retries. Snapshot SQL and `_sc` renders remain ignored beneath
+   `.sc-state/local/`; never force-add them. In the source repo, commit the
+   reconciled tree on a branch as usual.
 
 6. **Reboot** the session -> boot onto the new floor.
 
@@ -89,5 +103,5 @@ restored `.sc-state/` if the rolled-back floor should persist.
 Every schema change AFTER a fork exists ships as a migration file
 (`migrations/NNNN_*.sql`), never an edit to `schema.sql` — a baseline edit
 reaches fresh clones but never an existing fork; the migration ledger carries
-the delta. Authoring engine changes: structural change -> new migration file,
-additive where possible.
+the delta. Authoring engine changes (source repo): structural change -> new
+migration file, additive where possible.

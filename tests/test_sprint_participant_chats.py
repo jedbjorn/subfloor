@@ -195,7 +195,7 @@ def test_wake_prompt_retries_only_unconfirmed_sprint_writes(
 ) -> None:
     prompt = sprint_participant_chats.wake_prompt(23, role)
 
-    assert f"Sprint 23 handoff for your {label} role. Load `{skill}`." in prompt
+    assert f"Sprint 23 handoff for your {label} role. Load `sprint_protocol`, then `{skill}`." in prompt
     assert "If the handoff is not complete" not in prompt
     assert "run `sc sprint inbox --sprint 23` again" not in prompt
     assert (

@@ -203,23 +203,18 @@ def do_exec(name: object, command: object, timeout: int = SSH_TIMEOUT) -> dict:
     }
 
 
-def _inside(path: Path, roots: tuple[Path, ...]) -> bool:
-    return any(path == root or path.is_relative_to(root) for root in roots)
-
-
 def do_push(name: object, src: object, dest: object) -> dict:
     entry, error = _connection(name)
     if error:
         return error
     if not isinstance(src, str) or not isinstance(dest, str) or not dest:
         return _error("remote_push_invalid", "push requires source and destination")
-    repo_root = ports.ENGINE.parent.resolve()
-    source = Path(src)
-    if not source.is_absolute():
-        source = repo_root / source
-    source = source.resolve()
-    if not _inside(source, (repo_root,)):
-        return _error("remote_path_not_allowed", "push source must be inside the repo")
+    # One helper for both seats: the same roots and the same carved-out
+    # sub-trees `./sc vm push` applies (vm.transfer_path).
+    source, path_error = vm.transfer_path(src, "push")
+    if path_error:
+        return path_error
+    assert source is not None
     if not source.is_file():
         return _error("remote_push_invalid", "push source is not a file")
     assert entry is not None and isinstance(name, str)
@@ -245,18 +240,16 @@ def do_pull(name: object, src: object, dest: object) -> dict:
         return error
     if not isinstance(src, str) or not src or not isinstance(dest, str):
         return _error("remote_pull_invalid", "pull requires source and destination")
-    repo_root = ports.ENGINE.parent.resolve()
-    local_root = (repo_root / ".sc-state" / "local").resolve()
-    destination = Path(dest)
-    if not destination.is_absolute():
-        destination = repo_root / destination
-    destination = destination.resolve()
-    if not _inside(destination, (repo_root, local_root)):
-        return _error(
-            "remote_path_not_allowed",
-            "pull destination must be inside the repo or .sc-state/local",
-        )
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not dest:
+        return _error("remote_pull_invalid", "pull requires source and destination")
+    destination, path_error = vm.transfer_path(dest, "pull")
+    if path_error:
+        return path_error
+    assert destination is not None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _error("remote_pull_invalid", f"pull destination unusable: {exc}")
     assert entry is not None and isinstance(name, str)
     source = f"{entry['user']}@{entry['host']}:{src}"
     exit_code, stdout, stderr = _run(
@@ -328,6 +321,82 @@ def add_remote(name: object, entry: dict) -> dict:
     })
 
 
+LINK_NEXT = {
+    "remote_key_invalid": (
+        "point --key-path at an absolute, host-owned private key and "
+        "`chmod 600` it, then re-run ./sc remote add"
+    ),
+    "remote_known_hosts_invalid": (
+        "pass an absolute --known-hosts-path, or omit it to let the broker "
+        "pin the host key"
+    ),
+    "remote_config_invalid": "re-run ./sc remote add with --host, --user and --key-path",
+    "remote_unreachable": (
+        "check --host/--user/--port and that the key is authorized on the "
+        "remote, then ./sc remote status <name>"
+    ),
+    "broker_unreachable": "./sc vm-broker-up on the host, then ./sc remote status <name>",
+}
+
+
+def verify_remote(name: str) -> dict:
+    """Test the SAVED remote once over SSH; pass/fail and the next step.
+
+    On the host the check runs in this process (the key is here). A sandboxed
+    caller holds no key, so it asks the broker.
+    """
+    if os.environ.get("SC_SANDBOX"):
+        try:
+            response = vm.broker_call(
+                "GET", f"/remote/{name}/status", None, timeout=30
+            )
+        except (vm.BrokerConnectionError, vm.BrokerTimeoutError,
+                vm.BrokerResponseError):
+            response = {
+                "ok": False, "error": "broker_unreachable",
+                "output": "not run: the VM broker is not reachable from here",
+            }
+    else:
+        response = do_status(name)
+    ok = response.get("ok") is True
+    code = str(response.get("error") or "remote_unreachable")
+    check = {
+        "check": "ssh", "ok": ok,
+        "skipped": not ok and code == "broker_unreachable",
+        "output": str(response.get("output") or "")[:300],
+        "next": None if ok else LINK_NEXT.get(code, LINK_NEXT["remote_unreachable"]),
+    }
+    return {"passed": ok, "checks": [check]}
+
+
+def link_remote(name: object, entry: dict, verify: bool = True) -> dict:
+    """`./sc remote add`: save, start the broker, and test the link.
+
+    The block is durable before the check runs, so a failure reports
+    `remote_verify_failed` and says the remote IS saved. `verify=False` is the
+    save-only form for offline setup.
+    """
+    value = add_remote(name, entry)
+    if not value["ok"] or not verify:
+        return value
+    assert isinstance(name, str)
+    broker = vm.ensure_broker()
+    verified = verify_remote(name)
+    public = value["result"]["remote"]
+    if verified["passed"]:
+        return vm.operation_success(
+            "add", {"remote": public, "broker": broker, "verify": verified}
+        )
+    return vm.operation_error(
+        "add", "remote_verify_failed",
+        f"remote '{name}' IS saved, but the link did not verify. Fix what the "
+        "check names and re-run ./sc remote add, or pass --no-verify to save "
+        "without testing.",
+        {"saved": True, "remote": public, "checks": verified["checks"],
+         "broker": broker},
+    )
+
+
 def remove_remote(name: object) -> dict:
     if not _valid_name(name):
         return vm.operation_error(
@@ -393,8 +462,18 @@ def run_broker_operation(
     try:
         response = vm.broker_call(method, path, body, timeout=timeout)
     except (vm.BrokerConnectionError, vm.BrokerTimeoutError):
+        # `./sc vm-broker-up` starts nothing while no block exists, so say
+        # which case this is instead of always pointing at the broker.
+        if name not in read_all():
+            return vm.operation_error(
+                operation, "remote_not_found",
+                f"remote '{name}' is not declared on this install - add it "
+                "with ./sc remote add (./sc remote list shows what is linked)",
+            )
         return vm.operation_error(
-            operation, "broker_unreachable", "the VM broker is not reachable"
+            operation, "broker_unreachable",
+            f"remote '{name}' is declared but the VM broker is not running - "
+            "start it on the host with ./sc vm-broker-up",
         )
     except vm.BrokerResponseError:
         return vm.operation_error(
@@ -429,14 +508,28 @@ def run_broker_operation(
 def _human_result(value: dict) -> str:
     if not value["ok"]:
         error = value["error"]
-        return f"✗ remote {value['operation']} [{error['code']}]: {error['message']}"
+        head = f"✗ remote {value['operation']} [{error['code']}]: {error['message']}"
+        details = error.get("details") or {}
+        if error["code"] == "remote_verify_failed":
+            return "\n".join([
+                head, *vm.link_lines(details.get("checks"), details.get("broker"))
+            ])
+        return head
     operation = value["operation"]
     result = value["result"]
     if operation == "add":
+        if "verify" in result:
+            return "\n".join([
+                f"Remote '{result['remote']['name']}' saved · link verified",
+                *vm.link_lines(result["verify"]["checks"], result["broker"]),
+            ])
         state = "ready" if result["broker"]["ready"] else (
             "not running; start: ./sc vm-broker-up"
         )
-        return f"Remote '{result['remote']['name']}' saved · broker {state}"
+        return (
+            f"Remote '{result['remote']['name']}' saved (not verified) · "
+            f"broker {state}"
+        )
     if operation == "remove":
         return f"Remote '{result['name']}' removed"
     if operation == "list":
@@ -461,13 +554,21 @@ def build_client_parser() -> argparse.ArgumentParser:
         description="Use broker-served SSH against named remotes.",
     )
     commands = parser.add_subparsers(dest="operation", required=True)
-    add = commands.add_parser("add", help="add or replace a named remote")
+    add = commands.add_parser(
+        "add",
+        help="add or replace a named remote, start the broker and test the link",
+    )
     add.add_argument("name")
     add.add_argument("--host", required=True)
     add.add_argument("--user", required=True)
     add.add_argument("--port", type=int, default=22)
     add.add_argument("--key-path", required=True)
     add.add_argument("--known-hosts-path")
+    add.add_argument(
+        "--no-verify", action="store_true",
+        help="save the remote without testing the link or starting the broker "
+             "(offline setup)",
+    )
     add.add_argument("--json", action="store_true")
     for operation, description in (
         ("remove", "forget a named remote"),
@@ -509,7 +610,7 @@ def client_main(argv: list[str]) -> int:
         }
         if args.known_hosts_path:
             entry["known_hosts_path"] = args.known_hosts_path
-        value = add_remote(args.name, entry)
+        value = link_remote(args.name, entry, verify=not args.no_verify)
     elif args.operation == "remove":
         value = remove_remote(args.name)
     elif args.operation == "list":

@@ -316,8 +316,9 @@ Map :::class2 -> Spec :::class1 -> Build :::class1 -> Review :::class2 -> Author
    `.sc-worktrees/dev1`; each Developer has a separate editing lane.
 5. The Reviewer checks the diff against the spec and reports findings. The
    Developer fixes issues and repeats affected checks until review and CI pass.
-6. Outside an armed Sprint, give an explicit directive **naming the PR** before
-   a shell merges. Review approval and green checks alone are insufficient.
+6. Outside an armed Sprint, give an explicit directive **that identifies the PR**
+   before a shell merges: by number, or by naming an assignment and the condition its
+   PRs must meet. Review approval and green checks alone are insufficient.
    Inside an armed Sprint, your arming decision is the recorded grant; the
    owning Developer merges its registered PR only after live
    `sc sprint authorize-merge` approval.
@@ -766,6 +767,14 @@ Sprint work explicitly); the mechanics live here for the operator.
   the owning Developer, inside or outside a Sprint — see
   [Pull-request wakes](#pull-request-wakes). Planner and Reviewer receive no
   PR-event wakes.
+- **Job wakes.** Every `sc job` run that ends — a command, a subagent, a
+  watch — writes its terminal result, a `result` message in the owner's inbox
+  and a `re-enter` wake in one transaction. The wake resumes the owner's chat
+  at its next boundary, or opens a chat when the shell has none. Several runs
+  ending close together write one message each and may share one wake turn. A
+  shell in a terminal session is never interrupted: the message waits in its
+  inbox for the next boot. A wake states an outcome; it grants no review,
+  merge or Sprint authority.
 - **Coordinate mode.** Closing the Planner chat during an armed Sprint sets
   coordinate mode: idle Planner `re-enter` wakes open fresh ticket chats.
   Pause/resume from the GUI returns to supervise mode; automatic pauses
@@ -780,32 +789,30 @@ Sprint skills and `sc sprint --help`.
 ### Pull-request wakes
 
 Nobody polls GitHub. The API server runs a watcher process that pulses every few
-seconds and turns real PR state changes into durable wakes for the **Developer
-that owns the PR**. You start nothing, and neither does a shell.
+seconds and turns real PR state changes into durable wakes for the **shell
+that opened the PR**. You start nothing, and neither does a shell.
 
-A subscription reaches the watcher three ways:
+A subscription reaches the watcher two ways:
 
-- **Discovery** — the normal path. The engine reads which branch each
-  `.sc-worktrees/<shortname>` has checked out and subscribes that Developer to
-  the newest open PR whose head is that branch. Disposable `shell/*` bases are
-  never candidates.
+- **Discovery** — the normal path. The engine attributes every PR to the shell
+  named by the `Co-Authored-By: … <SHORTNAME@subfloor.local>` trailer on its
+  head commit and subscribes that shell, whatever it has checked out since. A
+  PR opened and merged between two passes is still caught.
 - **`sc sprint register-pr`** — inside a lane, adding the work-unit link on top
   of the same subscription (and attaching to one discovery already made).
-- **`sc pr subscribe --repository <owner/name> --pr <number>`** — the manual
-  fallback for a PR whose head is not the worktree's checked-out branch. That is
-  the verb's only form.
 
-Ownership is taken from the caller's identity, not a flag, and must be a
-Developer shell; one subscription exists per PR, and a second shell claiming it
-is refused. Four states wake the owner — **red**, **green**, **closed**,
+There is no manual subscribe verb. One subscription exists per PR, and a second
+shell claiming it is refused. Four states wake the owner — **red**, **green**, **closed**,
 **merged** — each carrying the repository, number, head SHA and an instruction.
 A state that has not changed (same state, same head SHA) produces no repeat
 wake.
 
 The instruction depends on the Sprint lifecycle. Inside an armed or paused
 Sprint it points at the Sprint's own gate; outside one, a green wake says
-plainly that green is not authorization — merge only under a standing FnB
-directive naming the PR — and a merged wake sends the Developer to the `git`
+plainly that green is not authorization — merge only under an explicit FnB
+directive that identifies the PR, by number or by assignment and stated
+condition —
+and a merged wake sends the Developer to the `git`
 skill's after-merge cleanup. Watcher internals, health and recovery:
 [`.super-coder/docs/sprint-pr-watcher.md`](../.super-coder/docs/sprint-pr-watcher.md).
 
@@ -821,9 +828,89 @@ skill's after-merge cleanup. Watcher internals, health and recovery:
 ```
 
 A job is a detached supervised one-shot. It outlives the shell session that
-started it, captures bounded output, group-kills on timeout, and posts a
-`result` message to the starting shell when it completes. Use it for suites,
-builds, and benchmarks that would otherwise die with the harness process.
+started it, captures bounded output, and group-kills on timeout. When it ends
+it writes a `result` message to the starting shell and wakes that shell (see
+[Wakes](#wakes)). Use it for suites, builds, and benchmarks that would
+otherwise die with the harness process.
+
+### Subagents
+
+```bash
+./sc job agent --harness <name> --model <selector> [--effort <level>] \
+  (--brief-file <path> | --brief "<text>") \
+  [--base <ref>] [--branch <name>] [--label <text>] [--timeout <seconds>]
+./sc job list --kind agent
+./sc job result <id>
+./sc job continue <id> --brief-file <path>
+./sc job kill <id>
+./sc job clean <id> [--discard]
+```
+
+A subagent is one headless harness run that a shell launches for small,
+bounded work: a check, a review by another model family, a research question,
+one contained change. Big work that needs several shells, review and a merge
+is a Sprint. A Claude shell can launch a Codex subagent and the reverse; Kimi
+and OpenCode are offered too, and Vibe is refused because its adapter has no
+headless mode.
+
+- **Identity.** A subagent is not a shell. It acts as the shell that launched
+  it, with that shell's token and git identity, and holds exactly that
+  shell's authority, no more and no less. The engine adds no refusal for what
+  it writes. The brief governs what it does, and the launching shell is
+  accountable for it.
+- **Model and effort.** The harness and model are required. Effort is
+  optional; omitted, the harness's own default for that model applies.
+- **Where it runs.** The engine creates a worktree for it,
+  `.sc-worktrees/agent-<run_id>`, at the launching shell's current commit or
+  at `--base`. `--branch` creates a new branch there; without it the worktree
+  is detached. When the run ends with the worktree unchanged the engine
+  removes it. Files that git ignores do not count as a change and are not
+  kept. A changed worktree stays until its shell runs `sc job clean`.
+- **Result.** The wake states the facts of the run and carries no part of the
+  subagent's final message. `sc job result <id>` prints that message.
+  `sc job continue <id>` resumes the same harness session in the same worktree
+  as a new run.
+- **Who may launch.** Every non-Admin flavor, from a browser chat or a
+  terminal. Inside an armed or paused Sprint, Developers and the Planner may;
+  a Reviewer of that Sprint may not. The operator has no launch control in
+  the browser: shells launch, the operator sees and stops.
+
+| Limit | Value |
+|---|---|
+| Live subagents for one shell | 3 |
+| Live subagents on the install | 6 |
+| Run time of one subagent run | 2 hours by default; `--timeout` up to 8 hours |
+| Nesting | a subagent cannot launch or continue a subagent |
+| Brief size | 64 KiB |
+| Live watchers for one shell | 10 |
+
+A launch that would pass a limit is refused before anything starts, and the
+refusal names the runs that hold the slots.
+
+### Watchers
+
+```bash
+./sc job start --until "<shell command>" [--every <seconds>] [--timeout <seconds>]
+./sc job watch pr --pr <n> [--repository owner/name] [--every <seconds>] [--timeout <seconds>]
+./sc job watch timer --after <seconds>
+```
+
+A watcher is a job that ends when a condition holds and wakes its shell once.
+`--until` repeats a shell command until it exits 0 (every 30 seconds, for at
+most an hour, unless set). `watch pr` ends when a PR's checks settle green or
+red, or it is merged or closed (read every 60 seconds, for at most an hour,
+unless set); any shell may watch any PR it can read, and the wake grants no
+merge authority. `watch timer` ends after a delay of at most 24 hours. Nothing
+recurs: each watcher has one outcome. A Developer's own PR still gets its
+facts from the [PR watcher](#pull-request-wakes).
+
+The **Runs** drawer in a chat and **Shells → Runs** show each subagent's
+harness, model, effort, state, time elapsed and time left, with **Result**,
+**Tail** and **Kill**; a continued subagent is one folded thread; watchers
+show their form, condition and last attempt; the limits are stated at the head
+of each list. The **Worktrees** tab labels a subagent's worktree with its run
+and launching shell. Reference:
+[`.super-coder/docs/runs.md`](../.super-coder/docs/runs.md).
 
 ### Generic headless launch
 
@@ -853,14 +940,31 @@ floor with every row intact. (The shell-facing version of this is the
 `self_update` skill — same procedure, framed as the handoff it is.)
 
 ```bash
-./sc update                     # fetch + materialize the engine, reconcile in place
+./sc update                     # fetch + materialize the engine, reconcile, land the repin
+```
+
+The engine lands its own repin. After the update — and again on every
+`./sc launch` and `./sc restart` — it compares the engine-managed tracked files
+(`sc`, `.sc-state/engine.ref`, `.sc-state/engine.source`, the managed block of
+`.gitignore`) with `origin/<default>`. On drift it commits only those files on
+top of the remote branch (your checkout's branch, index and other edits are
+untouched), force-pushes the `subfloor/repin` branch, opens or reuses its PR
+and merges it — or enables auto-merge when the base requires checks — then
+fast-forwards the main checkout. Shell worktrees pick the pin up on their next
+clean boot. Merging is a standing operator grant scoped to this engine-authored
+PR alone. It needs a GitHub `origin` and a signed-in `gh`; any failure is a
+one-line warning and the next launch retries.
+
+Without a GitHub `origin` or a signed-in `gh`, land the pin by hand:
+
+```bash
 git add .sc-state/engine.ref sc && git commit --no-verify -m "chore: update subfloor"
 ```
 
-The update commit is another deliberate operator-owned commit on the protected
-default branch. Launched shells still create a feature branch first; the
-pre-commit refusal shows every caller the same `--no-verify` recovery, so the
-branch rule is a reminder rail, not a gate.
+That manual update commit is a deliberate operator-owned commit on the
+protected default branch. Launched shells still create a feature branch first;
+the pre-commit refusal shows every caller the same `--no-verify` recovery, so
+the branch rule is a reminder rail, not a gate.
 
 `./sc update` first runs a `git pull --ff-only` for the tracked checkout itself
 — advisory, never blocking: an unsafe or offline pull warns and the engine
@@ -875,7 +979,7 @@ your unsnapshotted in-session writes survive), syncs the skills catalogue
 (id-stable, so grants stay valid), re-grants any new common skills, refreshes the
 repo map, re-installs the `subfloor` shell function for bash and fish, and
 re-snapshots the live state. Nothing under `.super-coder/` is
-committed — you commit only the bumped `.sc-state/engine.ref` and any
+committed — the engine lands the bumped pin itself (above); you commit only
 deliberately authored project changes. Generated snapshots and `_sc` renders
 remain ignored. Then restart the session to boot onto the new floor.
 
@@ -1526,11 +1630,13 @@ since it discards un-snapshotted DB edits). Beside them sit the configuration
 cards — Windows Test VM, Browser, Web Search — and the **Services** panel
 described under [Opt-in features](#opt-in-features).
 
-Browser sign-in normally attaches its own credential. `./sc token` prints the
-current operator token for the paste-it-by-hand recovery path and nothing else
-on stdout; it never rotates the credential, and a missing or insecurely
-permissioned artifact refuses with the supported service action rather than
-printing anything.
+The GUI asks you to sign in with a password and an authenticator code. Create
+the GUI user once on the host with `./sc auth user add <username>`, then
+finish in the browser; `./sc auth user reset <username>` is the recovery path
+for a lost password or authenticator. `./sc token` is retired: no token a CLI
+prints is a browser session. See
+[GUI sign-in](../.super-coder/docs/auth.md) and the
+[browser trust boundary](../.super-coder/docs/interface-trust-boundary.md).
 
 The live engine DB, canonical snapshot and backups live in the private XDG
 instance-state root. See the [engine reference](../.super-coder/README.md) for
@@ -1541,10 +1647,51 @@ current state boundaries and Admin recovery ownership.
 
 ### Shells tab
 
-The landing tab has four sub-views. **Harness** and **Skills** are scoped to the
-selected shell; the other two are fork-wide, and the shell selector greys out on
+The landing tab has five sub-views. **Harness** and **Skills** are scoped to the
+selected shell; the other three are fork-wide, and the shell selector greys out on
 them.
 
+- **Harness** — opens on **Harnesses**, one collapsible card per shipped
+  harness, then the selected shell's own sections. The cards are
+  install-wide: they read the same whichever shell is selected. Collapsed, a
+  card shows the harness, its provider and one summary line (its
+  background-conversion tier and, where it compacts, auto compaction on or
+  off with its trigger, the idle wait, and this week's compaction count).
+  Click the header to expand its sections (the browser remembers which
+  cards are open): **Background conversion** (the GUI conversion status,
+  with Claude's **Re-verify**), then, on the Claude, Codex, Kimi and
+  OpenCode cards, browser-chat **Compaction settings** and **Compaction
+  data**. Vibe's card has no compaction.
+  - *Auto compaction* — a switch and a trigger in tokens; tooltip:
+    "Compacts a chat when its context reaches the trigger size, checked after
+    each turn."
+  - *Idle compaction* — a wait dropdown (Off, or 5 to 55 minutes, kept under
+    the harness's cache life) and an idle size; tooltip: "Compacts a large
+    chat that has gone quiet, before the provider's cache expires, so your
+    next message is cheap."
+  - Each value shows its source (*saved*, *environment* or *default*); a
+    change saves at once, says *Saved* or the refusal beside the field, and
+    applies on each chat's next turn. The trigger and idle size must be at
+    least 90,000: the engine never compacts a chat on its own below that,
+    and a value under it from the environment or an older row is shown as
+    raised to the floor. The card also states the cache life (a fixed engine
+    value) and what applies to that harness: the trigger passed to the
+    harness, compaction after a turn, idle compaction.
+  - *Data*, over 7 or 30 days, from this install's own chats: chats and
+    model requests, median context and the share of requests at or above the
+    trigger, warm share (cache reads of input), cold rate by idle gap, cold
+    returns at or above the idle size, compactions by cause (harness,
+    threshold, idle, operator), idle compactions followed by a message within
+    24 hours, and what the engine's own compaction requests cost. A figure a
+    harness does not report reads *not reported*. The Claude, Codex and Kimi
+    cards link to their Provider Quota card.
+
+  Defaults: Claude auto compaction on at 250,000, idle after 50 minutes;
+  Codex and Kimi on at 250,000, idle after 25; OpenCode both off; idle size
+  125,000 everywhere. `SC_CHAT_COMPACT_WINDOW_CLAUDE` / `_CODEX` are only a
+  fallback until a Claude or Codex value is saved ([environment](environment.md#operator-knobs)).
+  Rules and records:
+  [conversation runtime](../.super-coder/docs/conversation-runtime.md#per-harness-compaction-settings-threshold-and-idle-compaction).
 - **Skills** — read a granted skill's content with an inline grant toggle beside
   each entry. The viewer shows rendered Markdown with a **raw** toggle, plus a
   character count and token estimate. It says whether you are editing a shared
@@ -1561,6 +1708,8 @@ them.
   many configured defaults are actually runnable — each non-runnable default
   named with its reason. If it finds any of that, it says *review verification
   warnings* rather than claiming success.
+- **Runs** — the runs of every shell, as a chat's **Runs** drawer shows
+  them for one (see [Subagents](#subagents)).
 
 ### Links and keys
 
@@ -1616,3 +1765,9 @@ percentage alone, never from a provider's own severity vocabulary. A percentage
 that could not be derived renders `n/a` with no bar rather than a reassuring
 0%, and a failed probe leaves the last-known figures standing with their age
 instead of claiming anything about your account.
+
+The **Settings** drawer (header button) shows the same readings in short
+under **Tokens**: one weekly row per provider (`weekly n/a` when none was
+read), followed by a **5-hour** row wherever the provider reported a 5-hour
+window, each with its reset countdown and percent used. A provider that
+reports no 5-hour window shows the weekly row only; nothing is estimated.

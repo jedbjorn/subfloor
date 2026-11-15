@@ -33,6 +33,7 @@ MIGRATIONS = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 import analytics  # noqa: E402
+import server
 from token_parsers import claude as p_claude  # noqa: E402
 from token_parsers import codex as p_codex  # noqa: E402
 from token_parsers import kimi as p_kimi  # noqa: E402
@@ -309,6 +310,48 @@ class KimiParserTest(unittest.TestCase):
         self.assertEqual(r["provider"], "kimi")
         self.assertEqual(r["title"], "swarm run")
 
+    def test_v2_state_cwd_epoch_ms_and_wire_protocol_provider(self):
+        # Kimi Code 2.x state.json (version 2): workDir -> cwd, createdAt /
+        # updatedAt in epoch ms; llm.request.provider names the wire protocol
+        # ("openai"), so the row keeps the boot-pinned "kimi"; the
+        # session-scope compaction record is real spend and is summed.
+        tmp = Path(tempfile.mkdtemp())
+        repo = tmp / "r"
+        (repo / ".sc-worktrees/dev1").mkdir(parents=True)
+        sess = tmp / "sessions/wd_dev1_x/session_2"
+        (sess / "agents/main").mkdir(parents=True)
+        (sess / "state.json").write_text(json.dumps({
+            "id": "session_2", "version": 2,
+            "cwd": str(repo / ".sc-worktrees/dev1"),
+            "createdAt": 1794517874258, "updatedAt": 1794518434320,
+            "archived": False, "agents": {}, "custom": {}}))
+        def rec(i, o, scope):
+            return json.dumps({"type": "usage.record", "model": "kimi-code/k3.1-pro",
+                               "usage": {"inputOther": i, "output": o,
+                                         "inputCacheRead": 3, "inputCacheCreation": 0},
+                               "usageScope": scope})
+        (sess / "agents/main/wire.jsonl").write_text("\n".join([
+            json.dumps({"type": "llm.request", "provider": "openai",
+                        "model": "k3.1-pro", "modelAlias": "kimi-code/k3.1-pro"}),
+            rec(10, 2, "turn"), rec(100, 4, "session")]))
+        orig = p_kimi.DATA_DIR
+        p_kimi.DATA_DIR = tmp / "sessions"
+        try:
+            rows = p_kimi.sweep(repo, lambda ref: None, lambda m: None)
+        finally:
+            p_kimi.DATA_DIR = orig
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["model"], "kimi-code/k3.1-pro")
+        self.assertEqual(r["input_tokens"], 110)
+        self.assertEqual(r["output_tokens"], 6)
+        self.assertEqual(r["provider"], "kimi")
+        self.assertEqual(r["cwd"], str(repo / ".sc-worktrees/dev1"))
+        self.assertEqual(r["started_at"], "2026-11-12T21:11:14Z")
+        self.assertEqual(r["ended_at"], "2026-11-12T21:20:34Z")
+        self.assertIsNone(r["title"])
+
 
 class OpencodeParserTest(unittest.TestCase):
     def test_reasoning_folds_into_output(self):
@@ -344,6 +387,79 @@ class OpencodeParserTest(unittest.TestCase):
         self.assertEqual(r["reasoning_tokens"], 20)    # split kept informationally
         self.assertEqual(r["input_tokens"], 100)
         self.assertEqual(r["provider"], "openai")
+
+
+class AnalyticsUsageTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = self.tmp / "shell_db.db"
+        build_engine_db(self.db)
+        self.con = sqlite3.connect(self.db)
+        self.con.row_factory = sqlite3.Row
+
+    def tearDown(self):
+        self.con.close()
+
+    def add_usage(self, shell_id, harness, ref, model, provider, started_at):
+        self.con.execute(
+            "INSERT INTO session_token_usage "
+            "(shell_id, harness, harness_session_ref, model, provider, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (shell_id, harness, ref, model, provider, started_at))
+
+    def favorites(self, **query):
+        q = {key: [value] for key, value in query.items()}
+        return server.get_analytics_usage(self.con, q)["favorite_models"]
+
+    def test_favorite_models_share_the_time_and_usage_filters(self):
+        for i in range(4):
+            self.add_usage(1, "codex", f"old-{i}", "gpt-old", "openai",
+                           "2026-01-01T10:00:00Z")
+        self.add_usage(1, "codex", "codex-recent", "gpt-recent", "openai",
+                       "2026-07-19T10:00:00Z")
+        for i in range(2):
+            self.add_usage(1, "kimi", f"kimi-{i}", "kimi-code/k3", "moonshot",
+                           "2026-07-19T10:00:00Z")
+        for i in range(3):
+            self.add_usage(2, "codex", f"dev-{i}", "gpt-dev", "openai",
+                           "2026-07-19T10:00:00Z")
+        self.add_usage(2, "claude", "claude-1", "claude-sonnet", "anthropic",
+                       "2026-07-19T10:00:00Z")
+        for i in range(5):
+            self.add_usage(1, "codex", f"future-{i}", "gpt-future", "openai",
+                           "2026-08-01T10:00:00Z")
+        self.con.commit()
+
+        window = {"from": "2026-07-01T00:00:00Z", "to": "2026-08-01T00:00:00Z"}
+        cases = [
+            ({}, [
+                {"flavor": "admin", "model": "gpt-future", "sessions": 5},
+                {"flavor": "dev", "model": "gpt-dev", "sessions": 3},
+            ]),
+            (window, [
+                {"flavor": "admin", "model": "kimi-code/k3", "sessions": 2},
+                {"flavor": "dev", "model": "gpt-dev", "sessions": 3},
+            ]),
+            ({**window, "harness": "codex"}, [
+                {"flavor": "admin", "model": "gpt-recent", "sessions": 1},
+                {"flavor": "dev", "model": "gpt-dev", "sessions": 3},
+            ]),
+            ({**window, "model": "kimi-code/k3"}, [
+                {"flavor": "admin", "model": "kimi-code/k3", "sessions": 2},
+            ]),
+            ({**window, "model": "claude-sonnet"}, [
+                {"flavor": "dev", "model": "claude-sonnet", "sessions": 1},
+            ]),
+            ({**window, "provider": "moonshot"}, [
+                {"flavor": "admin", "model": "kimi-code/k3", "sessions": 2},
+            ]),
+            ({**window, "shell": "2"}, [
+                {"flavor": "dev", "model": "gpt-dev", "sessions": 3},
+            ]),
+        ]
+        for query, expected in cases:
+            with self.subTest(query=query):
+                self.assertEqual(expected, self.favorites(**query))
 
 
 class CollectorTest(unittest.TestCase):
@@ -513,6 +629,77 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(con.execute(
             "SELECT shell_id FROM session_token_usage "
             "WHERE harness_session_ref='h4'").fetchone()[0], 1)
+
+    def test_subagent_session_is_attributed_to_its_launching_shell_and_run(self):
+        """Feature #96, spec #273 AC 16: a sweep over a session whose cwd is
+        `.sc-worktrees/agent-<run_id>` gives the usage row the launching
+        shell's id and the run id, and shows the tokens on the run row."""
+        con = self.con()
+        con.execute(
+            "INSERT INTO runs (run_id, owner_shell_id, registration_key, kind, label, argv, "
+            "cwd, evidence_path) VALUES (41, 2, 'k', 'agent', 'review', '[\"claude\"]', ?, '/e')",
+            (str(analytics.REPO_ROOT / ".sc-worktrees/agent-41"),))
+        con.execute(
+            "INSERT INTO run_agents (run_id, harness, requested_model, worktree, base_commit) "
+            "VALUES (41, 'claude', 'haiku', ?, ?)",
+            (str(analytics.REPO_ROOT / ".sc-worktrees/agent-41"), "a" * 40))
+        # A command job of the same number as a second worktree is not a subagent.
+        con.execute(
+            "INSERT INTO runs (run_id, owner_shell_id, registration_key, kind, label, argv, "
+            "cwd, evidence_path) VALUES (42, 2, 'j', 'job', 'x', '[\"true\"]', '/r', '/e')")
+        # The launching shell (dev1, a Codex session) was live at the time.
+        con.execute("INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, "
+                    "date, started_at, harness) VALUES (30, 2, '0001', '2026-07-19', "
+                    "'2026-07-19T09:00:00Z', 'codex')")
+        con.commit()
+        con.close()
+
+        data = self.tmp / "claude-data"
+        original = p_claude.DATA_DIR
+        p_claude.DATA_DIR = data
+        self.addCleanup(setattr, p_claude, "DATA_DIR", original)
+        for run_id in (41, 42):
+            cwd = str(analytics.REPO_ROOT / f".sc-worktrees/agent-{run_id}")
+            project = data / p_claude._encode(cwd)
+            project.mkdir(parents=True)
+            (project / f"session-{run_id}.jsonl").write_text("\n".join([
+                user_line("check the spec", cwd=cwd),
+                usage_line(f"m{run_id}a", model="claude-haiku-5-5", cwd=cwd, inp=100),
+                usage_line(f"m{run_id}b", model="claude-haiku-5-5", cwd=cwd, inp=40,
+                           ts="2026-07-19T10:05:00Z"),
+            ]) + "\n")
+
+        summary = analytics.sweep(only="claude", quiet=True)
+        self.assertEqual(summary["inserted"], 2)
+        con = self.con()
+        got = {r["harness_session_ref"].rsplit("/", 1)[-1]: dict(r) for r in con.execute(
+            "SELECT * FROM session_token_usage")}
+        tagged = next(v for k, v in got.items() if "session-41" in k)
+        self.assertEqual((tagged["shell_id"], tagged["run_id"]), (2, 41))
+        # Not unattributed: it sits in the launching shell's session, whatever
+        # harness the subagent ran on.
+        self.assertEqual(tagged["archive_id"], 30)
+        other = next(v for k, v in got.items() if "session-42" in k)
+        self.assertEqual((other["shell_id"], other["run_id"], other["archive_id"]),
+                         (None, None, None))
+        # The run row shows the tokens once a sweep has read them.
+        usage = json.loads(con.execute(
+            "SELECT usage_json FROM run_agents WHERE run_id=41").fetchone()[0])
+        self.assertEqual(usage["input_tokens"], 140)
+        self.assertEqual(usage["output_tokens"], 20)
+        self.assertEqual(usage["cache_read_tokens"], 40)
+        self.assertEqual(usage["models"], ["claude-haiku-5-5"])
+        self.assertTrue(usage["swept_at"])
+        import runs as runs_module
+        row = runs_module.RunStore(con, self.tmp / "engine").get(41)
+        self.assertEqual(row["agent"]["usage_json"]["input_tokens"], 140)
+        # A second sweep is idempotent.
+        analytics.sweep(only="claude", quiet=True, full=True)
+        self.assertEqual(con.execute(
+            "SELECT count(*) FROM session_token_usage").fetchone()[0], 2)
+        self.assertEqual(json.loads(con.execute(
+            "SELECT usage_json FROM run_agents WHERE run_id=41").fetchone()[0])["input_tokens"],
+            140)
 
 
 if __name__ == "__main__":

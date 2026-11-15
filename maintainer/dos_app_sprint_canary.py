@@ -18,6 +18,18 @@ The command is intentionally conservative:
 
 The live canary is intentionally not run in CI.  Hermetic tests inject the
 backend at the controller boundary and prove orchestration and failure cleanup.
+
+Sign-in (Feature #94): the canary plays the browser operator over HTTP, and a
+candidate with GUI sign-in answers only to a session.  The gate it faces is
+the DISPOSABLE install's, which has no GUI user.  As soon as the isolated
+runtime answers, the canary runs that install's own host verbs
+(``tool_session.py``): ``./sc auth user add canary`` for the engine user the
+install was made with, then ``./sc auth sessions mint``, labelled with the
+canary's name.  The session is revoked in cleanup, before the install is
+removed, and on Ctrl-C; a kill while the mint verb itself runs can leave it,
+listed under that label, for ``./sc auth sessions revoke``.  Its cookie is held in memory only and is never in the receipt.  If no
+session can be had the canary stops with ``CANARY_SIGN_IN_REQUIRED`` and
+cleans up.  A candidate from before sign-in needs none.
 """
 
 from __future__ import annotations
@@ -42,10 +54,19 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tool_session  # noqa: E402  (the operator session of a maintainer tool)
+
 RECEIPT_VERSION = 1
 WORKSPACE_PREFIX = "subfloor-dos-app-canary-"
 REMOTE_PREFIX = "subfloor-canary"
 ENGINE_REMOTE = "super-coder"
+TOOL_NAME = "dos-app Sprint canary"
+# Ports the canary never takes, free or not: a real engine's review port.
+RESERVED_PORTS = frozenset({8837})
+# The engine user the disposable install is created with, and so the one its
+# GUI user and the canary's session are made for.
+ENGINE_USER = "canary"
 MIN_GITHUB_REMAINING = 100
 MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 FORK_PREPARATION_PATHS = {
@@ -402,10 +423,45 @@ class CommandRunner:
         return result
 
 
+def sign_in_required_error(message: str | None = None) -> CanaryError:
+    """The one failure for an install whose gate the canary cannot pass."""
+    return CanaryError(
+        "CANARY_SIGN_IN_REQUIRED",
+        message
+        or (
+            f"{TOOL_NAME}: the install refused the request as not signed in. "
+            "Its session was revoked, was never obtained, or its user is no "
+            "longer an active engine user."
+        ),
+    )
+
+
+def open_operator_session(
+    workspace: Path, base_url: str, *, timeout: float = 60.0, **seams: Any
+) -> tool_session.ToolSession:
+    """The canary's operator session in the disposable install at `workspace`.
+
+    That install has no GUI user, so one is created for the engine user it
+    was installed with.  Nothing is sent for a candidate without sign-in.
+    """
+    try:
+        return tool_session.open_session(
+            workspace, base_url, TOOL_NAME, enrol=ENGINE_USER, timeout=timeout, **seams
+        )
+    except tool_session.SessionUnavailable as exc:
+        raise sign_in_required_error(str(exc)) from exc
+
+
 class JsonHttp:
-    def __init__(self, base_url: str, deadline: Deadline) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        deadline: Deadline,
+        session: tool_session.ToolSession | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.deadline = deadline
+        self.session = session
 
     def request(
         self,
@@ -419,6 +475,8 @@ class JsonHttp:
         headers = {"Content-Type": "application/json"}
         if key:
             headers["Idempotency-Key"] = key
+        if self.session is not None:
+            headers.update(self.session.headers())
         request = urllib.request.Request(
             self.base_url + path, data=raw, headers=headers, method=method
         )
@@ -429,6 +487,8 @@ class JsonHttp:
                 decoded = json.loads(response.read() or b"{}")
         except urllib.error.HTTPError as exc:
             payload = exc.read().decode(errors="replace")
+            if exc.code == 401 and '"sign_in_required"' in payload:
+                raise sign_in_required_error() from exc
             raise CanaryError(
                 "CANARY_API_FAILED",
                 f"{method} {path} returned HTTP {exc.code}",
@@ -478,6 +538,11 @@ class HostBackend:
         self.runner = CommandRunner(deadline)
         self.sleep = sleep
         self._port_sockets: list[socket.socket] = []
+        self._operator: tool_session.ToolSession | None = None
+
+    def release_operator(self) -> bool:
+        """Revoke the canary's operator session, if it holds one."""
+        return self._operator is None or self._operator.revoke()
 
     def _run(
         self,
@@ -524,6 +589,8 @@ class HostBackend:
     def _reserve_ports(self) -> tuple[int, int]:
         selected: list[int] = []
         for port in range(8800, 8900):
+            if port in RESERVED_PORTS:
+                continue
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
@@ -836,7 +903,7 @@ class HostBackend:
                 "--force",
                 "--skip-harness-install",
                 "--username",
-                "canary",
+                ENGINE_USER,
             ],
             cwd=facts.workspace,
             label="install disposable fork",
@@ -947,6 +1014,11 @@ class HostBackend:
                 pass
             self.deadline.remaining()
             self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
+        # The runtime answers. Before anything is created in it, the canary
+        # gets its operator session there (or learns it cannot have one).
+        self._operator = open_operator_session(
+            facts.workspace, api.base_url, timeout=self.deadline.remaining()
+        )
         status = self._run(
             [str(facts.workspace / "sc"), "harness-status"],
             cwd=facts.workspace,
@@ -1847,7 +1919,9 @@ raise TimeoutError("controller did not close the Force-new barrier")
         stage: Callable[[str], None],
         checkpoint: Callable[[], None],
     ) -> dict[str, Any]:
-        api = JsonHttp(f"http://127.0.0.1:{facts.api_port}", self.deadline)
+        api = JsonHttp(
+            f"http://127.0.0.1:{facts.api_port}", self.deadline, self._operator
+        )
         shells = self._shells(api.request("GET", "/api/shells"))
         required = {"PLN1", "DEV1", "REV1"}
         if not required.issubset(shells):
@@ -2251,6 +2325,12 @@ raise TimeoutError("controller did not close the Force-new barrier")
             )
 
         failures: list[str] = []
+        # First, while the install's own `./sc` is still there to do it.
+        if self._operator is not None and self._operator.gated:
+            revoked = self.release_operator()
+            record("revoke_operator_session", ok=revoked)
+            if not revoked:
+                failures.append("revoke_operator_session")
         repository = ledger.repository or (facts.repository if facts else None)
         if ledger.pull_request and repository and REPO_RE.fullmatch(repository):
             viewed = self._run(
@@ -2702,8 +2782,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = build_config(args)
         deadline = Deadline(config.whole_timeout_s, config.stage_timeout_s)
         receipt = Receipt(config.receipt_path, config)
-        controller = CanaryController(config, HostBackend(deadline), deadline, receipt)
-        controller.run()
+        backend = HostBackend(deadline)
+        controller = CanaryController(config, backend, deadline, receipt)
+        try:
+            controller.run()
+        finally:
+            # Cleanup revokes it. This is for the way out that skips cleanup:
+            # Ctrl-C, or anything else that is not an ordinary failure.
+            backend.release_operator()
         print(config.receipt_path)
         return 0
     except CanaryError as exc:

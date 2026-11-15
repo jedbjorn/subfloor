@@ -1953,27 +1953,10 @@ def main(argv: list[str]) -> int:
         # the reconciled tree on a branch as usual.
         print("  Review + commit the reconciled tree (the engine is tracked here).")
     else:
-        # Fork repin: the update edited tracked files in place but did NOT touch
-        # git — it never branches, commits, or changes branch, so a bare `./sc
-        # update` on `main` leaves the repin uncommitted on main. Spell out the
-        # full flow so the operator lands a PR and returns to main instead of
-        # sitting stranded on the repin branch (the engine is gitignored — only
-        # engine.ref + any genuinely authored install files).
-        try:
-            pin = (REPO_ROOT / ".sc-state" / "engine.ref").read_text().strip()[:12]
-        except Exception:
-            pin = ""
-        branch_hint = f"repin-{pin}" if pin else "repin-<sha>"
-        print("  This edited tracked files in place but did NOT touch git. Recommended flow:")
-        print(f"    git checkout -b {branch_hint}")
-        print("    git add sc .sc-state/engine.ref .sc-state/engine.source .gitignore   "
-              "# sc when the materialize changed it; + workflow "
-              "changes when reported")
-        print("    git commit -m 'chore(engine): repin' && git push -u origin HEAD")
-        print("    gh pr create")
-        print("    git checkout main        # return to main — don't stay stranded on the repin branch")
-        print("  After the PR merges:")
-        print("    git pull --ff-only       # brings the repin onto local main")
+        # Fork repin: the update edited tracked files in place. The engine lands
+        # them on the fork's default branch itself (decision #459) — commit, PR,
+        # merge and fast-forward — and launch/restart retry whatever is left.
+        subprocess.run([PY, str(ENGINE / "scripts" / "fork_repin.py"), "sync"], check=False)
     print("  A bad update? `./sc rollback` restores the DB + engine together.")
     print("  Restart your session to boot onto the new floor.")
     if epoch:

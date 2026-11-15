@@ -1,6 +1,6 @@
 ---
 name: issue_reporting
-description: Report engine defects upstream — the moment a sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on Subfloor; your repo's app bugs stay in the fork.
+description: Report an engine defect the moment a sc command fails or lies, a skill contradicts reality, or you work around the engine. Also when the API blocks a documented workflow. From a fork, file a GitHub issue on Subfloor (app bugs stay in the fork); in the Subfloor source repo, flag it and fix it here.
 category: substrate
 common: true
 ---
@@ -13,6 +13,17 @@ the failure is on screen — NEVER batch to session end.
 
 A workaround IS a report: deviating from a skill's steps, wrapping a command,
 or hand-patching state to proceed -> you hold the exact repro; file it now.
+
+## In the source repo
+
+In the Subfloor source repo (your boot's PROJECT vs ENGINE section says you
+are upstream) there is no upstream above you. The triggers and the capture
+list below still apply; the route changes. Open a flag with the captured
+evidence (`sc mem flag open "[Engine] <symptom> | Blocker for: <x>" …`) and
+tell the FnB; when the fix is yours or assigned, author it on a branch and PR.
+A GitHub issue on `jedbjorn/subfloor` is still right when the defect should
+be publicly tracked or a matching issue already exists — dedup first, as
+below. Everything else in this skill is fork procedure.
 
 ## Boundary — engine vs fork
 

@@ -79,6 +79,17 @@ def invocation_path(raw: str | os.PathLike[str],
     return path if path.is_absolute() else invocation_cwd(environ) / path
 
 
+def read_text(raw: str | os.PathLike[str],
+              environ: Mapping[str, str] | None = None) -> str:
+    """The text an operator-named source holds: ``-`` is stdin, anything else
+    a file resolved like :func:`invocation_path`. Raises ``OSError`` (and
+    ``UnicodeDecodeError``) to the caller, which owns the wording."""
+    if os.fspath(raw) == "-":
+        import sys
+        return sys.stdin.read()
+    return invocation_path(raw, environ).read_text()
+
+
 def scrubbed(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """A child environment without the one-command project identity.
 

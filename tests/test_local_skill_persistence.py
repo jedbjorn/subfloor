@@ -21,6 +21,7 @@ Run:
 from __future__ import annotations
 
 import contextlib
+import io
 import sqlite3
 import sys
 import tempfile
@@ -38,7 +39,8 @@ import snapshot as snapshot_mod
 SKILLS_DDL = (
     "CREATE TABLE skills (skill_id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, "
     "description TEXT, category TEXT, content TEXT, command TEXT, "
-    "common INTEGER NOT NULL DEFAULT 1, is_deleted INTEGER NOT NULL DEFAULT 0)")
+    "common INTEGER NOT NULL DEFAULT 1, is_deleted INTEGER NOT NULL DEFAULT 0, "
+    "seat TEXT CHECK (seat IN ('gui','tui')))")
 SHELLS_DDL = (
     "CREATE TABLE shells (shell_id INTEGER PRIMARY KEY, shortname TEXT, "
     "display_name TEXT, flavor TEXT, api_key TEXT, is_deleted INTEGER DEFAULT 0)")
@@ -252,6 +254,133 @@ class SkillCommandTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             skill_mod.main(["grant", "loc_b", "ghost"])
         self.assertEqual(self.grants(), [])
+
+    def flavor_grants(self):
+        con = sqlite3.connect(self.db)
+        try:
+            return con.execute(
+                "SELECT fs.flavor, s.name FROM flavor_skills fs "
+                "JOIN skills s USING (skill_id) ORDER BY 1, 2").fetchall()
+        finally:
+            con.close()
+
+    def patch_flavors(self, *names):
+        import shell_factory
+
+        return mock.patch.object(
+            shell_factory, "flavors",
+            return_value=[{"flavor": name} for name in names])
+
+    def test_flavor_ref_addresses_a_pack_with_no_member_shell(self):
+        """`flavor:<name>` is the spelling `sc skill list` prints; no shell of
+        the devops flavor exists here, and the pack is still reachable."""
+        with self.patch_flavors("dev", "devops", "planner"), mock.patch.object(
+            skill_mod.skill_projection, "reconcile_flavors"
+        ) as reconcile:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    skill_mod.main(["grant", "loc_b", "flavor:devops"]), 0)
+            self.assertIn("grant: loc_b → devops flavor", out.getvalue())
+            self.assertEqual(self.flavor_grants(), [("devops", "loc_b")])
+            self.assertEqual(reconcile.call_args.args[1], ["devops"])
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    skill_mod.main(["grant", "loc_b", "flavor:devops"]), 0)
+            self.assertIn("(already granted)", out.getvalue())
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    skill_mod.main(["revoke", "loc_b", "flavor:devops"]), 0)
+            self.assertIn("revoke: loc_b ⇸ devops flavor", out.getvalue())
+            self.assertEqual(self.flavor_grants(), [])
+            self.assertEqual(self.grants(), [])
+
+    def test_orphan_pack_row_is_revocable_without_a_template(self):
+        """A pack row whose flavor has neither template nor shell is still a
+        known flavor, so the grant that created the problem can be removed."""
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO flavor_skills (flavor, skill_id) "
+            "SELECT 'legacy', skill_id FROM skills WHERE name='loc_b'")
+        con.commit()
+        con.close()
+        with self.patch_flavors("dev"):
+            self.assertEqual(
+                skill_mod.main(["revoke", "loc_b", "flavor:legacy"]), 0)
+        self.assertEqual(self.flavor_grants(), [])
+
+    def test_unknown_flavor_is_refused_listing_valid_flavors(self):
+        with self.patch_flavors("dev", "devops"):
+            with self.assertRaises(SystemExit) as raised:
+                skill_mod.main(["grant", "loc_b", "flavor:ghost"])
+            message = str(raised.exception.code)
+            self.assertIn("no flavor 'ghost'", message)
+            # planner comes from the live PLN1 shell row, not a template.
+            self.assertIn("flavor:dev, flavor:devops, flavor:planner", message)
+            # A bare flavor name is still a shell reference, as before.
+            with self.assertRaises(SystemExit) as raised:
+                skill_mod.main(["grant", "loc_b", "devops"])
+            self.assertIn("no shell 'devops'", str(raised.exception.code))
+        self.assertEqual(self.flavor_grants(), [])
+
+    def test_shell_named_like_a_flavor_ref_is_refused_as_ambiguous(self):
+        """A shell created before the prefix was reserved may be named
+        `flavor:devops`; that ref must not silently move to the pack."""
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO shells (shell_id, shortname, api_key) "
+            "VALUES (7, 'flavor:devops', 'odd-token')")
+        con.commit()
+        con.close()
+        with self.patch_flavors("dev", "devops"):
+            for verb in ("grant", "revoke"):
+                with self.assertRaises(SystemExit) as raised:
+                    skill_mod.main([verb, "loc_b", "flavor:devops"])
+                message = str(raised.exception.code)
+                self.assertIn("ambiguous", message)
+                self.assertIn("'devops' flavor pack", message)
+                self.assertIn("shell 7", message)
+            self.assertEqual(self.flavor_grants(), [])
+            self.assertEqual(self.grants(), [])
+            # The shell stays reachable by id; other flavors are unaffected.
+            self.assertEqual(skill_mod.main(["grant", "loc_b", "7"]), 0)
+            self.assertEqual(self.grants(), [(7, "loc_b")])
+            self.assertEqual(
+                skill_mod.main(["grant", "loc_b", "flavor:dev"]), 0)
+            self.assertEqual(self.flavor_grants(), [("dev", "loc_b")])
+
+    def test_one_bad_ref_refuses_the_whole_call(self):
+        with self.patch_flavors("dev", "devops"):
+            with self.assertRaises(SystemExit):
+                skill_mod.main(
+                    ["grant", "loc_b", "flavor:devops", "dev1", "flavor:ghost"])
+        self.assertEqual(self.flavor_grants(), [])
+        self.assertEqual(self.grants(), [])
+
+    def test_shell_and_flavor_refs_mix_and_shell_refs_are_unchanged(self):
+        with self.patch_flavors("dev", "devops", "planner"):
+            rows = None
+            con = skill_mod.connect()
+            try:
+                rows = skill_mod._grant_spec(
+                    con, "loc_b", ["dev1", "PLN1", "flavor:devops"])
+            finally:
+                con.close()
+        self.assertEqual(
+            rows,
+            [
+                ("Bespoke dev1", True, "dev1"),
+                ("planner flavor", True, "PLN1"),
+                ("devops flavor", True, "flavor:devops"),
+            ],
+        )
+        self.assertEqual(self.grants(), [(1, "loc_b")])
+        self.assertEqual(
+            self.flavor_grants(), [("devops", "loc_b"), ("planner", "loc_b")])
 
     def test_rm_refuses_engine_and_retires_local(self):
         with self.assertRaises(SystemExit):
@@ -494,9 +623,11 @@ class LocalSkillPersistenceIntegrationTest(unittest.TestCase):
 
     # schema.sql is the partial core baseline; these columns arrive with the
     # migrations this fixture does not run (api_key from 0027, the retirement
-    # trio from 0268). Add them by hand so the fixture matches a migrated DB.
+    # trio from 0268, the skill seat from 0291). Add them by hand so the
+    # fixture matches a migrated DB.
     MIGRATED_COLUMNS = (
         "ALTER TABLE shells ADD COLUMN api_key TEXT",
+        "ALTER TABLE skills ADD COLUMN seat TEXT CHECK (seat IN ('gui','tui'))",
         "ALTER TABLE documents ADD COLUMN retired INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE documents ADD COLUMN retired_date TEXT",
         "ALTER TABLE documents ADD COLUMN superseded_by INTEGER",

@@ -69,6 +69,7 @@ const $ = () => ({});
 const chatStopReads = () => {}, chatStopStream = () => {};
 const chatStopHistoryPoll = () => {}, chatStopReview = () => {};
 const sprintStopPolling = () => {}, setDocumentTitle = () => {};
+const stopCatalogueWatch = () => {};
 let activeTab, shellTab, chatRouteShell, chatRouteConversation, chatRouteMode;
 let chatModeController = null, renders = 0;
 const renderInterface = () => { renders++; };
@@ -313,6 +314,7 @@ def test_stream_listeners_bind_server_types_and_non_display_events_advance_seque
     script = """
 let chatSource, chatRenderGeneration = 7;
 const chatStopStream = () => {};
+const startSessionWatch = () => ({errored() {}, opened() {}, signedOut() {}});
 class EventSource {
   constructor() { this.listeners = {}; }
   addEventListener(type, handler) { this.listeners[type] = handler; }
@@ -344,7 +346,9 @@ console.log(JSON.stringify({types: Object.keys(source.listeners), sequences,
   messageState: messages[0].state, userState: user.state}));
 """
     result = run_js(script)
-    assert set(result.pop("types")) == CONVERSATION_EVENT_TYPES
+    # Every conversation event type, plus the gate's own notice that the
+    # session has ended (spec 271), which is not a conversation event.
+    assert set(result.pop("types")) == CONVERSATION_EVENT_TYPES | {"sign_in_required"}
     assert result == {
         "sequences": [41, 42, 43], "requests": [], "itemCount": 1,
         "state": "queued", "messageState": "queued", "userState": "queued",
@@ -382,7 +386,7 @@ const chatApi = async (url) => {
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
 @pytest.mark.parametrize("phase", ["headers", "body"])
 def test_chat_reads_timeout_cancel_and_retry_without_timing_out_mutations(phase):
-    helpers = APP[APP.index("async function chatApi("):
+    helpers = APP[APP.index("// ── Session loss (spec #271)"):
                   APP.index("// The API refuses request bodies")]
     script = helpers + r"""
 const phase = PHASE;
@@ -486,8 +490,9 @@ const readController = new AbortController(), readSignal = readController.signal
 let chatReadController = readController;
 const generation = 1, selectedId = "cv_fixture";
 let chatRenderGeneration = 1, chatRouteMode = "chat", chatModeController = null;
+let chatNewChatAction = null;
 const CHAT_MODES = ["chat", "diff"];
-const document = {body: el("body", {})};
+const document = {body: el("body", {}), hidden: false, addEventListener() {}};
 const frames = [];
 const requestAnimationFrame = (callback) => { frames.push(callback); return frames.length; };
 const cancelAnimationFrame = () => {};
@@ -498,6 +503,14 @@ const chatStartedLabel = () => "started";
 const chatHeaderLabel = () => "header";
 const chatConversationName = () => "fixture";
 const chatTranscriptAtBottom = () => true;
+const chatPaintContextMeter = () => {};
+const CHAT_COMPACT_TOOLTIP = "";
+const chatCompactButtonState = () => ({visible: false, disabled: true,
+  pending: false, label: "Compact", title: ""});
+const chatColdReturnDue = () => false;
+const chatColdReturnable = () => true;
+const chatColdReturnClock = (coldReturn, now, previous) => coldReturn || previous;
+const chatKeepCompactionRequest = (next, previous) => next || previous;
 const chatFlushTranscript = (node, state) => {
   node.textContent = [...state.items.values()].map((item) => item.text).join("\n");
 };
@@ -703,7 +716,8 @@ console.log(JSON.stringify({ future, expired, malformed }));
         STYLE.index(".chat-shell-wake {"):
         STYLE.index("}", STYLE.index(".chat-shell-wake {")) + 1
     ]
-    assert "color: #ef545f" in wake_style
+    assert "color: var(--danger-strong)" in wake_style
+    assert "--danger-strong: #ef545f;" in STYLE
 
 
 def test_pending_wake_indicator_refreshes_without_a_new_polling_loop():
@@ -832,6 +846,12 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
     assert 'textContent: "＋ Chat"' in interface
     assert 'textContent: "Configure"' in interface
     assert "() => chatCreateConversation(shell));" in interface
+    # Spec 270: "＋ Chat" reads the catalogue without waiting on it, and
+    # Configure can refresh the pickers in place.
+    assert "    watchCatalogueOnNewChat();  // fire-and-forget" in interface
+    assert "await watchCatalogueOnNewChat" not in APP
+    assert 'textContent: "Refresh models"' in interface
+    assert "const refreshed = currentCatalogue(await loadModelCatalogue(true));" in interface
     assert "{ shell_id: shell.shell_id, ...fields }" in interface
     assert "chatRouteConversation === CHAT_CONFIGURE_ROUTE" in interface
     assert "await chatRenderNew(pane, shell, defaults, catalog)" in interface
@@ -1416,8 +1436,8 @@ def test_connection_status_is_attached_to_transcript_without_visible_copy():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     assert 'let streamStatus = "connecting"' in interface
-    assert 'source.onopen = () => onState("connected")' in interface
-    assert 'source.onerror = () => onState("reconnecting")' in interface
+    assert 'source.onopen = () => { watch.opened(); onState("connected"); };' in interface
+    assert 'source.onerror = () => { onState("reconnecting"); watch.errored(); };' in interface
     assert "transcriptHost.title = `Connection: ${connectionLabel}`" in interface
     assert "`Conversation transcript; connection ${connectionLabel.toLowerCase()}`" in interface
     assert '"stream-disconnected"' in interface
@@ -1651,7 +1671,7 @@ console.log(JSON.stringify({
         "activityHeaderItems": 1,
         "assistantToken": {
             "className": "chat-context-tokens",
-            "text": "12,345 tok",
+            "text": "12k tok",
         },
         "userHasToken": False,
         "assistantWithoutTokensHasToken": False,
@@ -1938,10 +1958,15 @@ def test_new_chat_request_log_skips_configuration_and_closes_before_create(state
                   APP.index("function chatModeHash")]
     handler = APP[APP.index("  newChat.onclick = async"):
                   APP.index("  configure.onclick = async")]
-    script = api_helpers + catalogue + loader + close + create + release + r"""
+    # Spec 270: one catalogue read rides along, un-awaited; the configuration
+    # load (flavor defaults) still stays out of the path.
+    watch = APP[APP.index("const CATALOGUE_WATCH_MS"):
+                APP.index("// ── Analytics ──")]
+    script = api_helpers + catalogue + watch + loader + close + create + release + r"""
 const state = STATE;
 const requests = [], notices = [];
 const shell = {shell_id: "sh_dev", shortname: "DEV1"};
+let activeTab = "interface";
 const selectedConversation = state === null ? null : {
   conversation_id: "cv_old", state: state === "sprint" ? "running" : state,
   scope: state === "sprint" ? "sprint" : "interactive", version: 1,
@@ -1964,6 +1989,8 @@ globalThis.fetch = async (url, options) => {
   }
   if (url === "/api/conversations" && options.method === "POST")
     return {ok: true, json: async () => ({conversation_id: "cv_new"})};
+  if (url === "/api/models")
+    return {ok: true, json: async () => ({stale: false, harnesses: {}})};
   throw new Error("unexpected request " + url);
 };
 """ + handler + r"""
@@ -1991,6 +2018,7 @@ globalThis.fetch = async (url, options) => {
         expected.append(close_request)
         assert result["beforeClose"] == {"requests": expected, "hash": ""}
     if state != "running":
+        expected.append({"url": "/api/models", "method": "GET", "body": None})
         expected.append(create_request)
     assert result["requests"] == expected
     assert result["hash"] == ("" if state == "running" else "DEV1/cv_new")
@@ -2458,7 +2486,8 @@ def test_history_card_has_independent_durable_star_button():
     assert 'button.textContent = starred ? "★" : "☆"' in interface
     assert 'button.setAttribute("aria-pressed", String(starred))' in interface
     assert ".chat-history-star:hover, .chat-history-star.starred" in STYLE
-    assert "color: #f4cf4a; opacity: 1;" in STYLE
+    assert "color: var(--star); opacity: 1;" in STYLE
+    assert "--star: #f4cf4a;" in STYLE
 
 
 def test_working_state_is_plain_animated_transcript_text_not_a_header_pill():
@@ -2474,13 +2503,66 @@ def test_working_state_is_plain_animated_transcript_text_not_a_header_pill():
     assert 'indicator.append("<Working>", chatWorkingDots())' in interface
     assert 'className: "chat-working-indicator"' in interface
     assert 'role: "status"' in interface
-    assert 'if (conversation.state === "running" && !working)' in transcript
-    assert "transcript.append(chatWorkingIndicator())" in transcript
+    tail = interface[interface.index("function chatPaintTranscriptTail"):
+                     interface.index("const CHAT_SHELL_STATE_CLASSES")]
+    assert 'transcript.dataset.conversationState = conversation.state || "idle"' in transcript
+    assert "chatPaintTranscriptTail(transcript)" in transcript
+    assert 'if (state === "running" && !working)' in tail
+    assert "transcript.append(chatWorkingIndicator())" in tail
     assert "chatStatePill(conversation.state)" not in transcript
     assert "header.append(title, queueState, actions)" in header
     assert "chatStatePill(conversation.state)" not in header
     assert "border" not in indicator_style
     assert "background" not in indicator_style
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_idle_chat_with_live_runs_shows_a_still_grey_waiting_line():
+    tail = APP[APP.index("let chatRunWaits"):
+               APP.index("const CHAT_SHELL_STATE_CLASSES")]
+    style = STYLE[STYLE.index(".chat-waiting-indicator {"):
+                  STYLE.index("}", STYLE.index(".chat-waiting-indicator {"))]
+    assert "color: var(--dim)" in style
+    assert "animation" not in style
+    script = r"""
+const el = (tag, props = {}) => ({ tag, ...props });
+const chatWorkingIndicator = () => ({ className: "chat-working-indicator" });
+const transcript = {
+  dataset: {}, kids: [],
+  append(node) { this.kids.push(node); },
+  querySelector(selector) {
+    return this.kids.find((node) => selector === `.${node.className}`) || null;
+  },
+};
+""" + tail + r"""
+const remove = (node) => { node.remove = () => {
+  transcript.kids = transcript.kids.filter((kid) => kid !== node); }; };
+const paint = (state, waits) => {
+  transcript.dataset.conversationState = state;
+  chatRunWaits = waits;
+  transcript.kids.forEach(remove);
+  chatPaintTranscriptTail(transcript);
+  return transcript.kids.map((node) => node.textContent || node.className);
+};
+console.log(JSON.stringify({
+  agent: paint("idle", {agents: 1, jobs: 0}),
+  job: paint("idle", {agents: 0, jobs: 1}),
+  both: paint("waiting", {agents: 2, jobs: 1}),
+  running: paint("running", {agents: 1, jobs: 1}),
+  backToIdle: paint("idle", {agents: 0, jobs: 3}),
+  nothingLive: paint("idle", {agents: 0, jobs: 0}),
+  closed: paint("closed", {agents: 1, jobs: 0}),
+}));
+"""
+    assert run_js(script) == {
+        "agent": ["Waiting on agent"],
+        "job": ["Waiting on job"],
+        "both": ["Waiting on 2 agents and job"],
+        "running": ["chat-working-indicator"],
+        "backToIdle": ["Waiting on 3 jobs"],
+        "nothingLive": [],
+        "closed": [],
+    }
 
 
 def test_shell_accent_colors_cover_idle_working_waiting_and_error_states():
@@ -2493,7 +2575,8 @@ def test_shell_accent_colors_cover_idle_working_waiting_and_error_states():
     assert ".chat-shell.state-queued," in STYLE
     assert ".chat-shell.state-running," in STYLE
     assert ".chat-shell.state-waiting { --shell-state-color: var(--accent); }" in STYLE
-    assert ".chat-shell.state-error { --shell-state-color: #ef7d86; }" in STYLE
+    assert ".chat-shell.state-error { --shell-state-color: var(--danger); }" in STYLE
+    assert "--danger: #ef7d86;" in STYLE
 
 
 def test_redline_chat_text_is_one_pixel_larger():
@@ -2709,7 +2792,7 @@ const holders = [{pid: 4242, start_ticks: 990, orphaned: "client-gone", claimed:
 
 def test_dropped_images_upload_raw_and_enter_the_message_as_paths():
     helpers = APP[
-        APP.index("async function chatApi("):
+        APP.index("// ── Session loss (spec #271)"):
         APP.index("function toast(msg)")
     ]
     script = helpers + r"""

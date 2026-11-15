@@ -8,15 +8,18 @@ common: false
 # sprint_dev — own one editing lane
 
 Load `sprint_protocol` first; it holds the lifecycle, wake types, inbox
-commands, relay contract, body limits, artifact paths, receipt recovery, and
-authority boundary. This skill holds only the Developer's steps.
+commands, relay contract, the typed-handoff order and body limit, artifact
+paths, receipt recovery, and authority boundary. This skill holds only the
+Developer's steps. Your typed handoffs are `complete-unit`, `register-pr`,
+`request-review`, and the merged handoff `send`; each follows the protocol's
+order.
 
 ## Route the entry
 
 | Trigger | First read / action |
 |---|---|
 | Assignment, verdict, question, blocker, relay | Inspect `sc sprint inbox --sprint <id>` once; accept or handle the relevant message. Accepted assignment -> `sc context --work-unit <id>` next. |
-| Self-describing engine-wide PR fact | Inspect the fact + registered PR directly. Do not manufacture a Sprint inbox item; check the inbox once immediately before the next typed handoff. |
+| Self-describing engine-wide PR fact | Inspect the fact + registered PR directly. It is not a Sprint inbox item; do not run the inbox for it. |
 | Live FnB instruction | Preserve its authority; read only durable state needed for safe action. |
 
 ## Bound the lane
@@ -31,31 +34,29 @@ before changing boundary, interface, deliverable, priority, or scope; ask the
 Reviewer about review evidence. Use the relay's unit question/blocker form and
 stop at a decision boundary until the answer arrives.
 
-A Developer does not pause the Sprint. Report blocker or integrity evidence to
-the Planner, continue safe independent work, and stop at the unsafe boundary.
-The Reviewer decides continue/replan/pause; the Planner executes the decision.
+Report blocker evidence to the Planner, continue safe independent work, and
+stop at the unsafe boundary; the Reviewer decides continue/replan and the
+Planner executes the decision.
+
+Pause the Sprint yourself only for an integrity problem that makes continuing
+unsafe, in the protocol's integrity-pause order: one `--intent information`
+message to the Planner with the evidence, impact, and recommendation, then
+`sc sprint pause --sprint <id> --reason <what is unsafe>` as the turn's last
+action.
 
 ## Build and verify
 
-Sync + branch; implement the smallest complete change. Per your TESTING
-POSTURE, finish code + run every available smallest affected gate. If the
-selected interpreter, runner, or declared dependency cannot execute one,
-record exact seat evidence; the registered PR supplies only that proof. Test
-assertion/source collection red or incomplete code = failure. Optional browser
-skip = non-failing. Keep external calls outside DB transactions; preserve
-durable identities and append-only evidence. Record failures, anomalies,
-retries, review friction, and departures for closeout.
-
-Immediately before `complete-unit`, `register-pr`, or `request-review`, re-run
-`sc sprint inbox --sprint <id>` once and act on new messages. After the typed
-handoff confirms its durable write, stop without another inbox pass. The
-reopened-PR route below is the sole exception.
+Sync + branch; implement the smallest complete change. Verification follows
+TESTING POSTURE (`spec_execution`): what to run, the CI fallback when a local
+gate cannot execute, and what counts as failure. In a Sprint the registered PR
+supplies only the proof the seat could not run. Keep external calls outside DB
+transactions; preserve durable identities and append-only evidence. Record
+failures, anomalies, retries, review friction, and departures for closeout.
 
 ## Report-only or no-code completion
 
-Only an explicitly planned report/no-code lane may finish without a PR. Keep
-the result near 6,000 characters and below 8,000; run `wc -m < <path>`, perform
-the pre-handoff inbox check, then require a durable completion receipt:
+Only an explicitly planned report/no-code lane may finish without a PR. Its
+final handoff requires a durable completion receipt:
 
 ```text
 sc sprint complete-unit --sprint <id> --work-unit <id> \
@@ -74,18 +75,18 @@ sc sprint register-pr --sprint <id> --repository <owner/name> \
 Register complete code even when a local gate is unavailable; registration
 obtains evidence, not review. After `register-pr` succeeds, retain ownership;
 red/green/closed/merged wakes continue (the engine may already have discovered
-the PR from your worktree branch; `register-pr` attaches it). Required checks:
-pending -> native wake; red -> fix/push; green -> judge/request review; none or
-untrustworthy watcher after one bounded read -> report + block. Follow
-context: armed -> fix red + judge/pass green + merged -> post-merge handoff;
+the PR from your worktree branch; `register-pr` attaches it). Required-check
+states are TESTING POSTURE's (`spec_execution`); in a Sprint, pending -> stop
+for the native wake, green -> judge, then request review, and a blocked gate
+-> report it to the Planner as a blocker. Follow context: armed -> fix red +
+judge/pass green + merged -> post-merge handoff;
 paused -> fix red now + judge green, review after resume; no active Sprint ->
 fix red if needed, green -> merge only on a standing FnB directive naming the
 PR, merged -> git skill after-merge cleanup. Planner/Reviewer get none.
 
 If the same registered PR was externally closed, then reopened, rebased, and
 pushed, replay the exact `register-pr` command. Require `created: false`, which
-keeps identity/ownership and takes a fresh snapshot. Its one pre-handoff inbox
-check covers registration replay + the immediately following review request.
+keeps identity/ownership and takes a fresh snapshot.
 Do not wait for a second PR-fact wake: immediately request review. Green
 proceeds; any other snapshot returns the watcher diagnostic without partial
 handoff. Never register a replacement PR or ask the Planner to bypass observed
@@ -105,8 +106,7 @@ Do not repeat this read as a polling loop.
 Complete each round in order:
 
 1. Finish readiness judgment + available local proof; require observed green.
-2. Perform the once-only inbox check; handle and `accept` new messages.
-3. Use `submit` first or `resubmit` after changes requested. The engine injects
+2. Use `submit` first or `resubmit` after changes requested. The engine injects
    the PR URL, registered id, exact green head, and work-unit id into the
    Reviewer's canonical bare one-line locator. Create no readiness file. Send
    no scope narrative, verification evidence, rationale, or review-focus
@@ -114,7 +114,7 @@ Complete each round in order:
    reference plus your rationale (decisions, rejected trade-offs): each verdict
    opens a fresh chat with only GitHub to read. Write no PR comments or
    annotations.
-4. As the literal final action, run:
+3. Final handoff:
 
 ```text
 sc sprint request-review \
@@ -122,12 +122,15 @@ sc sprint request-review \
   --intent <submit|resubmit> --key <stable-key>
 ```
 
-5. Require confirmation of the durable write + Reviewer wake; run no trailing
-   command and stop and await the native verdict wake.
+   Require the durable write + Reviewer wake, then await the native verdict
+   wake.
 
 Changes requested arrives as a fresh chat: orient from the PR body, diff, and
 verdict; do not re-litigate choices the rationale explains. Apply every
 blocking finding, re-establish green, and resubmit with a new review-round key.
+The engine pauses the Sprint for the FnB when a unit's eighth recorded verdict
+is still changes requested: the lane is not converging. Request no further
+review then; wait for the resume wake or the Planner's direction.
 Do not narrate cleared findings; the Reviewer verifies the full diff. Record
 disagreements as judgment. Reviewer owns scope/severity; Planner executes
 resulting action.
@@ -154,18 +157,16 @@ After the authorized merge:
 
 1. Clean the worktree; put merged PR + SHA, unit result, verification,
    judgments, and departures in the handoff file.
-2. Re-run `sc sprint inbox --sprint <id>` once; handle and `accept` new items.
-3. Run `wc -m < <path>`; keep the body near 6,000 characters and below 8,000.
-4. As the literal final action, send:
+2. Final handoff:
 
 ```text
 sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
   --intent handoff --key <stable-merged-handoff-key>
 ```
 
-5. Require the durable message + Planner wake, then stop immediately. Run no
-   trailing Git, Sprint, inbox, cleanup, or status command. Automatic merge
-   observation records the PR transition; this handoff releases the next wave.
+   Require the durable message + Planner wake. Automatic merge observation
+   completes the unit and releases the lanes that became ready; this handoff
+   is the lane's result record for the Planner.
 
 ## Report and stop
 

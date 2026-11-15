@@ -40,6 +40,8 @@ RECONCILIATION = (
     ENGINE / "migrations" / "0260_reseed_sprint_closeout_scope.sql",
     ENGINE / "migrations" / "0262_reseed_sprint_resume_reentry.sql",
     ENGINE / "migrations" / "0280_remove_sprint_followups.sql",
+    ENGINE / "migrations" / "0282_skills_dedupe_posture.sql",
+    ENGINE / "migrations" / "0284_reseed_sprint_consistency.sql",
 )
 RETIRED = (
     "memory", "db_map", "bootstrap", "surface_catalogue", "messaging", "flags",
@@ -128,6 +130,94 @@ class SprintSkillTest(unittest.TestCase):
                 self.assertNotIn("unusable success receipt", body)
                 self.assertNotIn("decision #46", body)
                 self.assertNotIn("--intent information --reply-to <message-id> --key", body)
+                # The handoff order and the engine-enforced body limit are
+                # stated once, in the protocol; role skills only name their
+                # handoffs.
+                self.assertNotIn("wc -m", body)
+                self.assertNotIn("6,000", body)
+                self.assertNotIn("8,000", body)
+
+    def test_protocol_states_the_handoff_order_and_enforced_limit_once(self):
+        protocol = skill_text(PROTOCOL)
+        self.assertIn("## Typed handoffs", protocol)
+        self.assertEqual(protocol.count("wc -m < <path>"), 1)
+        flat = " ".join(protocol.split())
+        self.assertIn("The engine refuses anything over 8,000", flat)
+        # Sprint communication is by wake only: one inbox read per wake, and
+        # no skill tells a participant to re-read it before a handoff.
+        self.assertIn("read the inbox once per wake", flat)
+        # ... with receipt recovery as the one stated exception, named in both
+        # places.
+        self.assertIn(
+            "The one exception is receipt recovery (below): a single further "
+            "inbox read to prove a postcondition after an unconfirmed write",
+            flat)
+        self.assertIn("the one inbox re-read a turn allows", flat)
+        # A participant integrity pause has one order, stated once in the
+        # protocol: the evidence message is not final, the pause is, because
+        # the pause interrupts the pauser's own turn.
+        self.assertIn(
+            "**Integrity pause** — the one exception to stopping after a handoff",
+            flat)
+        self.assertLess(flat.index("Do not stop on it."),
+                        flat.index("as the literal last action. The pause notifies"))
+        self.assertIn("interrupts every live participant turn, yours included", flat)
+        # The two-step order is the Developer's and Reviewer's. The Planner
+        # cannot relay to itself, so it pauses directly; protocol and
+        # sprint_pln agree.
+        self.assertLess(flat.index("A Developer or Reviewer: 1. Send the Planner"),
+                        flat.index("The Planner sends no evidence message"))
+        self.assertIn(
+            "The Planner sends no evidence message — the relay refuses a message "
+            "to yourself — and pauses directly", flat)
+        self.assertIn(
+            "Sprint participants cannot relay to self",
+            (ENGINE / "scripts" / "sprint_message_delivery.py").read_text())
+        pln = " ".join(skill_text("sprint_pln").split())
+        self.assertIn(
+            "For your own integrity pause, run the command below directly with "
+            "what and why in the reason; send yourself no evidence message", pln)
+        for name in ("sprint_dev", "sprint_rev"):
+            role = " ".join(skill_text(name).split())
+            self.assertIn("in the protocol's integrity-pause order", role, name)
+            self.assertIn("as the turn's last action", role, name)
+            self.assertNotIn("A Developer does not pause", role)
+            self.assertNotIn("Never run standalone pause", role)
+        # The delivery-terminal notice is not proof of current ownership.
+        rev = " ".join(skill_text("sprint_rev").split())
+        self.assertIn("receiving it normally means you are that owner", rev)
+        self.assertIn("`sc sprint show` names a different `conformance_owner`", rev)
+        board = (ENGINE / "scripts" / "sprint_board.py").read_text()
+        self.assertIn('"conformance_owner": (', board)
+        close = (ENGINE / "scripts" / "sprint_close.py").read_text()
+        self.assertIn(
+            "only the selected conformance Reviewer may record conformance", close)
+        self.assertIn("Do not run the inbox before or after it", flat)
+        for name in SKILLS:
+            self.assertNotIn("Re-run `sc sprint inbox", skill_text(name), name)
+        self.assertIn("no trailing Git, Sprint, inbox, cleanup, or status command", flat)
+        # The limit the protocol names is the one the relay enforces.
+        store_source = (ENGINE / "scripts" / "sprint_message_delivery.py").read_text()
+        self.assertIn("len(body) > 8000", store_source)
+        for name, handoffs in {
+            "sprint_dev": ("`complete-unit`", "`register-pr`", "`request-review`"),
+            "sprint_rev": ("`record-review`", "`record-conformance`"),
+        }.items():
+            flat = " ".join(skill_text(name).split())
+            self.assertIn("Your typed handoffs are", flat)
+            for handoff in handoffs:
+                self.assertIn(handoff, flat)
+        # No pre-handoff inbox check remains, so the reopened-PR route needs
+        # no exception to one.
+        self.assertNotIn("pre-handoff inbox check",
+                         " ".join(skill_text("sprint_dev").split()))
+
+    def test_reviewer_verdict_path_replaces_the_boot_gated_handoff_in_sprint(self):
+        flat = " ".join(skill_text("sprint_rev").split())
+        self.assertIn(
+            "Inside an armed Sprint this verdict path stands in place of the "
+            "Reviewer boot's FnB-gated handoff", flat)
+        self.assertIn("Outside an armed Sprint the boot procedure governs", flat)
 
     def test_protocol_wake_types_match_the_delivery_literals(self):
         protocol = skill_text(PROTOCOL)
@@ -149,11 +239,14 @@ class SprintSkillTest(unittest.TestCase):
             "complete", "abort", "request-review", "record-review",
             "authorize-merge", "dispatch", "monitor", "watcher-state",
             "record-conformance", "compile-report",
-            "cleanup-status", "cleanup", "show",
+            "cleanup-status", "cleanup", "show", "timeline",
         }
         combined = "\n".join(skill_text(name) for name in SKILLS)
-        for command in expected - {"monitor", "spec-revision", "complete"}:
+        for command in expected - {"monitor"}:
             self.assertIn(f"sc sprint {command}", combined)
+        # The Planner's read table names the authoritative lifecycle read.
+        self.assertIn("`sc sprint timeline --sprint <id> [--last <n>]`",
+                      skill_text("sprint_pln"))
         for gone in ("sc sprint monitor", "record-qaqc"):
             self.assertNotIn(gone, combined)
         parser = sprint_cli.build_parser()

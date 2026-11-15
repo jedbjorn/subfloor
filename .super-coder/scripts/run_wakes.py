@@ -314,38 +314,54 @@ def _retry_receipt(con, db_path, row):
         )
 
 
-def observe_codex_transcript(store, run, adapter, turn):
-    """Codex has a server transcript, not a local transcript path on NativeTurn.
-
-    Inspect the exact native turn outside transactions. Only a userMessage
-    containing the full queued wake prompt proves consumption; turn/start or
-    assistant activity alone is insufficient.
-    """
-    if run.harness != "codex" or "## wake_message #" not in run.body:
-        return
+def _codex_prompts(run, adapter, turn):
     inspect = getattr(adapter, "inspect", None)
     if not callable(inspect):
         return
-    from conversation_adapters.base import AdapterError
-
-    try:
-        inspection = inspect(turn.session_ref, run.context())
-    except AdapterError:
-        return  # no evidence; the ledger keeps enqueued/blocked visible
-    turns = inspection.metadata.get("turns", [])
-    matched = False
-    for native in turns:
+    inspection = inspect(turn.session_ref, run.context())
+    for native in inspection.metadata.get("turns", []):
         if not isinstance(native, dict) or native.get("id") != turn.run_ref:
             continue
         for item in native.get("items", []):
             if not isinstance(item, dict) or item.get("type") != "userMessage":
                 continue
-            content = item.get("content", [])
-            if any(
-                isinstance(part, dict) and part.get("text") == run.body
-                for part in content
-            ):
-                matched = True
+            for part in item.get("content", []):
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    yield part["text"]
+
+
+def _kimi_prompts(run, adapter, turn):
+    turn_prompt = getattr(adapter, "turn_prompt", None)
+    if not callable(turn_prompt):
+        return
+    prompt = turn_prompt(turn)
+    if prompt is not None:
+        yield prompt
+
+
+# Harnesses whose transcript is not a local path on NativeTurn. Claude's is,
+# and reconcile() reads it through _contains_prompt.
+_NATIVE_PROMPTS = {"codex": _codex_prompts, "kimi": _kimi_prompts}
+
+
+def observe_native_transcript(store, run, adapter, turn):
+    """Prove consumption from the exact native turn's recorded user prompt.
+
+    Runs outside transactions. Only a user prompt carrying the full queued
+    wake body proves consumption; turn start or assistant activity alone is
+    insufficient. A compacted session's dispatched prompt carries a trailing
+    re-ground line, so the stored body is matched as a prefix.
+    """
+    prompts = _NATIVE_PROMPTS.get(run.harness)
+    if prompts is None or "## wake_message #" not in run.body:
+        return
+    from conversation_adapters.base import AdapterError
+
+    body = run.body.rstrip()
+    try:
+        matched = any(text.startswith(body) for text in prompts(run, adapter, turn))
+    except AdapterError:
+        return  # no evidence; the ledger keeps enqueued/blocked visible
     if not matched:
         return
     con = store.connect()

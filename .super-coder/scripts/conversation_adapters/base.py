@@ -36,11 +36,13 @@ NORMALIZED_EVENTS = frozenset(
         "permission.requested",
         "input.requested",
         "usage",
+        "context.compacted",
         "run.completed",
         "run.failed",
         "run.interrupted",
     }
 )
+COMPACTION_TRIGGERS = frozenset({"auto", "manual", "unknown"})
 TERMINAL_EVENTS = frozenset(
     {"run.completed", "run.failed", "run.interrupted"}
 )
@@ -54,7 +56,7 @@ SEMVER_TOKEN = re.compile(
     r"(?:\+[0-9A-Za-z.-]+)?)(?=$|\s|\()"
 )
 MAINTAINED_OBSERVED_VERSIONS = {
-    "claude": "2.1.223 (Claude Code)",
+    "claude": "2.1.322 (Claude Code)",
     "codex": "codex-cli 0.155.1",
     "opencode": "1.18.9",
     "vibe": "vibe 2.22.0",
@@ -194,6 +196,27 @@ class ConversationContext:
     conversation_id: str | None = None
     lifecycle_epoch: int = 1
     boot_content: str | None = None
+    # Feature #95. ``compact_window`` is the engine setting for this harness
+    # (None = leave the harness default). ``context_window`` and
+    # ``context_tokens`` are the chat's latest recorded readings; either may
+    # be None, and an adapter never substitutes a guess for a missing one.
+    compact_window: int | None = None
+    context_window: int | None = None
+    context_tokens: int | None = None
+
+    def effective_compact_window(self) -> int | None:
+        """The window to hand the harness, or None for its own default.
+
+        A model whose recorded window is smaller than the setting keeps the
+        harness default: the setting means "compact earlier", never "later".
+        """
+        window = self.compact_window
+        if window is None:
+            return None
+        known = self.context_window
+        if known is not None and known < window:
+            return None
+        return window
 
     def checked_worktree(self) -> Path:
         if self.permission_mode not in PERMISSION_MODES:
@@ -254,6 +277,70 @@ class NormalizedEvent:
             )
 
 
+def token_count(value: Any) -> int | None:
+    """A whole, non-negative token figure, or None for anything else."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    if value < 0 or int(value) != value:
+        return None
+    return int(value)
+
+
+def compaction_event(
+    *,
+    trigger: Any,
+    native_type: str,
+    tokens_before: Any = None,
+    tokens_after: Any = None,
+    compaction_ref: Any = None,
+) -> NormalizedEvent:
+    """One ``context.compacted`` event. No summary text is ever carried.
+
+    A count the harness did not state, and the engine could not read, is
+    left out of the payload; it is never estimated.
+    """
+    payload: dict[str, Any] = {
+        "trigger": trigger if trigger in COMPACTION_TRIGGERS else "unknown",
+    }
+    before = token_count(tokens_before)
+    after = token_count(tokens_after)
+    if before is not None:
+        payload["tokens_before"] = before
+    if after is not None:
+        payload["tokens_after"] = after
+    if isinstance(compaction_ref, str) and compaction_ref:
+        payload["compaction_ref"] = compaction_ref
+    return NormalizedEvent("context.compacted", payload, native_type)
+
+
+def usage_event(
+    tokens: Mapping[str, Any],
+    native_type: str,
+    *,
+    scope: str,
+    context_tokens: Any = None,
+    context_window: Any = None,
+) -> NormalizedEvent:
+    """One ``usage`` event carrying the context-meter fields (Feature #95).
+
+    ``scope`` says what ``tokens`` measures. ``request`` is one model request
+    of the chat itself, the only scope the context meter reads. ``turn`` is a
+    whole-turn total and ``subagent`` is a request made by a delegated agent;
+    neither is the size of the chat's context, so neither carries
+    ``context_tokens``.
+    """
+    payload: dict[str, Any] = {"tokens": dict(tokens), "scope": scope}
+    size = token_count(context_tokens)
+    window = token_count(context_window)
+    if scope == "request" and size is not None:
+        payload["context_tokens"] = size
+    if window:
+        payload["context_window"] = window
+    return NormalizedEvent("usage", payload, native_type)
+
+
 @dataclass(frozen=True)
 class InterruptResult:
     acknowledged: bool
@@ -297,10 +384,36 @@ class ConversationAdapter(abc.ABC):
     """The only harness surface the broker consumes."""
 
     harness: str
+    # True when the harness has a confirmed way to compact a stored session
+    # on request (Feature #95). The chat shows the compact button only then.
+    manual_compaction = False
+    # True when the harness accepts the auto-compaction trigger as a token
+    # count at launch (Feature #95, spec #275): the broker then passes the
+    # harness's trigger in ``ConversationContext.compact_window``. The
+    # others get nothing and are compacted by the engine between turns.
+    compact_window_native = False
 
     def __init__(self, manifest: Mapping[str, Any]) -> None:
         self.manifest = dict(manifest)
         self.capabilities = AdapterCapabilities.from_manifest(manifest)
+
+    def compact(
+        self,
+        session_ref: str,
+        context: ConversationContext,
+    ) -> NativeTurn:
+        """Ask the harness to compact ``session_ref`` now.
+
+        The returned turn is streamed like any other. It yields the
+        compaction the harness reports, tagged ``manual``, and ends with a
+        terminal event: ``run.failed`` when the harness refused or the
+        request broke, ``run.completed`` otherwise, with or without a
+        reported compaction. The wait for a report is bounded.
+        """
+        raise AdapterError(
+            "HARNESS_COMPACT_UNSUPPORTED",
+            f"{self.harness} has no confirmed manual compaction trigger",
+        )
 
     @abc.abstractmethod
     def probe(self) -> ProbeResult:
@@ -333,6 +446,16 @@ class ConversationAdapter(abc.ABC):
             "HARNESS_ATTACH_UNSUPPORTED",
             f"{self.harness} cannot attach to a running native turn",
         )
+
+    def recovered_events(
+        self,
+        turn: NativeTurn,
+        context: ConversationContext,
+    ) -> list[NormalizedEvent]:
+        """Events a recovered turn left on a durable channel, for a run the
+        broker reconciles instead of streaming. Only a manual compaction is
+        asked: its marker would otherwise be lost with the pipe."""
+        return []
 
     @abc.abstractmethod
     def interrupt(self, turn: NativeTurn) -> InterruptResult:

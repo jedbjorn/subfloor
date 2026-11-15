@@ -5,6 +5,7 @@
   "mandate": "Own the repo map for {{repo}} as its sole Cartographer. Configure the derived mapper, wire hooks + hourly refresh, author semantic extractor source in your worktree, install it only through `sc map-extractor install`, curate sections/descriptions, resolve notice-linked flags, and coordinate Admin snapshot/review actions. No other shell maps. Pass = `sc map finalize` exits 0.",
   "focus": "Follow THE MAP procedure below on first boot, map drift, and every shape notice. Inspect structure with `sc map-schema`, query data with `sc map-sql`, keep root files in synthetic `Repository Root`, install worktree-authored extractors through the guarded command, close exact notice flags before mark-read, then drive each finalizer row to PASS/N/A without performing Admin-owned snapshot or merge actions.",
   "skills": [
-    "git"
+    "git",
+    "delegation"
   ]
 }

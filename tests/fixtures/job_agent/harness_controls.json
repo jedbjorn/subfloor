@@ -1,0 +1,242 @@
+{
+  "about": "Harness controls verified for Feature #96 task #910. Structure only: values are placeholders except the nonce and the event discriminators.",
+  "recorded": "2026-11-12",
+  "nonce": "NONCE-7f3a",
+  "harnesses": {
+    "claude": {
+      "cli_version": "2.1.322 (Claude Code)",
+      "live": true,
+      "model": "haiku",
+      "served_model": "claude-haiku-5-5",
+      "requests": 2,
+      "brief": "stdin",
+      "launch": {
+        "argv": [
+          "claude",
+          "--model",
+          "haiku",
+          "--dangerously-skip-permissions",
+          "--output-format",
+          "json",
+          "--session-id",
+          "00000000-0000-4000-8000-0000000000c1",
+          "-p"
+        ],
+        "exit_code": 0,
+        "stdout": "{\"duration_api_ms\":0,\"stop_reason\":\"end_turn\",\"session_id\":\"00000000-0000-4000-8000-0000000000c1\",\"total_cost_usd\":0.0,\"usage\":{\"input_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0,\"output_tokens_details\":{\"thinking_tokens\":0},\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"<str>\",\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":\"<str>\",\"iterations\":[{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"}],\"speed\":\"<str>\",\"fallback_credit\":null},\"modelUsage\":{\"claude-haiku-5-5\":{\"inputTokens\":0,\"outputTokens\":0,\"cacheReadInputTokens\":0,\"cacheCreationInputTokens\":0,\"webSearchRequests\":0,\"costUSD\":0.0,\"contextWindow\":0,\"maxOutputTokens\":0,\"thinkingTokens\":0,\"cacheCreationEphemeral5mInputTokens\":0,\"cacheCreationEphemeral1hInputTokens\":0,\"canonicalModel\":\"<str>\",\"provider\":\"<str>\",\"costBasis\":\"<str>\"}},\"permission_denials\":[],\"terminal_reason\":\"completed\",\"fast_mode_state\":\"<str>\",\"fast_mode_disabled_reason\":\"<str>\",\"subagent_stats\":{\"spawned\":0,\"requested\":{\"background\":0,\"foreground\":0,\"unset\":0},\"started_in_background\":0,\"max_depth\":0,\"spawned_by_subagents\":0,\"completed\":0,\"failed\":0,\"killed\":{\"parent\":0,\"user\":0,\"system\":0},\"refused\":{\"depth_limit\":0,\"concurrency_limit\":0,\"budget\":0},\"by_type\":{}},\"safety_stops\":0,\"is_error\":false,\"num_turns\":0,\"subtype\":\"success\",\"api_error_status\":null,\"result\":\"NONCE-7f3a\",\"ttft_ms\":0,\"type\":\"result\",\"duration_ms\":0,\"uuid\":\"<str>\",\"ttft_stream_ms\":0,\"time_to_request_ms\":0,\"first_content_frame_ms\":0,\"queued_turn_count\":0,\"result_index\":0}\n",
+        "session_ref": "00000000-0000-4000-8000-0000000000c1"
+      },
+      "resume": {
+        "argv": [
+          "claude",
+          "--model",
+          "haiku",
+          "--dangerously-skip-permissions",
+          "--output-format",
+          "json",
+          "--resume",
+          "00000000-0000-4000-8000-0000000000c1",
+          "-p"
+        ],
+        "exit_code": 0,
+        "stdout": "{\"duration_api_ms\":0,\"stop_reason\":\"end_turn\",\"session_id\":\"00000000-0000-4000-8000-0000000000c1\",\"total_cost_usd\":0.0,\"usage\":{\"input_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0,\"output_tokens_details\":{\"thinking_tokens\":0},\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"<str>\",\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":\"<str>\",\"iterations\":[{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"}],\"speed\":\"<str>\",\"fallback_credit\":null},\"modelUsage\":{\"claude-haiku-5-5\":{\"inputTokens\":0,\"outputTokens\":0,\"thinkingTokens\":0,\"cacheReadInputTokens\":0,\"cacheCreationInputTokens\":0,\"cacheCreationEphemeral5mInputTokens\":0,\"cacheCreationEphemeral1hInputTokens\":0,\"webSearchRequests\":0,\"costUSD\":0.0,\"contextWindow\":0,\"maxOutputTokens\":0,\"canonicalModel\":\"<str>\",\"provider\":\"<str>\",\"costBasis\":\"<str>\"}},\"permission_denials\":[],\"terminal_reason\":\"completed\",\"fast_mode_state\":\"<str>\",\"fast_mode_disabled_reason\":\"<str>\",\"subagent_stats\":{\"spawned\":0,\"requested\":{\"background\":0,\"foreground\":0,\"unset\":0},\"started_in_background\":0,\"max_depth\":0,\"spawned_by_subagents\":0,\"completed\":0,\"failed\":0,\"killed\":{\"parent\":0,\"user\":0,\"system\":0},\"refused\":{\"depth_limit\":0,\"concurrency_limit\":0,\"budget\":0},\"by_type\":{}},\"safety_stops\":0,\"is_error\":false,\"num_turns\":0,\"subtype\":\"success\",\"api_error_status\":null,\"result\":\"NONCE-7f3a\",\"ttft_ms\":0,\"type\":\"result\",\"duration_ms\":0,\"uuid\":\"<str>\",\"ttft_stream_ms\":0,\"time_to_request_ms\":0,\"first_content_frame_ms\":0,\"queued_turn_count\":0,\"result_index\":0}\n",
+        "session_ref": "00000000-0000-4000-8000-0000000000c1",
+        "recalled_nonce": true
+      },
+      "observed": {
+        "sigterm_before_brief_exit_code": 143,
+        "stdin_wait_seconds": 3,
+        "unknown_session_exit_code": 1,
+        "unknown_session_message": "No conversation found with session ID",
+        "reused_pinned_session_exit_code": 1,
+        "reused_pinned_session_message": "is already in use"
+      },
+      "continue_works": true
+    },
+    "codex": {
+      "cli_version": "codex-cli 0.167.1",
+      "live": true,
+      "model": "gpt-6-luna",
+      "effort": "low",
+      "requests": 2,
+      "brief": "stdin",
+      "scratch_only_flags": [
+        "--skip-git-repo-check"
+      ],
+      "launch": {
+        "argv": [
+          "codex",
+          "exec",
+          "-m",
+          "gpt-6-luna",
+          "-c",
+          "model_reasoning_effort=\"low\"",
+          "--sandbox",
+          "danger-full-access",
+          "--json",
+          "-o",
+          "{run_dir}/last-message.md",
+          "--skip-git-repo-check",
+          "-"
+        ],
+        "exit_code": 0,
+        "stdout": "{\"type\":\"thread.started\",\"thread_id\":\"00000000-0000-7000-8000-0000000000d1\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"<str>\",\"type\":\"agent_message\",\"text\":\"NONCE-7f3a\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":0,\"reasoning_output_tokens\":0}}\n",
+        "last_message_file": "NONCE-7f3a",
+        "session_ref": "00000000-0000-7000-8000-0000000000d1"
+      },
+      "resume": {
+        "argv": [
+          "codex",
+          "exec",
+          "resume",
+          "-m",
+          "gpt-6-luna",
+          "-c",
+          "model_reasoning_effort=\"low\"",
+          "-c",
+          "sandbox_mode=\"danger-full-access\"",
+          "--json",
+          "-o",
+          "{run_dir}/last-message.md",
+          "--skip-git-repo-check",
+          "00000000-0000-7000-8000-0000000000d1",
+          "-"
+        ],
+        "exit_code": 0,
+        "stdout": "{\"type\":\"thread.started\",\"thread_id\":\"00000000-0000-7000-8000-0000000000d1\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"<str>\",\"type\":\"agent_message\",\"text\":\"NONCE-7f3a\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":0,\"reasoning_output_tokens\":0}}\n",
+        "last_message_file": "NONCE-7f3a",
+        "session_ref": "00000000-0000-7000-8000-0000000000d1",
+        "recalled_nonce": true
+      },
+      "from_help": {
+        "resume_has_sandbox_flag": false,
+        "resume_has_cd_flag": false
+      },
+      "observed": {
+        "sigterm_before_brief_exit_code": -15
+      },
+      "continue_works": true
+    },
+    "kimi": {
+      "cli_version": "2.5.3",
+      "live": true,
+      "model": "kimi-code/kimi-for-coding-highspeed",
+      "requests": 4,
+      "brief": "argument",
+      "launch": {
+        "argv": [
+          "kimi",
+          "-p",
+          "{brief}",
+          "-m",
+          "kimi-code/kimi-for-coding-highspeed"
+        ],
+        "output_format": "text",
+        "exit_code": 0,
+        "stdout": "• NONCE-7f3a\n\n",
+        "stderr_ends_with": "To resume this session: kimi -r session_00000000-0000-4000-8000-0000000000k1\n",
+        "session_ref": "session_00000000-0000-4000-8000-0000000000k1",
+        "session_list_json_keys": [
+          "id",
+          "title",
+          "lastPrompt",
+          "workDir",
+          "sessionDir",
+          "createdAt",
+          "updatedAt",
+          "archived",
+          "metadata",
+          "lastTurnReason"
+        ]
+      },
+      "resume": {
+        "argv": [
+          "kimi",
+          "-p",
+          "{brief}",
+          "--output-format",
+          "stream-json",
+          "-S",
+          "session_00000000-0000-4000-8000-0000000000k1",
+          "-m",
+          "kimi-code/kimi-for-coding-highspeed"
+        ],
+        "output_format": "stream-json",
+        "exit_code": 0,
+        "stdout": "{\"role\":\"meta\",\"type\":\"system.version\",\"version\":\"2.5.3\"}\n{\"role\":\"assistant\",\"content\":\"NONCE-7f3a\"}\n{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_00000000-0000-4000-8000-0000000000k1\",\"command\":\"kimi -r session_00000000-0000-4000-8000-0000000000k1\",\"content\":\"To resume this session: kimi -r session_00000000-0000-4000-8000-0000000000k1\"}\n",
+        "session_ref": "session_00000000-0000-4000-8000-0000000000k1",
+        "recalled_nonce": true
+      },
+      "observed": {},
+      "continue_works": true,
+      "dash_briefs": {
+        "about": "A brief that starts with dashes is accepted as the value of -p; both were fresh launches in stream-json.",
+        "argv": [
+          "kimi",
+          "-m",
+          "kimi-code/kimi-for-coding-highspeed",
+          "--output-format",
+          "stream-json",
+          "-p",
+          "{brief}"
+        ],
+        "runs": [
+          {
+            "brief_starts_with": "---\n",
+            "exit_code": 0,
+            "stdout": "{\"role\":\"meta\",\"type\":\"system.version\",\"version\":\"2.5.3\"}\n{\"role\":\"assistant\",\"content\":\"NONCE-7f3a\"}\n{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_00000000-0000-4000-8000-0000000000k2\",\"command\":\"kimi -r session_00000000-0000-4000-8000-0000000000k2\",\"content\":\"To resume this session: kimi -r session_00000000-0000-4000-8000-0000000000k2\"}\n",
+            "session_ref": "session_00000000-0000-4000-8000-0000000000k2"
+          },
+          {
+            "brief_starts_with": "-h ",
+            "exit_code": 0,
+            "stdout": "{\"role\":\"meta\",\"type\":\"system.version\",\"version\":\"2.5.3\"}\n{\"role\":\"assistant\",\"content\":\"NONCE-7f3a\"}\n{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_00000000-0000-4000-8000-0000000000k2\",\"command\":\"kimi -r session_00000000-0000-4000-8000-0000000000k2\",\"content\":\"To resume this session: kimi -r session_00000000-0000-4000-8000-0000000000k2\"}\n",
+            "session_ref": "session_00000000-0000-4000-8000-0000000000k2"
+          }
+        ]
+      }
+    },
+    "opencode": {
+      "cli_version": "1.19.5",
+      "live": true,
+      "model": "ollama-cloud/deepseek-v4.1-flash",
+      "requests": 2,
+      "brief": "stdin",
+      "launch": {
+        "argv": [
+          "opencode",
+          "run",
+          "--model",
+          "ollama-cloud/deepseek-v4.1-flash",
+          "--format",
+          "json"
+        ],
+        "exit_code": 0,
+        "stdout": "{\"type\":\"step_start\",\"timestamp\":0,\"sessionID\":\"ses_000000000000000000000000oc\",\"part\":{\"id\":\"<str>\",\"messageID\":\"<str>\",\"sessionID\":\"ses_000000000000000000000000oc\",\"type\":\"step-start\"}}\n{\"type\":\"text\",\"timestamp\":0,\"sessionID\":\"ses_000000000000000000000000oc\",\"part\":{\"id\":\"<str>\",\"messageID\":\"<str>\",\"sessionID\":\"ses_000000000000000000000000oc\",\"type\":\"text\",\"text\":\"NONCE-7f3a\",\"time\":{\"start\":0,\"end\":0}}}\n{\"type\":\"step_finish\",\"timestamp\":0,\"sessionID\":\"ses_000000000000000000000000oc\",\"part\":{\"id\":\"<str>\",\"reason\":\"stop\",\"messageID\":\"<str>\",\"sessionID\":\"ses_000000000000000000000000oc\",\"type\":\"step-finish\",\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":0}},\"cost\":0.0}}\n",
+        "session_ref": "ses_000000000000000000000000oc"
+      },
+      "resume": {
+        "argv": [
+          "opencode",
+          "run",
+          "--model",
+          "ollama-cloud/deepseek-v4.1-flash",
+          "--format",
+          "json",
+          "-s",
+          "ses_000000000000000000000000oc"
+        ],
+        "exit_code": 0,
+        "stdout": "{\"type\":\"step_start\",\"timestamp\":0,\"sessionID\":\"ses_000000000000000000000000oc\",\"part\":{\"id\":\"<str>\",\"messageID\":\"<str>\",\"sessionID\":\"ses_000000000000000000000000oc\",\"type\":\"step-start\"}}\n{\"type\":\"text\",\"timestamp\":0,\"sessionID\":\"ses_000000000000000000000000oc\",\"part\":{\"id\":\"<str>\",\"messageID\":\"<str>\",\"sessionID\":\"ses_000000000000000000000000oc\",\"type\":\"text\",\"text\":\"NONCE-7f3a\",\"time\":{\"start\":0,\"end\":0}}}\n{\"type\":\"step_finish\",\"timestamp\":0,\"sessionID\":\"ses_000000000000000000000000oc\",\"part\":{\"id\":\"<str>\",\"reason\":\"stop\",\"messageID\":\"<str>\",\"sessionID\":\"ses_000000000000000000000000oc\",\"type\":\"step-finish\",\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":0}},\"cost\":0.0}}\n",
+        "session_ref": "ses_000000000000000000000000oc",
+        "recalled_nonce": true
+      },
+      "observed": {
+        "sigterm_before_brief_exit_code": -15,
+        "unknown_session_exit_code": 1,
+        "unknown_session_message": "Session not found"
+      },
+      "continue_works": true
+    }
+  }
+}

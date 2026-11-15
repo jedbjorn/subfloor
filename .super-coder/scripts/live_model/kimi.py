@@ -1,6 +1,6 @@
 """kimi probe — ~/.kimi-code/sessions/wd_<name>_<hash>/session_<uuid>/.
 
-`state.json` carries the absolute `workDir`, so the worktree match is exact —
+`state.json` carries the absolute `workDir` (Kimi Code 2.x state v2: `cwd`), so the worktree match is exact —
 no path encoding to undo (the `wd_` dir name embeds the cwd's basename, but the
 hash makes it a hint, not an identity).
 
@@ -68,7 +68,7 @@ def read(worktree) -> "dict | None":
             continue
         except (json.JSONDecodeError, ValueError):
             continue  # malformed, not unreadable — the spec's skip-and-walk-on
-        if not isinstance(state, dict) or state.get("workDir") != worktree:
+        if not isinstance(state, dict) or (state.get("workDir") or state.get("cwd")) != worktree:
             continue
         wire = sess / "agents" / "main" / "wire.jsonl"  # main thread ONLY
         try:

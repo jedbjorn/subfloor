@@ -40,12 +40,14 @@ source baseline.
 
 ## Hand source maintenance upstream
 
-Use `issue_reporting` when the installed version or adapter contract remains
-unqualified. Include the complete version line, seat and engine commit,
+In a fork, use `issue_reporting` when the installed version or adapter
+contract remains unqualified. Include the complete version line, seat and engine commit,
 selector/effort, status/list/resolve outputs, sanitized native-check result,
 expected versus actual behavior, and the narrow failing boundary.
 
 Tracking forks do not edit materialized `.super-coder/` metadata or adapters.
-Pass after a published fix = the exact build reports `tested`, simulated newer
+In the Subfloor source repo there is no upstream to hand to: carry the same
+evidence to the FnB and author the metadata or adapter change on a branch and
+PR, when that work is yours or assigned. Pass after a published fix = the exact build reports `tested`, simulated newer
 builds remain `best-effort`, and the local route still resolves from fresh
 evidence after the authorized update/restart.

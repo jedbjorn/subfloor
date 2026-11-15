@@ -39,6 +39,13 @@ def _json_array(path: str) -> list[dict]:
     return value
 
 
+def _positive_int(raw: str) -> int:
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
+
 def _integer_list(values: list[int] | None) -> list[int]:
     return list(dict.fromkeys(values or ()))
 
@@ -478,6 +485,20 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_timeline(args: argparse.Namespace) -> int:
+    """The Sprint's append-only event log — the authoritative lifecycle read.
+
+    A quiet `monitor` cannot tell a Sprint that never dispatched from one that
+    already completed; the terminal events here can."""
+    result = mem._api("GET", f"/_sc/sprint/{args.sprint}/timeline")
+    if args.last is not None:
+        events = result.get("events") or []
+        result["total_events"] = len(events)
+        result["events"] = events[-args.last:]
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_compile_report(args: argparse.Namespace) -> int:
     result = mem._api("GET", f"/_sc/sprint/{args.sprint}/report?limit={args.limit}")
     print(json.dumps(result["evidence_packet"], indent=2, sort_keys=True))
@@ -821,6 +842,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     show.add_argument("--sprint", type=int, required=True)
     show.set_defaults(fn=cmd_show)
+
+    timeline = sub.add_parser(
+        "timeline",
+        help=(
+            "Read one Sprint's full append-only event log (the authoritative "
+            "lifecycle read: look for lifecycle.completed / lifecycle.aborted)"
+        ),
+    )
+    timeline.add_argument("--sprint", type=int, required=True)
+    timeline.add_argument(
+        "--last",
+        type=_positive_int,
+        metavar="N",
+        help="only the newest N events; total_events reports the full count",
+    )
+    timeline.set_defaults(fn=cmd_timeline)
 
     report = sub.add_parser(
         "compile-report", help="Planner prints the bounded evidence packet"

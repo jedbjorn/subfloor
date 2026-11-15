@@ -27,6 +27,9 @@ import request_timing
 import server
 import transport
 
+sys.path.insert(0, str(ROOT / "tests"))
+from signin_fixture import sign_in  # noqa: E402
+
 
 class Writer:
     def __init__(self, *, disconnect=False):
@@ -87,16 +90,29 @@ class RequestTimingCase(unittest.IsolatedAsyncioTestCase):
 
 class RequestTimingTransportTest(RequestTimingCase):
     async def test_real_api_json_static_and_error_headers(self):
+        # The operator is a signed-in browser (Feature #94).
+        signed = sign_in(self, host="localhost").raw()
+        active = mock.patch.object(server, "_active_user", return_value=True)
+        active.start()
+        self.addCleanup(active.stop)
         with tempfile.TemporaryDirectory() as tmp:
             ui = Path(tmp)
             (ui / "app.js").write_text("console.log('timed');")
             with mock.patch.object(server, "UI_DIR", ui):
                 for path, status in (("/app.js", 200), ("/missing", 404)):
                     with self.subTest(path=path):
+                        actual, headers, _ = await self.request(
+                            server.dispatch_http, path, headers=signed)
+                        self.assertEqual(actual, status)
+                        self.assertEqual(timing_values(headers), (0, 0, 0))
+                # The gate's refusals are timed like any other response.
+                for path, status in (("/app.js", 401), ("/missing", 302)):
+                    with self.subTest(path=path, signed_out=True):
                         actual, headers, _ = await self.request(server.dispatch_http, path)
                         self.assertEqual(actual, status)
                         self.assertEqual(timing_values(headers), (0, 0, 0))
-        actual, headers, body = await self.request(server.dispatch_http, method="TRACE")
+        actual, headers, body = await self.request(
+            server.dispatch_http, method="TRACE", headers=signed)
         self.assertEqual(actual, 405)
         self.assertTrue(json.loads(body))
         self.assertEqual(timing_values(headers), (0, 0, 0))
@@ -484,12 +500,22 @@ class RequestTimingApiTest(RequestTimingCase):
             "INSERT INTO shells VALUES(1, 'shell-token', 0);"
         )
         con.close()
+        def gate_db():
+            con = sqlite3.connect(self.db_path)
+            con.row_factory = sqlite3.Row
+            return con
+
         for patch in (
             mock.patch.object(conversation_routes, "DB_PATH", self.db_path),
             mock.patch.object(request_timing, "RECORDER", self.recorder),
+            # The gate reads the session's user and a Bearer's shell here.
+            mock.patch.object(server, "db", side_effect=gate_db),
         ):
             patch.start()
             self.addCleanup(patch.stop)
+        # The operator is a signed-in browser (Feature #94).
+        self.browser = sign_in(self, host="localhost")
+        self.signed = self.browser.raw(origin=False)
 
     async def test_endpoint_database_open_failure_keeps_no_store(self):
         with mock.patch.object(
@@ -498,6 +524,7 @@ class RequestTimingApiTest(RequestTimingCase):
         ) as connect:
             status, headers, body = await self.request(
                 server.dispatch_http, "/api/diagnostics/request-timing",
+                headers=self.signed,
             )
         connect.assert_called_once_with()
         self.assertEqual(status, 500)
@@ -510,15 +537,25 @@ class RequestTimingApiTest(RequestTimingCase):
         }})
 
     async def test_endpoint_database_query_failure_keeps_no_store_and_closes(self):
-        for auth in ("", "\r\nAuthorization: Bearer shell-token"):
+        # Through the gate as the signed-in operator, and straight at the
+        # endpoint as a shell (the gate refuses a shell before it gets here).
+        for auth in ("signed in", "shell at the endpoint"):
             with self.subTest(auth=auth):
                 con = mock.Mock()
                 con.execute.side_effect = sqlite3.OperationalError("secret-shaped-query failed")
                 with mock.patch.object(conversation_routes, "_db", return_value=con):
-                    status, headers, body = await self.request(
-                        server.dispatch_http, "/api/diagnostics/request-timing",
-                        headers="Host: localhost" + auth,
-                    )
+                    if auth == "signed in":
+                        status, headers, body = await self.request(
+                            server.dispatch_http, "/api/diagnostics/request-timing",
+                            headers=self.signed,
+                        )
+                    else:
+                        status, headers, body = await self.request(
+                            lambda method, path, raw, _body: request_timing.handle(
+                                method, raw),
+                            "/api/diagnostics/request-timing",
+                            headers="Host: localhost\r\nAuthorization: Bearer shell-token",
+                        )
                 con.execute.assert_called_once()
                 con.close.assert_called_once_with()
                 self.assertEqual(status, 500)
@@ -532,28 +569,59 @@ class RequestTimingApiTest(RequestTimingCase):
 
     async def test_endpoint_operator_only_and_loopback_host(self):
         endpoint = "/api/diagnostics/request-timing"
-        status, headers, body = await self.request(server.dispatch_http, endpoint)
+        status, headers, body = await self.request(
+            server.dispatch_http, endpoint, headers=self.signed)
         self.assertEqual(status, 200)
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(timing_values(headers), (0, 0, 0))
         self.assertEqual(json.loads(body)["started_at"], "test-start")
+        cookie = f"\r\nCookie: {self.browser.cookie}"
+        # At the gate (Feature #94): no header is not the operator, a shell is
+        # refused, and a cookie counts only on a loopback Host.
         for header, expected, code in (
-            ("Host: localhost\r\nAuthorization: Bearer shell-token", 403, "OPERATOR_REQUIRED"),
-            ("Host: localhost\r\nAuthorization: Bearer unknown", 401, "UNAUTHORIZED"),
-            ("Host: localhost\r\nAuthorization: Basic shell-token", 401, "UNAUTHORIZED"),
-            ("Host: evil.example", 403, "HOST_NOT_ALLOWED"),
-            ("", 403, "HOST_NOT_ALLOWED"),
+            ("Host: localhost", 401, "sign_in_required"),
+            ("Host: localhost\r\nAuthorization: Bearer shell-token", 403, "fnb_operator_required"),
+            ("Host: localhost\r\nAuthorization: Bearer shell-token" + cookie, 403, "fnb_operator_required"),
+            ("Host: localhost\r\nAuthorization: Bearer unknown", 401, "sign_in_required"),
+            ("Host: localhost\r\nAuthorization: Basic shell-token", 401, "sign_in_required"),
+            ("Host: evil.example", 401, "sign_in_required"),
+            ("Host: evil.example" + cookie, 401, "sign_in_required"),
+            ("", 401, "sign_in_required"),
         ):
             with self.subTest(header=header):
                 status, headers, body = await self.request(server.dispatch_http, endpoint, headers=header)
                 self.assertEqual(status, expected)
                 self.assertEqual(json.loads(body)["error"]["code"], code)
                 self.assertEqual(headers["Cache-Control"], "no-store")
+
+        # At the endpoint itself, for a caller that did not come through the
+        # gate: the same admission checks the conversation API makes.
+        def endpoint_only(method, path, raw, _body):
+            return request_timing.handle(method, raw)
+
+        for header, expected, code in (
+            ("Host: localhost", 401, "sign_in_required"),
+            ("Host: localhost\r\nAuthorization: Bearer shell-token", 403, "OPERATOR_REQUIRED"),
+            ("Host: localhost\r\nAuthorization: Bearer unknown", 401, "UNAUTHORIZED"),
+            ("Host: localhost\r\nAuthorization: Basic shell-token", 401, "UNAUTHORIZED"),
+            ("Host: evil.example" + cookie, 403, "HOST_NOT_ALLOWED"),
+            ("", 403, "HOST_NOT_ALLOWED"),
+        ):
+            with self.subTest(header=header, at="endpoint"):
+                status, headers, body = await self.request(endpoint_only, endpoint, headers=header)
+                self.assertEqual(status, expected)
+                self.assertEqual(json.loads(body)["error"]["code"], code)
+                self.assertEqual(headers["Cache-Control"], "no-store")
         for host in ("127.0.0.1:8800", "[::1]:8800"):
-            status, _, _ = await self.request(server.dispatch_http, endpoint, headers=f"Host: {host}")
+            status, _, _ = await self.request(
+                server.dispatch_http, endpoint, headers=f"Host: {host}" + cookie)
             self.assertEqual(status, 200)
         with mock.patch.object(conversation_routes, "_db") as connect:
-            status, _, _ = await self.request(server.dispatch_http, endpoint, headers="Host: remote.example")
+            status, _, _ = await self.request(
+                server.dispatch_http, endpoint, headers="Host: remote.example" + cookie)
+            self.assertEqual(status, 401)
+            status, _, _ = await self.request(
+                endpoint_only, endpoint, headers="Host: remote.example" + cookie)
             self.assertEqual(status, 403)
             connect.assert_not_called()
 
@@ -563,7 +631,8 @@ class RequestTimingApiTest(RequestTimingCase):
             await self.request(lambda *args: (200, [], b"{}"), path)
         self.assertEqual(len(self.recorder.snapshot()["templates"]), 64)
         self.assertEqual(self.recorder.snapshot()["templates"]["other"]["count"], 7)
-        status, _, body = await self.request(server.dispatch_http, "/api/diagnostics/request-timing")
+        status, _, body = await self.request(
+            server.dispatch_http, "/api/diagnostics/request-timing", headers=self.signed)
         self.assertEqual(status, 200)
         self.assertEqual(len(json.loads(body)["templates"]), 64)
         self.assertEqual(json.loads(body)["templates"]["other"]["count"], 7)
@@ -593,7 +662,8 @@ class RequestTimingApiTest(RequestTimingCase):
             mock.patch.object(conversation_routes, "_db", side_effect=read_only_db),
             mock.patch.object(request_timing, "RECORDER", self.recorder),
         ):
-            status, headers, body = await self.request(server.dispatch_http, "/api/diagnostics/request-timing")
+            status, headers, body = await self.request(
+                server.dispatch_http, "/api/diagnostics/request-timing", headers=self.signed)
         self.assertEqual(status, 200)
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(json.loads(body), {

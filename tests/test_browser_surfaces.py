@@ -18,6 +18,7 @@ import server
 import skill
 
 from tests.test_web_search import _build_file_db
+from tests.signin_fixture import sign_in
 
 
 @pytest.fixture
@@ -31,6 +32,9 @@ def api(tmp_path, monkeypatch):
         return con
 
     monkeypatch.setattr(server, "db", connect)
+    # The operator is a signed-in browser (Feature #94): a request with no
+    # shell token carries the session cookie.
+    signed_in = sign_in()
 
     def call(action, token=None, origin="http://127.0.0.1:8800", route="/api/browser"):
         raw = json.dumps({"action": action}).encode()
@@ -39,10 +43,13 @@ def api(tmp_path, monkeypatch):
             headers += ["Origin: " + origin, "Sec-Fetch-Site: same-origin"]
         if token:
             headers += ["Authorization: Bearer " + token]
+        else:
+            headers += ["Cookie: " + signed_in.cookie]
         status, _, body = server.dispatch_http("POST", route, "\r\n".join(headers), raw)
         return status, json.loads(body)
 
-    return call
+    yield call
+    signed_in.restore()
 
 
 @pytest.mark.parametrize(

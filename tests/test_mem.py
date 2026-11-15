@@ -91,7 +91,8 @@ class MemMessageHelpContractTest(unittest.TestCase):
             for action in send._actions
             for option in action.option_strings
         }
-        self.assertEqual(options, {"-h", "--help", "--kind"})
+        self.assertEqual(
+            options, {"-h", "--help", "--kind", "--body-file", "--json"})
 
         rendered = send.format_help()
         synopsis = (
@@ -180,6 +181,62 @@ class ApiMemTest(unittest.TestCase):
 
     def run_mem(self, *argv) -> int:
         return mem.main(list(argv))
+
+    def run_out(self, *argv, stdin: "str | None" = None):
+        """(exit status, stdout) of one `sc mem` call, optionally fed stdin."""
+        buf = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(buf))
+            if stdin is not None:
+                stack.enter_context(mock.patch("sys.stdin", io.StringIO(stdin)))
+            rc = self.run_mem(*argv)
+        return rc, buf.getvalue()
+
+    def run_json(self, *argv, stdin: "str | None" = None):
+        """A write under --json: stdout must be exactly one JSON object."""
+        rc, out = self.run_out(*argv, "--json", stdin=stdin)
+        self.assertEqual(len(out.strip().splitlines()), 1, out)
+        return rc, json.loads(out)
+
+    def refusal(self, *argv, stdin: "str | None" = None) -> str:
+        """The stderr text of a call that must refuse with status 1."""
+        with self.assertRaises(SystemExit) as caught:
+            self.run_out(*argv, stdin=stdin)
+        self.assertIsInstance(caught.exception.code, str)
+        return caught.exception.code
+
+    def server_today(self) -> str:
+        """The date the SERVER stamps (SQLite `date('now')`, UTC). The local
+        `date.today()` differs from it for every hour the two calendars
+        disagree, so a stamped date is compared with this one."""
+        return self.q("SELECT date('now')")[0]
+
+    def fails(self, *argv, stdin: "str | None" = None):
+        """(exit status, stdout, stderr prose) of a call that must refuse."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            if stdin is not None:
+                stack.enter_context(mock.patch("sys.stdin", io.StringIO(stdin)))
+            with self.assertRaises(SystemExit) as caught:
+                self.run_mem(*argv)
+        code = caught.exception.code
+        if isinstance(code, str):      # sys.exit(str): stderr text + status 1
+            return 1, out.getvalue(), code
+        return code, out.getvalue(), err.getvalue()
+
+    def fails_json(self, *argv, stdin: "str | None" = None):
+        """A refusal under --json: nonzero status, prose on stderr, and
+        exactly one `{"ok": false, "error": …}` object on stdout."""
+        rc, out, err = self.fails(*argv, "--json", stdin=stdin)
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(err.strip(), "the stderr prose must survive --json")
+        self.assertEqual(len(out.strip().splitlines()), 1, out)
+        payload = json.loads(out)
+        self.assertIs(payload["ok"], False)
+        self.assertEqual(set(payload["error"]), {"code", "message", "http_status"})
+        return rc, payload
 
     def write(self, sql, *params):
         con = sqlite3.connect(self.db)
@@ -560,8 +617,6 @@ class ApiMemTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.run_mem("get", "flags", "--resolved")
         with self.assertRaises(SystemExit):
-            self.run_mem("get", "flags", "--feature", "1")
-        with self.assertRaises(SystemExit):
             self.run_mem("get", "flags", "1", "--resolved", "--feature", "1")
         with self.assertRaises(SystemExit):
             self.run_mem("get", "state", "--resolved")
@@ -838,8 +893,9 @@ class ApiMemTest(unittest.TestCase):
                 self.run_mem("doc", "edit", str(did), "--title", "spec ser v2"), 0)
             self.assertEqual(self.run_mem("doc", "freeze", str(did)), 0)
             self.assertEqual(len(calls), 3)  # add + edit + freeze each serialize once
-            # a failed serialize never fails the write — the row commits, the
-            # CLI warns and exits nonzero so the drift is visible
+            # a failed serialize never fails the write — the row commits and
+            # the CLI warns but exits 0: a nonzero exit reads as "retry", and
+            # a retried `doc add` writes a second document
             def boom():
                 raise RuntimeError("snapshot failed:\nbroken")
             server.run_snapshot_render = boom
@@ -847,10 +903,21 @@ class ApiMemTest(unittest.TestCase):
             with contextlib.redirect_stdout(buf):
                 rc = self.run_mem("doc", "add", "spec ser2", "--body-file",
                                   str(body), "--feature", str(fid))
-            self.assertEqual(rc, 1)
+            self.assertEqual(rc, 0)
             self.assertIn("WARNING", buf.getvalue())
             self.assertIsNotNone(
                 self.q("SELECT document_id FROM documents WHERE title='spec ser2'"))
+            # under --json the same outcome is a `warning` field on the one
+            # object, still exit 0, still carrying the created id
+            rc, out = self.run_json("doc", "add", "spec ser3", "--body-file",
+                                    str(body), "--feature", str(fid))
+            self.assertEqual(rc, 0)
+            self.assertTrue(out["ok"])
+            self.assertIn("snapshot/render failed", out["warning"])
+            self.assertIn("broken", out["warning_detail"])
+            self.assertEqual(
+                out["document_id"],
+                self.q("SELECT document_id FROM documents WHERE title='spec ser3'")[0])
         finally:
             server.run_snapshot_render = real_rsr
             server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
@@ -1041,11 +1108,17 @@ class ApiMemTest(unittest.TestCase):
             self.write("DROP TRIGGER fail_atomic_spec_move")
 
     def test_feature_move_guidance_is_rendered_for_shells(self):
-        # F72: the move verb lives in the planner and dev flavor bodies.
-        for flavor in ("planner", "dev"):
+        # The move verb lives in the `spec_authoring` (Planner) and
+        # `spec_execution` (Developer) skills; each flavor body names its skill.
+        for flavor, skill in (("planner", "spec_authoring"), ("dev", "spec_execution")):
             with self.subTest(flavor=flavor):
                 body = (ENGINE / "templates" / "shells" / f"{flavor}.md").read_text()
-                self.assertIn("sc mem doc move <document_id> --feature <target>", body)
+                self.assertIn(f"`{skill}`", body)
+                detail = ENGINE / "assets" / "skills" / skill / "SKILL.md"
+                self.assertIn(
+                    "sc mem doc move <document_id> --feature <target>",
+                    detail.read_text(),
+                )
         planner = (ENGINE / "templates" / "shells" / "planner.md").read_text()
         self.assertIn("## REVISE, FREEZE, DOCUMENT", planner)
         self.assertIn("sc mem doc move", (ENGINE / "scripts" / "mem.py").read_text())
@@ -1503,6 +1576,551 @@ class ApiMemTest(unittest.TestCase):
         self.run_mem("oriented")
         self.assertEqual(self.q("SELECT bootstrapped FROM shells WHERE shell_id=1")[0], 1)
 
+    # ── agent ergonomics: --json writes ───────────────────────────────────────
+    def test_every_leaf_verb_accepts_json(self):
+        def leaves(parser, trail=()):
+            subs = [a for a in parser._actions
+                    if isinstance(a, mem.argparse._SubParsersAction)]
+            if not subs:
+                yield trail, parser
+            for action in subs:
+                for name, child in action.choices.items():
+                    yield from leaves(child, trail + (name,))
+        seen = 0
+        for trail, parser in leaves(mem.build_parser()):
+            seen += 1
+            self.assertIn("--json", parser._option_string_actions, " ".join(trail))
+        self.assertGreater(seen, 30)
+
+    def test_json_writes_return_one_object_with_created_ids(self):
+        rc, out = self.run_json("roadmap", "add", "feat json", "--status", "next")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat json'")[0]
+        self.assertEqual((rc, out["ok"], out["feature_id"]), (0, True, fid))
+        self.assertIn(f"#{fid}", out["message"])
+        self.assertNotIn("via engine API", json.dumps(out))
+
+        body = self.tmp / "json.md"
+        body.write_text("# json\nbody\n")
+        rc, out = self.run_json("doc", "add", "spec json", "--body-file", str(body),
+                                "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec json'")[0]
+        self.assertEqual((rc, out["document_id"], out["kind"]), (0, did, "spec"))
+        self.assertNotIn("warning", out)
+
+        rc, out = self.run_json("task", "add", "task json", "--doc", str(did))
+        tid = self.q("SELECT task_id FROM spec_tasks WHERE title='task json'")[0]
+        self.assertEqual(
+            (out["task_id"], out["feature_id"], out["document_id"], out["seq"]),
+            (tid, fid, did, 1))
+
+        rc, out = self.run_json("decision", "json decision", "--feature", str(fid))
+        self.assertEqual(
+            out["decision_id"],
+            self.q("SELECT decision_id FROM shell_decisions "
+                   "WHERE decision='json decision'")[0])
+        self.assertEqual(out["feature_id"], fid)
+
+        rc, out = self.run_json("flag", "open", "[x] json flag | Blocker for: y",
+                                "--name", "SC-JSON")
+        flag_id = self.q("SELECT flag_id FROM flags WHERE display_name='SC-JSON'")[0]
+        self.assertEqual((out["flag_id"], out["display_name"]), (flag_id, "SC-JSON"))
+        # close prints the row before it writes — under --json that prose is
+        # gone and the row identity rides in the object instead
+        rc, out = self.run_json("flag", "close", str(flag_id), "--notes", "done")
+        # … uniformly the plural list, with the full identifying row
+        self.assertEqual(out["flag_ids"], [flag_id])
+        self.assertNotIn("flag_id", out)
+        self.assertEqual(out["resolution_notes"], "done")
+        self.assertEqual(out["flags"], [{
+            "flag_id": flag_id, "display_name": "SC-JSON", "priority": "Medium",
+            "owner": "tc", "created_date": self.server_today(),
+            "feature_id": None, "feature_title": None,
+            "description": "[x] json flag | Blocker for: y"}])
+
+        rc, out = self.run_json("message", "send", "peer", "json hello")
+        self.assertEqual(
+            out["message_id"],
+            self.q("SELECT message_id FROM shell_messages WHERE body='json hello'")[0])
+        self.assertEqual((out["to"], out["kind"], out["duplicate"]),
+                         ("peer", "shell", False))
+
+        rc, out = self.run_json("seed", "json seed moment")
+        self.assertEqual(
+            out["entry_id"],
+            self.q("SELECT entry_id FROM shell_identity_entries "
+                   "WHERE body='json seed moment'")[0])
+        rc, out = self.run_json("retire", str(out["entry_id"]))
+        self.assertTrue(out["retired"])
+        for argv in (("state", "json state"), ("narrative", "json beat"),
+                     ("curated",), ("which",)):
+            rc, out = self.run_json(*argv)
+            self.assertEqual((rc, out["ok"]), (0, True), argv)
+
+    def test_default_write_output_is_unchanged_prose(self):
+        rc, out = self.run_out("state", "prose state")
+        self.assertEqual(out, "mem: current_state updated (11 chars)\n"
+                              "  (via engine API — live in the shared engine DB)\n")
+
+    def test_help_documents_the_exit_status_table(self):
+        rendered = mem.build_parser().format_help()
+        self.assertIn("exit status:", rendered)
+        for status in ("  0  success", "  1  refused or failed", "  2  usage error"):
+            self.assertIn(status, rendered)
+        self.assertIn("Exit status", mem.__doc__)
+
+    def test_json_failure_is_one_object_on_stdout_with_the_same_status(self):
+        # the API answered an error
+        rc, payload = self.fails_json("retire", "999999")
+        self.assertEqual(rc, 1)
+        self.assertEqual((payload["error"]["code"], payload["error"]["http_status"]),
+                         ("api_error", 404))
+        # the client refused the arguments
+        rc, payload = self.fails_json("lns", "a rule with no triage")
+        self.assertEqual((rc, payload["error"]["code"]), (1, "refused"))
+        self.assertIn("--supersedes", payload["error"]["message"])
+        # argparse itself refused the command line
+        rc, payload = self.fails_json("flag", "edit", "not-a-number")
+        self.assertEqual((rc, payload["error"]["code"], payload["error"]["http_status"]),
+                         (2, "usage", None))
+        # a read under --json follows the same contract
+        rc, payload = self.fails_json("get", "flags", "999999")
+        self.assertEqual((rc, payload["error"]["http_status"]), (1, 404))
+        # without --json a failure prints nothing on stdout
+        rc, out, err = self.fails("retire", "999999")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("HTTP 404", err)
+
+    def test_json_keys_are_stable_null_not_omitted(self):
+        rc, out = self.run_json("flag", "open", "[x] unnamed json | Blocker for: y")
+        self.assertIn("display_name", out)
+        self.assertIsNone(out["display_name"])
+        rc, out = self.run_json("decision", "json decision without a feature")
+        self.assertIn("feature_id", out)
+        self.assertIsNone(out["feature_id"])
+        rc, out = self.run_json("flag", "close", str(
+            self.q("SELECT flag_id FROM flags WHERE description="
+                   "'[x] unnamed json | Blocker for: y'")[0]))
+        self.assertIsNone(out["resolution_notes"])
+        self.assertIsNone(out["flags"][0]["display_name"])
+
+    def test_missing_body_is_a_usage_error_like_argparse(self):
+        for argv in (("state",), ("narrative",), ("seed",), ("lns", "--new"),
+                     ("decision",), ("flag", "open"), ("message", "send", "peer")):
+            rc, out, err = self.fails(*argv)
+            self.assertEqual((rc, out), (2, ""), argv)
+            self.assertIn("is required", err, argv)
+            self.assertIn("--body-file PATH|-", err, argv)
+        rc, payload = self.fails_json("state")
+        self.assertEqual((rc, payload["error"]["code"]), (2, "usage"))
+
+    # ── agent ergonomics: one read grammar ────────────────────────────────────
+    def test_get_documents_positional_id_equals_doc_flag(self):
+        self.run_mem("roadmap", "add", "feat grammar")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat grammar'")[0]
+        body = self.tmp / "grammar.md"
+        body.write_text("# grammar\nGRAMMAR-BODY\n")
+        self.run_mem("doc", "add", "spec grammar", "--body-file", str(body),
+                     "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec grammar'")[0]
+        _, by_flag = self.run_out("get", "documents", "--doc", str(did))
+        for form in (("documents", str(did)), ("document", str(did)),
+                     ("doc", str(did)), ("documents", str(did), "--doc", str(did))):
+            rc, out = self.run_out("get", *form)
+            self.assertEqual((rc, out), (0, by_flag), form)
+        self.assertIn("GRAMMAR-BODY", by_flag)
+        self.assertIn("name two documents",
+                      self.refusal("get", "documents", str(did), "--doc", str(did + 1)))
+
+    def test_get_roadmap_single_feature_reads_retired_with_deps_and_docs(self):
+        self.run_mem("project", "add", "wsone", "One WS")
+        self.run_mem("roadmap", "add", "feat base")
+        self.run_mem("roadmap", "add", "feat single", "--summary", "the summary",
+                     "--project", "wsone")
+        base = self.q("SELECT feature_id FROM roadmap WHERE title='feat base'")[0]
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat single'")[0]
+        self.run_mem("roadmap", "depends", str(fid), "--on", str(base))
+        body = self.tmp / "single.md"
+        body.write_text("# single\nbody\n")
+        self.run_mem("doc", "add", "spec single", "--body-file", str(body),
+                     "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec single'")[0]
+        self.run_mem("roadmap", "status", str(fid), "retired")
+
+        rc, out = self.run_out("get", "roadmap", str(fid), "--json")
+        feature = json.loads(out)["feature"]
+        self.assertEqual(
+            (feature["feature_id"], feature["title"], feature["roadmap_status"],
+             feature["project"], feature["blocked_by"]),
+            (fid, "feat single", "retired", "wsone", [base]))
+        self.assertEqual([d["document_id"] for d in feature["documents"]], [did])
+        rc, out = self.run_out("get", "feature", str(fid))
+        self.assertEqual(rc, 0)
+        self.assertIn(f"#{fid} [retired] feat single", out)
+        self.assertIn("work-stream: wsone", out)
+        self.assertIn(f"depends on: #{base}", out)
+        self.assertIn(f"spec #{did}", out)
+        # the board itself is unchanged: retired stays hidden from the list
+        _, board = self.run_out("get", "roadmap")
+        self.assertNotIn("feat single", board)
+        self.assertIn("no such feature", self.refusal("get", "roadmap", "999999"))
+
+    def test_get_flags_feature_alone_lists_that_features_open_flags(self):
+        self.run_mem("roadmap", "add", "feat flags A")
+        self.run_mem("roadmap", "add", "feat flags B")
+        a = self.q("SELECT feature_id FROM roadmap WHERE title='feat flags A'")[0]
+        b = self.q("SELECT feature_id FROM roadmap WHERE title='feat flags B'")[0]
+        self.run_mem("flag", "open", "[x] a-open | Blocker for: a", "--name",
+                     "SC-FA-OPEN", "--feature", str(a))
+        self.run_mem("flag", "open", "[x] a-done | Blocker for: a", "--name",
+                     "SC-FA-DONE", "--feature", str(a))
+        self.run_mem("flag", "open", "[x] b-open | Blocker for: b", "--name",
+                     "SC-FB-OPEN", "--feature", str(b))
+        done = self.q("SELECT flag_id FROM flags WHERE display_name='SC-FA-DONE'")[0]
+        self.run_mem("flag", "close", str(done), "--notes", "cleared")
+
+        rc, out = self.run_out("get", "flags", "--feature", str(a), "--json")
+        self.assertEqual([f["display_name"] for f in json.loads(out)["flags"]],
+                         ["SC-FA-OPEN"])
+        rc, out = self.run_out("get", "flag", "--feature", str(a))
+        self.assertIn("SC-FA-OPEN", out)
+        self.assertNotIn("SC-FB-OPEN", out)
+        self.assertNotIn("SC-FA-DONE", out)
+        # history keeps its own explicit form
+        rc, out = self.run_out("get", "flags", "--feature", str(a), "--resolved",
+                               "--json")
+        self.assertEqual([f["display_name"] for f in json.loads(out)["flags"]],
+                         ["SC-FA-DONE"])
+        rc, out = self.run_out("get", "flags", "--feature", "999999")
+        self.assertIn("no matching flags", out)
+
+    def test_get_id_on_every_surface_reads_one_row_or_names_the_form(self):
+        self.run_mem("roadmap", "add", "feat ids")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat ids'")[0]
+        body = self.tmp / "ids.md"
+        body.write_text("# ids\nbody\n")
+        self.run_mem("doc", "add", "spec ids", "--body-file", str(body),
+                     "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec ids'")[0]
+        self.run_mem("task", "add", "task ids one", "--doc", str(did))
+        self.run_mem("task", "add", "task ids two", "--doc", str(did))
+        tid = self.q("SELECT task_id FROM spec_tasks WHERE title='task ids two'")[0]
+        rc, out = self.run_out("get", "task", str(tid))
+        self.assertIn(f"#{tid} seq 2 [pending] task ids two", out)
+        self.assertIn(f"feature #{fid} · doc #{did}", out)
+        self.assertNotIn("task ids one", out)
+        rc, out = self.run_out("get", "tasks", str(tid), "--json")
+        self.assertEqual(json.loads(out)["task"]["document_id"], did)
+        self.assertIn("no such task", self.refusal("get", "tasks", "999999"))
+
+        rc, out = self.run_out("get", "shells", "2")
+        self.assertEqual(out.strip(), "#2 peer — Peer")
+        rc, out = self.run_out("get", "shell", "3", "--json")
+        self.assertEqual([x["shortname"] for x in json.loads(out)["shells"]], ["rev1"])
+        self.run_mem("seed", "pickable seed")
+        entry = self.q("SELECT entry_id FROM shell_identity_entries "
+                       "WHERE body='pickable seed'")[0]
+        rc, out = self.run_out("get", "seed", str(entry))
+        self.assertIn("pickable seed", out)
+        self.assertIn("no shells row #999", self.refusal("get", "shells", "999"))
+
+        # single-value surfaces refuse an id and say what to run instead
+        message = self.refusal("get", "state", "4")
+        self.assertIn("one value", message)
+        self.assertIn("`get state`", message)
+        # a scope-less task read names every accepted form
+        message = self.refusal("get", "tasks")
+        for form in ("get tasks <task_id>", "--doc <document_id>",
+                     "--feature <feature_id>"):
+            self.assertIn(form, message)
+        self.assertIn("get qaqc <spec_document_id>", self.refusal("get", "qaqc"))
+        rc, _ = self.run_out("get", "qaqc", str(did))
+        self.assertEqual(rc, 0)
+
+    # ── agent ergonomics: bodies from a file or stdin ─────────────────────────
+    def test_body_file_and_stdin_feed_every_text_verb(self):
+        note = self.tmp / "note.txt"
+        note.write_text("line one\n\"quoted\" $HOME `tick`\n\n")
+        want = "line one\n\"quoted\" $HOME `tick`"
+
+        self.run_mem("message", "send", "peer", "--body-file", str(note))
+        self.assertIsNotNone(
+            self.q("SELECT 1 FROM shell_messages WHERE body=? AND to_shell_id=2", want))
+        self.run_out("message", "send", "peer", "--body-file", "-",
+                     stdin="from stdin\n")
+        self.assertIsNotNone(
+            self.q("SELECT 1 FROM shell_messages WHERE body='from stdin'"))
+
+        self.run_out("narrative", "--body-file", "-", stdin="stdin beat\n")
+        self.assertIn("stdin beat", self.q(
+            "SELECT full_narrative FROM shell_memory_archives WHERE archive_id=1")[0])
+
+        rationale = self.tmp / "why.txt"
+        rationale.write_text("because of the file\n")
+        self.run_out("decision", "--body-file", "-", "--rationale-file",
+                     str(rationale), stdin="decide from stdin\n")
+        row = self.q("SELECT rationale FROM shell_decisions "
+                     "WHERE decision='decide from stdin'")
+        self.assertEqual(row[0], "because of the file")
+
+        self.run_out("lns", "--new", "--body-file", "-", stdin="Rule from stdin.\n")
+        self.assertIsNotNone(self.q(
+            "SELECT 1 FROM shell_identity_entries WHERE body='Rule from stdin.'"))
+
+        self.run_mem("flag", "open", "--body-file", str(note), "--name", "SC-BF")
+        flag_id = self.q("SELECT flag_id FROM flags WHERE display_name='SC-BF'")[0]
+        self.assertEqual(
+            self.q("SELECT description FROM flags WHERE flag_id=?", flag_id)[0], want)
+        self.run_out("flag", "edit", str(flag_id), "--append-file", "-",
+                     stdin="APPENDED\n")
+        self.assertIn("APPENDED", self.q(
+            "SELECT description FROM flags WHERE flag_id=?", flag_id)[0])
+        self.run_out("flag", "close", str(flag_id), "--notes-file", "-",
+                     stdin="closed from stdin\n")
+        self.assertEqual(
+            self.q("SELECT resolution_notes FROM flags WHERE flag_id=?", flag_id)[0],
+            "closed from stdin")
+
+        self.run_mem("roadmap", "add", "feat stdin doc")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat stdin doc'")[0]
+        self.run_out("doc", "add", "spec stdin", "--body-file", "-", "--feature",
+                     str(fid), stdin="# stdin spec\nSTDIN-BODY\n")
+        did, body = self.q(
+            "SELECT document_id, body FROM documents WHERE title='spec stdin'")
+        self.assertIn("STDIN-BODY", body)
+        self.run_out("doc", "edit", str(did), "--body-file", "-",
+                     stdin="# stdin spec\nEDITED-BODY\n")
+        self.assertIn("EDITED-BODY", self.q(
+            "SELECT body FROM documents WHERE document_id=?", did)[0])
+
+    def test_body_file_refusals_name_the_fix_and_write_nothing(self):
+        note = self.tmp / "both.txt"
+        note.write_text("from file\n")
+        rc, _, err = self.fails(
+            "message", "send", "peer", "inline", "--body-file", str(note))
+        self.assertEqual(rc, 2)
+        self.assertIn("not both", err)
+        self.assertIn("cannot read", self.refusal(
+            "narrative", "--body-file", str(self.tmp / "absent.txt")))
+        self.assertIn("is empty", self.refusal(
+            "narrative", "--body-file", "-", stdin="\n\n"))
+        self.assertIn("only one argument", self.refusal(
+            "decision", "--body-file", "-", "--rationale-file", "-", stdin="x\n"))
+        self.assertIsNone(self.q(
+            "SELECT 1 FROM shell_messages WHERE body IN ('inline', 'from file')"))
+
+    # ── agent ergonomics: fewer round-trips ───────────────────────────────────
+    def test_inbox_names_the_sender_by_shortname(self):
+        with mock.patch.object(mem, "SC_API_TOKEN", PEER_TOKEN):
+            self.run_mem("message", "send", "tc", "who sent this")
+        mid = self.q("SELECT message_id FROM shell_messages "
+                     "WHERE body='who sent this'")[0]
+        rc, out = self.run_out("message", "check")
+        self.assertIn(f"[#{mid}] from shell #2 (peer) · ", out)
+        rc, out = self.run_out("get", "messages")
+        self.assertIn(f"[#{mid}] from shell #2 (peer) · ", out)
+        rc, out = self.run_json("message", "check")
+        row = next(m for m in out["messages"] if m["message_id"] == mid)
+        self.assertEqual(row["from_shortname"], "peer")
+        self.run_mem("message", "mark-read", str(mid))
+
+    def test_message_check_limit_bounds_the_listing_not_the_count(self):
+        with mock.patch.object(mem, "SC_API_TOKEN", REVIEW_TOKEN):
+            for m in mem._api("GET", "/_sc/mem/messages")["messages"]:
+                mem._api("PATCH", f"/_sc/mem/messages/{m['message_id']}/read")
+        for n in range(3):
+            self.run_mem("message", "send", "rev1", f"limit probe {n}")
+        with mock.patch.object(mem, "SC_API_TOKEN", REVIEW_TOKEN):
+            rc, out = self.run_out("message", "check", "2")
+            self.assertIn("mem: 3 unread (showing the newest 2):", out)
+            self.assertEqual(out.count("limit probe"), 2)
+            rc, out = self.run_out("message", "check")
+            self.assertIn("mem: 3 unread:", out)
+            self.assertEqual(out.count("limit probe"), 3)
+            rc, out = self.run_json("message", "check", "1")
+            self.assertEqual((out["unread"], len(out["messages"])), (3, 1))
+            # 0 / negative N is a usage error (status 2), not a silent
+            # "everything" and not a status-1 refusal
+            for bad in ("0", "-3"):
+                rc, out, err = self.fails("message", "check", bad)
+                self.assertEqual((rc, out), (2, ""), bad)
+                self.assertIn("usage:", err)
+            rc, payload = self.fails_json("message", "check", "0")
+            self.assertEqual((rc, payload["error"]["code"]), (2, "usage"))
+            self.assertIn("positive count", payload["error"]["message"])
+            # several ids in one call
+            ids = [m["message_id"] for m in
+                   mem._api("GET", "/_sc/mem/messages")["messages"]]
+            rc, out = self.run_out("message", "mark-read", *map(str, ids))
+            self.assertIn("mem: messages " + ", ".join(f"#{i}" for i in ids)
+                          + " marked read", out)
+            rc, out = self.run_out("message", "check")
+            self.assertEqual(out, "mem: inbox empty\n")
+
+    def test_mark_read_batch_failure_reports_applied_and_not_applied(self):
+        ids = []
+        for n in range(2):
+            with mock.patch.object(mem, "SC_API_TOKEN", PEER_TOKEN):
+                self.run_mem("message", "send", "tc", f"batch probe {n}")
+            ids.append(self.q("SELECT message_id FROM shell_messages "
+                              "WHERE body=?", f"batch probe {n}")[0])
+        first, second = ids
+        rc, payload = self.fails_json(
+            "message", "mark-read", str(first), "999999", str(second))
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["error"]["http_status"], 404)
+        self.assertEqual(payload["applied_ids"], [first])
+        self.assertEqual(payload["not_applied_ids"], [999999, second])
+        self.assertIn(f"applied: #{first}; not applied: #999999, #{second}",
+                      payload["error"]["message"])
+        self.assertIsNotNone(self.q(
+            "SELECT read_at FROM shell_messages WHERE message_id=?", first)[0])
+        self.assertIsNone(self.q(
+            "SELECT read_at FROM shell_messages WHERE message_id=?", second)[0])
+        # the prose form names the same split on stderr
+        rc, out, err = self.fails("message", "mark-read", "999999", str(second))
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn(f"applied: none; not applied: #999999, #{second}", err)
+        # success: always the plural list, never a lone message_id
+        rc, out = self.run_json("message", "mark-read", str(second))
+        self.assertEqual(out["message_ids"], [second])
+        self.assertNotIn("message_id", out)
+
+    def test_inbox_newest_first_is_stable_within_one_second(self):
+        with mock.patch.object(mem, "SC_API_TOKEN", REVIEW_TOKEN):
+            for m in mem._api("GET", "/_sc/mem/messages")["messages"]:
+                mem._api("PATCH", f"/_sc/mem/messages/{m['message_id']}/read")
+        stamp = "2031-01-01 00:00:00"      # three rows inside one second
+        ids = [self.write(
+            "INSERT INTO shell_messages (from_shell_id, to_shell_id, kind, body, "
+            "created_at) VALUES (1, 3, 'shell', ?, ?)", f"tie {n}", stamp)
+            for n in range(3)]
+        with mock.patch.object(mem, "SC_API_TOKEN", REVIEW_TOKEN):
+            rc, out = self.run_json("message", "check", "1")
+            self.assertEqual([m["message_id"] for m in out["messages"]], [ids[-1]])
+            rc, out = self.run_json("message", "check")
+            self.assertEqual([m["message_id"] for m in out["messages"]], ids[::-1])
+            self.run_mem("message", "mark-read", *map(str, ids))
+
+    def test_flag_append_file_starts_on_a_new_line(self):
+        self.run_mem("flag", "open", "a\nb", "--name", "SC-APPEND-NL")
+        flag_id = self.q(
+            "SELECT flag_id FROM flags WHERE display_name='SC-APPEND-NL'")[0]
+        note = self.tmp / "append.txt"
+        note.write_text("appended\n")
+        self.run_mem("flag", "edit", str(flag_id), "--append-file", str(note))
+        self.run_out("flag", "edit", str(flag_id), "--body-file", "-",
+                     stdin="again\n")
+        self.assertEqual(
+            self.q("SELECT description FROM flags WHERE flag_id=?", flag_id)[0],
+            "a\nb\nappended\nagain")
+        # inline --append stays byte-exact, as on main
+        self.run_mem("flag", "edit", str(flag_id), "--append", " glued")
+        self.assertTrue(self.q(
+            "SELECT description FROM flags WHERE flag_id=?", flag_id)[0]
+            .endswith("again glued"))
+
+    def test_flag_close_missing_id_prints_no_closing_line_and_closes_nothing(self):
+        self.run_mem("flag", "open", "[x] precheck | Blocker for: z",
+                     "--name", "SC-PRECHECK")
+        flag_id = self.q(
+            "SELECT flag_id FROM flags WHERE display_name='SC-PRECHECK'")[0]
+        rc, out, err = self.fails("flag", "close", str(flag_id), "999999")
+        self.assertEqual((rc, out), (1, ""))      # no "closing flag …" line
+        self.assertIn("no such flag #999999 — nothing was closed", err)
+        self.assertEqual(
+            self.q("SELECT resolved FROM flags WHERE flag_id=?", flag_id)[0], 0)
+        rc, payload = self.fails_json("flag", "close", str(flag_id), "999999")
+        self.assertEqual(payload["error"]["http_status"], 404)
+        self.assertEqual(payload["applied_ids"], [])
+        self.assertEqual(payload["not_applied_ids"], [flag_id, 999999])
+        self.run_mem("flag", "close", str(flag_id))
+
+    def test_task_add_refuses_feature_mismatch_and_duplicate_seq_cleanly(self):
+        self.run_mem("roadmap", "add", "feat own")
+        self.run_mem("roadmap", "add", "feat other")
+        own = self.q("SELECT feature_id FROM roadmap WHERE title='feat own'")[0]
+        other = self.q("SELECT feature_id FROM roadmap WHERE title='feat other'")[0]
+        body = self.tmp / "own.md"
+        body.write_text("# own\nbody\n")
+        self.run_mem("doc", "add", "spec own", "--body-file", str(body),
+                     "--feature", str(own))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec own'")[0]
+        rc, payload = self.fails_json("task", "add", "wrong feature", "--doc",
+                                      str(did), "--feature", str(other))
+        self.assertEqual(payload["error"]["http_status"], 409)
+        self.assertIn(f"belongs to feature #{own}, not #{other}",
+                      payload["error"]["message"])
+        self.run_mem("task", "add", "seq one", "--doc", str(did), "--seq", "1")
+        rc, payload = self.fails_json("task", "add", "seq clash", "--doc",
+                                      str(did), "--seq", "1")
+        self.assertEqual(payload["error"]["http_status"], 409)
+        self.assertIn("seq 1 is already taken", payload["error"]["message"])
+        self.assertIn("next free slot (2)", payload["error"]["message"])
+        self.assertNotIn("UNIQUE", payload["error"]["message"])
+        self.assertIsNone(self.q("SELECT 1 FROM spec_tasks WHERE title IN "
+                                 "('wrong feature', 'seq clash')"))
+        # a frozen spec's plan is still worked: inference is unchanged by freeze
+        self.run_mem("doc", "freeze", str(did))
+        rc, out = self.run_json("task", "add", "after freeze", "--doc", str(did))
+        self.assertEqual((out["feature_id"], out["seq"]), (own, 2))
+
+    def test_flag_close_several_ids_checks_all_before_closing_any(self):
+        ids = []
+        for name in ("SC-MULTI-A", "SC-MULTI-B", "SC-MULTI-C"):
+            self.run_mem("flag", "open", f"[x] {name} | Blocker for: z", "--name", name)
+            ids.append(self.q("SELECT flag_id FROM flags WHERE display_name=?", name)[0])
+        a, b, c = ids
+        self.run_mem("flag", "close", str(c), "--notes", "first closer")
+        # one already-closed id refuses the whole call — nothing is written
+        message = self.refusal("flag", "close", str(a), str(c), str(b), "--notes", "x")
+        self.assertIn("already closed", message)
+        self.assertIn("none of the flags named in this call were closed", message)
+        for flag_id in (a, b):
+            self.assertEqual(
+                self.q("SELECT resolved FROM flags WHERE flag_id=?", flag_id)[0], 0)
+        self.assertEqual(
+            self.q("SELECT resolution_notes FROM flags WHERE flag_id=?", c)[0],
+            "first closer")
+        rc, out = self.run_out("flag", "close", str(a), str(b), str(a),
+                               "--notes", "swept")
+        self.assertEqual(rc, 0)
+        self.assertIn(f"mem: closing flag #{a} (SC-MULTI-A)", out)
+        self.assertIn(f"mem: 2 flags closed: #{a} (SC-MULTI-A), #{b} (SC-MULTI-B)", out)
+        for flag_id in (a, b):
+            self.assertEqual(
+                tuple(self.q("SELECT resolved, resolution_notes FROM flags "
+                             "WHERE flag_id=?", flag_id)), (1, "swept"))
+
+    def test_task_add_infers_feature_and_advances_seq(self):
+        self.run_mem("roadmap", "add", "feat infer")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat infer'")[0]
+        body = self.tmp / "infer.md"
+        body.write_text("# infer\nbody\n")
+        self.run_mem("doc", "add", "spec infer", "--body-file", str(body),
+                     "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec infer'")[0]
+        rc, out = self.run_out("task", "add", "infer one", "--doc", str(did))
+        self.assertIn("added (seq 1, 'infer one')", out)
+        # the explicit form still works exactly as before
+        self.run_mem("task", "add", "infer five", "--feature", str(fid),
+                     "--doc", str(did), "--seq", "5")
+        self.run_mem("task", "add", "infer next", "--doc", str(did))
+        got = {r["title"]: (r["feature_id"], r["seq"]) for r in (
+            self.q("SELECT title, feature_id, seq FROM spec_tasks WHERE title=?", t)
+            for t in ("infer one", "infer five", "infer next"))}
+        self.assertEqual(got, {"infer one": (fid, 1), "infer five": (fid, 5),
+                               "infer next": (fid, 6)})
+        self.assertIn("no such document",
+                      self.refusal("task", "add", "orphan", "--doc", "999999"))
+        self.run_mem("doc", "add", "standalone infer", "--body-file", str(body),
+                     "--kind", "doc")
+        loose = self.q(
+            "SELECT document_id FROM documents WHERE title='standalone infer'")[0]
+        self.assertIn("has no feature",
+                      self.refusal("task", "add", "loose", "--doc", str(loose)))
+        self.assertIsNone(
+            self.q("SELECT 1 FROM spec_tasks WHERE title IN ('orphan', 'loose')"))
+
     # ── reads via the API ─────────────────────────────────────────────────────
     def test_get_surfaces_return_ok(self):
         # `tasks` needs a scope (--doc/--feature); the rest list unscoped.
@@ -1514,6 +2132,249 @@ class ApiMemTest(unittest.TestCase):
                 continue
             self.assertEqual(self.run_mem("get", surface), 0, surface)
 
+    # ── narrative reads: the caller's own session archives ───────────────────
+    def _peer_archives(self, count: int = 13) -> list:
+        """Give the peer shell `count` session archives (newest = active) and
+        act as the peer; everything is undone when the test ends."""
+        ids = list(range(9001, 9001 + count))
+        con = sqlite3.connect(self.db)
+        for n, aid in enumerate(ids, start=1):
+            text = (f"# {n:04d} | 2026-02-{n:02d} | session opened\n\n"
+                    f"## Narrative\n\n[09:00] Session start.\n")
+            if aid != ids[-1]:
+                text += f"[09:05] beat of session {n}\n[09:10] handoff {n}\n"
+            con.execute(
+                "INSERT INTO shell_memory_archives "
+                "(archive_id, shell_id, session_id, date, full_narrative) "
+                "VALUES (?, 2, ?, ?, ?)",
+                (aid, f"{n:04d}", f"2026-02-{n:02d}", text))
+        con.execute("UPDATE shells SET active_archive_id=? WHERE shell_id=2",
+                    (ids[-1],))
+        con.commit()
+        con.close()
+
+        def undo():
+            con = sqlite3.connect(self.db)
+            con.execute("UPDATE shells SET active_archive_id=NULL WHERE shell_id=2")
+            con.execute("DELETE FROM shell_memory_archives WHERE shell_id=2")
+            con.commit()
+            con.close()
+        self.addCleanup(undo)
+        patch = mock.patch.object(mem, "SC_API_TOKEN", PEER_TOKEN)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return ids
+
+    def test_get_narrative_default_names_its_archive_and_the_previous_one(self):
+        ids = self._peer_archives()
+        rc, out = self.run_out("get", "narrative")
+        self.assertEqual(rc, 0)
+        lines = out.splitlines()
+        self.assertEqual(
+            lines[0], f"archive #{ids[-1]} · session 0013 · 2026-02-13 (active)")
+        self.assertIn("[09:00] Session start.", out)
+        # only the session-start line so far → one hint naming the read
+        self.assertIn(f"`sc mem get narrative {ids[-2]}`", lines[-1])
+        self.assertIn(f"archive #{ids[-2]} · session 0012", lines[-1])
+        rc, out = self.run_out("get", "narrative", "--json")
+        data = json.loads(out)
+        self.assertEqual(data["archive_id"], ids[-1])
+        self.assertTrue(data["active"])
+        self.assertEqual(data["lines"], 1)
+        self.assertIn("Session start.", data["narrative"])
+        self.assertEqual(data["previous"], {
+            "archive_id": ids[-2], "session_id": "0012",
+            "date": "2026-02-12", "lines": 3})
+        # once the session has its own lines the hint is gone
+        self.run_mem("narrative", "first real beat")
+        rc, out = self.run_out("get", "narrative")
+        self.assertIn("first real beat", out)
+        self.assertNotIn("previous session", out)
+
+    def test_get_narrative_reads_an_own_archive_by_id_and_prev(self):
+        ids = self._peer_archives()
+        rc, out = self.run_out("get", "narrative", str(ids[3]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.splitlines()[0],
+                         f"archive #{ids[3]} · session 0004 · 2026-02-04")
+        self.assertIn("handoff 4", out)
+        self.assertNotIn("previous session", out)
+        rc, out = self.run_out("get", "narrative", str(ids[3]), "--json")
+        data = json.loads(out)
+        self.assertEqual(
+            (data["archive_id"], data["session_id"], data["date"],
+             data["lines"], data["active"]),
+            (ids[3], "0004", "2026-02-04", 3, False))
+        self.assertIn("handoff 4", data["narrative"])
+        rc, out = self.run_out("get", "narrative", "--prev")
+        self.assertEqual(out.splitlines()[0],
+                         f"archive #{ids[-2]} · session 0012 · 2026-02-12")
+        self.assertIn("handoff 12", out)
+        rc, out = self.run_out("get", "narrative", "--prev", "--json")
+        self.assertEqual(json.loads(out)["archive_id"], ids[-2])
+
+    def test_get_narrative_prev_skips_sessions_that_recorded_nothing(self):
+        ids = self._peer_archives()
+        stub = "## Narrative\n\n[09:00] Session start.\n"
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE shell_memory_archives SET full_narrative=? "
+                    "WHERE archive_id IN (?, ?)", (stub, ids[-2], ids[-3]))
+        con.commit()
+        con.close()
+        # sessions 12 and 11 hold only their start line → 10 is "previous"
+        rc, out = self.run_out("get", "narrative", "--prev", "--json")
+        self.assertEqual(json.loads(out)["archive_id"], ids[-4])
+        rc, out = self.run_out("get", "narrative", "--json")
+        self.assertEqual(json.loads(out)["previous"]["archive_id"], ids[-4])
+        rc, out = self.run_out("get", "narrative")
+        self.assertIn(f"`sc mem get narrative {ids[-4]}`", out.splitlines()[-1])
+        # a stub archive is still readable by id and still listed
+        rc, out = self.run_out("get", "narrative", str(ids[-2]), "--json")
+        self.assertEqual(json.loads(out)["lines"], 1)
+        rc, out = self.run_out("get", "narrative", "--list", "--json")
+        self.assertEqual(json.loads(out)["archives"][1]["archive_id"], ids[-2])
+
+    def test_get_narrative_prev_keeps_untimestamped_recorded_text(self):
+        ids = self._peer_archives()
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "UPDATE shell_memory_archives SET full_narrative=? WHERE archive_id=?",
+            ("# 0012 | 2026-02-12 | session opened\n\n## Narrative\n\n"
+             "[09:00] Session start.\nHandoff: deployment completed\n",
+             ids[-2]))
+        con.commit()
+        con.close()
+        # one timestamped line, but text was recorded after it → not a stub
+        rc, out = self.run_out("get", "narrative", "--prev", "--json")
+        data = json.loads(out)
+        self.assertEqual(data["archive_id"], ids[-2])
+        self.assertEqual((data["lines"], data["stub"]), (1, False))
+        self.assertIn("Handoff: deployment completed", data["narrative"])
+        rc, out = self.run_out("get", "narrative", "--json")
+        data = json.loads(out)
+        self.assertTrue(data["stub"])               # the active one IS a stub
+        self.assertEqual(data["previous"]["archive_id"], ids[-2])
+        # the same text appended to the active session ends the hint
+        urllib.request.urlopen(urllib.request.Request(
+            f"{mem.SC_API_BASE}/_sc/mem/narrative", method="POST",
+            data=json.dumps({"text": "untimestamped note"}).encode(),
+            headers={"Authorization": f"Bearer {PEER_TOKEN}",
+                     "Content-Type": "application/json"})).read()
+        rc, out = self.run_out("get", "narrative")
+        self.assertIn("untimestamped note", out)
+        self.assertNotIn("previous session", out)
+
+    def test_get_narrative_prev_stops_at_the_first_recorded_archive(self):
+        ids = self._peer_archives()
+        real = server._narrative_is_stub
+        seen = []
+
+        def counting(narrative):
+            seen.append(narrative)
+            return real(narrative)
+        with mock.patch.object(server, "_narrative_is_stub", counting):
+            rc, out = self.run_out("get", "narrative", "--prev", "--json")
+        self.assertEqual(json.loads(out)["archive_id"], ids[-2])
+        # the scan's own check plus the one shaping the row it returns —
+        # never the eleven older bodies
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all("session 12" in n for n in seen))
+
+    def test_get_narrative_out_of_range_ids_read_as_missing(self):
+        self._peer_archives(2)
+        for raw in ("0", "9223372036854775807", "9223372036854775808",
+                    "99999999999999999999999999"):
+            with self.subTest(archive_id=raw):
+                rc, out, err = self.fails("get", "narrative", raw, "--json")
+                self.assertEqual(rc, 1)
+                error = json.loads(out)["error"]
+                self.assertEqual(error["http_status"], 404)
+                self.assertIn("no such archive among your sessions",
+                              error["message"])
+        # the raw route too: a sign or a non-number is a 404, never a 500
+        for raw in ("-1", "-9223372036854775809", "abc", "1.5", "%31"):
+            with self.subTest(path=raw):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(urllib.request.Request(
+                        f"{mem.SC_API_BASE}/_sc/mem/narrative/{raw}",
+                        headers={"Authorization": f"Bearer {PEER_TOKEN}"}))
+                self.assertEqual(caught.exception.code, 404)
+        # argparse reads `-1` as a number, so it reaches the server the same way
+        self.assertIn("no such archive among your sessions",
+                      self.refusal("get", "narrative", "-1"))
+
+    def test_get_narrative_refuses_another_shells_archive(self):
+        ids = self._peer_archives()
+        # archive 1 is shell 1's: to the peer it reads like a missing row
+        foreign = self.refusal("get", "narrative", "1")
+        self.assertIn("HTTP 404", foreign)
+        self.assertIn("no such archive among your sessions", foreign)
+        missing = self.refusal("get", "narrative", "424242")
+        self.assertIn("no such archive among your sessions", missing)
+        rc, out, err = self.fails("get", "narrative", "1", "--json")
+        self.assertEqual(rc, 1)
+        error = json.loads(out)
+        self.assertFalse(error["ok"])
+        self.assertEqual(error["error"]["code"], "api_error")
+        self.assertEqual(error["error"]["http_status"], 404)
+        self.assertNotIn("beat", out)
+        # …and the peer's archives are just as closed to shell 1
+        with mock.patch.object(mem, "SC_API_TOKEN", TOKEN):
+            self.assertIn("no such archive among your sessions",
+                          self.refusal("get", "narrative", str(ids[3])))
+            rc, out = self.run_out("get", "narrative", "--list", "--json")
+            self.assertEqual(
+                [a["archive_id"] for a in json.loads(out)["archives"]], [1])
+            self.assertIn("no session archive before the active one",
+                          self.refusal("get", "narrative", "--prev"))
+
+    def test_get_narrative_list_is_bounded_and_newest_first(self):
+        ids = self._peer_archives()
+        rc, out = self.run_out("get", "narrative", "--list", "--json")
+        data = json.loads(out)
+        self.assertEqual(data["limit"], 10)
+        self.assertEqual([a["archive_id"] for a in data["archives"]],
+                         ids[:2:-1])               # the 10 newest of 13
+        self.assertEqual(data["archives"][0], {
+            "archive_id": ids[-1], "session_id": "0013", "date": "2026-02-13",
+            "lines": 1, "stub": True, "active": True})
+        self.assertEqual(data["archives"][1]["lines"], 3)
+        self.assertFalse(data["archives"][1]["active"])
+        rc, out = self.run_out("get", "narrative", "--list")
+        rows = out.splitlines()
+        self.assertEqual(
+            rows[0],
+            f"archive #{ids[-1]} · session 0013 · 2026-02-13 · 1 line(s) (active)")
+        self.assertEqual(
+            rows[1], f"archive #{ids[-2]} · session 0012 · 2026-02-12 · 3 line(s)")
+        self.assertEqual(len(rows), 11)             # 10 rows + the footer
+        self.assertNotIn("handoff", out)
+
+    def test_get_narrative_argument_refusals(self):
+        # a conflicting argument is a usage error: status 2, code `usage`
+        for argv, said in (
+                (("get", "narrative", "1", "--list"),
+                 "one of <archive_id>, --prev or --list"),
+                (("get", "narrative", "1", "--prev"),
+                 "one of <archive_id>, --prev or --list"),
+                (("get", "narrative", "--prev", "--list"),
+                 "one of <archive_id>, --prev or --list"),
+                (("get", "state", "--list"), "only valid with get narrative"),
+                (("get", "flags", "--prev"), "only valid with get narrative")):
+            with self.subTest(argv=argv):
+                rc, out, err = self.fails(*argv)
+                self.assertEqual(rc, 2)
+                self.assertIn(said, err)
+                rc, out, err = self.fails(*argv, "--json")
+                self.assertEqual(rc, 2)
+                self.assertEqual(json.loads(out)["error"]["code"], "usage")
+        # a shell with no session archive still gets the plain answer
+        with mock.patch.object(mem, "SC_API_TOKEN", REVIEW_TOKEN):
+            rc, out = self.run_out("get", "narrative")
+            self.assertEqual((rc, out.strip()), (0, "(no active narrative)"))
+            rc, out = self.run_out("get", "narrative", "--list")
+            self.assertEqual(out.strip(), "mem: no session archives")
+
     def test_get_tasks_requires_scope(self):
         with self.assertRaises(SystemExit):  # no --doc/--feature → fail loud
             self.run_mem("get", "tasks")
@@ -1521,7 +2382,12 @@ class ApiMemTest(unittest.TestCase):
     def test_get_surface_aliases(self):
         # boot docs say "doc", the write surface is `mem doc` — the read
         # surface accepts both short forms as `documents` (#242c).
-        for alias in mem.GET_SURFACE_ALIASES:
+        for alias, surface in mem.GET_SURFACE_ALIASES.items():
+            self.assertIn(surface, mem.GET_SURFACES, alias)
+            if surface == "tasks":      # needs a scope, like the plural form
+                self.assertEqual(
+                    self.run_mem("get", alias, "--feature", "0"), 0, alias)
+                continue
             self.assertEqual(self.run_mem("get", alias), 0, alias)
 
     # ── shared planning reads (the docs/spec/review surfaces) ─────────────────
@@ -1610,7 +2476,7 @@ class ApiMemTest(unittest.TestCase):
         row = self._row(target)
         self.assertEqual(row["retired"], 1)
         self.assertEqual(row["superseded_by"], successor)
-        self.assertEqual(row["retired_date"], str(date.today()))
+        self.assertEqual(row["retired_date"], self.server_today())
 
     def test_bare_retire_is_legal_and_leaves_no_successor(self):
         target = self._doc("retire bare B")
@@ -1851,7 +2717,7 @@ class ApiMemTest(unittest.TestCase):
         for payload in (listed, one):
             self.assertEqual(payload["frozen_date"], "2026-03-04")
             self.assertEqual(payload["retired"], 1)
-            self.assertEqual(payload["retired_date"], str(date.today()))
+            self.assertEqual(payload["retired_date"], self.server_today())
             self.assertEqual(payload["superseded_by"], successor)
             self.assertEqual(payload["superseded_by_title"],
                              "retire read successor K")
@@ -1891,7 +2757,7 @@ class ApiMemTest(unittest.TestCase):
                                           str(target)), 0)
         text = out.getvalue()
         self.assertIn(f"[retired → #{successor}]", text)
-        self.assertIn(f"retired {date.today()} — superseded by "
+        self.assertIn(f"retired {self.server_today()} — superseded by "
                       f"#{successor} retire single successor M", text)
         self.assertIn("# target M", text)   # the body still reads
 
@@ -1923,7 +2789,13 @@ class ApiMemTest(unittest.TestCase):
     def test_retirement_guidance_is_rendered_for_the_planner(self):
         planner = (ENGINE / "templates" / "shells" / "planner.md").read_text()
         self.assertIn("## REVISE, FREEZE, DOCUMENT", planner)
-        self.assertIn("sc mem doc retire <id> [--superseded-by <id>]", planner)
+        revise = planner.split("## REVISE, FREEZE, DOCUMENT", 1)[1]
+        self.assertIn("Retiring a document is metadata about it", revise)
+        self.assertIn("`spec_authoring`", revise)
+        detail = ENGINE / "assets" / "skills" / "spec_authoring" / "SKILL.md"
+        self.assertIn(
+            "sc mem doc retire <id> [--superseded-by <id>]", detail.read_text()
+        )
         self.assertIn("sc mem doc retire", mem.__doc__)
 
 

@@ -25,6 +25,7 @@ import time
 import uuid
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -32,9 +33,14 @@ ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 SCRIPTS = ENGINE / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+if str(ENGINE / "api") not in sys.path:
+    sys.path.insert(0, str(ENGINE / "api"))
 
 import active_chat_registry
+import browser_gate
+import compaction_settings
 import conversation_broker
+import conversation_compaction
 import conversation_events
 import conversation_git_targets
 import db_driver
@@ -54,10 +60,7 @@ _SIGNAL_GROUP = os.killpg
 _ALLOWED_HOST_SET = frozenset(("127.0.0.1", "localhost", "::1"))
 # The confusion every shell-facing browser refusal prevents, named first
 # (Feature #91 E5/E6); server.py reuses it for the browser profile routes.
-BROWSER_OWNERSHIP_CONFUSION = (
-    "the browser profile and its chats belong to the operator; a shell drives, "
-    "it does not own"
-)
+BROWSER_OWNERSHIP_CONFUSION = browser_gate.BROWSER_OWNERSHIP_CONFUSION
 _BROWSER_HARNESSES = tuple(sorted(ADAPTER_TYPES))
 _BROWSER_HARNESS_SQL = ",".join("?" for _ in _BROWSER_HARNESSES)
 _CONVERSATION_STATES = frozenset(
@@ -74,6 +77,9 @@ _UPLOADS_PATH = re.compile(
     r"^/api/conversations/(cv_[0-9a-f]{32})/uploads$"
 )
 _EVENTS_PATH = re.compile(r"^/api/conversations/(cv_[0-9a-f]{32})/events$")
+_COMPACTIONS_PATH = re.compile(
+    r"^/api/conversations/(cv_[0-9a-f]{32})/compactions$"
+)
 _INTERRUPTIONS_PATH = re.compile(
     r"^/api/conversations/(cv_[0-9a-f]{32})/interruptions$"
 )
@@ -232,11 +238,21 @@ def _operator(con, headers) -> dict:
             f"{BROWSER_OWNERSHIP_CONFUSION}: conversations are owned by the "
             "browser operator",
         )
-    row = con.execute(
-        "SELECT user_id,username FROM users WHERE is_active=1 ORDER BY user_id LIMIT 1"
+    # No Authorization header proves nothing (Feature #94): the operator is
+    # the user a verified session cookie belongs to, and nobody else.
+    session = browser_gate.operator_session(
+        headers,
+        lambda user_id: con.execute(
+            "SELECT 1 FROM users WHERE user_id=? AND is_active=1", (user_id,)
+        ).fetchone() is not None,
+    )
+    row = None if session is None else con.execute(
+        "SELECT user_id,username FROM users WHERE user_id=?",
+        (session["user_id"],),
     ).fetchone()
     if row is None:
-        raise ApiError(503, "OPERATOR_UNAVAILABLE", "no active operator exists")
+        payload = browser_gate.sign_in_required_payload()["error"]
+        raise ApiError(401, payload["code"], payload["message"], payload["details"])
     return {"user_id": int(row["user_id"]), "username": row["username"]}
 
 
@@ -434,6 +450,18 @@ _REGISTRY_PROCESS_JOIN = (
     " ON reg.shell_id=c.shell_id AND reg.chat_id=c.conversation_id"
 )
 
+# The harness's saved compaction settings (spec #275), joined into the chat
+# row so the transcript projection's meter reads them without a read of its
+# own. NULL columns mean "not saved": the environment and defaults apply.
+_COMPACTION_SETTINGS_COLUMNS = "".join(
+    f"ccs.{column} AS compaction_{column},"
+    for column in compaction_settings.SAVED_COLUMNS
+)
+
+_COMPACTION_SETTINGS_JOIN = (
+    " LEFT JOIN chat_compaction_settings ccs ON ccs.harness=c.harness"
+)
+
 _CLOSE_REQUESTED_AFTER_REOPEN = (
     "requested.event_type='conversation.close.requested' "
     "AND requested.sequence>COALESCE("
@@ -461,14 +489,21 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
         " WHERE queued.conversation_id=c.conversation_id "
         " AND queued.message_kind!='control' "
         " AND queued.state IN ('accepted','queued')) AS queued_count,"
+        "(SELECT MAX(m.message_id) FROM conversation_messages m "
+        " WHERE m.conversation_id=c.conversation_id "
+        " AND " + conversation_compaction.manual_compact_sql("m") +
+        " AND m.state IN ('accepted','queued','running')) "
+        "AS pending_compaction_message_id,"
         "(SELECT active.run_id FROM conversation_runs active "
         " WHERE active.conversation_id=c.conversation_id "
         " AND active.state IN ('leased','starting','running') "
         " ORDER BY active.run_id DESC LIMIT 1) AS active_run_id,"
         + _REGISTRY_PROCESS_COLUMNS
+        + _COMPACTION_SETTINGS_COLUMNS
         + _SPRINT_MANAGED_COLUMN
         + " FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
         + _REGISTRY_PROCESS_JOIN
+        + _COMPACTION_SETTINGS_JOIN
         + " WHERE c.conversation_id=? AND c.owner_user_id=? "
         f"AND c.harness IN ({_BROWSER_HARNESS_SQL})",
         (conversation_id, owner_user_id, *_BROWSER_HARNESSES),
@@ -503,6 +538,41 @@ def _process_projection(row) -> dict:
     }
 
 
+def _manual_compaction_supported(harness: str) -> bool:
+    """True when the harness's adapter has a confirmed manual trigger."""
+    return bool(getattr(ADAPTER_TYPES.get(harness), "manual_compaction", False))
+
+
+def _compaction_controls(row) -> dict:
+    """What the compact button needs: whether to show it and whether it is on.
+
+    ``supported`` is the harness; ``available`` adds a stored session to
+    compact and an open chat, and is what shows the button. ``enabled`` is
+    false while a turn or an earlier request is in flight: the button is
+    then greyed out, and the server refuses a press for the same reason.
+    """
+    supported = _manual_compaction_supported(row["harness"])
+    pending = row["pending_compaction_message_id"]
+    available = (
+        supported
+        and bool(row["harness_session_ref"])
+        and row["state"] != "closed"
+    )
+    busy = (
+        row["state"] in ("queued", "running", "waiting")
+        or row["active_run_id"] is not None
+        or pending is not None
+        or row["close_requested_at"] is not None
+    )
+    return {
+        "supported": supported,
+        "available": available,
+        "enabled": available and not busy,
+        "pending": pending is not None,
+        "message_id": int(pending) if pending is not None else None,
+    }
+
+
 def _conversation_projection(row) -> dict:
     contract_version = int(row["route_contract_version"])
     binding = None
@@ -529,6 +599,13 @@ def _conversation_projection(row) -> dict:
         control_state = binding["control_state"]
         native_variant_id = binding["native_variant_id"]
         native_option_id = binding.get("native_option_id")
+    # The compact button's state needs columns only the single-chat read
+    # carries; a list row has none and its chats show no button.
+    detail = (
+        {"compaction": _compaction_controls(row)}
+        if "pending_compaction_message_id" in row.keys()
+        else {}
+    )
     return {
         "conversation_id": row["conversation_id"],
         "shell": {
@@ -558,6 +635,8 @@ def _conversation_projection(row) -> dict:
         "close_requested_at": row["close_requested_at"],
         "sprint_managed": bool(row["sprint_managed"]),
         "process": _process_projection(row),
+        **detail,
+        "cold_return": conversation_compaction.cold_return_settings(),
         "version": int(row["version"]),
     }
 
@@ -929,6 +1008,13 @@ def _cancel_queued_turns(con, conversation_id: str) -> int:
         "claim_owner=NULL,claimed_at=NULL,lease_expires_at=NULL "
         f"WHERE message_id IN ({marks}) AND state IN ('pending','claimed')",
         message_ids,
+    )
+    # A queued manual compact request still ends in its one line.
+    conversation_compaction.settle_cancelled_requests(
+        con,
+        conversation_id,
+        message_ids,
+        error_code="CONVERSATION_CLOSING",
     )
     return int(cancelled)
 
@@ -2024,6 +2110,64 @@ def _create_message(con, operator: dict, conversation_id: str, headers, body: di
     )
 
 
+def _request_compaction(
+    con, operator: dict, conversation_id: str, headers, body: dict
+):
+    """The manual compact button: ask the chat's harness to compact now.
+
+    The request joins the chat's own queue as an engine-sent control
+    message, so the broker runs it like a turn (one at a time, in order,
+    interruptible) and a message sent meanwhile waits behind it. It is not
+    an operator message and never shows as one: the transcript lists prompts
+    only, and the request is recorded as ``compaction.requested``. The press
+    ends in a ``context.compacted`` marker, a ``compaction.failed`` line or
+    a ``compaction.not_reported`` notice, written by the broker.
+    """
+    _only_fields(body, set())
+    key = _idempotency_key(headers)
+
+    with db_driver.write_transaction(con, "conversation.compaction.create"):
+        # The operator check: only the chat's owner reaches the helper.
+        _require_conversation(con, conversation_id, operator["user_id"])
+        # The shared helper applies the refusals and writes the request,
+        # the same path the threshold check and the idle scheduler use.
+        result = conversation_compaction.enqueue_compaction(
+            con,
+            conversation_id,
+            conversation_compaction.CAUSE_OPERATOR,
+            idempotency_key=key,
+            user_id=int(operator["user_id"]),
+        )
+        if result.refusal is not None:
+            status = 404 if result.refusal == "CONVERSATION_NOT_FOUND" else 409
+            raise ApiError(
+                status,
+                result.refusal,
+                result.detail or result.refusal,
+                (
+                    {"message_id": result.pending_message_id}
+                    if result.pending_message_id is not None
+                    else None
+                ),
+            )
+    if result.existing:
+        return _json(
+            202,
+            {
+                "compaction": {
+                    "message_id": result.message_id,
+                    "state": result.state,
+                },
+            },
+        )
+    conversation_events.notify(conversation_id)
+    conversation_broker.notify_commit()
+    return _json(
+        202,
+        {"compaction": {"message_id": result.message_id, "state": "queued"}},
+    )
+
+
 def _queue_position(con, message_id: int) -> int:
     row = con.execute(
         "SELECT COUNT(*) FROM conversation_outbox target "
@@ -2276,8 +2420,142 @@ def _utf8_prefix(value: str, maximum: int) -> str:
     return raw[:maximum].decode("utf-8", errors="ignore")
 
 
-def _transcript_activity_label(event_type: str, payload: dict) -> str:
-    if event_type == "permission.requested":
+def _short_tokens(value: int) -> str:
+    """A token figure as the chat shows it: 123456 -> "123k", 850 -> "850"."""
+    return f"{round(value / 1000)}k" if value >= 1000 else str(value)
+
+
+def _compaction_projection(payload: dict) -> dict:
+    """The marker's figures: what the harness stated, and nothing else."""
+    trigger = payload.get("trigger")
+    cause = payload.get("cause")
+    projection = {
+        "trigger": (
+            trigger
+            if trigger in ("auto", "manual", "unknown")
+            else "unknown"
+        ),
+        "tokens_before": _token_count(payload.get("tokens_before")),
+        "tokens_after": _token_count(payload.get("tokens_after")),
+    }
+    # Why the chat compacted (spec #275). A marker recorded before causes
+    # existed has none, and keeps its old shape.
+    if cause in conversation_compaction.CAUSES:
+        projection["cause"] = cause
+        trigger_tokens = _token_count(payload.get("trigger_tokens"))
+        if trigger_tokens is not None:
+            projection["trigger_tokens"] = trigger_tokens
+    return projection
+
+
+# How the marker names each harness when the harness compacted on its own.
+_HARNESS_NAMES = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "kimi": "Kimi",
+    "opencode": "OpenCode",
+}
+
+
+def _compaction_cause_phrase(cause: str | None, harness: str | None) -> str:
+    """"Context compacted" plus why (spec #275 "Marker wording")."""
+    if cause == conversation_compaction.CAUSE_THRESHOLD:
+        return "Context compacted at the trigger"
+    if cause == conversation_compaction.CAUSE_IDLE:
+        return "Context compacted while idle"
+    if cause == conversation_compaction.CAUSE_HARNESS:
+        name = _HARNESS_NAMES.get(harness or "", harness or "the harness")
+        return f"Context compacted by {name}"
+    return "Context compacted"
+
+
+def _compaction_label(payload: dict, harness: str | None = None) -> str:
+    """"Context compacted while idle · 141k → 29k"; unknown parts left out.
+
+    The opening names the cause: "compacted" (the operator's button),
+    "compacted at the trigger", "compacted while idle", or "compacted by
+    <harness>". A marker recorded before causes existed keeps its old
+    wording, with "automatic" or "manual" at the end. A threshold
+    compaction that left the chat at or above its trigger says so.
+
+    Claude's figure after is the summary alone (``post_tokens``): the next
+    request also carries the system prompt and tools and is several times
+    larger. Its marker says "summary" so the figure is not read as the new
+    context size. The stored event is the same for every harness.
+
+    A figure after that is not lower than the figure before is not shown as
+    a reduction: the compaction ran and freed nothing (a small chat, whose
+    rebuilt context is no smaller than the old one), so the marker reads
+    "Context compacted · 21k, nothing to drop · manual". Both figures stay
+    in the event as the harness stated them.
+    """
+    marker = _compaction_projection(payload)
+    before, after = marker["tokens_before"], marker["tokens_after"]
+    summary = " summary" if harness == "claude" else ""
+    cause = marker.get("cause")
+    parts = [_compaction_cause_phrase(cause, harness)]
+    if before is not None and after is not None and after >= before:
+        parts.append(f"{_short_tokens(before)}, nothing to drop")
+    elif before is not None and after is not None:
+        parts.append(
+            f"{_short_tokens(before)} → {_short_tokens(after)}{summary}"
+        )
+    elif before is not None:
+        parts.append(f"from {_short_tokens(before)}")
+    elif after is not None:
+        parts.append(
+            f"{_short_tokens(after)} summary"
+            if summary
+            else f"now {_short_tokens(after)}"
+        )
+    if cause is None:
+        if marker["trigger"] == "auto":
+            parts.append("automatic")
+        elif marker["trigger"] == "manual":
+            parts.append("manual")
+    elif (
+        cause == conversation_compaction.CAUSE_THRESHOLD
+        and marker.get("trigger_tokens") is not None
+        and after is not None
+        and after >= marker["trigger_tokens"]
+    ):
+        # At most one threshold compaction per turn: the next turn's end
+        # is checked again.
+        parts.append("still at or above the trigger")
+    return " · ".join(parts)
+
+
+def _compaction_failed_label(payload: dict) -> str:
+    """The one-line error of a manual compaction that did not happen."""
+    if payload.get("outcome") == "cancelled":
+        return "Compaction stopped — the context was not compacted"
+    reason = payload.get("detail") or payload.get("error")
+    reason = " ".join(str(reason).split()) if reason else ""
+    return (
+        f"Compaction failed — {reason}"
+        if reason
+        else "Compaction failed — the context was not compacted"
+    )
+
+
+COMPACTION_NOT_REPORTED_LABEL = (
+    "Compaction not reported — the harness finished without reporting a "
+    "compaction"
+)
+
+
+def _transcript_activity_label(
+    event_type: str, payload: dict, harness: str | None = None
+) -> str:
+    if event_type == "context.compacted":
+        label = _compaction_label(payload, harness)
+    elif event_type == "compaction.failed":
+        label = _compaction_failed_label(payload)
+    elif event_type == "compaction.not_reported":
+        label = COMPACTION_NOT_REPORTED_LABEL
+    elif event_type == "message.reground":
+        label = "Re-ground line added to this message (context was compacted)"
+    elif event_type == "permission.requested":
         label = "Waiting for permission"
     elif event_type == "input.requested":
         label = "Waiting for input"
@@ -2549,7 +2827,9 @@ def _transcript_projection(
             event_scope.append(
                 "(message_id IS NULL AND run_id IS NULL AND event_type IN "
                 "('permission.requested','input.requested','run.failed',"
-                "'run.interrupted','run.unknown','run.process.ended'))"
+                "'run.interrupted','run.unknown','run.process.ended',"
+                "'context.compacted','compaction.failed',"
+                "'compaction.not_reported'))"
             )
         event_scope_sql = " OR ".join(event_scope) or "0"
         event_rows = con.execute(
@@ -2664,6 +2944,7 @@ def _transcript_projection(
         }
         segments_by_run: dict[int, dict[int, list[dict]]] = {}
         context_tokens_by_run: dict[int, dict[int, int]] = {}
+        context_measured: set[tuple[int, int]] = set()
         latest_assistant_anchor_by_run: dict[int, int] = {}
         latest_assistant_segment_by_run: dict[int, tuple[int, int, str]] = {}
         evidence_count_by_run: dict[int, int] = {}
@@ -2681,6 +2962,10 @@ def _transcript_projection(
             "run.interrupted",
             "run.unknown",
             "run.process.ended",
+            "context.compacted",
+            "compaction.failed",
+            "compaction.not_reported",
+            "message.reground",
         }
         for event in events:
             run_id = event["run_id"]
@@ -2730,6 +3015,14 @@ def _transcript_projection(
                     context_tokens_by_run.setdefault(int(run_id), {})[
                         assistant_anchor
                     ] = context_tokens
+                    # Only a ``request`` reading is a context size. Anything
+                    # else is a token figure of another meaning (a turn
+                    # total from an unscoped event) and is labelled as such.
+                    measured = (int(run_id), assistant_anchor)
+                    if event["payload"].get("scope") == "request":
+                        context_measured.add(measured)
+                    else:
+                        context_measured.discard(measured)
             elif event["event_type"] in activity_types:
                 activities.append(event)
 
@@ -2800,6 +3093,7 @@ def _transcript_projection(
                             run_id,
                             {},
                         ).get(anchor),
+                        "context_measured": (run_id, anchor) in context_measured,
                         "text_truncated": False,
                     })
 
@@ -2814,7 +3108,7 @@ def _transcript_projection(
             run_id = event["run_id"]
             if run_id is not None and int(run_id) not in retained_runs:
                 continue
-            items.append({
+            item = {
                 "item_id": f"event:{event['sequence']}",
                 "kind": "activity",
                 "order_sequence": event["sequence"],
@@ -2827,9 +3121,13 @@ def _transcript_projection(
                 "label": _transcript_activity_label(
                     event["event_type"],
                     event["payload"],
+                    conversation["harness"],
                 ),
                 "sequence": event["sequence"],
-            })
+            }
+            if event["event_type"] == "context.compacted":
+                item["compaction"] = _compaction_projection(event["payload"])
+            items.append(item)
         items.sort(key=lambda item: (item["order_sequence"], item["item_id"]))
 
         message_source_limited = (
@@ -2887,6 +3185,7 @@ def _transcript_projection(
                     int(active_run_id) if active_run_id is not None else None
                 ),
                 "close_requested_at": conversation["close_requested_at"],
+                "compaction": _compaction_controls(conversation),
             },
             "items": items,
             "older_cursor": older_cursor,
@@ -2917,6 +3216,80 @@ def _transcript_projection(
                     else active_run["latest_boundary_sequence"]
                 ),
             }
+        if cursor is None:
+            # The context meter: the latest size and window the harness
+            # reported, read from the events this page already loaded (the
+            # projection's read budget is fixed). Either is None when it was
+            # not reported; the page shows nothing rather than a guess.
+            meter = conversation_compaction.meter_reading(reversed(events))
+            # The auto-compact window the engine applies to this chat's next
+            # turn: the harness's trigger in effect (saved, then environment,
+            # then default; spec #275), or None when auto compaction is off,
+            # the harness has no settings, or the model's reported window is
+            # smaller. It is where the engine compacts, so Kimi and OpenCode
+            # show a percentage too when a trigger is in effect for them.
+            settings = compaction_settings.from_saved(
+                conversation["harness"],
+                tuple(
+                    conversation[f"compaction_{column}"]
+                    for column in compaction_settings.SAVED_COLUMNS
+                ),
+            )
+            applied = (
+                settings.effective_trigger if settings is not None else None
+            )
+            if (
+                applied is not None
+                and meter["context_window"] is not None
+                and meter["context_window"] < applied
+            ):
+                applied = None
+            meter["compact_window"] = applied
+            # The cold-return rule, evaluated as the chat is opened: large
+            # and idle past the settings means the provider cache is gone
+            # and the next message re-reads the whole context. Idle is
+            # measured from the last model activity, not from the chat row's
+            # stamp, which close, reopen, rename and Stop all move. The page
+            # re-checks the rule while it stays open, against this server's
+            # clock (``server_time``), never its own. Never during a turn,
+            # never for a managed participant. A closed chat counts when a
+            # message would reopen it onto its stored session, which is how
+            # the operator usually comes back to one.
+            cold = conversation_compaction.cold_return_settings()
+            server_now = datetime.now(timezone.utc)
+            # Read from the events this page already loaded, like the meter:
+            # the projection's read budget is fixed.
+            last_model_activity = conversation_compaction.last_model_activity(
+                reversed(events)
+            )
+            returnable = conversation["state"] in ("idle", "error") or (
+                conversation["state"] == "closed"
+                and conversation["conversation_scope"] == "normal"
+                and bool(conversation["harness_session_ref"])
+            )
+            projection["cold_return"] = {
+                **cold,
+                "last_model_activity_at": last_model_activity,
+                # Stated only when there is an activity to time against it:
+                # a chat whose model never answered has nothing to go cold.
+                "server_time": (
+                    server_now.strftime("%Y-%m-%d %H:%M:%S")
+                    if last_model_activity is not None
+                    else None
+                ),
+                "due": (
+                    returnable
+                    and active_run_id is None
+                    and not bool(conversation["sprint_managed"])
+                    and conversation_compaction.cold_return_due(
+                        meter["context_tokens"],
+                        last_model_activity,
+                        server_now,
+                        cold,
+                    )
+                ),
+            }
+            projection["context"] = meter
         if warnings:
             projection["warnings"] = warnings
         _bound_transcript_response(
@@ -3012,6 +3385,11 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
                         owner_user_id=operator["user_id"],
                         query=query,
                     ),
+                )
+            compactions = _COMPACTIONS_PATH.fullmatch(parsed.path)
+            if compactions and method == "POST":
+                return _request_compaction(
+                    con, operator, compactions.group(1), headers, body
                 )
             interruptions = _INTERRUPTIONS_PATH.fullmatch(parsed.path)
             if interruptions and method == "POST":
@@ -3124,6 +3502,20 @@ def _project_event_payload(
     projected = _redact_event_value(payload, secrets)
     if event_type != "usage":
         return projected
+    # An adapter that states a scope has already said what this event
+    # measures: a ``request`` carries its own ``context_tokens``, and a
+    # ``turn`` total or a ``subagent`` request is not the chat's context, so
+    # no figure is derived for it. Only an event recorded before the scope
+    # existed (or by an adapter that states none) falls back to the sum.
+    if "scope" in payload:
+        if (
+            payload.get("scope") != "request"
+            or _token_count(payload.get("context_tokens")) is None
+        ):
+            projected.pop("context_tokens", None)
+        if _token_count(payload.get("context_window")) is None:
+            projected.pop("context_window", None)
+        return projected
     context_tokens = _usage_context_tokens(projected)
     if context_tokens is not None:
         projected["context_tokens"] = context_tokens
@@ -3154,10 +3546,51 @@ def _stream_authorize(headers_raw: str, conversation_id: str):
     con = _db()
     try:
         operator = _operator(con, headers)
+        # The stream bypasses `dispatch_http`, so the gate's origin rule for
+        # a signed-in `GET /api/*` is applied here.
+        if not browser_gate.site_ok("GET", "/api/conversations", headers):
+            raise ApiError(
+                403, "NOT_SAME_ORIGIN", "cross-site conversation stream rejected"
+            )
         _require_conversation(con, conversation_id, operator["user_id"])
     finally:
         con.close()
     return headers
+
+
+def _active_user(user_id: int) -> bool:
+    """Whether a session's user is an active engine user (for the gate)."""
+    con = _db()
+    try:
+        return con.execute(
+            "SELECT 1 FROM users WHERE user_id=? AND is_active=1", (user_id,)
+        ).fetchone() is not None
+    finally:
+        con.close()
+
+
+def _stream_still_signed_in(headers) -> bool:
+    """An open stream's authorisation point (Feature #94).
+
+    A stream outlives the request that opened it, so the gate's one decision
+    (`browser_gate.operator_session`: the cookie still verifies AND its user
+    is still an active engine user) is made again at every turn of the loop:
+    before each batch of events is read, and after each wait. A revoked
+    session or a deactivated user therefore ends an open stream at its next
+    event or its next heartbeat, whichever comes first. If the check cannot
+    run, the stream ends: undecided is refused.
+    """
+    try:
+        return browser_gate.operator_session(headers, _active_user) is not None
+    except Exception:  # noqa: BLE001 — undecided is refused
+        return False
+
+
+_STREAM_SIGNED_OUT = (
+    "event: " + browser_gate.SIGN_IN_REQUIRED + "\ndata: "
+    + json.dumps(browser_gate.sign_in_required_payload(), separators=(",", ":"))
+    + "\n\n"
+).encode()
 
 
 def _after_sequence(query, headers) -> int:
@@ -3267,6 +3700,12 @@ async def stream_events(
     await writer.drain()
     try:
         while True:
+            if not await asyncio.to_thread(_stream_still_signed_in, headers):
+                # Named, so the page can tell "signed out" from "offline";
+                # its reconnect then meets the gate's 401.
+                writer.write(_STREAM_SIGNED_OUT)
+                await writer.drain()
+                break
             observed = conversation_events.generation(conversation_id)
             events = await asyncio.to_thread(_event_batch, conversation_id, after)
             if events:

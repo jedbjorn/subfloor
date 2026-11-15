@@ -1,6 +1,6 @@
 ---
 name: dev_kit
-description: Read the fork's declared development hooks, execution seat, readiness state, evidence locations, and supported recovery surfaces. Planner-only on demand; Developer and Reviewer receive the same inventory in boot.
+description: The fork's dev hooks and seats; load before you run or diagnose sc deps, sc test, sc lint, or sc typecheck, or plan what a seat can prove. Holds the fork's declared development hooks, execution seat, readiness states, evidence locations, and supported recovery surfaces. Planner-only on demand; Developer and Reviewer receive the same inventory in boot.
 category: substrate
 common: false
 ---
@@ -81,13 +81,9 @@ uses this skill for pinch-hit development and capability design. It describes
 the available surface and boundaries, not the fork's test assertions,
 deployment ritual, database technique, or VM lifecycle.
 
-## RUN RECEIPTS
+## Run receipts
 
-Attach completed local evidence by run id with `sc job attach <id> --pr <number>`
-or `sc job attach <id> --work-unit <id>`. The run and target must share an owner;
-a PR must already be registered. Use `--repository owner/name` if its number is
-ambiguous. The Runs drawer and fleet offer the same attachment action.
-Receipts show beside the observed GitHub check in Chats and the Sprint board.
-A commit outside the PR head's ancestry is stale; unavailable ancestry stays
-unknown. Pruned logs retain their receipt. Receipts supplement CI evidence;
-only GitHub checks and the existing merge grant authorize a merge.
+Attach a finished local run to its PR or work unit with
+`sc job attach <id> --pr <number>|--work-unit <id>`. The ownership,
+registration, and stale-ancestry rules are the RUN RECEIPTS section of the
+`git` skill; a receipt supplements CI and never authorizes a merge.

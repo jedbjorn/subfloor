@@ -46,6 +46,7 @@ class VendoredAssetTest(ServedAssetTestCase):
         transport closes the connection per response, so EOF is the end."""
         with socket.create_connection(("127.0.0.1", self.port), timeout=10) as s:
             s.sendall(f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                      f"Cookie: {self.browser.cookie}\r\n"
                       "Connection: close\r\n\r\n".encode())
             chunks = []
             while True:
@@ -248,6 +249,14 @@ class VendoredAssetTest(ServedAssetTestCase):
                          "HEAD sent a body after its headers")
         self.assertIn(b"Content-Length: %d" % len(get_body), head)
         self.assertEqual(body, b"")
+        # The gate's refusal of a HEAD is held to the same rule.
+        self.browser.revoke()
+        refused, _, after_refusal = self.raw(
+            "HEAD", "/vendor/xterm/xterm.js").partition(b"\r\n\r\n")
+        self.assertTrue(refused.startswith(b"HTTP/1.1 401 "), refused[:40])
+        self.assertEqual(after_refusal, b"",
+                         "a refused HEAD sent a body after its headers")
+        self.browser.publish()
         self.assertEqual(headers.get("Content-Length"), str(len(get_body)))
         self.assertEqual(headers.get("Content-Type"),
                          get_headers.get("Content-Type"))

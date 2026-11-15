@@ -89,8 +89,13 @@ whose `.git` is a file — the exact shape of a shell seat at
 `PROJECT_BRAND_DIRS = [".kimi-code/skills"]`,
 `PROJECT_GENERIC_DIRS = [".agents/skills"]`.
 
-**That probe was run OUTSIDE the declared conversation window.** `conversation`
-still pins `[0.30.0, 0.34.0)` with `0.33.0` verified; 2.0.1 is far above it, and
+**That probe was run OUTSIDE the conversation window declared at the time.**
+`conversation` then pinned `[0.30.0, 0.34.0)` with `0.33.0` verified; 2.0.1 was
+far above it. On 2026-11-12 the ceiling was raised to `2.6.0` to cover the
+installed `2.5.3`, by operator ruling (flag SC-1610, Feature #95 spec #272):
+build against the installed version and assume its behaviour holds.
+`verified_cli_version` stays `0.33.0`, so an installed 2.5.3 reports
+`supported`, never `verified`:
 nothing here re-probes the `kimi-print` driver contract. Native skill delivery
 does not depend on that window — `skill_dirs` is not version-gated — and the
 failure mode is benign in both directions: an in-window `0.3x` build that does
@@ -146,3 +151,111 @@ normalized events from print mode, resumes with `-S`, and interrupts with
 `headless.effort.env` supplies `KIMI_MODEL_THINKING_EFFORT`. Session inspection
 uses native stored evidence. The manifest does not advertise interactive
 permission responses. See `scripts/conversation_adapters/kimi.py` in the engine.
+
+### Context meter, compaction and the compact trigger (Feature #95, spec #275)
+
+Checked on Kimi Code `2.5.3` with `kimi-code/k3.1-pro`, 2026-11-13, live on
+the delivery host. The adapter reads the main wire (`agents/main/wire.jsonl`)
+after the run ends, as it always has:
+
+- **Meter.** Each `usage.record` with `usageScope: turn` is one model request
+  of the chat and becomes one `usage` event with scope `request`:
+  `context_tokens` = `inputOther` + `inputCacheRead` + `inputCacheCreation`,
+  `context_window` = the model's `max_context_size` read (never written) from
+  the `config.toml` beside the session store, left out when unreadable.
+  Kimi events are ingested after the run, so `created_at` is ingest time;
+  each reading carries **`requested_at`, the record's own `time` in epoch
+  milliseconds (UTC, integer)**, for gap and cache figures. `usageScope:
+  session` records (a compaction's own request among them) give no reading.
+  The whole-turn total is kept as before, now labelled scope `turn` with no
+  `context_tokens`.
+- **Compaction event.** `context.apply_compaction` becomes `context.compacted`
+  with `tokens_before` / `tokens_after`; the trigger is the `source` of the
+  preceding `full_compaction.begin` (`manual`, `auto`, otherwise `unknown`)
+  and `compaction_ref` is `<session>@<time>`, so a replayed slice is not
+  recorded twice. `summary` and `contextSummary` are never read into an event.
+- **Trigger (the spec's gate).** `/compact` as the prompt of a resumed
+  `kimi -S <id> -p` run does **not** compact: it reaches the model as plain
+  text. `/compact` as ACP `session/prompt` (`kimi acp`, after `initialize`
+  and `session/load`) does: it answers `end_turn` at once and compacts in
+  the background, writing `full_compaction.begin` (`source: manual`),
+  `context.apply_compaction` and `full_compaction.complete`. The connection
+  must stay open until then; closing it cancels the compaction
+  (`full_compaction.cancel`). The first `session/load` of a session appends a
+  project-context injection just after it answers, and a compaction begun
+  before that lands is cancelled, so the adapter waits for the wire to go
+  quiet before it sends `/compact`. The manifest's `conversation.compact`
+  block records the mechanism; `manual_compaction` is true.
+- **Run identity.** A compaction run writes no `turn.prompt` and no `end_turn`
+  step, so it is found by the `full_compaction.begin` it appends after the
+  wire boundary taken just before `/compact` is sent (anything the load
+  wrote, a compaction of Kimi's own included, is never claimed; run ref
+  `kimi-<time>-<offset>`, like a turn's) and ends on `full_compaction.complete`
+  (`run.completed`, with the marker and the request's own usage under scope
+  `compaction`) or `full_compaction.cancel` (`run.failed`,
+  `HARNESS_COMPACT_REFUSED`). No end within 15 minutes ends the run with no
+  marker, which the chat shows as not reported. A recovered compaction run
+  reconciles from the same records and records the marker and the cost the
+  live stream did not; the cost names its record (`usage_ref`), so the store
+  keeps one copy of each.
+
+Kimi takes no token-count trigger at launch (`compactionTriggerRatio` is a
+ratio of the window in the user's own `config.toml`, which the engine never
+edits), so `compact_window_native` is false: the engine compacts Kimi chats
+between turns when the meter reaches the harness's trigger, and while idle.
+Both are set on the Kimi card in **Shells → Harness**: Auto compaction on at
+250,000 and Idle compaction after 25 minutes by default, the wait capped at
+25 because Kimi's measured cache life is about 30 minutes. Neither acts
+below 90,000 tokens. No environment variable applies to Kimi. The chat's
+meter shows a percentage of the trigger in effect once it has a reading.
+
+## Subagent keys (`headless.agent`, Feature #96, spec #273)
+
+`scripts/job_agent.py` builds an `sc job` subagent command from the `headless`
+block and these optional keys; no harness name appears in the job code. An
+adapter without them is refused for a subagent by the name of the missing key
+and is unaffected otherwise.
+
+| Key | Value | Meaning |
+|---|---|---|
+| `brief.delivery` | `argument` | the brief is the value of `-p`; the ledger records the token `{brief}`, never the text |
+| `result` | `--output-format stream-json`, `stdout_jsonl`, `role: assistant`, field `content` | the last assistant record is the final message |
+| `session` | `event`, `session.resume_hint`, field `session_id` | the final meta record names the session |
+| `resume` | `-S` | `-S <id>` continues the session; the id is unchanged |
+
+Checked on Kimi Code 2.5.3, 2026-11-12, model alias
+`kimi-code/kimi-for-coding-highspeed`, four requests: a text-mode launch, a
+`stream-json` resume with `-S` that recalled the first reply, and two fresh
+`stream-json` launches whose briefs began with `---` and with `-h`. Both were
+accepted as the value of `-p`, so a brief may start with dashes. Text mode
+prints the reply on stdout behind a bullet and the resume hint on stderr, so
+the structured stream is used. `kimi session list --cwd <dir> --json` also lists
+the session without a request. Exit codes on stop and timeout were not
+observed.
+
+### What a subagent on this harness is
+
+`sc job agent --harness kimi --model <selector> [--effort <level>]` runs Kimi Code
+once, headless, in a worktree the engine creates
+(`.sc-worktrees/agent-<run_id>`), and wakes the launching shell when the run
+ends. `sc job continue <id>` resumes the same session in that worktree as a
+new run. Any shell may launch it, whatever harness that shell itself runs on.
+
+- **Identity.** The run has the launching shell's environment: its API token,
+  its shell identity and its git identity. It holds exactly that shell's
+  authority, no more and no less, and that shell is accountable for what it
+  does. The engine adds no refusal for what it writes. The worktree carries no
+  boot file, so the CLI starts plain and learns its task from the brief.
+- **Model and effort.** The model is required. Effort is optional: when given,
+  it travels in the environment as `KIMI_MODEL_THINKING_EFFORT`; when omitted, no effort setting is sent and the CLI's own default
+  for that model applies.
+- **Limits.** One shell may have 3 subagents live and the install 6. A run is
+  stopped after 2 hours by default, or after `--timeout` seconds, at most 8
+  hours. A subagent cannot launch or continue a subagent. A brief is at most
+  64 KiB.
+- **Watches.** `sc job start --until`, `sc job watch pr` and
+  `sc job watch timer` are engine jobs, not harness runs, and behave the same
+  on every harness. One shell may have 10 live.
+
+The verbs, the worktree rule and the wake are in
+[`docs/runs.md`](../../docs/runs.md).

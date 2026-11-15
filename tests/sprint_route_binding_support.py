@@ -23,7 +23,7 @@ def _runtime(harness: str) -> tuple[dict, dict]:
     compatibility = route_bindings._runtime_manifest_compatibility(
         harness,
         {
-            "claude": "2.1.223",
+            "claude": "2.1.322",
             "codex": "0.146.0",
             "kimi": "0.33.0",
             "opencode": "1.18.9",
@@ -92,7 +92,7 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
         digest = route_bindings.digest_json(binding)
         source_fingerprint = "3" * 64
         harness_version = {
-            "claude": "2.1.223",
+            "claude": "2.1.322",
             "codex": "0.146.0",
             "kimi": "0.33.0",
             "opencode": "1.18.9",

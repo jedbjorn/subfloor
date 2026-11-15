@@ -24,26 +24,31 @@ RATIFIED_OPT_INS = {
         "snapshot",
     },
     "planner": {
+        "cli_orchestration",
+        "delegation",
         "dev_kit",
         "flag_sweep",
         "fork_skill_design",
         "git",
         "onboard",
+        "spec_authoring",
         "sprint_pln",
         "sprint_prep",
         "sprint_protocol",
         "themed_markdown",
     },
     "dev": {
+        "delegation",
         "git",
         "harness_readiness",
         "redline_review",
+        "spec_execution",
         "sprint_dev",
         "sprint_protocol",
     },
-    "reviewer": {"git", "redline_review", "sprint_protocol", "sprint_rev"},
-    "devops": {"git", "themed_markdown"},
-    "cartographer": {"git"},
+    "reviewer": {"delegation", "git", "redline_review", "sprint_protocol", "sprint_rev"},
+    "devops": {"delegation", "git", "themed_markdown"},
+    "cartographer": {"delegation", "git"},
 }
 # The pack matrix 0241 established, proven in isolation by the 0241 fixture
 # below; F72 (0257) retired twelve of these names and added two.
@@ -93,6 +98,8 @@ import snapshot  # noqa: E402
 sys.path.insert(0, str(ENGINE / "api"))
 import review_routes  # noqa: E402
 import server  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from signin_fixture import sign_in  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "render"))
 import compose  # noqa: E402
@@ -273,28 +280,6 @@ class HardCutoverMigrationTest(unittest.TestCase):
         con.executescript(sql)
         con.executescript(sql)
 
-        for name in ("harness_readiness",):
-            expected = seed_skills.parse_skill(
-                ENGINE / "assets" / "skills" / name / "SKILL.md"
-            )
-            actual = con.execute(
-                "SELECT description,category,command,common,content,is_deleted "
-                "FROM skills WHERE name=?",
-                (name,),
-            ).fetchone()
-            self.assertEqual(
-                tuple(actual),
-                (
-                    expected["description"],
-                    expected["category"],
-                    expected["command"],
-                    expected["common"],
-                    expected["content"],
-                    0,
-                ),
-                name,
-            )
-
         actual_dev_kit = con.execute(
             "SELECT description,category,command,common,content,is_deleted "
             "FROM skills WHERE name='dev_kit'"
@@ -333,6 +318,42 @@ class HardCutoverMigrationTest(unittest.TestCase):
                 "WHERE name='fork_testing_seat'"
             ).fetchone()),
             ("local", "fork", "local bytes"),
+        )
+
+        # Historical migrations are immutable: the current harness_readiness
+        # body arrives through the trailing 0282 reseed, which must also leave
+        # a fork-customized dev_kit untouched.
+        reseed = (MIGRATIONS / "0282_skills_dedupe_posture.sql").read_text()
+        con.executescript(reseed)
+        con.executescript(reseed)
+        for name in ("harness_readiness",):
+            expected = seed_skills.parse_skill(
+                ENGINE / "assets" / "skills" / name / "SKILL.md"
+            )
+            actual = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name=?",
+                (name,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(actual),
+                (
+                    expected["description"],
+                    expected["category"],
+                    expected["command"],
+                    expected["common"],
+                    expected["content"],
+                    0,
+                ),
+                name,
+            )
+
+        self.assertEqual(
+            tuple(con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='dev_kit'"
+            ).fetchone()),
+            custom_dev_kit,
         )
 
     def test_legacy_dev_kit_starter_replays_and_upgrades_through_later_reseeds(self) -> None:
@@ -509,8 +530,9 @@ class GrantApiTest(unittest.TestCase):
             status, _headers, body = server.dispatch_http(
                 "PUT",
                 f"/api/flavors/dev/skills/{self.kid}",
-                "Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
-                "Content-Length: 17\r\n",
+                sign_in(self, host="127.0.0.1").add_to(
+                    "Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                    "Content-Length: 17\r\n"),
                 b'{"granted": true}',
             )
         self.assertEqual(status, 200, body)
@@ -529,8 +551,9 @@ class GrantApiTest(unittest.TestCase):
             status, _headers, body = server.dispatch_http(
                 "PUT",
                 f"/api/shells/{self.custom1}/skills/{self.kid}",
-                "Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
-                "Content-Length: 18\r\n",
+                sign_in(self, host="127.0.0.1").add_to(
+                    "Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                    "Content-Length: 18\r\n"),
                 b'{"granted": false}',
             )
         self.assertEqual(status, 200, body)
@@ -566,6 +589,20 @@ class ShellFactoryTest(unittest.TestCase):
                 "SELECT COUNT(*) FROM skills "
                 "WHERE common=1 AND is_deleted=0"
             ).fetchone()[0],
+        )
+
+    def test_flavor_prefix_is_reserved_for_pack_references(self) -> None:
+        for shortname in ("flavor:devops", " Flavor:dev "):
+            with self.subTest(shortname=shortname):
+                with self.assertRaisesRegex(ValueError, "flavor:"):
+                    shell_factory.create_shell(
+                        self.con, flavor=None, name="Odd", shortname=shortname
+                    )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM shells WHERE shortname LIKE 'flavor:%'"
+            ).fetchone()[0],
+            0,
         )
 
     def test_standard_shell_stores_no_per_shell_grants(self) -> None:

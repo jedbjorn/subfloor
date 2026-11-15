@@ -38,7 +38,7 @@ SEMVER_TOKEN = re.compile(
 # Parsing a matching semantic core is useful diagnostic evidence, but it must
 # not promote an arbitrary wrapper or custom build to the tested assurance.
 MAINTAINED_OBSERVED_VERSIONS = {
-    "claude": "2.1.223 (Claude Code)",
+    "claude": "2.1.322 (Claude Code)",
     "codex": "codex-cli 0.155.1",
     "opencode": "1.18.9",
     "vibe": "vibe 2.22.0",

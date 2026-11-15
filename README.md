@@ -58,6 +58,8 @@ Python 3.14.x with `sqlite3`, and a reachable Docker daemon for the default sand
 Select `./sc install --runtime host` for the systemd-supervised host runtime
 without Docker. On macOS or Windows, create a Linux VM; keep the checkout on guest storage.
 Set `SC_PYTHON` to an absolute interpreter path if needed.
+Claude Code 2.1.304 or later is the supported minimum; older versions are not
+supported (and are not blocked).
 
 Run these commands from your own host terminal:
 
@@ -133,6 +135,28 @@ for setup, boundaries, and the separate operator-run real-extension acceptance.
 
 The guide is themed Markdown: read it on GitHub or
 [open its tabbed presentation](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/docs/README.md).
+
+## Reusable skills
+
+[Create a presentation](skills/create-presentation/SKILL.md) is a portable,
+style-neutral skill for offline HTML decks, animated SVGs, authentic demo
+footage, presenter notes, and short video exports. Copy the complete
+`skills/create-presentation/` folder, including its references, into your
+harness's supported skill directory. This package is not yet installed or
+granted automatically by Subfloor.
+
+## More projects
+
+Subfloor is part of [Designs/OS](https://designs-os.com). Other open-source projects by the same author:
+
+- **[FAI Browser](https://jedbjorn.github.io/fai-browser/)** — lets a coding agent work in one browser tab you approve, with permission levels, secret redaction and compact page summaries. ([source](https://github.com/jedbjorn/fai-browser))
+- **[RST](https://jedbjorn.github.io/rst-c/)** — a native Revit add-in for curated ribbon profiles: admins build them, users load them with one click. ([source](https://github.com/jedbjorn/rst-c))
+- **[Gantt-It](https://jedbjorn.github.io/gantt-it/)** — a Revit add-in that draws Gantt charts in your project, ready to place on sheets. ([source](https://github.com/jedbjorn/gantt-it))
+- **[Splash-It](https://jedbjorn.github.io/splash-it/)** — a Revit add-in that colors view tabs by file, so open models and families are easy to tell apart. ([source](https://github.com/jedbjorn/splash-it))
+- **[md-converter](https://md-converter.designs-os.com)** — a static web app that renders themed Markdown into styled, shareable HTML. ([source](https://github.com/jedbjorn/md-converter))
+- **[Storybench](https://github.com/jedbjorn/storybench)** — a local workspace for developing videos with an AI production agent.
+- **[AnJ Cloud](https://jedbjorn.github.io/anj-cloud/)** — household file sync from a gateway you host yourself, with clients for Linux, macOS, Windows and Android. ([source](https://github.com/jedbjorn/anj-cloud))
+- **[Pick-It](https://jedbjorn.github.io/pick-it/)** — a Revit add-in that picks any colour on screen, shows its RGB values on the ribbon button and adds it to Revit's custom colours. ([source](https://github.com/jedbjorn/pick-it))
 
 ## License
 

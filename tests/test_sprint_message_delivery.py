@@ -2161,7 +2161,7 @@ class WakeDeliveryTest(SprintMessageCase):
                     self.developer_conversation_id,
                     (
                         f"Sprint {self.sprint_id} handoff for your Developer role. "
-                        "Load `sprint_dev`. Run `sc sprint inbox --sprint "
+                        "Load `sprint_protocol`, then `sprint_dev`. Run `sc sprint inbox --sprint "
                         f"{self.sprint_id}` now and act on the Sprint message(s) using "
                         "`sprint_dev`. Confirm every Sprint write succeeds before "
                         "stopping. If a Sprint command failed or did not confirm its "
@@ -2222,7 +2222,7 @@ class WakeDeliveryTest(SprintMessageCase):
             self.assertEqual(
                 observed[role],
                 f"Sprint {self.sprint_id} handoff for your {label} role. "
-                f"Load `{skill}`. Run `sc sprint inbox --sprint {self.sprint_id}` "
+                f"Load `sprint_protocol`, then `{skill}`. Run `sc sprint inbox --sprint {self.sprint_id}` "
                 f"now and act on the Sprint message(s) using `{skill}`. Confirm "
                 "every Sprint write succeeds before stopping. If a Sprint command "
                 "failed or did not confirm its durable write, retry that command. "

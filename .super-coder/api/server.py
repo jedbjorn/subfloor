@@ -56,6 +56,31 @@ LOG_MAX_EVENTS = 20
 # A size backstop behind the semantic filter (superseded rows excluded); the
 # client footer names what was hidden, so the cap is never silent.
 DECISIONS_INDEX_CAP = 30
+# mem get narrative --list: the caller's most recent session archives.
+NARRATIVE_INDEX_CAP = 10
+
+
+def _narrative_line_count(narrative: "str | None") -> int:
+    """The `[HH:MM]` lines of one archive."""
+    return sum(1 for line in (narrative or "").splitlines()
+               if line.startswith("["))
+
+
+def _narrative_is_stub(narrative: "str | None") -> bool:
+    """Nothing recorded: the narrative is empty, or exactly what a session
+    opens with — the `# …` title, `## Narrative`, one `[HH:MM] Session start.`
+    line. ANY other text counts as recorded, timestamped or not: the POST
+    endpoint appends its `text` verbatim."""
+    lines = [ln.strip() for ln in (narrative or "").splitlines() if ln.strip()]
+    if lines and lines[0].startswith("# "):
+        lines.pop(0)
+    if lines and lines[0] == "## Narrative":
+        lines.pop(0)
+    return not lines or (
+        len(lines) == 1 and lines[0].startswith("[")
+        and lines[0].endswith("] Session start."))
+
+
 _LOG_LOCK = threading.Lock()
 
 sys.path.insert(0, str(ENGINE / "scripts"))
@@ -63,6 +88,8 @@ import artifact_policy  # noqa: E402
 import run_seat
 import seat_conversion
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
+import compaction_cards  # Harness cards: compaction settings + data, spec #275
+import compaction_settings  # per-harness compaction settings, spec #275
 import conversation_broker  # noqa: E402  (Feature #24 durable turn service)
 import conversation_launch  # noqa: E402  (canonical shell launch preparation)
 import conversation_reaper  # noqa: E402  (Feature #31 orphan process ladder)
@@ -99,6 +126,10 @@ import sprint_participant_chats  # noqa: E402  (registry-backed Sprint wake chat
 import sprint_pr_watcher  # noqa: E402  (engine-wide PR subscription observation)
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import route_bindings  # noqa: E402  (shared durable model-route freshness gate)
+import engine_ops  # noqa: E402  (where the host-side engine-ops service is)
+import engine_update  # is an engine update available — the drawer badge
+import browser_gate  # noqa: E402  (the sign-in gate: default deny, Feature #94)
+import cli_credential  # noqa: E402  (the engine CLI credential for sc verbs)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
 from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quota probes — doc #49)
@@ -117,16 +148,28 @@ import flat as flat_render  # noqa: E402  (document render-path ownership)
 # Normal activation contract: DB_PATH = instance_state.active_database_path(ENGINE)
 DB_PATH = instance_state.maintenance_database_path(ENGINE)
 
-# The app SHELL stays a frozen route table (spec #48): four files, a closed set
-# that has not changed in the life of the project, and index.html is where the
-# CSP header hangs. Adding one is a route change its author is already looking
-# at. Vendored assets are the opposite population — see _VENDOR_TYPES below.
+# The app SHELL stays a frozen route table (spec #48): a closed set that
+# changes only by a deliberate edit here, and index.html is where the CSP
+# header hangs. Adding one is a route change its author is already looking
+# at: theme.js joined in spec #270, because the theme has to be applied from
+# <head> before first paint and the CSP forbids doing that inline. Vendored
+# assets are the opposite population — see _VENDOR_TYPES below.
 _STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    "/theme.js": ("theme.js", "application/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
+    # The sign-in page and the files it loads (Feature #94). These, and
+    # `/vendor/qrcode.js`, are the only static files `browser_gate.OPEN_ROUTES`
+    # serves to a visitor who has not signed in; `/style.css` and `/theme.js`
+    # above are shared with the app shell.
+    "/signin.html": ("signin.html", "text/html; charset=utf-8"),
+    "/signin.js": ("signin.js", "application/javascript; charset=utf-8"),
+    "/signin.css": ("signin.css", "text/css; charset=utf-8"),
 }
+# The pages: each carries the CSP, and the app shell renews the session cookie.
+_PAGES = frozenset(("index.html", "signin.html"))
 
 # Vendored assets resolve PER REQUEST against `ui/vendor/` (spec #48). The
 # frozen table above ages at a different rate than the file bodies it points
@@ -193,7 +236,7 @@ def _resolve_vendor(rel: str) -> tuple:
 _CSP_HOSTS = ("127.0.0.1", "localhost")
 
 
-def _csp(port: int) -> str:
+def _csp(port: int, engine_ops_port: int | None = None) -> str:
     """Content-Security-Policy for the app shell (spec #20 Security And
     Privacy; spec #26 Trust Boundary, where same-origin script execution is
     operator-equivalent and this header is therefore release-critical):
@@ -217,6 +260,12 @@ def _csp(port: int) -> str:
     """
     sockets = " ".join(f"{scheme}://{host}:{port}"
                        for host in _CSP_HOSTS for scheme in ("ws", "wss"))
+    # The host-side engine-ops service is a second loopback origin the browser
+    # calls directly (spec #270). Port-exact, like the sockets, and absent
+    # until this install has allocated that port.
+    if engine_ops_port is not None:
+        sockets += "".join(f" http://{host}:{engine_ops_port}"
+                           for host in _CSP_HOSTS)
     return ("default-src 'self'; script-src 'self'; "
             "style-src 'self' 'unsafe-inline'; "
             f"connect-src 'self' {sockets}; img-src 'self' data:; "
@@ -304,6 +353,14 @@ TASK_STATUSES = {"pending", "in_progress", "done", "cancelled"}
 # A plan is OPEN while any of its tasks is outside this set. Named once so a
 # reader of `retire` and a reader of the task lifecycle see the same rule.
 TERMINAL_TASK_STATUSES = {"done", "cancelled"}
+# The status each refused Harness-card compaction request is answered with.
+COMPACTION_REFUSAL_STATUS = {
+    "COMPACTION_HARNESS_UNKNOWN": 404,
+    "COMPACTION_SETTING_UNKNOWN": 422,
+    "COMPACTION_SETTING_INVALID": 422,
+    "COMPACTION_SETTINGS_EMPTY": 400,
+    "COMPACTION_DAYS_INVALID": 400,
+}
 
 
 def db():
@@ -538,7 +595,7 @@ def get_delivery_audit(con) -> dict:
 def get_cli_skills(con) -> dict:
     """Exact read projection used by authenticated ``sc skill list`` calls."""
     skills = rows(con.execute(
-        "SELECT skill_id, name, description, category, common, is_deleted "
+        "SELECT skill_id, name, description, category, common, seat, is_deleted "
         "FROM skills ORDER BY is_deleted, name"
     ))
     scopes: dict[int, list[str]] = {}
@@ -1457,12 +1514,15 @@ def get_analytics_tokens(con, q) -> dict:
 
 def get_analytics_usage(con, q) -> dict:
     """Behavioral reads for the Analytics tab's usage panels. `from`/`to`
-    scope the shipped counts to the UI's selected window; comparisons are at
-    DAY granularity (substr to the date part) because the source columns mix
-    `datetime('now')` (space-separated) and ISO-T formats — full-string
-    comparison across the two lies about same-day ordering."""
-    frm = (q.get("from", [""])[0] or "")[:10]
-    to = (q.get("to", [""])[0] or "")[:10]
+    scope the favorites and shipped counts to the UI's selected window;
+    shipped comparisons are at DAY granularity (substr to the date part)
+    because the source columns mix `datetime('now')` (space-separated) and
+    ISO-T formats — full-string comparison across the two lies about same-day
+    ordering."""
+    frm_param = (q.get("from", [""])[0] or "").strip()
+    to_param = (q.get("to", [""])[0] or "").strip()
+    frm = frm_param[:10]
+    to = to_param[:10]
     window, wparams = "", []
     if frm:
         window += " AND substr({col}, 1, 10) >= ?"
@@ -1472,13 +1532,22 @@ def get_analytics_usage(con, q) -> dict:
         wparams.append(to)
 
     # favorite model per shell flavor — most sessions wins, read-time only
+    fav_window, fparams = "", []
+    if frm_param:
+        fav_window += f" AND {_ANALYTICS_TS} >= ?"
+        fparams.append(frm_param)
+    if to_param:
+        fav_window += f" AND {_ANALYTICS_TS} < ?"
+        fparams.append(to_param)
+    where, params = _analytics_where(q)
     fav: dict[str, dict] = {}
     for r in con.execute(
             "SELECT s.flavor, u.model, "
             "COUNT(DISTINCT u.harness || '|' || u.harness_session_ref) AS sessions "
             "FROM session_token_usage u JOIN shells s ON s.shell_id=u.shell_id "
-            "WHERE u.model IS NOT NULL AND s.flavor IS NOT NULL "
-            "GROUP BY s.flavor, u.model"):
+            "WHERE u.model IS NOT NULL AND s.flavor IS NOT NULL"
+            f"{fav_window}{where} GROUP BY s.flavor, u.model",
+            fparams + params):
         if r["flavor"] not in fav or r["sessions"] > fav[r["flavor"]]["sessions"]:
             fav[r["flavor"]] = {"flavor": r["flavor"], "model": r["model"],
                                 "sessions": r["sessions"]}
@@ -3075,17 +3144,51 @@ class Handler(BaseHTTPRequestHandler):
                     "details": {},
                 }})
             return False
-        operator = con.execute(
-            "SELECT 1 FROM users WHERE is_active=1 ORDER BY user_id LIMIT 1"
-        ).fetchone()
+        # No Authorization header proves nothing (Feature #94): the operator
+        # is the user a verified session cookie belongs to. `dispatch_http`
+        # has already refused a request without one; this is the same check,
+        # held where the route is, for a caller that did not come that way.
+        operator = browser_gate.operator_session(
+            self.headers,
+            lambda user_id: con.execute(
+                "SELECT 1 FROM users WHERE user_id=? AND is_active=1",
+                (user_id,),
+            ).fetchone() is not None,
+        )
         if operator is None:
-            self._send(401, {"error": {
-                "code": "unauthorized",
-                "message": "no active browser operator exists",
-                "details": {},
-            }})
+            self._send(401, browser_gate.sign_in_required_payload(),
+                       headers={"Cache-Control": "no-store"})
             return False
         return True
+
+    # The Harness cards' compaction routes (Feature #95, spec #275): operator
+    # only, like the conversion Re-verify beside them. A refused setting is
+    # answered with its code and field and writes nothing.
+    def _harness_compaction(self, con, path: str, put: bool = False):
+        if not self._require_browser_operator(con, "harness settings"):
+            return None
+        if put and not self._require_browser_mutation_origin(
+                "harness settings changes"):
+            return None
+        try:
+            if path == "/api/harnesses/compaction":
+                return self._send(200, compaction_cards.cards(con))
+            harness = unquote(path.strip("/").split("/")[2])
+            if put:
+                session = browser_gate.operator_session(
+                    self.headers, lambda _user_id: True)
+                saved = compaction_settings.save(
+                    con, harness, self._body(),
+                    user_id=session["user_id"] if session else None)
+                return self._send(200, compaction_cards.card(con, saved))
+            raw = parse_qs(urlparse(self.path).query).get("days", ["7"])[0]
+            days = int(raw) if raw.isdigit() else 0
+            return self._send(200, compaction_cards.card_data(con, harness, days))
+        except compaction_settings.SettingsError as exc:
+            return self._send(
+                COMPACTION_REFUSAL_STATUS.get(exc.code, 400),
+                {"error": {"code": exc.code, "message": exc.message,
+                           "details": {"field": exc.field} if exc.field else {}}})
 
     def _sprint_board_error(self, exc: Exception):
         if isinstance(exc, sprint_board.ProjectionError):
@@ -4199,35 +4302,6 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             con.close()
 
-    def _pr_post(self, path: str, body: dict):
-        """Authenticated shell-owned PR subscription surface."""
-        shell_id = self._require_shell_auth()
-        if shell_id is None:
-            return
-        con = db()
-        try:
-            if path != "/_sc/pr/subscribe":
-                return self._send(404, {"error": "not found"})
-            try:
-                pr_number = int(body.get("pr_number"))
-            except (TypeError, ValueError) as exc:
-                raise ValueError("pr_number must be a positive integer") from exc
-            receipt = sprint_pr_watcher.SprintPRWatcher(
-                con, repo_root=REPO_ROOT
-            ).subscribe(
-                owner_shell_id=shell_id,
-                repository=body.get("repository") or "",
-                pr_number=pr_number,
-            )
-            return self._send(201 if receipt.created else 200, {
-                "subscription_id": receipt.subscription_id,
-                "created": receipt.created,
-            })
-        except Exception as exc:
-            return self._sprint_error(exc)
-        finally:
-            con.close()
-
     # -- authenticated shell CLI catalogue reads --
 
     def _shell_catalog_get(self, path: str):
@@ -4355,7 +4429,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, out)
 
     def _runs_request(self, path: str, *, post: bool = False):
-        from runs import RunStore
+        from runs import RunLimitError, RunStore
 
         operator = path.startswith('/api/')
         con = db()
@@ -4386,7 +4460,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not post:
                     query = parse_qs(urlparse(self.path).query)
                     owner = int(query['shell_id'][0]) if operator and query.get('shell_id') else sid
-                    filters = {'kind': query.get('kind', [None])[0], 'state': query.get('state', [None])[0]}
+                    filters = {'kind': query.get('kind', [None])[0],
+                               'exclude_kind': query.get('exclude_kind', [None])[0],
+                               'state': query.get('state', [None])[0]}
                     limit = query.get('limit', ['200'])[0]
                     listed = store.list(owner, **filters, limit=int(limit) if limit.isdecimal() else 200)
                     attention = con.execute(
@@ -4394,7 +4470,8 @@ class Handler(BaseHTTPRequestHandler):
                         "AND (state='running' OR wake_state='blocked')", (owner, owner),
                     ).fetchone()[0]
                     return self._send(200, {'runs': listed, 'total': store.count(owner, **filters),
-                                            'attention_count': attention})
+                                            'attention_count': attention,
+                                            'limits': store.limits(owner, fleet=operator)})
                 if operator:
                     raise PermissionError('registration requires shell authentication')
                 return self._send(201, store.register(sid, self._body()))
@@ -4416,6 +4493,8 @@ class Handler(BaseHTTPRequestHandler):
                     handle.seek(max(0, log.stat().st_size - 65536))
                     text = handle.read(65536).decode(errors='replace')
                 return self._send(200, {'text': text, 'evidence_pruned': False})
+            if action == 'result' and not post:
+                return self._send(200, store.result(rid, sid))
             if action == 'kill' and post:
                 return self._send(200, store.kill(rid, sid))
             if operator:
@@ -4426,9 +4505,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, store.terminal(rid, sid, self._body()))
             if post and action == 'receipt':
                 return self._send(200, store.receipt(rid, sid, self._body()))
+            if post and action == 'facts':
+                return self._send(200, store.facts(rid, sid, self._body()))
+            if post and action == 'clean':
+                return self._send(200, store.clean(rid, sid, self._body()))
             if post and action == 'prune-evidence':
                 return self._send(200, store.prune_evidence(rid, sid))
             return self._send(404, {'error': 'unknown run action'})
+        except RunLimitError as exc:
+            return self._send(429, {'error': str(exc)})
         except PermissionError as exc:
             return self._send(403, {'error': str(exc)})
         except KeyError as exc:
@@ -4631,12 +4716,111 @@ class Handler(BaseHTTPRequestHandler):
                     "ORDER BY sort_order, feature_id"))
                 return self._send(200, {"roadmap": rm})
 
-            if path == "/_sc/mem/narrative":
+            if len(parts) == 4 and parts[2] == "roadmap":
+                # One feature by id, RETIRED ONES INCLUDED — the board above
+                # hides them, so it cannot answer "what is feature N?" for a
+                # citation that outlived its feature. Carries what a planner
+                # otherwise assembles from three reads: the work-stream, the
+                # dependency set, and the feature's documents (no bodies).
+                fid = int(parts[3])
                 r = con.execute(
-                    "SELECT a.full_narrative FROM shells s "
-                    "JOIN shell_memory_archives a ON a.archive_id = s.active_archive_id "
-                    "WHERE s.shell_id=?", (sid,)).fetchone()
-                return self._send(200, {"narrative": (r[0] if r else None)})
+                    "SELECT r.feature_id, r.title, r.roadmap_status, r.summary, "
+                    "r.project_id, r.sort_order, "
+                    "(SELECT p.shortname FROM projects p "
+                    " WHERE p.project_id=r.project_id) AS project "
+                    "FROM roadmap r WHERE r.feature_id=?", (fid,)).fetchone()
+                if r is None:
+                    return self._send(404, {"error": "no such feature"})
+                feature = dict(r)
+                feature["blocked_by"] = [e[0] for e in con.execute(
+                    "SELECT blocked_by FROM feature_blockers WHERE feature_id=? "
+                    "ORDER BY blocked_by", (fid,))]
+                feature["documents"] = rows(con.execute(
+                    "SELECT document_id, kind, seq, title, frozen FROM documents "
+                    "WHERE feature_id=? ORDER BY kind DESC, seq, document_id",
+                    (fid,)))
+                return self._send(200, {"feature": feature})
+
+            if path == "/_sc/mem/narrative" or (
+                    len(parts) == 4 and parts[2] == "narrative"):
+                # The caller's OWN session archives only: every query here is
+                # scoped to the token's shell, so another shell's archive id
+                # answers exactly like one that does not exist.
+                q = parse_qs(urlparse(self.path).query)
+                r = con.execute(
+                    "SELECT active_archive_id FROM shells WHERE shell_id=?",
+                    (sid,)).fetchone()
+                active_id = r[0] if r else None
+
+                def shaped(a) -> dict:
+                    return {
+                        "archive_id": a[0], "session_id": a[1], "date": a[2],
+                        "lines": _narrative_line_count(a[3]),
+                        "stub": _narrative_is_stub(a[3]),
+                        "active": a[0] == active_id, "narrative": a[3]}
+
+                def scan(where: str, params: tuple, limit: int = -1):
+                    # A lazy cursor, newest first: a caller that stops early
+                    # never loads the bodies it did not reach.
+                    return con.execute(
+                        "SELECT archive_id, session_id, date, full_narrative "
+                        "FROM shell_memory_archives "
+                        f"WHERE shell_id=? AND {where} "
+                        "ORDER BY archive_id DESC LIMIT ?",
+                        (sid, *params, limit))
+
+                def archives(where: str, params: tuple, limit: int = 1) -> list:
+                    return [shaped(a) for a in scan(where, params, limit)]
+
+                def previous() -> list:
+                    # The newest earlier session that recorded something: an
+                    # archive holding nothing past its session-start line has
+                    # no handoff to read, so it is skipped. Stops at the
+                    # first hit — only a run of stubs is ever read past.
+                    cur = scan("(? IS NULL OR archive_id < ?)",
+                               (active_id, active_id))
+                    try:
+                        for a in cur:
+                            if not _narrative_is_stub(a[3]):
+                                return [shaped(a)]
+                        return []
+                    finally:
+                        cur.close()
+
+                if len(parts) == 4:
+                    # Digits only (so no sign), and inside SQLite's signed
+                    # 64-bit rowid range: anything else cannot name a row.
+                    raw = parts[3]
+                    wanted = int(raw) if raw.isascii() and raw.isdigit() \
+                        and len(raw) <= 19 else 0
+                    found = (archives("archive_id=?", (wanted,))
+                             if 1 <= wanted <= 2**63 - 1 else [])
+                    if not found:
+                        return self._send(404, {
+                            "error": "no such archive among your sessions"})
+                    return self._send(200, found[0])
+                if q.get("list", ["0"])[0] == "1":
+                    found = archives("1=1", (), NARRATIVE_INDEX_CAP)
+                    for a in found:
+                        del a["narrative"]
+                    return self._send(200, {"archives": found,
+                                            "limit": NARRATIVE_INDEX_CAP})
+                if q.get("prev", ["0"])[0] == "1":
+                    found = previous()
+                    if not found:
+                        return self._send(404, {
+                            "error": "no session archive before the active one"})
+                    return self._send(200, found[0])
+                found = archives("archive_id=?", (active_id,))
+                out = found[0] if found else {
+                    "archive_id": None, "session_id": None, "date": None,
+                    "lines": 0, "stub": True, "active": False,
+                    "narrative": None}
+                prev = previous()
+                out["previous"] = ({k: prev[0][k] for k in
+                                    ("archive_id", "session_id", "date", "lines")}
+                                   if prev else None)
+                return self._send(200, out)
 
             if path == "/_sc/mem/messages":
                 # ?direction=sent — the caller's OUTBOUND view (#333): after an
@@ -4651,13 +4835,18 @@ class Handler(BaseHTTPRequestHandler):
                         "JOIN shells s ON s.shell_id = m.to_shell_id "
                         "WHERE m.from_shell_id=? "
                         "AND m.kind IN ('shell','task','result') "
-                        "ORDER BY m.created_at DESC LIMIT 50", (sid,)))
+                        "ORDER BY m.created_at DESC, m.message_id DESC "
+                        "LIMIT 50", (sid,)))
                     return self._send(200, {"messages": msgs, "direction": "sent"})
                 msgs = rows(con.execute(
-                    "SELECT message_id, from_shell_id, kind, body, created_at, read_at "
-                    "FROM shell_messages WHERE to_shell_id=? "
-                    "AND kind IN ('shell','task','result') "
-                    "ORDER BY read_at IS NOT NULL, created_at DESC LIMIT 50",
+                    "SELECT m.message_id, m.from_shell_id, "
+                    "s.shortname AS from_shortname, m.kind, m.body, "
+                    "m.created_at, m.read_at FROM shell_messages m "
+                    "LEFT JOIN shells s ON s.shell_id = m.from_shell_id "
+                    "WHERE m.to_shell_id=? "
+                    "AND m.kind IN ('shell','task','result') "
+                    "ORDER BY m.read_at IS NOT NULL, m.created_at DESC, "
+                    "m.message_id DESC LIMIT 50",
                     (sid,)))
                 return self._send(200, {"messages": msgs})
 
@@ -4738,6 +4927,17 @@ class Handler(BaseHTTPRequestHandler):
                     "status, completed_date, resolution_notes FROM spec_tasks WHERE " + where +
                     " ORDER BY seq", params))
                 return self._send(200, {"tasks": ts})
+
+            if len(parts) == 4 and parts[2] == "tasks":
+                # One task by id — a task id from a message or a wake needs no
+                # prior knowledge of its spec or feature to be read.
+                r = con.execute(
+                    "SELECT task_id, feature_id, document_id, seq, title, description, "
+                    "status, completed_date, resolution_notes FROM spec_tasks "
+                    "WHERE task_id=?", (int(parts[3]),)).fetchone()
+                if r is None:
+                    return self._send(404, {"error": "no such task"})
+                return self._send(200, {"task": dict(r)})
 
             return self._send(404, {"error": "not found"})
         except ValueError:
@@ -5006,15 +5206,53 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/_sc/mem/tasks":
                 title = (body.get("title") or "").strip()
                 fid, did, seq = body.get("feature_id"), body.get("document_id"), body.get("seq")
-                if not title or fid is None or did is None or seq is None:
-                    return self._send(400, {"error": "feature_id, document_id, seq, title required"})
-                cur = con.execute(
-                    "INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (int(fid), int(did), int(seq), title,
-                     body.get("description") or None, sid))
+                if not title or did is None:
+                    return self._send(400, {"error": (
+                        "document_id and title required (feature_id and seq "
+                        "are inferred from the document when omitted)")})
+                did = int(did)
+                # The spec already names its feature: omitted, it is read off
+                # the document; given, it must agree. A frozen spec is not
+                # special here — its plan is still worked after it ships.
+                d = con.execute(
+                    "SELECT feature_id FROM documents WHERE document_id=?",
+                    (did,)).fetchone()
+                if fid is None:
+                    if d is None:
+                        return self._send(404, {"error": "no such document"})
+                    if d[0] is None:
+                        return self._send(400, {"error": (
+                            f"document #{did} has no feature — pass feature_id")})
+                    fid = d[0]
+                elif d is not None and d[0] is not None and int(fid) != d[0]:
+                    return self._send(409, {"error": (
+                        f"document #{did} belongs to feature #{d[0]}, not "
+                        f"#{int(fid)} — pass --feature {d[0]} or omit it")})
+                # One statement reads the next free slot and writes it, so two
+                # concurrent adds cannot be handed the same number.
+                try:
+                    cur = con.execute(
+                        "INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id) "
+                        "VALUES (?, ?, COALESCE(?, (SELECT COALESCE(MAX(seq), 0) + 1 "
+                        "FROM spec_tasks WHERE document_id=?)), ?, ?, ?)",
+                        (int(fid), did, int(seq) if seq is not None else None, did,
+                         title, body.get("description") or None, sid))
+                except sqlite3.IntegrityError as exc:
+                    con.rollback()
+                    if "UNIQUE" not in str(exc) or seq is None:
+                        raise
+                    free = con.execute(
+                        "SELECT COALESCE(MAX(seq), 0) + 1 FROM spec_tasks "
+                        "WHERE document_id=?", (did,)).fetchone()[0]
+                    return self._send(409, {"error": (
+                        f"seq {int(seq)} is already taken in document #{did}'s "
+                        f"plan — omit --seq for the next free slot ({free})")})
+                seq = con.execute(
+                    "SELECT seq FROM spec_tasks WHERE task_id=?",
+                    (cur.lastrowid,)).fetchone()[0]
                 con.commit()
-                return self._send(201, {"task_id": cur.lastrowid})
+                return self._send(201, {"task_id": cur.lastrowid,
+                                        "feature_id": int(fid), "seq": seq})
 
             if path == "/_sc/mem/docs":
                 # feature_id is OPTIONAL — standalone (feature-less) docs are part
@@ -5498,8 +5736,13 @@ class Handler(BaseHTTPRequestHandler):
             }
             # Restrictive CSP on the app shell (spec #20 Security): vendored
             # scripts/styles + same-origin connections only, no inline script.
-            if fname == "index.html":
+            if fname in _PAGES:
                 headers["Content-Security-Policy"] = _CSP
+            if fname == "index.html":
+                # Loading the app is "use": re-issue the session cookie with a
+                # fresh lifetime (the engine never expires a session; a
+                # browser drops a cookie after about 400 days).
+                headers.update(browser_gate.renewal_headers(self.headers))
             if self._if_none_match(headers["ETag"]):
                 return self._not_modified(headers)
             return self._send(200, text, ctype, headers=headers)
@@ -5523,7 +5766,16 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(urlparse(self.path).query)
             fetch = q.get("fetch", ["0"])[0] in ("1", "true", "yes")
             try:
-                return self._send(200, git_hygiene.compute(fetch=fetch))
+                state = git_hygiene.compute(fetch=fetch)
+                # A subagent's worktree is named for its run, not for a shell:
+                # say which run it is and which shell launched it.
+                from runs import RunStore
+                con = db()
+                try:
+                    RunStore(con, ENGINE).label_worktrees(state["worktrees"])
+                finally:
+                    con.close()
+                return self._send(200, state)
             except Exception as e:
                 return self._fail(e)
         # Rolling webapp event log — no DB, just the last LOG_MAX_EVENTS events.
@@ -5532,6 +5784,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/logs":
             return self._send(200, {"events": list(reversed(read_log())),
                                     "max": LOG_MAX_EVENTS})
+        if path == "/api/auth/status":
+            # Open (browser_gate.OPEN_ROUTES): what the sign-in page needs
+            # before anyone is signed in. No secret. The authority is
+            # the host engine-ops service; a signed-in caller also has its
+            # cookie renewed.
+            try:
+                payload = browser_gate.auth_status(
+                    self.path, self.headers, engine_ops.discovery(
+                        in_container() or bool(os.environ.get("SC_SANDBOX"))),
+                    _active_user)
+            except Exception as e:
+                return self._fail(e)
+            headers = {"Cache-Control": "no-store"}
+            if payload["signed_in"]:
+                headers.update(browser_gate.renewal_headers(self.headers))
+            return self._send(200, payload, headers=headers)
         if path == "/api/models":
             q = parse_qs(urlparse(self.path).query)
             try:
@@ -5564,6 +5832,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"templates": shell_factory.flavors()})
             if path == "/api/flavor-defaults":
                 return self._send(200, get_flavor_defaults(con))
+            if path == "/api/harnesses/compaction" or (
+                    path.startswith("/api/harnesses/")
+                    and path.endswith("/compaction-data")):
+                return self._harness_compaction(con, path)
             if path.startswith("/api/shells/"):
                 sid = int(path.rsplit("/", 1)[1])
                 shell = get_shell(con, sid)
@@ -5714,9 +5986,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/analytics/filters":
                 return self._send(200, get_analytics_filters(con))
             if path == "/api/analytics/quota":
-                # Arrival at #analytics-quota. Probes only when this process's
-                # last probe ATTEMPT is older than the TTL — never at boot,
-                # never on a timer, never from the Token Analytics section.
+                # Arrival at #analytics-quota, or the settings drawer's Tokens
+                # section opening. Probes only when this process's last probe
+                # ATTEMPT is older than the TTL — never at boot, never on a
+                # timer, never from the Token Analytics section.
                 return self._send(200, get_analytics_quota(con))
             if path == "/api/scripts":
                 return self._send(200, {"scripts": script_list()})
@@ -5734,6 +6007,20 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 return self._send(200, {**browser_mod.status(), "config": browser_mod.read(),
                     "defaults": browser_mod.defaults()})
+            if path == "/api/engine-ops":
+                # Where the host-side engine-ops service is, and whether it
+                # answers. The browser calls that service directly; this API
+                # runs none of its verbs (spec #270 Engine controls).
+                if not self._require_browser_operator(con, "engine operations"):
+                    return
+                return self._send(200, engine_ops.discovery(
+                    in_container() or bool(os.environ.get("SC_SANDBOX"))))
+            if path == "/api/engine-ops/update-check":
+                # Whether `./sc update` would move the engine: the Engine
+                # drawer's update badge. Read-only git, cached per ref.
+                if not self._require_browser_operator(con, "engine operations"):
+                    return
+                return self._send(200, engine_update.check())
             if path == "/api/web-search":
                 # Status only — configured / provider / last-four hint / when.
                 # The key itself never crosses this boundary (doc #215).
@@ -5787,8 +6074,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._runs_request(path, post=True)
         if path.startswith("/_sc/mem/"):
             return self._mem_post(path, self._body())
-        if path.startswith("/_sc/pr/"):
-            return self._pr_post(path, self._body())
         if path.startswith("/_sc/sprint/"):
             return self._sprint_post(path, self._body())
         if path == "/_sc/browser":
@@ -6182,6 +6467,9 @@ class Handler(BaseHTTPRequestHandler):
                     con, parts[2], self._body()
                 )
                 return self._send(status, payload)
+            if (len(parts) == 4 and parts[:2] == ["api", "harnesses"]
+                    and parts[3] == "compaction"):
+                return self._harness_compaction(con, path, put=True)
             if len(parts) == 5 and parts[1] == "flavors" and parts[3] == "skills":
                 ok, err = set_flavor_grant(
                     con, parts[2], int(parts[4]),
@@ -6227,7 +6515,23 @@ class Handler(BaseHTTPRequestHandler):
                 tsb = self._body().get("ts")
                 if tsb is not None and not isinstance(tsb, dict):
                     return self._send(400, {"error": "ts must be an object"})
-                return self._send(200, {"ok": True, "ts": ts_mod.write(tsb)})
+                # Same replies as the ts-broker's PUT /ts: a bad host or user
+                # name is the caller's error (400, nothing saved), and a save
+                # that fails says so by code instead of a bare 500 string.
+                try:
+                    saved = ts_mod.write(tsb)
+                except ts_mod.BlockInvalid as exc:
+                    return self._send(400, {
+                        "ok": False, "error": "ts_block_invalid",
+                        "message": f"the ts block was not saved: {exc}"})
+                except Exception as exc:  # noqa: BLE001 — report, keep serving
+                    traceback.print_exc()
+                    return self._send(500, {
+                        "ok": False, "error": "ts_write_failed",
+                        "message": ("the ts block was not saved "
+                                    f"({type(exc).__name__}: {exc}); the "
+                                    "previous block is still in effect")})
+                return self._send(200, {"ok": True, "ts": saved})
             if path == "/api/pm2":
                 pb = self._body().get("pm2")
                 if pb is not None and not isinstance(pb, dict):
@@ -6338,11 +6642,59 @@ class _ShimHandler(Handler):
     # log_request/log_message already quiet via Handler.log_message.
 
 
+def _live_shell_token(token: str) -> bool:
+    """Whether a Bearer token is a live shell's API key (for the gate)."""
+    con = db()
+    try:
+        return con.execute(
+            "SELECT 1 FROM shells WHERE api_key=? AND COALESCE(is_deleted,0)=0",
+            (token,)).fetchone() is not None
+    finally:
+        con.close()
+
+
+def _active_user(user_id: int) -> bool:
+    """Whether a session's user is an active engine user (for the gate)."""
+    con = db()
+    try:
+        return con.execute(
+            "SELECT 1 FROM users WHERE user_id=? AND is_active=1",
+            (user_id,)).fetchone() is not None
+    finally:
+        con.close()
+
+
+def _gate(method: str, path: str, headers_raw: str) -> tuple | None:
+    """The sign-in gate's refusal for this request, or None to let it through.
+
+    Fails closed: if the check itself cannot run (the engine DB is busy while
+    a session's user or a Bearer's shell is looked up), the request is
+    refused with a retryable 503. It is never let through undecided.
+    """
+    try:
+        verdict = browser_gate.authorize(
+            method, path, conversation_routes._parse_headers(headers_raw),
+            _live_shell_token, _active_user)
+    except Exception:  # noqa: BLE001 — undecided is refused
+        traceback.print_exc()
+        body = b"" if method == "HEAD" else json.dumps(browser_gate.error_payload(
+            "gate_unavailable",
+            "the sign-in check could not run — retry")).encode()
+        return 503, [("Content-Type", "application/json"),
+                     ("Cache-Control", "no-store"), ("Retry-After", "2")], body
+    return None if verdict.allowed else verdict.response
+
+
 def dispatch_http(method: str, path: str, headers_raw: str,
                   body: bytes) -> tuple:
     """The transport's HTTP entry: route one request, return
     (status, [(header, value)], body bytes). Focused retained routes go to
     their own modules; everything else runs through the shimmed Handler."""
+    # THE gate (Feature #94, spec #271): default deny, decided before any
+    # route below is chosen. Nothing above this line answers a request.
+    refusal = _gate(method, path, headers_raw)
+    if refusal is not None:
+        return refusal
     parsed = urlparse(path)
     if parsed.path == "/api/diagnostics/request-timing":
         return request_timing.handle(method, headers_raw)
@@ -6474,6 +6826,65 @@ def require_loopback_bind(bind: str) -> None:
     )
 
 
+# Every port this process's listening sockets actually hold, reported by the
+# transport once it is bound (`_on_bound`). Not the port that was asked for,
+# and not always one: `--port 0` asks the kernel to choose, and on a
+# dual-stack bind (`SC_BIND=localhost`) it chooses one for IPv4 and another
+# for IPv6. Empty until the bind. The engine CLI credential is published
+# under each of these ports and no other.
+_LISTEN_PORTS: tuple[int, ...] = ()
+
+
+def _on_bound(ports) -> None:
+    """The transport's `on_bound`: the ports the listening sockets hold."""
+    global _LISTEN_PORTS
+    _LISTEN_PORTS = tuple(ports)
+
+
+def publish_cli_credential() -> None:
+    """Publish this process's engine CLI token, owner-only, under run/, as
+    the credential of every port it bound.
+
+    Called only after the listener is bound, and keyed by port, so the file
+    for a port always names the token of the server holding it. The same
+    token goes under each port this server holds: a caller reaches one server
+    whichever of its sockets it calls. A second server of this checkout on
+    another port publishes its own file and does not touch these. Nothing
+    removes a file, at startup or at shutdown: another port's may belong to a
+    live server, and a token with no server behind it opens nothing.
+
+    Loud, and not fatal, whatever goes wrong, and port by port: one port's
+    failure does not stop the next port's file, and none of them stops the
+    server. With no token published for a port the CLI routes still take a
+    shell token, and `./sc snapshot` says that no credential is published
+    for that port.
+    """
+    token, ports = browser_gate.CLI_TOKEN, _LISTEN_PORTS
+
+    def loud(port, exc) -> None:
+        print("server: could NOT publish the engine CLI credential for port "
+              f"{port} ({type(exc).__name__}: {exc}). The server is running; "
+              "`./sc snapshot` and `./sc update` will be refused by it on "
+              "that port until the next restart publishes one.", flush=True)
+
+    if not token:
+        return loud(None, RuntimeError("no token was minted"))
+    if not ports:
+        return loud(None, RuntimeError(
+            "the transport did not report the bound port"))
+    for port in ports:
+        try:
+            cli_credential.publish(token, port)
+        except Exception as exc:  # noqa: BLE001 — never a reason to stop serving
+            loud(port, exc)
+
+
+def _on_listening() -> None:
+    """What may happen only once this process holds the port."""
+    publish_cli_credential()
+    start_runtime_services()
+
+
 def start_runtime_services() -> None:
     """Start commit-woken conversations and Sprint/engine services."""
     broker = conversation_broker.start_service(
@@ -6523,7 +6934,7 @@ def _run_server(port: int) -> int:
     # The app shell's socket sources are port-exact (see `_csp`), so bind the
     # policy to the port actually being served before any request can render it.
     global _CSP
-    _CSP = _csp(port)
+    _CSP = _csp(port, ports_mod.stored_engine_ops_port())
     if not DB_PATH.exists():
         sys.exit(f"server: no DB at {DB_PATH} — run `./sc rebuild` first.")
     require_current_schema(DB_PATH)
@@ -6542,6 +6953,14 @@ def _run_server(port: int) -> int:
     # api_key rotation is picked up here. Lives under the gitignored,
     # never-snapshotted .super-coder/run/.
     mem_credentials.provision(str(DB_PATH), f"http://127.0.0.1:{port}")
+    # The engine CLI credential (Feature #94): a fresh token every boot. It
+    # is minted here, in memory only, so the gate knows it before the first
+    # request. It is PUBLISHED only once this process holds the port
+    # (`_on_listening`): a duplicate startup that loses the bind must not
+    # replace the file the surviving server's callers read.
+    global _LISTEN_PORTS
+    _LISTEN_PORTS = ()           # known only once the sockets are bound
+    browser_gate.CLI_TOKEN = cli_credential.mint()
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can
     # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which
@@ -6574,7 +6993,8 @@ def _run_server(port: int) -> int:
                 port,
                 dispatch_http,
                 _ws_unavailable,
-                on_started=start_runtime_services,
+                on_bound=_on_bound,
+                on_started=_on_listening,
                 stream_handler=conversation_routes.stream_events,
             )
         finally:
@@ -6593,6 +7013,9 @@ def _run_server(port: int) -> int:
 
 
 def main(argv):
+    # A server started from inside a subagent's process tree is not that
+    # subagent; every chat it launches would otherwise inherit the run id.
+    os.environ.pop("SC_JOB_AGENT_RUN", None)
     # server.log is stdout+stderr as the dispatcher redirected them; stamp both
     # before the first line is written. basicConfig carries no time of its own
     # — the writer adds one per line, once.
@@ -6610,8 +7033,9 @@ def main(argv):
     try:
         instance_state.active_database_path(ENGINE)
         state = instance_state.maintenance_state(ENGINE)
-        # `_run_server` retains the combined on_started=start_runtime_services
-        # callback while this outer scope retains runtime ownership.
+        # `_run_server` retains the combined on_started=_on_listening callback
+        # (which runs start_runtime_services) while this outer scope retains
+        # runtime ownership.
         with state_relocation.shared_runtime(state, command="api-server"):
             return _run_server(port)
     except instance_state.MaintenanceCutoverRequired as exc:

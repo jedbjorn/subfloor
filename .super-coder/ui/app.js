@@ -74,7 +74,7 @@ function addCopyButton(pre) {
 }
 
 async function api(path, method = "GET", body, extraHeaders = {}) {
-  const r = await fetch("/api" + path, {
+  const r = await sessionFetch("/api" + path, {
     method, headers: {
       ...(body ? { "Content-Type": "application/json" } : {}),
       ...extraHeaders,
@@ -95,6 +95,183 @@ async function api(path, method = "GET", body, extraHeaders = {}) {
   return data;
 }
 
+// ── Session loss (spec #271) ────────────────────────────────────────────────
+// The review server answers a request without a valid session with
+// `401 {"error":"sign_in_required"}`; the host authority answers
+// `401 {"error":{"code":"sign_in_required"}}`. Either means the session was
+// revoked or has gone: the operator is sent to the sign-in screen with the
+// place they were at as `next`, instead of seeing "offline" or an error toast.
+const SIGN_IN_PATH = "/signin.html";
+let leavingForSignIn = false;
+// `next` is honoured only as a path on this origin, and what is validated is
+// the value that will be navigated to, after the URL parser has normalised
+// it: "/a/..//host" and "/%2e//host" both normalise to "//host", which a
+// browser reads as another origin. The result must start with exactly one
+// "/", hold no backslash or control character, and parse back to itself on
+// this origin. Anything else falls back to "/".
+const NEXT_UNSAFE = /[\\\u0000-\u001f\u007f]/;
+const NEXT_LOCAL = /^\/(?![\/\\])/;
+function safeNext(raw, origin) {
+  if (typeof raw !== "string" || NEXT_UNSAFE.test(raw) || !NEXT_LOCAL.test(raw)) return "/";
+  let url;
+  try { url = new URL(raw, origin); } catch { return "/"; }
+  if (url.origin !== origin) return "/";
+  const path = url.pathname + url.search + url.hash;
+  if (NEXT_UNSAFE.test(path) || !NEXT_LOCAL.test(path)) return "/";
+  let again;
+  try { again = new URL(path, origin); } catch { return "/"; }
+  if (again.origin !== origin || again.pathname + again.search + again.hash !== path) return "/";
+  return again.pathname === "/signin.html" ? "/" : path;
+}
+function signInUrl() {
+  return SIGN_IN_PATH + "?next=" + encodeURIComponent(
+    safeNext(location.pathname + location.search + location.hash, location.origin));
+}
+function goToSignIn() {
+  if (leavingForSignIn) return;   // many requests can fail at once; leave once
+  leavingForSignIn = true;
+  location.assign(signInUrl());
+}
+function isSignInRequired(status, data) {
+  const error = data?.error;
+  return status === 401
+    && (error === "sign_in_required" || error?.code === "sign_in_required");
+}
+// Every request this page makes goes through here: it is the only fetch call
+// in the file. On sign_in_required the page is leaving, so the caller is left
+// waiting rather than handed an error to report.
+async function sessionFetch(url, init) {
+  const response = await fetch(url, init);
+  if (response.status === 401) {
+    const data = await response.clone().json().catch(() => null);
+    if (isSignInRequired(401, data)) {
+      goToSignIn();
+      return new Promise(() => {});
+    }
+  }
+  return response;
+}
+// An EventSource reports an error with no status, and reconnects by itself,
+// so a revoked session and a network drop look the same from there. The
+// stream therefore has one owned watch (sessionWatch) that asks the open
+// auth-status route what the error meant. Three answers, kept apart:
+//   "in"       the server answered and the session holds
+//   "out"      the server answered `signed_in: false`: go to sign-in
+//   "unknown"  anything else: unreachable, an error status, a malformed body
+// Unknown is never read as "in". The gate also says so directly, with a
+// `sign_in_required` event on the stream before it closes it; that event goes
+// to sign-in without a probe.
+//
+// One watch per live stream, holding at most one timer and one probe.
+// Stopping or replacing the stream cancels it, so nothing asks about a
+// stream that is gone. Probes are spaced by the watch's wait: five seconds,
+// doubling to a minute while the answer stays unknown or the server keeps
+// refusing the stream.
+//
+// The watch never gives up while its stream is the live one. A stream the
+// server refuses while the session holds is reopened at that growing wait,
+// which settles at one attempt a minute, so a server that recovers is picked
+// up within a minute with no reload. A closed stream therefore always has an
+// attempt scheduled, which is what the "Reconnecting" label claims. Three
+// wake-ups bring the next attempt forward instead of adding a timer: the tab
+// becoming visible, the browser coming back online, and the operator sending
+// a message.
+//
+// The probe belongs to the watch too. Stopping or replacing the stream aborts
+// a probe that is still out, so there is never more than one status request
+// in flight for the page; and a probe that gets no answer within
+// SESSION_PROBE_TIMEOUT_MS is aborted and counted as "unknown", so a stalled
+// route cannot hold the one probe slot.
+const SESSION_PROBE_MIN_MS = 5000;
+const SESSION_PROBE_MAX_MS = 60000;
+const SESSION_PROBE_TIMEOUT_MS = 10000;
+let sessionWatch = null;
+let sessionProbedAt = -Infinity;
+function stopSessionWatch() {
+  if (!sessionWatch) return;
+  const watch = sessionWatch;
+  sessionWatch = null;
+  clearTimeout(watch.timer);
+  if (watch.abortProbe) watch.abortProbe();
+}
+async function probeSession(signal) {
+  try {
+    const response = await sessionFetch("/api/auth/status", { signal });
+    if (!response.ok) return "unknown";
+    const status = await response.json();
+    return status?.signed_in === true ? "in" : status?.signed_in === false ? "out" : "unknown";
+  } catch { return "unknown"; }
+}
+function wakeSessionWatch() {
+  if (sessionWatch) sessionWatch.wake();
+}
+// `closed()` says whether the browser has given up on the stream (the server
+// refused it); `reopen()` opens a fresh one. `wait` carries over from the
+// stream this one replaced, and resets when a stream opens.
+function startSessionWatch({ closed, reopen, wait = SESSION_PROBE_MIN_MS }) {
+  stopSessionWatch();
+  const watch = { timer: null, probing: false, wait };
+  sessionWatch = watch;
+  const live = () => sessionWatch === watch && !leavingForSignIn;
+  const schedule = (delay) => {
+    if (watch.timer || watch.probing || !live()) return;   // one pending, never a queue
+    watch.timer = setTimeout(run, Math.max(0, delay));
+  };
+  const run = async () => {
+    watch.timer = null;
+    if (!live()) return;
+    watch.probing = true;
+    sessionProbedAt = Date.now();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SESSION_PROBE_TIMEOUT_MS);
+    watch.abortProbe = () => { clearTimeout(timeout); controller.abort(); };
+    const outcome = await probeSession(controller.signal);
+    clearTimeout(timeout);
+    watch.abortProbe = null;
+    watch.probing = false;
+    if (!live()) return;   // stopped or replaced meanwhile: its answer is nobody's
+    if (outcome === "out") {
+      stopSessionWatch();
+      goToSignIn();
+      return;
+    }
+    if (outcome === "unknown") {
+      // Not evidence either way: back off, and keep asking only while the
+      // stream is closed, since a stream the browser is still retrying
+      // raises its own next error.
+      watch.wait = Math.min(watch.wait * 2, SESSION_PROBE_MAX_MS);
+      if (closed()) schedule(watch.wait);
+      return;
+    }
+    if (!closed()) { watch.wait = SESSION_PROBE_MIN_MS; return; }
+    // Signed in, yet the server refused the stream: reopen it, further apart
+    // each time up to the ceiling, for as long as this stream is the live one.
+    reopen({ wait: Math.min(watch.wait * 2, SESSION_PROBE_MAX_MS) });
+  };
+  // Bring the pending attempt forward (never sooner than the minimum gap
+  // since the last probe). Only a stream the browser has given up on needs
+  // it: an open stream has nothing pending, and one the browser is still
+  // retrying comes back by itself.
+  watch.wake = () => {
+    if (!live() || watch.probing || !closed()) return;
+    clearTimeout(watch.timer);
+    watch.timer = null;
+    schedule(sessionProbedAt + SESSION_PROBE_MIN_MS - Date.now());
+  };
+  return {
+    // Every stream error lands here; it asks at most once per wait.
+    errored: () => schedule(sessionProbedAt + watch.wait - Date.now()),
+    // An open stream has nothing pending: a probe timer left from before it
+    // connected is dropped with the back-off.
+    opened: () => {
+      clearTimeout(watch.timer);
+      watch.timer = null;
+      watch.wait = SESSION_PROBE_MIN_MS;
+    },
+    signedOut: () => { if (live()) { stopSessionWatch(); goToSignIn(); } },
+  };
+}
+
 function requestKey() {
   return globalThis.crypto?.randomUUID?.()
     || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -107,7 +284,7 @@ async function chatApi(path, method = "GET", body, idempotencyKey, signal) {
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   let response;
   try {
-    response = await fetch("/api" + path, {
+    response = await sessionFetch("/api" + path, {
       method, headers, signal,
       body: body === undefined || raw ? body : JSON.stringify(body),
     });
@@ -183,7 +360,7 @@ function toast(msg) {
 function setStatus(s) { $("#status").textContent = s; }
 
 // ── Skill sections ──────────────────────────────────────────────────────────
-// One grouping rule for the Shells skill viewer AND Skill Assignments. "Repo
+// Grouping rule for Skill Assignments. "Repo
 // skills" are fork-local (origin='repo', derived server-side from the snapshot
 // rule: name not under engine assets/skills) and always lead; engine skills
 // section by their category.
@@ -209,15 +386,13 @@ function groupSkills(skills, { alwaysRepo = false } = {}) {
 // ── Shells ──────────────────────────────────────────────────────────────────
 // dos-arch-style viewer (ported from dos-arch shell_core/ui /shells): sticky
 // identity sub-header (pill shell picker + role/mandate), then Harness |
-// Skills | Skill Assignments | Default Models sub-tabs. Flat panels,
+// Skill Assignments | Default Models | Runs sub-tabs. Flat panels,
 // accordions, popover pickers, and a unified edit modal.
 let selectedShell = null;
-let shellTab = "harness";     // 'harness' | 'skills' | 'assignments' | 'models'
-let activeSkillId = null;     // skill-viewer selection; reset on shell switch
+let shellTab = "harness";     // 'harness' | 'assignments' | 'models' | 'runs'
 let shellRenderEpoch = 0;     // discard stale async renders after re-navigation
 const SHELL_TAB_HASH = {
   harness: "shells",
-  skills: "shells-skills",
   assignments: "shells-skill-assignments",
   models: "shells-default-models",
   runs: "shells-runs",
@@ -333,6 +508,135 @@ function openEditModal({ title, value, onSave }) {
   ta.focus();
 }
 
+// Slide-over drawer (spec #270): one panel entering from the right, the
+// sibling of openModal. Its overlay is a .modal-overlay carrying closeModal,
+// so the single Esc handler at boot closes it topmost-first with no second
+// listener; a mousedown on the backdrop closes it too. `sections` is an
+// ordered list of { id, label, render }: each becomes a labelled block whose
+// body element carries the id, so a caller (or a later lane) fills the mount
+// with replaceChildren without touching the label. render(mount, { close })
+// is optional — a section without one stays empty but labelled. A render may
+// return a function; it runs once when the drawer closes, so a section can
+// release listeners and stop late answers from painting.
+// onClose runs once, on every close path. Returns the close function.
+// Keyboard focus stays inside the panel while it is open: Tab from the last
+// control wraps to the first, Shift+Tab from the first wraps to the last, and
+// a Tab that starts outside the panel is pulled in.
+const DRAWER_FOCUSABLE = "button, [href], input, select, textarea, [tabindex]";
+function openDrawer({ title, sections = [], width = 380, onClose }) {
+  const priorFocus = document.activeElement;
+  const overlay = el("div", { className: "modal-overlay drawer-overlay" });
+  let closed = false;
+  const cleanups = [];
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    overlay.remove();
+    for (const cleanup of cleanups) { try { cleanup(); } catch { /* one section's cleanup never blocks close */ } }
+    if (onClose) onClose();
+    if (priorFocus?.isConnected && typeof priorFocus.focus === "function") priorFocus.focus();
+  };
+  overlay.closeModal = close;
+  overlay.onmousedown = (e) => { if (e.target === overlay) close(); };
+  const panel = el("aside", { className: "drawer" });
+  overlay.onkeydown = (e) => {
+    if (e.key !== "Tab") return;
+    const stops = [...panel.querySelectorAll(DRAWER_FOCUSABLE)].filter((node) =>
+      !node.disabled && node.tabIndex !== -1 && !node.closest?.("[hidden]"));
+    const first = stops[0], last = stops[stops.length - 1];
+    const active = document.activeElement;
+    let target = null;
+    if (!stops.length) target = panel;
+    else if (!panel.contains(active)) target = e.shiftKey ? last : first;
+    else if (e.shiftKey && active === first) target = last;
+    else if (!e.shiftKey && active === last) target = first;
+    if (!target) return;
+    e.preventDefault();
+    target.focus();
+  };
+  panel.tabIndex = -1;
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", "drawer-title");
+  panel.style.width = width + "px";
+  const dismiss = el("button", { className: "drawer-close", type: "button", textContent: "✕" });
+  dismiss.setAttribute("aria-label", "Close drawer");
+  dismiss.onclick = close;
+  const body = el("div", { className: "drawer-body" });
+  for (const section of sections) {
+    const mount = el("div", { className: "drawer-mount", id: section.id });
+    body.append(el("section", { className: "drawer-section" },
+      el("h3", { className: "drawer-label" }, section.label), mount));
+    if (section.render) {
+      try {
+        const cleanup = section.render(mount, { close });
+        if (typeof cleanup === "function") cleanups.push(cleanup);
+      }
+      catch (e) { mount.replaceChildren(el("div", { className: "drawer-note" }, "error: " + e.message)); }
+    }
+  }
+  panel.append(
+    el("div", { className: "drawer-head" },
+      el("div", { className: "drawer-title", id: "drawer-title" }, title), dismiss),
+    body);
+  overlay.append(panel);
+  document.body.append(overlay);
+  dismiss.focus();
+  return close;
+}
+
+// The operator's settings drawer: five mounts in a fixed order. This lane
+// fills Appearance; Tokens, Models and Engine are filled by assigning a
+// render(mount, { close }) function to their entry in DRAWER_SECTIONS.
+const DRAWER_SECTIONS = [
+  { id: "drawer-appearance", label: "Appearance", render: renderDrawerAppearance },
+  { id: "drawer-tokens", label: "Tokens", render: null },
+  { id: "drawer-models", label: "Models", render: null },
+  { id: "drawer-engine", label: "Engine", render: null },
+  { id: "drawer-account", label: "Account", render: null },
+];
+// The header button toggles: a second press closes the open drawer.
+let closeSettingsDrawer = null;
+function openSettingsDrawer() {
+  if (closeSettingsDrawer) { closeSettingsDrawer(); return; }
+  closeSettingsDrawer = openDrawer({
+    title: "Settings", sections: DRAWER_SECTIONS,
+    onClose: () => { closeSettingsDrawer = null; },
+  });
+}
+
+// Appearance: System | Light | Dark. theme.js owns storage and the pre-paint
+// application (window.scTheme); this is only the control.
+const THEME_CHOICES = [["system", "System"], ["light", "Light"], ["dark", "Dark"]];
+function renderDrawerAppearance(mount) {
+  const theme = window.scTheme;
+  const group = el("div", { className: "filters seg theme-choice" });
+  group.setAttribute("role", "radiogroup");
+  group.setAttribute("aria-label", "Theme");
+  const note = el("div", { className: "drawer-note" });
+  const paint = () => {
+    const picked = theme ? theme.choice() : "system";
+    for (const b of group.children) {
+      const on = b.dataset.theme === picked;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-checked", String(on));
+    }
+    note.textContent = !theme ? "Theme control unavailable: theme.js did not load."
+      : picked === "system" ? `Following the system setting (${theme.resolved()}).`
+      : "Saved in this browser.";
+  };
+  for (const [value, label] of THEME_CHOICES) {
+    const b = el("button", { className: "chip", type: "button", textContent: label });
+    b.dataset.theme = value;
+    b.setAttribute("role", "radio");
+    b.disabled = !theme;
+    b.onclick = () => { theme.set(value); paint(); };
+    group.append(b);
+  }
+  paint();
+  mount.replaceChildren(group, note);
+}
+
 // Read-only skill-content viewer — 800×650, rendered markdown with a raw
 // toggle bottom-left, char/~token readout in the header.
 async function openSkillContentModal(skill) {
@@ -385,7 +689,7 @@ function openNewShellModal(templates, root) {
         flavor: fl.value || null,
         name: nm.value.trim(),
       });
-      selectedShell = r.shell_id; activeSkillId = null;
+      selectedShell = r.shell_id;
       close(); setStatus(`shell created — ${r.shortname}`); renderShells(root);
     } catch (e) { toast("error: " + e.message); create.disabled = false; create.textContent = "Create"; }
   };
@@ -394,8 +698,10 @@ function openNewShellModal(templates, root) {
 }
 
 // Runs use the same rows in the shell drawer and operator fleet view.
+const runStamp = (value) =>
+  Date.parse(String(value || "").replace(" ", "T") + (/Z$|[+-]\d\d:\d\d$/.test(value || "") ? "" : "Z"));
 const runAge = (value) => {
-  const stamp = Date.parse(String(value || "").replace(" ", "T") + (/Z$|[+-]\d\d:\d\d$/.test(value || "") ? "" : "Z"));
+  const stamp = runStamp(value);
   if (!Number.isFinite(stamp)) return "—";
   const seconds = Math.max(0, Math.floor((Date.now() - stamp) / 1000));
   return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h`;
@@ -433,51 +739,247 @@ async function attachRun(run, refresh) {
     };
   } catch (error) { toast(error.message); }
 }
-function renderRunRows(host, runs, shells, refresh) {
-  host.replaceChildren();
-  if (!runs.length) { host.append(el("div", { className: "muted" }, "No runs.")); return; }
+const RUN_LIVE = ["registered", "running"];
+const runSpan = (value) => {
+  const seconds = Math.max(0, Math.floor(value));
+  if (seconds < 60) return `${seconds}s`;
+  const pad = (n) => String(n).padStart(2, "0");
+  return seconds < 3600 ? `${Math.floor(seconds / 60)}m${pad(seconds % 60)}s`
+    : `${Math.floor(seconds / 3600)}h${pad(Math.floor((seconds % 3600) / 60))}m`;
+};
+// Elapsed and remaining time, from the ledger's start time and time limit. A
+// finished run states how long it ran and its limit.
+function runClock(run, now = Date.now()) {
+  const start = runStamp(run.started_at || run.created_at);
+  const limit = Number(run.timeout_seconds) > 0 ? Number(run.timeout_seconds) : null;
+  if (!Number.isFinite(start)) return limit ? `limit ${runSpan(limit)}` : "no time limit";
+  if (RUN_LIVE.includes(run.state)) {
+    const elapsed = Math.max(0, (now - start) / 1000);
+    if (!limit) return `elapsed ${runSpan(elapsed)} · no time limit`;
+    return elapsed >= limit ? `elapsed ${runSpan(elapsed)} · past its limit of ${runSpan(limit)}`
+      : `elapsed ${runSpan(elapsed)} · ${runSpan(limit - elapsed)} left of ${runSpan(limit)}`;
+  }
+  const end = runStamp(run.finished_at);
+  if (!Number.isFinite(end)) return "run time not recorded" + (limit ? ` · limit ${runSpan(limit)}` : "");
+  const ran = `ran ${runSpan((end - start) / 1000)}`;
+  return limit ? `${ran} of ${runSpan(limit)} limit` : ran;
+}
+// One timer keeps the clocks of live rows current between refreshes.
+const runClocks = new Set();
+let runClockTimer = null;
+function runClockNode(run) {
+  const node = el("span", { className: "run-clock" }, runClock(run));
+  if (!RUN_LIVE.includes(run.state)) return node;
+  runClocks.add({ node, run });
+  runClockTimer ??= setInterval(() => {
+    for (const clock of runClocks) {
+      if (clock.node.isConnected) clock.node.textContent = runClock(clock.run);
+      else runClocks.delete(clock);
+    }
+    if (!runClocks.size) { clearInterval(runClockTimer); runClockTimer = null; }
+  }, 1000);
+  return node;
+}
+const runTerminal = (run) => {
+  try { return JSON.parse(run.terminal_json || "null") || {}; } catch { return {}; }
+};
+// A probe run is a watcher. Its form and condition are read from the ledger's
+// argv, as `sc job list --kind probe` reads them.
+function runWatch(run) {
+  if (run.kind !== "probe") return null;
+  const argv = Array.isArray(run.argv) ? run.argv : [];
+  if (argv[0] === "sc" && argv[1] === "job" && argv[2] === "watch" && ["pr", "timer"].includes(argv[3])) {
+    const options = {};
+    for (let i = 4; i + 1 < argv.length; i += 2) options[argv[i]] = argv[i + 1];
+    if (argv[3] === "timer") return { form: "timer", condition: `${options["--after"] ?? "?"} seconds pass` };
+    return { form: "pr", condition: `PR #${options["--pr"] ?? "?"}`
+      + (options["--repository"] ? ` in ${options["--repository"]}` : "")
+      + ": checks settle (green or red), or it is merged or closed" };
+  }
+  return { form: "until", condition: argv[argv.length - 1] || "" };
+}
+const runAttemptText = (attempt) => (attempt && Number.isInteger(attempt.number)
+  ? `Last attempt ${attempt.number}: exit ${attempt.exit_code}`
+    + (String(attempt.excerpt || "").trim() ? ` · ${String(attempt.excerpt).trim()}` : "")
+  : "");
+// A live watcher's attempts are the lines of its log; the ledger holds only the final one.
+async function runLastAttempt(run, node) {
+  try {
+    const { text } = await api(`/runs/${run.run_id}/tail`);
+    const last = String(text || "").trim().split("\n").pop();
+    node.textContent = runAttemptText(JSON.parse(last || "null")) || "No attempt yet.";
+  } catch { node.textContent = "Last attempt not readable."; }
+}
+const runTokens = (usage) => (usage ? (usage.input_tokens || 0) + (usage.output_tokens || 0) : null);
+const RUN_TOKEN_BASIS = "Input plus output tokens, as the usage sweep read them. Cache reads and "
+  + "cache writes are not included here; the Analytics tab counts them as well.";
+// A continued subagent is one thread: every run of it works in the first run's
+// worktree, so that path groups them. The list is newest first, so the first
+// run met is the latest and the rest fold beneath it.
+function runThreads(runs) {
+  const threads = [], byWorktree = new Map();
   for (const run of runs) {
-    const owner = shells.find((s) => s.shell_id === run.owner_shell_id);
-    const row = el("article", { className: "run-row", ariaLabel: `Run ${run.run_id}` });
-    row.append(el("div", { className: "run-heading" },
-      el("strong", {}, `#${run.run_id} ${run.label}`),
-      el("span", { className: `run-state run-state-${run.state}` }, run.state)));
-    row.append(el("div", { className: "run-facts" },
-      `${owner?.shortname || run.owner_shell_id} · ${run.kind} · ${runAge(run.started_at || run.created_at)} · exit ${run.exit_code ?? "—"}`,
-      el("span", { className: `run-wake run-wake-${run.wake_state}`, title: run.delivery_error || run.last_error || "" }, `Wake: ${run.wake_state}`)));
-    const actions = el("div", { className: "run-actions" });
-    const tail = el("button", { className: "act", type: "button" }, "Tail");
-    tail.onclick = async () => {
-      try {
-        const evidence = await api(`/runs/${run.run_id}/tail`);
-        const close = el("button", { className: "act", type: "button" }, "Close");
-        const dismiss = openModal({ title: `Run #${run.run_id} · ${run.label}`,
-          bodyNode: el("pre", { className: "run-log" }, evidence.evidence_pruned ? "Evidence was pruned." : evidence.text || "No output yet."), footerEnd: close });
-        close.onclick = dismiss;
-      } catch (error) { toast(error.message); }
+    const key = run.kind === "agent" && run.agent?.worktree;
+    const thread = key && byWorktree.get(key);
+    if (thread) { thread.earlier.push(run); continue; }
+    const made = { head: run, earlier: [] };
+    if (key) byWorktree.set(key, made);
+    threads.push(made);
+  }
+  return threads;
+}
+// The limits are stated once at the head of a list. A list at a limit says so in words.
+// `part` limits it to the half a split drawer lists: "agents" or "watchers".
+function runLimitsLine(limits, shell, shells = [], part = null) {
+  if (!limits?.agents || !limits?.watchers) return null;
+  const agents = part === "watchers" ? null : limits.agents;
+  const watchers = part === "agents" ? null : limits.watchers;
+  const name = (id) => shells.find((s) => String(s.shell_id) === String(id))?.shortname || `shell ${id}`;
+  const who = shell ? (shell.shortname || `shell ${shell.shell_id}`) : null;
+  const facts = [], full = [];
+  if (who && limits.agents.shell_live != null) {
+    if (agents) {
+      facts.push(`Subagents: ${agents.shell_live} of ${agents.per_shell} live for ${who} · ${agents.install_live} of ${agents.per_install} on this install.`);
+      if (agents.shell_live >= agents.per_shell) full.push(`${who} is at its limit of ${agents.per_shell} live subagents.`);
+    }
+    if (watchers) {
+      facts.push(`Watchers: ${watchers.shell_live} of ${watchers.per_shell} live for ${who}.`);
+      if (watchers.shell_live >= watchers.per_shell) full.push(`${who} is at its limit of ${watchers.per_shell} live watchers.`);
+    }
+  } else {
+    if (agents) facts.push(`Subagents: ${agents.install_live} of ${agents.per_install} live on this install; one shell may run ${agents.per_shell}.`);
+    if (watchers) facts.push(`Watchers: ${watchers.install_live} live on this install; one shell may run ${watchers.per_shell}.`);
+    for (const [id, count] of Object.entries(agents?.by_shell || {}))
+      if (count >= agents.per_shell) full.push(`${name(id)} is at its limit of ${agents.per_shell} live subagents.`);
+    for (const [id, count] of Object.entries(watchers?.by_shell || {}))
+      if (count >= watchers.per_shell) full.push(`${name(id)} is at its limit of ${watchers.per_shell} live watchers.`);
+  }
+  if (agents && agents.install_live >= agents.per_install) full.push(`This install is at its limit of ${agents.per_install} live subagents.`);
+  const line = el("div", { className: "run-limits" + (full.length ? " run-limits-full" : "") }, facts.join(" "));
+  if (full.length) line.append(el("strong", {}, ` ${full.join(" ")} A further launch is refused until one ends.`));
+  return line;
+}
+async function showRunResult(run) {
+  try {
+    const found = await api(`/runs/${run.run_id}/result`);
+    const facts = found.agent || {};
+    const body = el("div", { className: "run-result" },
+      el("div", { className: "muted" }, [`${found.state} · exit ${found.exit_code ?? "—"}`,
+        facts.harness, facts.requested_model, `effort ${facts.effective_effort || "default"}`,
+        found.result_bytes != null ? `${found.result_bytes} bytes` : null].filter(Boolean).join(" · ")),
+      el("pre", { className: "run-log" }, found.available ? found.text : "No result is recorded yet."));
+    if (found.truncated) body.append(el("div", { className: "warning" },
+      "Truncated: the first 256 KiB are shown. The full text is result.md beside the run's log."));
+    const close = el("button", { className: "act", type: "button" }, "Close");
+    const dismiss = openModal({ title: `Result of run #${run.run_id} · ${run.label}`, bodyNode: body, footerEnd: close });
+    close.onclick = dismiss;
+  } catch (error) { toast(error.message); }
+}
+// `thread` is given for the row at the head of a thread; a folded earlier run has
+// none and is marked `folded`.
+function runRow(run, shells, refresh, thread = null, folded = false) {
+  const owner = shells.find((s) => s.shell_id === run.owner_shell_id);
+  const live = RUN_LIVE.includes(run.state);
+  const terminal = runTerminal(run);
+  const agent = run.kind === "agent" ? run.agent : null;
+  const watch = runWatch(run);
+  const row = el("article", { className: "run-row" + (thread ? "" : " run-row-earlier"), ariaLabel: `Run ${run.run_id}` });
+  row.append(el("div", { className: "run-heading" },
+    el("strong", {}, `#${run.run_id} ${run.label}`),
+    el("span", { className: `run-state run-state-${run.state}` }, run.state)));
+  const body = el("div", { className: "run-body" });
+  body.append(el("div", { className: "run-facts" },
+    `${owner?.shortname || run.owner_shell_id} · ${run.kind} · ${runAge(run.started_at || run.created_at)} · exit ${run.exit_code ?? "—"}`,
+    el("span", { className: `run-wake run-wake-${run.wake_state}`, title: run.delivery_error || run.last_error || "" }, `Wake: ${run.wake_state}`)));
+  if (agent) body.append(el("div", { className: "run-detail" },
+    `${agent.harness} · ${agent.requested_model} · effort ${agent.effective_effort || "default"}`
+    + (agent.continues_run_id ? ` · continues run #${agent.continues_run_id}` : "")));
+  if (watch) body.append(el("div", { className: "run-detail" }, `watch ${watch.form} · ${watch.condition}`));
+  body.append(el("div", { className: "run-detail" }, runClockNode(run)));
+  if (watch && watch.form !== "timer") {
+    const attempt = el("div", { className: "run-detail run-attempt" },
+      runAttemptText(terminal.probe_attempt) || (live ? "Reading the last attempt…" : "No attempt was recorded."));
+    if (live) runLastAttempt(run, attempt);
+    body.append(attempt);
+  }
+  // Tokens arrive with a usage sweep, not with the wake. A continued thread's
+  // tokens are counted on its first run, so the thread's latest row shows them,
+  // and the folded first run says its figure is the thread's. The basis is
+  // input + output only; the Analytics tab also counts cache reads and writes.
+  if (agent && (thread || agent.usage_json)) {
+    const root = Number(/agent-(\d+)$/.exec(agent.worktree || "")?.[1]);
+    const threaded = folded || Boolean(thread && (thread.earlier.length || agent.continues_run_id));
+    const tokens = el("div", { className: "run-detail run-tokens", title: RUN_TOKEN_BASIS });
+    const paint = (usage) => {
+      const total = runTokens(usage);
+      tokens.textContent = total == null ? "Input + output tokens: not read yet (they arrive with a usage sweep)"
+        : threaded ? `Input + output tokens: ${total} for this thread, counted on run #${root}`
+          : `Input + output tokens: ${total}`;
     };
-    const copy = el("button", { className: "act", type: "button" }, "Copy status command");
-    copy.onclick = () => Promise.resolve().then(() => navigator.clipboard.writeText(`sc job status ${run.run_id}`))
-      .then(() => toast("copied"), () => toast("copy failed"));
-    actions.append(tail, copy);
-    if (["registered", "running"].includes(run.state)) {
-      const kill = el("button", { className: "act danger", type: "button" }, "Kill");
-      kill.onclick = async () => {
-        if (!confirm(`Kill run #${run.run_id} (${run.label})?`)) return;
-        kill.disabled = true;
-        try { await api(`/runs/${run.run_id}/kill`, "POST", {}); await refresh(); }
-        catch (error) { toast(error.message); }
-        finally { kill.disabled = false; }
-      };
-      actions.append(kill);
-    }
-    if (["done", "failed", "timeout", "killed", "lost"].includes(run.state)) {
-      const attach = el("button", { className: "act", type: "button" }, "Attach receipt");
-      attach.onclick = () => attachRun(run, refresh);
-      actions.append(attach);
-    }
-    row.append(actions);
-    host.append(row);
+    const first = thread ? [run, ...thread.earlier].find((r) => r.run_id === root) : run;
+    paint(first?.agent?.usage_json);
+    // The thread's first run may lie beyond the rows this list loaded.
+    if (!first && Number.isInteger(root))
+      api(`/runs/${root}`).then((found) => paint(found.agent?.usage_json), () => {});
+    body.append(tokens);
+  }
+  // The engine's own note on how the run ended. For a lost subagent it says
+  // what the engine found of the harness process at that time.
+  if (terminal.spawn_error) body.append(el("div", { className: "run-note" },
+    `${run.state === "lost" ? "When the run was marked lost" : "Reason"}: ${terminal.spawn_error}`));
+  if (run.wake_state === "blocked" && run.last_error) body.append(el("div", { className: "run-note" }, run.last_error));
+  row.append(body);
+  const actions = el("div", { className: "run-actions" });
+  const tail = el("button", { className: "act", type: "button" }, "Tail");
+  tail.onclick = async () => {
+    try {
+      const evidence = await api(`/runs/${run.run_id}/tail`);
+      const close = el("button", { className: "act", type: "button" }, "Close");
+      const dismiss = openModal({ title: `Run #${run.run_id} · ${run.label}`,
+        bodyNode: el("pre", { className: "run-log" }, evidence.evidence_pruned ? "Evidence was pruned." : evidence.text || "No output yet."), footerEnd: close });
+      close.onclick = dismiss;
+    } catch (error) { toast(error.message); }
+  };
+  actions.append(tail);
+  if (agent) {
+    const result = el("button", { className: "act", type: "button" }, "Result");
+    result.onclick = () => showRunResult(run);
+    actions.append(result);
+  }
+  const copy = el("button", { className: "act", type: "button" }, "Copy status command");
+  copy.onclick = () => Promise.resolve().then(() => navigator.clipboard.writeText(`sc job status ${run.run_id}`))
+    .then(() => toast("copied"), () => toast("copy failed"));
+  actions.append(copy);
+  if (live) {
+    const kill = el("button", { className: "act danger", type: "button" }, "Kill");
+    kill.onclick = async () => {
+      if (!confirm(`Kill run #${run.run_id} (${run.label})?`)) return;
+      kill.disabled = true;
+      try { await api(`/runs/${run.run_id}/kill`, "POST", {}); await refresh(); }
+      catch (error) { toast(error.message); }
+      finally { kill.disabled = false; }
+    };
+    actions.append(kill);
+  } else {
+    const attach = el("button", { className: "act", type: "button" }, "Attach receipt");
+    attach.onclick = () => attachRun(run, refresh);
+    actions.append(attach);
+  }
+  row.append(actions);
+  return row;
+}
+function renderRunRows(host, runs, shells, refresh, { limits = null, shell = null, part = null, empty = "No runs." } = {}) {
+  host.replaceChildren();
+  const line = runLimitsLine(limits, shell, shells, part);
+  if (line) host.append(line);
+  if (!runs.length) { host.append(el("div", { className: "muted" }, empty)); return; }
+  for (const thread of runThreads(runs)) {
+    host.append(runRow(thread.head, shells, refresh, thread));
+    if (!thread.earlier.length) continue;
+    const count = thread.earlier.length;
+    host.append(el("details", { className: "run-thread" },
+      el("summary", {}, `${count} earlier run${count === 1 ? "" : "s"} of this subagent`),
+      ...thread.earlier.map((run) => runRow(run, shells, refresh, null, true))));
   }
 }
 function renderProcessTile(host, snapshot) {
@@ -493,7 +995,7 @@ function renderProcessTile(host, snapshot) {
 async function renderRunsFleet(host, shells, badge) {
   const filters = el("div", { className: "run-filters" });
   const list = el("div", { className: "run-list" });
-  let runs = [];
+  let runs = [], limits = null;
   const select = (label, options) => {
     const node = el("select", { ariaLabel: label });
     node.append(el("option", { value: "" }, `All ${label.toLowerCase()}`));
@@ -503,10 +1005,11 @@ async function renderRunsFleet(host, shells, badge) {
     return node;
   };
   const shell = select("Shells", shells.map((s) => [String(s.shell_id), s.shortname || s.display_name]));
-  const kind = select("Kinds", ["job", "devkit", "probe"].map((s) => [s, s]));
+  const kind = select("Kinds", ["job", "agent", "probe", "devkit"].map((s) => [s, s]));
   const state = select("States", ["registered", "running", "done", "failed", "timeout", "killed", "lost"].map((s) => [s, s]));
   const paint = () => renderRunRows(list, runs.filter((r) => (!shell.value || String(r.owner_shell_id) === shell.value)
-    && (!kind.value || r.kind === kind.value) && (!state.value || r.state === state.value)), shells, refresh);
+    && (!kind.value || r.kind === kind.value) && (!state.value || r.state === state.value)), shells, refresh,
+    { limits, shell: shells.find((s) => String(s.shell_id) === shell.value) || null });
   const caption = el("p", { className: "muted" });
   let refreshEpoch = 0;
   const refresh = async () => {
@@ -519,6 +1022,7 @@ async function renderRunsFleet(host, shells, badge) {
       const result = await api(`/runs?${query}`);
       if (!host.isConnected || epoch !== refreshEpoch) return;
       runs = result.runs;
+      limits = result.limits;
       caption.textContent = `Newest ${countLabel(runs.length, result.total)} matching runs.`;
       // The tab always counts the fleet, even when its rows are filtered.
       const count = shell.value ? await api("/runs?limit=1") : result;
@@ -534,32 +1038,298 @@ async function renderRunsFleet(host, shells, badge) {
   await refresh();
 }
 async function renderConversionStatus(host) {
-  host.replaceChildren(el("div", { className: "muted" }, "Loading harness conversion status…"));
+  host.replaceChildren(el("div", { className: "muted" }, "Loading harness status…"));
+  // The compaction settings of the four compacting harnesses come from one
+  // added call (spec #275); its failure shows inside each card and never
+  // hides the conversion content.
+  const compaction = api("/harnesses/compaction").then(
+    (value) => ({ value }), (error) => ({ error }));
   try {
     const { harness_status: statuses = {} } = await api("/flavor-defaults");
     if (!host.isConnected) return;
-    host.replaceChildren(el("h3", {}, "GUI background conversion"));
-    const explanations = { rewrite: "Background calls become durable jobs.", "deny-only": "Background calls are refused; use sc job.", disarmed: "Conversion is off; use sc job manually." };
-    for (const [harness, status] of Object.entries(statuses)) {
-      const evidence = status.conversion;
-      const row = el("div", { className: "run-row" }, el("strong", {}, harness));
-      if (!evidence) row.append(el("div", { className: "muted" }, "No conversion hook; use sc job for durable GUI work."));
-      else {
-        row.append(el("div", {}, `${evidence.version || "version unverified"} · ${evidence.tier}`),
-          el("div", {}, explanations[evidence.tier] || "Conversion status unavailable."),
-          el("div", { className: "muted" }, `Verified: ${evidence.verified_at || "never"}`));
-        if (evidence.error) row.append(el("div", { className: "error" }, evidence.error));
-        const verify = el("button", { className: "act", type: "button" }, "Re-verify");
-        verify.onclick = async () => {
-          verify.disabled = true; verify.textContent = "Verifying…";
-          try { await api(`/harnesses/${harness}/conversion/verify`, "POST", {}); await renderConversionStatus(host); }
-          catch (error) { toast(error.message); verify.disabled = false; verify.textContent = "Re-verify"; }
-        };
-        row.append(verify);
-      }
-      host.append(row);
-    }
+    const { value: settings, error: settingsError } = await compaction;
+    if (!host.isConnected) return;
+    const cards = Object.fromEntries((settings?.harnesses || []).map((card) => [card.harness, card]));
+    host.replaceChildren(el("h3", {}, "Harnesses"));
+    const rerender = () => renderConversionStatus(host);
+    for (const [harness, status] of Object.entries(statuses))
+      host.append(harnessCard(harness, status?.conversion, cards[harness], settingsError, rerender));
   } catch (error) { host.replaceChildren(el("div", { className: "error" }, error.message)); }
+}
+
+const CONVERSION_EXPLANATIONS = {
+  rewrite: "Background calls become durable jobs.",
+  "deny-only": "Background calls are refused; use sc job.",
+  disarmed: "Conversion is off; use sc job manually.",
+};
+
+function conversionSection(harness, evidence, rerender) {
+  const section = el("section", { className: "hc-section hc-conversion" }, el("h4", {}, "Background conversion"));
+  if (!evidence) {
+    section.append(el("div", { className: "muted" }, "No conversion hook; use sc job for durable GUI work."));
+    return section;
+  }
+  section.append(el("div", {}, `${evidence.version || "version unverified"} · ${evidence.tier}`),
+    el("div", {}, CONVERSION_EXPLANATIONS[evidence.tier] || "Conversion status unavailable."),
+    el("div", { className: "muted" }, `Verified: ${evidence.verified_at || "never"}`));
+  if (evidence.error) section.append(el("div", { className: "error" }, evidence.error));
+  const verify = el("button", { className: "act", type: "button" }, "Re-verify");
+  verify.onclick = async () => {
+    verify.disabled = true; verify.textContent = "Verifying…";
+    try { await api(`/harnesses/${harness}/conversion/verify`, "POST", {}); await rerender(); }
+    catch (error) { toast(error.message); verify.disabled = false; verify.textContent = "Re-verify"; }
+  };
+  section.append(verify);
+  return section;
+}
+
+// ── Harness cards: compaction settings and data (Feature #95, spec #275) ─────
+// The Claude, Codex, Kimi and OpenCode cards add Compaction settings and
+// Compaction data sections; Vibe's card has conversion only. Settings are
+// install-wide and save on change; data is computed by the engine on request.
+const CC_HARNESSES = ["claude", "codex", "kimi", "opencode"];
+const CC_LABELS = {
+  claude: "Claude (Anthropic)",
+  codex: "Codex (OpenAI)",
+  kimi: "Kimi (Moonshot)",
+  opencode: "One setting for every model provider behind OpenCode",
+};
+// The Analytics view's quota card per provider; OpenCode has none.
+const CC_QUOTA = { claude: "anthropic", codex: "openai", kimi: "moonshot" };
+const CC_TIPS = {
+  auto: "Compacts a chat when its context reaches the trigger size, checked after each turn.",
+  idle: "Compacts a large chat that has gone quiet, before the provider's cache expires, so your next message is cheap.",
+};
+const CC_CAUSES = ["harness", "threshold", "idle", "operator"];
+const CC_EXPANDED_KEY = "sc.harness-cards.expanded";
+
+function ccExpanded() {
+  try { return new Set(JSON.parse(globalThis.localStorage.getItem(CC_EXPANDED_KEY) || "[]")); }
+  catch { return new Set(); }
+}
+function ccRemember(harness, open) {
+  try {
+    const set = ccExpanded();
+    if (open) set.add(harness); else set.delete(harness);
+    globalThis.localStorage.setItem(CC_EXPANDED_KEY, JSON.stringify([...set]));
+  } catch { /* the browser refused storage: the card still works */ }
+}
+const ccK = (n) => n == null ? "not reported" : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
+const ccPct = (x) => `${Math.round(x * 100)}%`;
+
+function ccSummary(card) {
+  const auto = card.auto_enabled ? `Auto compaction on at ${ccK(card.effective_trigger ?? card.trigger_tokens)}` : "Auto compaction off";
+  const idle = card.idle_after_minutes == null ? "Idle compaction off" : `Idle compaction after ${card.idle_after_minutes} min`;
+  const count = card.week_compactions ?? 0;
+  return `${auto} · ${idle} · ${count} compaction${count === 1 ? "" : "s"} this week`;
+}
+
+// A focusable info control beside a setting's name: the tooltip opens on
+// hover and on keyboard focus (style.css .cc-info).
+function ccInfo(harness, key, name) {
+  const id = `cc-tip-${harness}-${key}`;
+  return el("span", { className: "cc-info", tabIndex: 0, role: "button",
+    ariaLabel: `About ${name}`, title: CC_TIPS[key] },
+  "i", el("span", { className: "cc-tip", role: "tooltip", id }, CC_TIPS[key]));
+}
+
+function ccSources(card, fields) {
+  return el("span", { className: "muted cc-source" },
+    fields.map(([field, label]) => `${label}: ${card.sources?.[field] || "default"}`).join(" · "));
+}
+
+// The engine never compacts on its own below its floor (90,000 tokens): a
+// value under it, from the environment or an older row, is raised to it.
+function ccFloorNote(card, field) {
+  const raised = field === "trigger_tokens" ? card.trigger_raised_to_floor : card.idle_min_raised_to_floor;
+  if (!raised) return null;
+  return el("span", { className: "cc-floor" },
+    `In effect: ${ccK(card.floor_tokens)}, raised to the engine floor (the engine never compacts below ${ccK(card.floor_tokens)})`);
+}
+
+function ccSettings(state, flash) {
+  const { harness, card } = state;
+  const section = el("section", { className: "hc-section cc-settings" }, el("h4", {}, "Compaction settings"),
+    el("div", { className: "muted" }, "Applies to every shell's browser chats on this install."));
+  const off = !card.manual_trigger;
+  if (off) section.append(el("div", { className: "cc-unavailable" }, card.unavailable_reason));
+  const statuses = {};
+  const status = (field) => (statuses[field] = el("span", { className: "cc-status", ariaLive: "polite" }));
+  const save = async (field, value) => {
+    const line = statuses[field];
+    line.className = "cc-status"; line.textContent = "Saving…";
+    try {
+      const saved = await api(`/harnesses/${harness}/compaction`, "PUT", { [field]: value });
+      state.card = { ...card, ...saved, week_compactions: card.week_compactions };
+      // The repaint keeps the figures already shown, then reloads them: a
+      // new trigger or idle size changes the figures read against it.
+      state.paint({ field, text: "Saved" });
+      await ccLoadData(state);
+    } catch (error) { line.className = "cc-status error"; line.textContent = error.message; }
+  };
+  const whole = (input) => {
+    const raw = String(input.value).replace(/[,_\s]/g, "");
+    return /^\d+$/.test(raw) ? Number(raw) : input.value;
+  };
+
+  const autoSwitch = el("input", { type: "checkbox", className: "cc-switch", checked: !!card.auto_enabled, disabled: off });
+  autoSwitch.onchange = () => save("auto_enabled", !!autoSwitch.checked);
+  const trigger = el("input", { type: "number", className: "cc-number", min: card.min_tokens, step: 1000, value: String(card.trigger_tokens), disabled: off });
+  trigger.onchange = () => save("trigger_tokens", whole(trigger));
+  section.append(el("div", { className: "cc-setting cc-auto" },
+    el("span", { className: "cc-name" }, "Auto compaction"), ccInfo(harness, "auto", "Auto compaction"),
+    el("label", {}, autoSwitch, " On"), status("auto_enabled"),
+    el("label", {}, "Trigger ", trigger, " tokens"), status("trigger_tokens"),
+    ...[ccFloorNote(card, "trigger_tokens")].filter(Boolean),
+    ccSources(card, [["auto_enabled", "switch"], ["trigger_tokens", "trigger"]])));
+
+  const wait = el("select", { className: "cc-wait", disabled: off });
+  wait.append(el("option", { value: "" }, "Off"));
+  for (const minutes of card.idle_choices || []) wait.append(el("option", { value: String(minutes) }, `${minutes} min`));
+  wait.value = card.idle_after_minutes == null ? "" : String(card.idle_after_minutes);
+  wait.onchange = () => save("idle_after_minutes", wait.value === "" ? null : Number(wait.value));
+  const size = el("input", { type: "number", className: "cc-number", min: card.min_tokens, step: 1000, value: String(card.idle_min_tokens), disabled: off });
+  size.onchange = () => save("idle_min_tokens", whole(size));
+  section.append(el("div", { className: "cc-setting cc-idle" },
+    el("span", { className: "cc-name" }, "Idle compaction"), ccInfo(harness, "idle", "Idle compaction"),
+    el("label", {}, "Wait ", wait), status("idle_after_minutes"),
+    el("label", {}, "Idle size ", size, " tokens"), status("idle_min_tokens"),
+    ...[ccFloorNote(card, "idle_min_tokens")].filter(Boolean),
+    ccSources(card, [["idle_after_minutes", "wait"], ["idle_min_tokens", "idle size"]])));
+
+  section.append(el("div", { className: "muted cc-life" },
+    `Cache life: ${card.cache_life_minutes} min${card.cache_life_measured ? "" : " (cache life not measured)"}; a fixed engine value, not a setting.`));
+  const applies = el("ul", { className: "cc-applies" });
+  for (const part of card.applies || [])
+    applies.append(el("li", { className: part.available ? "" : "muted" }, `${part.label}: ${part.note}`));
+  section.append(el("div", { className: "cc-name" }, "What applies to this harness"), applies);
+  if (flash && statuses[flash.field]) statuses[flash.field].textContent = flash.text;
+  return section;
+}
+
+function ccDataRows(d) {
+  const ctx = d.context || {};
+  const trigger = d.settings?.trigger_tokens;
+  const gaps = d.cold_by_gap || {};
+  const cold = d.cold_returns || {};
+  const cost = d.compaction_cost || {};
+  const payoff = d.idle_payoff || {};
+  return [
+    ["Chats, model requests", `${d.chats} chats · ${d.requests} model requests`],
+    ["Median context per request", ctx.median_tokens == null ? "no readings" : ccK(ctx.median_tokens)],
+    [`Requests at or above the trigger (${ccK(trigger)})`, ctx.share_at_or_above_trigger == null ? "no readings"
+      : `${ccPct(ctx.share_at_or_above_trigger)} (${ctx.at_or_above_trigger} of ${ctx.readings})`],
+    ["Warm share: cache reads of input", !d.warm_share?.reported ? "not reported"
+      : d.warm_share.share == null ? "no requests" : ccPct(d.warm_share.share)],
+    ["Cold rate by idle gap", !gaps.reported ? `not reported${gaps.note ? ` (${gaps.note})` : ""}`
+      : (gaps.buckets || []).map((b) => `${b.label}: ${b.rate == null ? "–" : ccPct(b.rate)} (${b.cold} of ${b.requests})`).join(" · "),
+      `A request is cold when under ${ccPct(gaps.cold_share_under ?? 0.5)} of its input was read from the cache; the gap is the time since the chat's previous request.`],
+    ["Cold returns at or above the idle size", !cold.reported ? "not reported"
+      : `${cold.count} · tokens re-read ${cold.tokens_reread == null ? "not reported" : ccK(cold.tokens_reread)}`,
+      "A request after a gap of at least the cache life; tokens re-read are its uncached input plus cache writes."],
+    ["Compactions by cause, median before → after", CC_CAUSES.map((cause) => {
+      const c = d.compactions?.by_cause?.[cause] || { count: 0 };
+      const sizes = c.count && (c.median_before != null || c.median_after != null)
+        ? ` (${ccK(c.median_before)} → ${ccK(c.median_after)})` : "";
+      return `${cause} ${c.count}${sizes}`;
+    }).join(" · ")],
+    ["Idle compactions that paid off", `${payoff.followed ?? 0} followed by a message within 24 h · ${payoff.not_followed ?? 0} not followed`
+      + (payoff.pending ? ` · ${payoff.pending} still within 24 h` : "")],
+    ["Compaction cost", !cost.reported ? "not reported" : !cost.requests ? "none"
+      : `${ccK(cost.total)} tokens over ${cost.requests} engine compaction request${cost.requests === 1 ? "" : "s"}`],
+  ];
+}
+
+function ccData(state) {
+  const { harness } = state;
+  const section = el("section", { className: "hc-section cc-data" }, el("h4", {}, "Compaction data"));
+  const switcher = el("div", { className: "cc-days" });
+  for (const days of [7, 30]) {
+    // Not .active-tab: its underline is absolutely positioned and would
+    // span the page from a button that is not a containing block.
+    const button = el("button", { type: "button", className: "act", ariaPressed: String(days === state.days) }, `${days} days`);
+    button.onclick = () => { state.days = days; state.figures = null; state.paint(); return ccLoadData(state); };
+    switcher.append(button);
+  }
+  // A repaint (after a save) shows the figures already loaded for this
+  // period rather than going back to "Loading…".
+  const shown = state.figures?.days === state.days ? state.figures.table : null;
+  state.dataBody = shown
+    ? el("div", { className: "cc-data-body" }, shown)
+    : el("div", { className: "cc-data-body muted" }, "Loading…");
+  section.append(switcher, state.dataBody);
+  if (CC_QUOTA[harness])
+    section.append(el("a", { className: "cc-quota", href: "#analytics-quota" },
+      `Provider quota (${CC_QUOTA[harness]}) on the Analytics view →`));
+  return section;
+}
+
+async function ccLoadData(state) {
+  const body = state.dataBody, days = state.days;
+  try {
+    const d = await api(`/harnesses/${state.harness}/compaction-data?days=${days}`);
+    if (body !== state.dataBody || days !== state.days) return;
+    const table = el("dl", { className: "cc-figures" });
+    for (const [label, value, caption] of ccDataRows(d)) {
+      const dd = el("dd", {}, value);
+      if (caption) dd.append(el("div", { className: "muted cc-caption" }, caption));
+      table.append(el("dt", {}, label), dd);
+    }
+    state.figures = { days, table };
+    body.className = "cc-data-body"; body.replaceChildren(table);
+  } catch (error) {
+    if (body !== state.dataBody) return;
+    body.className = "cc-data-body error"; body.textContent = error.message;
+  }
+}
+
+// One harness card: a header (name, provider, one summary line) that
+// expands to its sections — Background conversion, then, on the compacting
+// harnesses, Compaction settings and Compaction data. The browser remembers
+// which cards are open; a compacting card reloads its saved row and its data
+// each time it is expanded.
+function harnessCard(harness, evidence, card, loadError, rerender) {
+  const compacting = CC_HARNESSES.includes(harness);
+  const host = el("div", { className: "harness-card" });
+  const state = { harness, card, days: 7, open: ccExpanded().has(harness), dataBody: null };
+  const loaded = compacting && !!card;
+  state.paint = (flash) => {
+    const summary = el("span", { className: "hc-summary muted" },
+      evidence ? `Conversion ${evidence.tier}` : "No conversion hook");
+    if (loaded) summary.append(` · ${ccSummary(state.card)}`);
+    const head = el("button", { type: "button", className: "hc-head", ariaExpanded: String(state.open) },
+      el("span", { className: "hc-chevron", ariaHidden: "true" }, state.open ? "▾" : "▸"),
+      el("span", { className: "hc-title" }, el("strong", { className: "hc-name" }, harness),
+        ...(compacting ? [" ", el("span", { className: "muted cc-label" }, CC_LABELS[harness])] : [])),
+      summary);
+    if (compacting && !card) head.append(el("span", { className: "error hc-error" },
+      `Compaction settings unavailable: ${loadError?.message || "not returned"}`));
+    head.onclick = () => {
+      state.open = !state.open; ccRemember(harness, state.open); state.paint();
+      if (state.open && loaded) return ccOpen(state);
+    };
+    host.replaceChildren(head);
+    if (!state.open) return;
+    const body = el("div", { className: "hc-body" }, conversionSection(harness, evidence, rerender));
+    if (loaded) body.append(ccSettings(state, flash), ccData(state));
+    host.append(body);
+  };
+  state.paint();
+  if (state.open && loaded) ccLoadData(state);
+  return host;
+}
+
+// Expanding reloads the saved row (another tab may have saved since), then
+// the data for the selected period.
+async function ccOpen(state) {
+  try {
+    const { harnesses = [] } = await api("/harnesses/compaction");
+    const fresh = harnesses.find((card) => card.harness === state.harness);
+    if (fresh) state.card = fresh;
+  } catch { /* the settings already shown stand; the next expand retries */ }
+  if (!state.open) return;
+  state.paint();
+  await ccLoadData(state);
 }
 
 async function renderShells(root) {
@@ -585,7 +1355,7 @@ async function renderShells(root) {
       caption: x.shortname ? "/" + x.shortname : (x.flavor || ""),
     })),
     value: selectedShell,
-    onChange: (v) => { selectedShell = Number(v); activeSkillId = null; renderShells(root); },
+    onChange: (v) => { selectedShell = Number(v); renderShells(root); },
   }));
   if (s.role) idy.append(el("div", { className: "kv" }, microlabel("Role"), el("span", {}, s.role)));
   if (s.mandate) idy.append(el("div", { className: "kv" }, microlabel("Mandate"), el("span", {}, s.mandate)));
@@ -623,12 +1393,12 @@ async function renderShells(root) {
     sub.classList.add("subbar-inert");
   root.append(sub);
 
-  // Harness / Skills are scoped to the selected shell. Skill Assignments and
+  // Harness is scoped to the selected shell. Skill Assignments and
   // Default Models are fork-global views nested here to keep shell setup in
   // one place. Hash navigation gives every section a reload-safe URL.
   const tabs = el("div", { className: "vtabs" });
   let runsBadge;
-  for (const [key, label] of [["harness", "Harness"], ["skills", "Skills"],
+  for (const [key, label] of [["harness", "Harness"],
                               ["assignments", "Skill Assignments"],
                               ["models", "Default Models"], ["runs", "Runs"]]) {
     const b = el("button", { className: shellTab === key ? "active-tab" : "", type: "button", textContent: label });
@@ -648,8 +1418,7 @@ async function renderShells(root) {
   if (shellTab === "runs") renderRunsFleet(pane, shells, runsBadge);
   else if (shellTab === "harness") renderHarness(pane, s);
   else if (shellTab === "models") renderDefaultModels(pane, s);
-  else if (shellTab === "assignments") renderSkillAssignments(pane);
-  else renderSkillViewer(pane, s);
+  else renderSkillAssignments(pane);
 }
 
 // Default Models — the flavor_defaults launch matrix: per flavor, a model per
@@ -956,8 +1725,21 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
 
 let modelCatalogue = null;
 const supersededModelCatalogueGenerations = new Set();
+// Views that display the catalogue hear every adoption, whichever request
+// caused it. Whoever adds a listener removes it when its view closes.
+const modelCatalogueListeners = new Set();
+// What a view should show for a response it received: a response whose
+// generation was superseded while it was in flight yields the page's catalogue.
+function currentCatalogue(response) {
+  return modelCatalogue
+    && supersededModelCatalogueGenerations.has(response.catalogue_generation)
+    ? modelCatalogue : response;
+}
 
-async function loadModelCatalogue(refresh = false) {
+// `announce` is asked when the answer arrives, not when the request leaves: a
+// caller whose view has gone by then still gets the catalogue adopted, but
+// the "New models available!" notice stays silent.
+async function loadModelCatalogue(refresh = false, { announce = () => true } = {}) {
   const catalog = await api(refresh ? "/models?refresh=1" : "/models");
   const generation = catalog.catalogue_generation;
   const baselineGeneration = modelCatalogue?.catalogue_generation;
@@ -987,13 +1769,14 @@ async function loadModelCatalogue(refresh = false) {
         .filter((model) => model.availability === "available"
           && !known.has(`${harness}/${model.id}`))
         .map((model) => `${harness}: ${model.id}`));
-    if (added.length) toast(`New models available!\n${added.join("\n")}`);
+    if (added.length && announce()) toast(`New models available!\n${added.join("\n")}`);
   }
   // A failed refresh must not consume the baseline for the next successful read.
   if (!catalog.stale || !modelCatalogue) {
     if (baselineGeneration && generationChanged)
       supersededModelCatalogueGenerations.add(baselineGeneration);
     modelCatalogue = catalog;
+    for (const listener of [...modelCatalogueListeners]) listener(catalog);
   }
   return catalog;
 }
@@ -1189,7 +1972,7 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
 // then the law-curated identity (read-only by design, Laws 2–4 / 7), then the
 // record. Char/token readout spans everything below it.
 function renderHarness(root, s) {
-  const conversion = el("section", { className: "conversion-status vpanel" });
+  const conversion = el("section", { className: "conversion-status" });
   root.append(conversion);
   renderConversionStatus(conversion);
   const groups = [{ title: "Operational", items: [
@@ -1259,80 +2042,6 @@ function accordion(sec, s) {
   body.append(sec.node || (sec.text ? mdBlock(sec.text) : el("div", { className: "acc-text" }, "—")));
   d.append(body);
   return d;
-}
-
-// Skill Viewer — popover picker with inline grant toggles (☑/☐ — toggling
-// does not change the selection), then the selected skill's full content in a
-// panel with a char/token readout. Content lazy-loads per selection.
-function renderSkillViewer(root, s) {
-  const skills = s.skills;
-  if (!skills.length) { root.append(el("div", { className: "muted" }, "No skills in the catalogue.")); return; }
-  if (activeSkillId == null || !skills.find((k) => k.skill_id === activeSkillId))
-    activeSkillId = (skills.find((k) => k.granted) || skills[0]).skill_id;
-  const active = skills.find((k) => k.skill_id === activeSkillId);
-
-  const wrap = el("div", { className: "gdrop" });
-  const btn = el("button", { className: "gdrop-btn", type: "button" });
-  btn.append(el("span", { className: "gdrop-label mono" }, active.name),
-    el("span", { className: "gdrop-caret" }, "⇅"));
-  const menu = el("div", { className: "gmenu", hidden: true });
-  const grantPath = (skillId) => s.flavor
-    ? `/flavors/${encodeURIComponent(s.flavor)}/skills/${skillId}`
-    : `/shells/${s.shell_id}/skills/${skillId}`;
-  for (const k of skills) {
-    const row = el("div", { className: "gmenu-item" + (k.skill_id === activeSkillId ? " active-row" : "") });
-    const tog = el("button", { className: "gmenu-check", type: "button",
-      title: k.granted ? "Revoke" : "Grant", textContent: k.granted ? "☑" : "☐" });
-    tog.onclick = async () => {
-      try {
-        await api(grantPath(k.skill_id), "PUT", { granted: !k.granted });
-        k.granted = k.granted ? 0 : 1;
-        tog.textContent = k.granted ? "☑" : "☐";
-        tog.title = k.granted ? "Revoke" : "Grant";
-        setStatus(s.flavor
-          ? `${s.flavor} flavor pack updated`
-          : `${s.display_name} Bespoke pack updated`);
-      } catch (e) { toast("error: " + e.message); }
-    };
-    const sel = el("button", { className: "gmenu-name mono", type: "button", textContent: k.name });
-    sel.onclick = () => {
-      activeSkillId = k.skill_id; menu.hidden = true;
-      root.replaceChildren(); renderSkillViewer(root, s);
-    };
-    row.append(tog, sel, el("span", { className: "gmenu-cap" }, sectionLabel(sectionOf(k))));
-    menu.append(row);
-  }
-  btn.onclick = () => { menu.hidden = !menu.hidden; };
-  wrap.append(btn, menu);
-
-  // rendered markdown by default; the right-aligned toggle shows raw text
-  const rawBtn = el("button", { className: "rawtoggle", type: "button",
-    title: "Toggle raw markdown", textContent: "raw", hidden: true });
-  root.append(
-    el("div", { className: "muted note" },
-      s.flavor
-        ? `Shared ${s.flavor} pack — changes apply to every ${s.flavor} shell.`
-        : `Bespoke pack — changes apply only to ${s.display_name}.`),
-    el("div", { className: "viewer-head" }, microlabel("Skill Viewer"), wrap, rawBtn));
-  const stats = statRow([["Char Count", "…"], ["Est. Tokens", "…"]]);
-  const panel = el("div", { className: "vpanel viewer-panel" });
-  root.append(stats, panel);
-
-  api("/skills/" + activeSkillId).then((full) => {
-    stats.replaceWith(statRow([
-      ["Char Count", fmt((full.content || "").length)],
-      ["Est. Tokens", "~" + fmt(approxTokens(full.content || ""))]]));
-    if (full.description) panel.append(el("div", { className: "muted desc-line" }, full.description));
-    const rendered = mdBlock(full.content || "(no content)");
-    const raw = el("pre", { className: "raw-pre", hidden: true }, full.content || "");
-    panel.append(rendered, raw);
-    rawBtn.hidden = false;
-    rawBtn.onclick = () => {
-      raw.hidden = !raw.hidden;
-      rendered.hidden = !raw.hidden;
-      rawBtn.textContent = raw.hidden ? "raw" : "rendered";
-    };
-  }).catch((e) => panel.append(el("div", { className: "muted" }, "error: " + e.message)));
 }
 
 // ── Skill Assignments (catalogue, sectioned) ─────────────────────────────────
@@ -2330,7 +3039,7 @@ async function renderScripts(view) {
       if (s.danger && !confirm(`Run "${s.name}"?\n\n${s.desc}`)) return;
       run.disabled = true; setStatus("running " + s.key + "…");
       try {
-        const r = await fetch("/api/scripts/" + s.key, { method: "POST" });
+        const r = await sessionFetch("/api/scripts/" + s.key, { method: "POST" });
         const data = await r.json();
         out.hidden = false; out.textContent = data.output || "(done)";
         setStatus(data.ok ? s.key + " ✓" : s.key + " failed (" + data.code + ")");
@@ -2402,7 +3111,7 @@ function serviceRow(s, hostLifecycle) {
     setStatus(`${s.name}: ${action}…`);
     row.classList.add("busy");
     try {
-      const r = await fetch(`/api/services/${s.key}/${action}`, {
+      const r = await sessionFetch(`/api/services/${s.key}/${action}`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
       const data = await r.json();
       out.hidden = false; out.textContent = data.output || "(done)";
@@ -2600,7 +3309,7 @@ async function openWinVmModal() {
       row.append(head, out);
       results.append(row);
       try {
-        const r = await fetch("/api/vm/validate/" + check,
+        const r = await sessionFetch("/api/vm/validate/" + check,
           { method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ vm }) });
         const data = await r.json();
@@ -2748,7 +3457,7 @@ async function renderMap(root) {
   const remap = el("button", { className: "act", textContent: "re-map ↻" });
   remap.onclick = async () => {
     remap.disabled = true; setStatus("mapping…");
-    try { await fetch("/api/scripts/map", { method: "POST" }); setStatus("mapped"); renderMap(root); }
+    try { await sessionFetch("/api/scripts/map", { method: "POST" }); setStatus("mapped"); renderMap(root); }
     finally { remap.disabled = false; }
   };
   head.append(remap);
@@ -2826,8 +3535,14 @@ async function renderWorktrees(root, opts = {}) {
     const top = el("div", { className: "wt-top" });
     top.append(el("span", { className: "wt-path" }, w.path === "." ? ".  (main)" : w.path));
     top.append(el("span", { className: "mono wt-branch" }, w.branch || "(detached)"));
+    // A subagent's worktree is named for its run, not for a shell: say whose it is.
+    if (w.agent) top.append(el("span", { className: "pill wt-agent" }, w.agent.known
+      ? `subagent run #${w.agent.run_id} · launched by ${w.agent.owner || `shell ${w.agent.owner_shell_id}`}`
+      : `subagent run #${w.agent.run_id} · not in the run ledger`));
     main.append(top);
     const bits = [dirty ? `✎ ${w.dirty} uncommitted` : "clean"];
+    if (w.agent?.known) bits.unshift(`${w.agent.harness} · ${w.agent.requested_model}`,
+      `latest run #${w.agent.latest_run_id} ${w.agent.state}`);
     if (w.behind) bits.push(`${w.behind} behind`);
     if (w.ahead) bits.push(`${w.ahead} ahead`);
     main.append(el("div", { className: "wt-meta muted" }, bits.join("  ·  ")));
@@ -2838,6 +3553,9 @@ async function renderWorktrees(root, opts = {}) {
       det.append(el("pre", {}, w.dirty_files.join("\n") + extra));
       main.append(det);
     }
+    if (w.agent?.known) main.append(el("div", { className: "wt-meta muted" },
+      ["registered", "running"].includes(w.agent.state) ? "A subagent run is live in it."
+        : `Kept after its run ended. Its launching shell removes it with \`sc job clean ${w.agent.latest_run_id}\`.`));
     wc.append(el("div", { className: "wt-row" },
       el("span", { className: "wt-dot " + (dirty ? "dirty" : "clean") }), main));
   }
@@ -2864,6 +3582,747 @@ async function renderWorktrees(root, opts = {}) {
   if (unknown.length) sc.append(el("div", { className: "muted wt-prov" },
     `${unknown.length} branch(es) with unknown merge state (gh unavailable): ${unknown.map((b) => b.name).join(", ")}`));
   root.append(sc);
+}
+
+// ── Settings drawer: Tokens, Models, Engine (spec #270) ─────────────────────
+// Each renderer is assigned onto its DRAWER_SECTIONS entry, so the section
+// order and labels stay with the drawer and only the bodies live here.
+
+// Tokens: how close each provider is to its WEEKLY limit, and to its 5-HOUR
+// limit where it reports one, as percent used.
+// One GET of the same route the Analytics → Provider Quota view reads. The
+// server answers from the stored reading, first re-probing the providers
+// itself when its last attempt is older than its 60s TTL — so opening the
+// drawer can cost one probe a minute at most. The drawer never calls the
+// forced route; that control lives in the full view, which the link opens.
+//
+// below 75 normal · 75+ amber · 90+ red. These are the drawer's own, earlier
+// than the full view's 80/95 (anQuotaClass): this is the early-warning glance.
+// The colour is chosen from the figure as DISPLAYED (anPct rounds to one
+// decimal), so a row reading "75%" is amber and one reading "74.9%" is not.
+// NULL has no class: an absent number is not a low one.
+const drawerQuotaClass = (pct) => {
+  if (pct == null) return "";
+  const shown = Math.round(pct * 10) / 10;
+  return shown >= 90 ? " red" : shown >= 75 ? " amber" : "";
+};
+const DRAWER_WEEKLY_KINDS = ["weekly", "weekly_scoped"];
+// The 5-hour window, by the kind each probe stores it under. Codex and Kimi
+// expose a duration, so an 18000-second window lands as `five_hour`.
+// Claude's usage endpoint exposes none: its 5-hour window arrives as
+// limits[kind=session], which carries the same percent and reset as the same
+// payload's own `five_hour` block, and is absent exactly when that block is
+// null (no window open). `session` is read only when the provider stored no
+// `five_hour`, so one window never shows twice.
+const DRAWER_FIVE_HOUR_KINDS = ["five_hour", "session"];
+function drawerFiveHourWindows(windows) {
+  for (const kind of DRAWER_FIVE_HOUR_KINDS) {
+    const found = windows.filter((w) => w.window_kind === kind);
+    if (found.length) return found;
+  }
+  return [];
+}
+// One row per weekly window, and every provider gets at least one row: a
+// provider with no weekly window reads "weekly n/a", never 0% and never a
+// missing line. A 5-hour row follows only where the provider REPORTED a 5-hour
+// window; a provider without one shows weekly only, and nothing is estimated.
+// Percent is always percent USED — Kimi included — so the column means one
+// thing and the thresholds apply to it directly.
+function drawerQuotaRows(providers) {
+  const rows = [];
+  for (const prov of providers || []) {
+    const name = AN_PROVIDER_LABEL[prov.provider] || prov.provider;
+    const windows = prov.windows || [];
+    const weekly = windows
+      .filter((w) => DRAWER_WEEKLY_KINDS.includes(w.window_kind))
+      .sort((a, b) => anWindowRank(a) - anWindowRank(b));
+    if (!weekly.length) rows.push({ name: name + " · weekly", pct: null, resets_at: null });
+    for (const w of weekly) {
+      const scope = w.scope || (w.window_kind === "weekly_scoped" ? "scoped" : "");
+      rows.push({
+        name: name + " · weekly" + (scope ? " · " + scope : ""),
+        pct: w.used_percent ?? null, resets_at: w.resets_at || null,
+      });
+    }
+    for (const w of drawerFiveHourWindows(windows)) {
+      rows.push({
+        name: name + " · 5-hour" + (w.scope ? " · " + w.scope : ""),
+        pct: w.used_percent ?? null, resets_at: w.resets_at || null,
+      });
+    }
+  }
+  return rows;
+}
+
+function renderDrawerTokens(mount, { close }) {
+  const link = el("a", {
+    className: "drawer-link", href: "#analytics-quota", textContent: "Open full analytics →",
+  });
+  link.onclick = () => close();  // the href navigates; the drawer just gets out of the way
+  const body = el("div", { className: "drawer-note" }, "Loading…");
+  mount.replaceChildren(body, link);
+  let closed = false;
+  api("/analytics/quota").then((data) => {
+    if (closed) return;
+    // The server lists every provider it knows, read or not, so there is no
+    // empty state: a provider never read is a row reading "n/a".
+    const providers = data.providers || [];
+    const table = el("div", { className: "drawer-quota" });
+    table.append(
+      el("span", { className: "drawer-quota-head" }, "Limit"),
+      el("span", { className: "drawer-quota-head" }, "Resets"),
+      el("span", { className: "drawer-quota-head drawer-quota-pct" }, "Used"));
+    for (const r of drawerQuotaRows(providers)) {
+      const reset = el("span", { className: "drawer-quota-reset" }, anCountdown(r.resets_at));
+      if (r.resets_at) reset.title = "resets " + r.resets_at;
+      table.append(
+        el("span", { className: "drawer-quota-name", title: r.name }, r.name), reset,
+        el("span", { className: "drawer-quota-pct" + drawerQuotaClass(r.pct) }, anPct(r.pct)));
+    }
+    const shown = [table];
+    // The age of the OLDEST reading shown: a stale figure is never passed off
+    // as fresh, and one line cannot overstate any provider's freshness.
+    const oldest = providers.map((p) => p.captured_at).filter(Boolean).sort()[0];
+    if (oldest) shown.push(el("div", { className: "drawer-note" }, "as of " + anAge(oldest)));
+    mount.replaceChildren(...shown, link);
+  }, (error) => { if (!closed) body.textContent = "quota error: " + error.message; });
+  return () => { closed = true; };
+}
+
+// Models: what the server says about its catalogue cache, and a manual refresh.
+const MODEL_STALE_REASONS = {
+  ttl: "the cache is older than its time-to-live",
+  generation_mismatch: "the catalogue generation changed",
+  local_source_changed: "local model sources changed",
+};
+function catalogueAge(iso, now = Date.now()) {
+  const at = iso ? Date.parse(iso) : NaN;
+  if (Number.isNaN(at)) return null;
+  const minutes = Math.max(0, Math.round((now - at) / 60000));
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  if (minutes < 48 * 60) return `${Math.round(minutes / 60)} h ago`;
+  return `${Math.round(minutes / 1440)} d ago`;
+}
+// `fetched_at` is the last successful fetch. A failed refresh keeps the old
+// catalogue and still stamps `refresh_completed_at`, so that time dates the
+// attempt, never the catalogue.
+function catalogueFreshness(catalog) {
+  const age = catalogueAge(catalog.fetched_at);
+  const attempted = catalogueAge(catalog.refresh_completed_at);
+  return {
+    age: age ? `Fetched ${age} · ${new Date(catalog.fetched_at).toLocaleString()}`
+      : "Never fetched",
+    stale: Boolean(catalog.stale),
+    state: catalog.stale
+      ? "Stale — " + (MODEL_STALE_REASONS[catalog.stale_reason]
+        || catalog.stale_reason || "refresh pending")
+      : "Current",
+    attempt: catalog.stale && catalog.error
+      ? `Last refresh failed${attempted ? " " + attempted : ""}: ${catalog.error}` : "",
+  };
+}
+
+function renderDrawerModels(mount) {
+  const age = el("div", { className: "drawer-note" }, "Loading…");
+  const state = el("div", { className: "drawer-model-state" });
+  const attempt = el("div", { className: "drawer-model-state stale" });
+  const refresh = el("button", { className: "act", type: "button", textContent: "Refresh models" });
+  const paint = (catalog, refreshed = false) => {
+    const fresh = catalogueFreshness(catalog);
+    age.textContent = fresh.age;
+    state.textContent = fresh.state;
+    state.className = "drawer-model-state" + (fresh.stale ? " stale" : "");
+    attempt.textContent = fresh.attempt
+      || (refreshed && fresh.stale ? "The refresh did not complete." : "");
+  };
+  // Only this section's newest read paints its own answer, so a slow opening
+  // read cannot overwrite a refresh that finished first. Adoptions caused
+  // elsewhere (Configure, the new-chat watch) arrive through the listener.
+  // Closing the drawer removes the listener and retires every pending read.
+  let newest = 0;
+  let closed = false;
+  const read = (refreshing) => {
+    const mine = ++newest;
+    return loadModelCatalogue(refreshing).then((catalog) => {
+      if (!closed && mine === newest) paint(currentCatalogue(catalog), refreshing);
+    }, (error) => {
+      if (closed || mine !== newest) return;
+      age.textContent = "catalogue error: " + error.message;
+      state.textContent = attempt.textContent = "";
+    });
+  };
+  const adopted = (catalog) => paint(catalog);
+  modelCatalogueListeners.add(adopted);
+  refresh.onclick = async () => {
+    refresh.disabled = true;
+    refresh.textContent = "Refreshing…";
+    await read(true);
+    refresh.disabled = false;
+    refresh.textContent = "Refresh models";
+  };
+  mount.replaceChildren(age, state, attempt,
+    el("div", { className: "drawer-actions" }, refresh));
+  read(false);
+  return () => { closed = true; modelCatalogueListeners.delete(adopted); };
+}
+
+// Engine: version facts and the three engine controls. The verbs run in the
+// host-side engine-ops service, never in the review API: this page finds the
+// service through GET /api/engine-ops and then talks to it directly. The
+// service's own GET /status is the authority on whether it is up, and its
+// `ops` facts word every confirmation, so nothing here is keyed on runtime.
+const ENGINE_OPS = [
+  ["update", "Update engine"],
+  ["restart", "Restart engine"],
+  ["update-harnesses", "Update harnesses"],
+];
+// Shown when the engine cannot describe its own operations (an engine
+// without the discovery route, or an unreachable review API).
+const ENGINE_CLI_FALLBACK = {
+  update: "./sc update", restart: "./sc restart", "update-harnesses": "./sc update-harnesses",
+};
+const ENGINE_FOLLOW_MS = 2000;
+const ENGINE_FOLLOW_LIMIT = 150;   // five minutes, then stop and say so
+const ENGINE_NOT_STARTED_AFTER = 5;
+
+// The host authority (the engine-ops service) is reached directly, on the
+// hostname this page was loaded from: the session cookie is bound to that
+// exact host, and cookies ignore ports, so the authority receives it only
+// when both use the same name.
+function authorityBase(url) {
+  if (!url) return null;
+  try {
+    const target = new URL(url);
+    target.hostname = location.hostname;
+    return target.origin;
+  } catch { return null; }
+}
+// Every request to the host authority goes through here: sign-in state,
+// devices, engine status and the engine operations. It sends the session
+// cookie and never an Authorization header; a POST carries a JSON object
+// (the authority reads no field of it for /ops/). sign_in_required is
+// handled by sessionFetch.
+async function engineOpsRequest(base, path, method = "GET", body = {}) {
+  const init = { method, credentials: "include" };
+  if (method === "POST") {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  const response = await sessionFetch(base + path, init);
+  const data = await response.json().catch(() => ({}));
+  return { status: response.status, ok: response.ok, data };
+}
+
+const ENGINE_PIN_CLI = "./sc auth origin";
+// discovery: where the service is. auth: its /auth/status, asked first
+// because it needs no session and says whether a GUI origin is pinned.
+// status: /status, which needs the session. refusal: the error the service
+// gave instead of an answer (for example this page's origin is not the
+// pinned one).
+async function engineOpsLoad() {
+  let discovery = null;
+  try { discovery = await api("/engine-ops"); } catch { /* no route, or the engine is down */ }
+  const base = authorityBase(discovery?.url);
+  let auth = null, status = null, refusal = null;
+  if (base) {
+    try {
+      const answer = await engineOpsRequest(base, "/auth/status");
+      if (answer.ok) auth = answer.data;
+      else refusal = answer.data.error || null;
+      if (auth && auth.pinned !== false) {
+        if (auth.signed_in === false) {
+          goToSignIn();
+          return new Promise(() => {});
+        }
+        const read = await engineOpsRequest(base, "/status");
+        if (read.ok && read.data.pinned !== false) status = read.data;
+        else if (!read.ok) refusal = read.data.error || null;
+      }
+    } catch { /* the service is not running */ }
+  }
+  return { discovery, base, auth, status, refusal };
+}
+
+function engineView({ discovery, auth = null, status, refusal = null }) {
+  const described = status?.ops || discovery?.ops;
+  const ops = {};
+  for (const [op] of ENGINE_OPS)
+    ops[op] = described?.[op] || { cli: ENGINE_CLI_FALLBACK[op] };
+  return {
+    known: Boolean(discovery),
+    up: Boolean(status),
+    unpinned: auth && auth.pinned === false ? {
+      reason: auth.reason || "No GUI origin is pinned for this install.",
+      setupCli: auth.setup_cli || null, pinCli: auth.pin_cli || ENGINE_PIN_CLI,
+    } : null,
+    refusal,
+    runtime: status?.runtime || discovery?.runtime || null,
+    ops,
+    recoveryCli: status?.recovery_cli || discovery?.recovery_cli || null,
+    startCli: discovery?.start_cli || null,
+    engineRef: status?.engine_ref || null,
+    running: Boolean(status?.running),
+    operation: status?.operation || null,
+    logTail: status?.log_tail || "",
+    logTruncated: Boolean(status?.log_truncated),
+    liveSessions: status?.live_sessions || null,
+  };
+}
+
+// The confirmation text, from the operation's facts alone.
+function engineConfirmLines(op, facts, view) {
+  const lines = [`Runs ${facts.cli} on the host.`];
+  if (facts.stops_engine)
+    lines.push("The engine stops while this runs. This page reconnects when it returns.");
+  const live = view.liveSessions;
+  // A missing count is said, never guessed.
+  const count = (n, noun) => typeof n === "number"
+    ? `${n} ${noun}${n === 1 ? "" : "s"} live now.` : "The live count is unavailable.";
+  if (facts.ends_sessions === "all")
+    lines.push("All live sessions end. " + count(live?.count, "session"));
+  else if (facts.ends_sessions === "browser")
+    lines.push("Browser chats end; terminal sessions keep running. "
+      + count(live?.browser, "browser chat"));
+  if (live?.indeterminate && facts.ends_sessions && facts.ends_sessions !== "none")
+    lines.push(`${live.indeterminate} more harness processes could not be attributed.`);
+  if (facts.takes_effect === "next_restart")
+    lines.push("The change takes effect at the next restart; the running engine is unchanged until then.");
+  if (op === "update")
+    lines.push("A failed update leaves the engine stopped."
+      + (view.recoveryCli ? ` Recover with ${view.recoveryCli}.` : ""));
+  return lines;
+}
+
+// An operation that stops the engine needs its name typed; the rest need a
+// plain confirm. Resolves true only on the confirm button.
+function engineConfirm(op, label, facts, view) {
+  return new Promise((resolve) => {
+    const typed = Boolean(facts.stops_engine);
+    const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+    const confirm = el("button", {
+      className: "act primary" + (typed ? " danger" : ""), type: "button",
+      textContent: label, disabled: typed,
+    });
+    const body = el("div", { className: "engine-confirm" });
+    for (const line of engineConfirmLines(op, facts, view)) body.append(el("p", {}, line));
+    if (typed) {
+      const input = el("input", {
+        type: "text", className: "engine-confirm-input", autocomplete: "off",
+        ariaLabel: `Type ${op} to confirm`,
+      });
+      input.oninput = () => { confirm.disabled = input.value.trim() !== op; };
+      body.append(el("label", { className: "k" }, `Type ${op} to confirm`), input);
+    }
+    let answer = false;
+    const close = openActionModal({
+      title: label, bodyNode: body, dismissNode: cancel, actionNode: confirm,
+      width: 460, height: 380,
+    });
+    // Esc and the backdrop go through the overlay's closeModal: wrap it so
+    // every way out answers.
+    const overlay = body.closest ? body.closest(".modal-overlay") : null;
+    const finish = () => { close(); resolve(answer); };
+    if (overlay) {
+      overlay.closeModal = finish;
+      overlay.onmousedown = (event) => { if (event.target === overlay) finish(); };
+    }
+    if (typed) body.querySelector?.("input")?.focus();
+    cancel.onclick = finish;
+    confirm.onclick = () => { if (!confirm.disabled) { answer = true; finish(); } };
+  });
+}
+
+const engineOutcome = (operation) => operation.state === "finished"
+  ? (operation.ok ? "finished, exit 0" : `failed, exit ${operation.exit_code ?? "unknown"}`)
+  : operation.state;
+function engineOperationLine(operation) {
+  if (!operation) return "No operation has run yet.";
+  const outcome = engineOutcome(operation);
+  const when = operation.finished_at || operation.started_at;
+  return `${operation.op} — ${outcome}` + (when ? ` · ${new Date(when).toLocaleString()}` : "")
+    + (operation.error ? ` · ${operation.error}` : "");
+}
+
+// The Update engine button's badge: amber when `./sc update` would move the
+// engine, green when it would not, nothing when the check could not be made.
+function engineUpdateBadge(check) {
+  if (check?.state === "available")
+    return el("span", { className: "pill warn engine-update-badge",
+      title: `Upstream ${check.branch} is at ${check.upstream.slice(0, 12)}`
+        + `; installed ${check.installed.slice(0, 12)}.` }, "Update available");
+  if (check?.state === "current")
+    return el("span", { className: "pill ok engine-update-badge",
+      title: `Installed ${check.installed.slice(0, 12)} matches upstream ${check.branch}.` },
+      "Up to date");
+  return null;
+}
+
+function renderDrawerEngine(mount) {
+  const facts = el("div", { className: "engine-facts" });
+  const harnesses = el("div", { className: "engine-harnesses" });
+  const banner = el("div", { className: "engine-banner", role: "status" });
+  const last = el("div", { className: "engine-last" });
+  const controls = el("div", { className: "engine-controls" });
+  mount.replaceChildren(facts, harnesses, banner, last, controls);
+  // Closing the drawer ends this section: nothing paints afterwards, and a
+  // wait in progress is woken so its loop can end instead of lingering.
+  let closed = false;
+  let waitTimer = null, wake = null;
+  const alive = () => !closed;
+  let following = false;
+  let updateCheck = null;
+  let painted = null;   // the last paint's arguments, to repaint the badge
+  const checkForUpdate = () => api("/engine-ops/update-check").then((check) => {
+    updateCheck = check;
+    if (alive() && painted && !following) paint(...painted);
+  }, () => { /* no badge: the check is advisory */ });
+
+  const paint = (state, note = null) => {
+    if (closed) return;
+    painted = [state, note];
+    const view = engineView(state);
+    facts.replaceChildren(
+      el("span", { className: "engine-k" }, "Engine ref"),
+      el("span", { className: "engine-v" }, view.engineRef || "unavailable"),
+      el("span", { className: "engine-k" }, "Runtime"),
+      el("span", { className: "engine-v" }, view.runtime || "unavailable"));
+    banner.className = "engine-banner" + (note?.tone ? " " + note.tone : "");
+    banner.textContent = note ? note.text
+      : !view.known ? "Engine controls are unavailable on this engine. Use the CLI:"
+      : view.unpinned ? `${view.unpinned.reason} On the host, run ${view.unpinned.pinCli}`
+        + (view.unpinned.setupCli ? ` (or ${view.unpinned.setupCli} if no GUI user exists yet).` : ".")
+      : view.refusal ? "The host authority refused this page: "
+        + [view.refusal.code, view.refusal.message].filter(Boolean).join(": ")
+      : !view.up ? "The engine-ops service is not running."
+        + (view.startCli ? ` Start it with ${view.startCli}.` : "")
+      : "";
+    const tail = [];
+    if (view.up) {
+      tail.push(el("div", { className: "drawer-note" }, engineOperationLine(view.operation)));
+      if (view.logTail) tail.push(el("details", {
+        className: "engine-log", open: note?.tone === "warn" },
+        el("summary", {}, view.logTruncated ? "Log tail (truncated)" : "Log tail"),
+        el("pre", {}, view.logTail)));
+    }
+    last.replaceChildren(...tail);
+    const busy = following || view.running;
+    controls.replaceChildren(...ENGINE_OPS.map(([op, label]) => {
+      const button = el("button", {
+        className: "act", type: "button", textContent: label,
+        disabled: !view.up || busy,
+      });
+      button.onclick = () => request(op, label, view);
+      const row = el("div", { className: "engine-control" }, button);
+      const badge = op === "update" ? engineUpdateBadge(updateCheck) : null;
+      if (badge) row.append(badge);
+      if (!view.up) row.append(el("code", { className: "engine-cli" }, view.ops[op].cli));
+      return row;
+    }));
+    return view;
+  };
+
+  // Wait for an operation to end and for the engine to answer again. The
+  // review API is expected to disappear when the engine stops, and the
+  // service too on a restart, so a failed read here is a tick, not an error.
+  const follow = async (state, op, previous) => {
+    following = true;
+    const stops = Boolean(engineView(state).ops[op]?.stops_engine);
+    const waiting = { text: stops ? "Engine restarting…" : `${op} running…`, tone: "busy" };
+    paint(state, waiting);
+    let outcome = { text: "Still waiting on the engine. Check it from the CLI.", tone: "warn" };
+    for (let tick = 1; tick <= ENGINE_FOLLOW_LIMIT && alive(); tick += 1) {
+      await new Promise((resolve) => {
+        wake = resolve;
+        waitTimer = setTimeout(resolve, ENGINE_FOLLOW_MS);
+      });
+      if (!alive()) break;
+      const healthy = await api("/health").then(() => true, () => false);
+      const next = healthy ? await engineOpsLoad() : {
+        discovery: state.discovery, base: state.base, auth: state.auth, refusal: null,
+        status: state.base
+          ? await engineOpsRequest(state.base, "/status")
+            .then((answer) => answer.ok ? answer.data : null, () => null)
+          : null,
+      };
+      state = { ...next, discovery: next.discovery || state.discovery, base: next.base || state.base };
+      const operation = next.status?.operation;
+      if (!next.status || next.status.running) continue;
+      const fresh = operation && operation.op === op
+        && operation.started_at !== previous?.started_at;
+      if (!fresh) {
+        if (healthy && tick >= ENGINE_NOT_STARTED_AFTER) {
+          outcome = { text: `${op} did not start. Try again.`, tone: "warn" };
+          break;
+        }
+        continue;
+      }
+      if (!operation.ok) {
+        const view = engineView(state);
+        outcome = {
+          text: `${op} did not complete (${engineOutcome(operation)}).`
+            + (stops && !healthy && view.recoveryCli
+              ? ` The engine is stopped; recover with ${view.recoveryCli}.` : ""),
+          tone: "warn",
+        };
+        break;
+      }
+      if (!healthy) continue;   // finished cleanly; the engine is still coming up
+      outcome = {
+        text: `${op} finished.` + (engineView(state).ops[op]?.takes_effect === "next_restart"
+          ? " It takes effect at the next restart." : ""),
+        tone: "ok",
+      };
+      break;
+    }
+    following = false;
+    if (!alive()) return;
+    paint(state, outcome);
+    if (op === "update" && outcome.tone === "ok") checkForUpdate();
+  };
+
+  // Closing the drawer withdraws a confirmation that has not been sent yet:
+  // after every wait between the confirm button and the POST, a closed
+  // section stops, so nothing is posted from a drawer the operator has left.
+  const request = async (op, label, view) => {
+    if (!await engineConfirm(op, label, view.ops[op], view) || closed) return;
+    const state = await engineOpsLoad();
+    if (closed) return;
+    const url = state.base;
+    if (!state.status || !url) { paint(state); return; }
+    const previous = state.status.operation;
+    following = true;
+    paint(state, { text: `Starting ${op}…`, tone: "busy" });
+    let answer = null;
+    try { answer = await engineOpsRequest(url, "/ops/" + op, "POST"); }
+    catch { /* no answer: handled below */ }
+    following = false;
+    if (answer?.status === 202) return follow(state, op, previous);
+    if (answer?.status === 409 && answer.data.operation) {
+      // Someone else's operation is in flight: show it and wait on it.
+      const running = answer.data.operation;
+      state.status = { ...state.status, running: true, operation: running };
+      return follow(state, running.op, null);
+    }
+    if (!answer && view.ops[op].stops_engine)
+      return follow(state, op, previous);   // the engine going down can cut the answer off
+    const problem = answer?.data?.error;
+    const fix = problem?.code === "gui_origin_unpinned"
+      ? ` On the host, run ${problem.details?.pin_cli || ENGINE_PIN_CLI}.` : "";
+    paint(await engineOpsLoad(), {
+      text: `${op} was not started: ` + (problem
+        ? [problem.code, problem.message].filter(Boolean).join(": ") + fix
+        : "the engine-ops service did not answer."),
+      tone: "warn",
+    });
+  };
+
+  paint({ discovery: null, status: null }, { text: "Loading…" });
+  engineOpsLoad().then((state) => {
+    if (!alive()) return;
+    if (state.status?.running && state.status.operation)
+      follow(state, state.status.operation.op, null);
+    else paint(state);
+  });
+  checkForUpdate();
+  // Harness versions: the browser-surface status the Configure form already
+  // reads, plus the version the model catalogue last verified, when it has one.
+  Promise.all([
+    api("/flavor-defaults"),
+    loadModelCatalogue().catch(() => null),
+  ]).then(([defaults, catalog]) => {
+    const verified = catalog?.verification?.harnesses || {};
+    const rows = Object.entries(defaults.harness_status || {}).flatMap(([name, status]) => {
+      const version = status.version || verified[name]?.observed_version
+        || verified[name]?.version || status.conversion?.version;
+      const health = !status.installed ? "not installed" : !status.enabled ? "disabled"
+        : status.healthy ? "ready" : status.unavailable_reason || "unavailable";
+      return [
+        el("span", { className: "engine-k" }, name),
+        el("span", { className: "engine-v" }, `${version || "version unknown"} · ${health}`),
+      ];
+    });
+    if (alive()) harnesses.replaceChildren(...rows);
+  }, () => {
+    if (alive()) harnesses.replaceChildren(
+      el("div", { className: "drawer-note" }, "Harness status unavailable."));
+  });
+  return () => {
+    closed = true;
+    clearTimeout(waitTimer);
+    if (wake) wake();
+  };
+}
+
+// Account (spec #271): who is signed in, this device, the other devices, sign
+// out and revoke. All of it is the host authority's: the review server only
+// says where the authority is. A revoked device is returned to the sign-in
+// screen by its own next request.
+const ACCOUNT_SESSIONS_CLI = "./sc auth sessions";
+const accountWhen = (iso) => iso ? new Date(iso).toLocaleString() : "unknown";
+const accountDevice = (session) => session?.device || "Unnamed device";
+
+async function accountLoad() {
+  let where = null;
+  try { where = await api("/auth/status"); } catch { /* an engine without sign-in, or down */ }
+  const base = authorityBase(where?.authority?.url);
+  if (!base) return { base: null, down: true };
+  try {
+    const status = await engineOpsRequest(base, "/auth/status");
+    if (!status.ok) return { base, refusal: status.data.error || { code: String(status.status) } };
+    if (status.data.signed_in === false) {
+      goToSignIn();
+      return new Promise(() => {});
+    }
+    const listed = await engineOpsRequest(base, "/auth/sessions");
+    return { base, user: status.data.user, current: status.data.session,
+      sessions: listed.ok ? listed.data.sessions || [] : null };
+  } catch { return { base, down: true }; }
+}
+
+// Plain confirmation for revoking one device. Resolves true only on confirm.
+function accountConfirmRevoke(session) {
+  return new Promise((resolve) => {
+    const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+    const confirm = el("button", {
+      className: "act primary danger", type: "button", textContent: "Revoke",
+    });
+    const body = el("div", { className: "engine-confirm" },
+      el("p", {}, `Revoke ${accountDevice(session)}, last seen ${accountWhen(session.last_seen_at)}?`),
+      el("p", {}, "That browser is returned to the sign-in screen on its next request."));
+    let answer = false;
+    const close = openActionModal({
+      title: "Revoke device", bodyNode: body, dismissNode: cancel, actionNode: confirm,
+      width: 440, height: 260,
+    });
+    const finish = () => { close(); resolve(answer); };
+    const overlay = body.closest ? body.closest(".modal-overlay") : null;
+    if (overlay) {
+      overlay.closeModal = finish;
+      overlay.onmousedown = (event) => { if (event.target === overlay) finish(); };
+    }
+    cancel.onclick = finish;
+    confirm.onclick = () => { answer = true; finish(); };
+  });
+}
+
+function renderDrawerAccount(mount) {
+  let closed = false;
+  const note = (text, tone = "") =>
+    el("div", { className: "drawer-note" + (tone ? " " + tone : ""), role: "status" }, text);
+  const paint = (state, message = null) => {
+    if (closed) return;
+    if (state.down) {
+      mount.replaceChildren(
+        note("The host authority is not running, so this page cannot list devices, "
+          + "revoke one, or sign out. Start it with ./sc launch."),
+        el("div", { className: "drawer-note" }, "From the host: ",
+          el("code", { className: "engine-cli" }, ACCOUNT_SESSIONS_CLI)));
+      return;
+    }
+    if (state.refusal) {
+      mount.replaceChildren(note("The host authority refused this page: "
+        + [state.refusal.code, state.refusal.message].filter(Boolean).join(": ")));
+      return;
+    }
+    const signOut = el("button", { className: "act", type: "button", textContent: "Sign out" });
+    signOut.onclick = async () => {
+      signOut.disabled = true;
+      try {
+        const answer = await engineOpsRequest(state.base, "/auth/sign-out", "POST", {});
+        if (answer.ok) { location.assign(SIGN_IN_PATH); return; }
+        paint(state, "Sign-out failed: " + (answer.data.error?.message || answer.status));
+      } catch { paint(state, "Sign-out failed: the host authority did not answer."); }
+    };
+    const others = (state.sessions || []).filter((session) => !session.current);
+    const list = el("div", { className: "account-devices" });
+    for (const session of others) {
+      const revoke = el("button", { className: "act", type: "button", textContent: "Revoke" });
+      revoke.setAttribute("aria-label", `Revoke ${accountDevice(session)}`);
+      revoke.onclick = async () => {
+        if (!await accountConfirmRevoke(session) || closed) return;
+        revoke.disabled = true;
+        try {
+          const answer = await engineOpsRequest(
+            state.base, "/auth/sessions/revoke", "POST", { id: session.id });
+          if (answer.ok && answer.data.current) { location.assign(SIGN_IN_PATH); return; }
+          const failed = answer.ok ? null
+            : "Revoke failed: " + (answer.data.error?.message || answer.status);
+          const next = await accountLoad();
+          paint(next, failed);
+        } catch { paint(state, "Revoke failed: the host authority did not answer."); }
+      };
+      list.append(el("div", { className: "account-device" },
+        el("div", { className: "account-device-name" }, accountDevice(session)),
+        el("div", { className: "drawer-note" }, `Last seen ${accountWhen(session.last_seen_at)}`),
+        revoke));
+    }
+    mount.replaceChildren(
+      el("div", { className: "engine-facts" },
+        el("span", { className: "engine-k" }, "Signed in as"),
+        el("span", { className: "engine-v" }, state.user?.username || "unknown"),
+        el("span", { className: "engine-k" }, "This device"),
+        el("span", { className: "engine-v" },
+          `${accountDevice(state.current)} · since ${accountWhen(state.current?.created_at)}`)),
+      el("div", { className: "drawer-actions" }, signOut),
+      el("div", { className: "account-heading" }, "Other devices"),
+      state.sessions === null ? note("The device list could not be read.")
+        : others.length ? list : note("No other device is signed in."),
+      ...(message ? [note(message, "warn")] : []));
+  };
+  mount.replaceChildren(note("Loading…"));
+  accountLoad().then((state) => paint(state));
+  return () => { closed = true; };
+}
+
+for (const [id, render] of [
+  ["drawer-tokens", renderDrawerTokens],
+  ["drawer-models", renderDrawerModels],
+  ["drawer-engine", renderDrawerEngine],
+  ["drawer-account", renderDrawerAccount],
+]) DRAWER_SECTIONS.find((section) => section.id === id).render = render;
+
+// "＋ Chat" asks the server for its catalogue without waiting on the answer:
+// the GET alone makes a stale server start its own background refresh. Only
+// the server's `stale` flag is read. A stale answer earns one notice and one
+// bounded watch that reloads the catalogue when the refresh lands, then stops;
+// past the cap it gives up quietly and the next read picks the result up.
+const CATALOGUE_WATCH_MS = 3000;
+const CATALOGUE_WATCH_LIMIT = 20;
+// The watch belongs to the Chats view. Once the operator has left it, the
+// new-chat path issues no catalogue request and raises no catalogue notice:
+// the router's show() calls stopCatalogueWatch() on every other view, and
+// each step below re-checks before it reads or speaks. An answer that was
+// already in flight may still update the in-memory catalogue, silently.
+let catalogueWatch = null;   // { timer } while one watch is armed, else null
+const catalogueWatchInView = () => activeTab === "interface";
+function stopCatalogueWatch() {
+  if (!catalogueWatch) return;
+  clearTimeout(catalogueWatch.timer);
+  catalogueWatch = null;
+}
+function watchCatalogueOnNewChat() {
+  if (!catalogueWatchInView()) return;
+  loadModelCatalogue(false, { announce: catalogueWatchInView }).then((catalog) => {
+    if (!catalog.stale || catalogueWatch || !catalogueWatchInView()) return;
+    const watch = catalogueWatch = { timer: null };
+    const armed = () => catalogueWatch === watch;
+    toast("Model catalogue is stale — refreshing in the background.");
+    let polls = 0;
+    const poll = async () => {
+      if (!armed()) return;
+      polls += 1;
+      let done = polls >= CATALOGUE_WATCH_LIMIT;
+      // loadModelCatalogue adopts a fresh answer as the page's catalogue and
+      // announces new models itself, so the successful poll is the reload.
+      try { if (!(await loadModelCatalogue(false, { announce: armed })).stale) done = true; }
+      catch { /* a transient read failure spends one poll */ }
+      if (!armed()) return;   // cancelled while the read was out
+      if (done) stopCatalogueWatch();
+      else watch.timer = setTimeout(poll, CATALOGUE_WATCH_MS);
+    };
+    watch.timer = setTimeout(poll, CATALOGUE_WATCH_MS);
+  }, () => { /* chat creation never depends on the catalogue */ });
 }
 
 // ── Analytics ──────────────────────────────────────────────────────────────
@@ -3109,7 +4568,7 @@ async function anTokenSection(root) {
   let filters, usage;
   try {
     [filters, usage] = await Promise.all([
-      api("/analytics/filters"), api("/analytics/usage?from=" + winFrom)]);
+      api("/analytics/filters"), api("/analytics/usage" + anQuery({ from: winFrom }))]);
     if (!anSessions.length && !anDaysLoaded) await anLoadPage(anRange);
   } catch (e) {
     root.replaceChildren(el("div", { className: "card" }, "error: " + e.message));
@@ -3172,8 +4631,8 @@ async function anTokenSection(root) {
 
   // usage panels — favorite model by flavor · peak day · features shipped ·
   // specs shipped · docs outstanding. Peak day is client-computed from the
-  // combined buckets (all classes, all models in the slice); the shipped
-  // counts are window-scoped server-side; outstanding is current-state.
+  // combined buckets (all classes, all models in the slice); favorites and
+  // shipped counts are window-scoped server-side; outstanding is current-state.
   const panelsTop = el("div", { className: "an-panels" });
   const panels = el("div", { className: "an-panels" });
   // items: strings, or {id, label} — an id renders as #id with a copy button
@@ -3251,7 +4710,8 @@ async function anTokenSection(root) {
 }
 
 // ── Provider Quota — harness quota (spec doc #57, superseding #49) ────────────
-// Token Analytics answers *what did we spend*; this answers *how much is left*.
+// Token Analytics answers *what did we spend*; this answers *how much of each
+// provider's limit has been used*.
 // ONE CARD PER PROVIDER, showing that provider's most recent reading and the
 // age of the reading. Nothing about who is signed in — decision #75.
 //
@@ -3279,7 +4739,7 @@ async function anTokenSection(root) {
 // those apart.
 const AN_PROVIDER_LABEL = { anthropic: "Claude", openai: "Codex", moonshot: "Kimi" };
 // Where the operator goes to manage the account itself. This panel deliberately
-// stops at "how much is left" — the FnB's ruling that retired account identity
+// stops at usage against each limit — the FnB's ruling that retired account identity
 // rests on the provider's own page being one click away, so the link is part of
 // the design and not a convenience. Each URL is taken from the harness CLI's own
 // binary rather than guessed; Kimi links straight to its membership quota tab.
@@ -3335,26 +4795,17 @@ function anAge(iso) {
 
 function anWindowRow(w, provider) {
   const pct = w.used_percent;
-  // Kimi's own usage surface presents quota remaining. Its endpoint commonly
-  // normalizes limit/used to a 100-point scale, so rendering `28 / 100` looks
-  // like an absolute request allowance and inverts the 72%-left figure the
-  // operator sees on Kimi. Keep used_percent as the threshold source, but make
-  // Kimi's presentation match the provider: remaining bar + explicit label,
-  // and no count-like rendering of percentage-normalized values.
   const isKimi = provider === "moonshot";
-  const displayPct = isKimi && pct != null
-    ? Math.max(0, Math.min(100, 100 - pct)) : pct;
-  const pctText = isKimi && pct != null ? anPct(displayPct) + " left" : anPct(pct);
   const row = el("div", { className: "an-win" });
   row.append(el("div", { className: "an-win-head" },
     el("span", { className: "an-win-name" }, anWindowName(w)),
-    el("span", { className: "an-win-pct" + anQuotaClass(pct) }, pctText)));
+    el("span", { className: "an-win-pct" + anQuotaClass(pct) }, anPct(pct))));
   const meter = el("div", { className: "an-meter" });
   if (pct != null) {
     // Clamped: a provider reporting over 100 fills the track, it does not
     // overflow it. NULL draws no fill at all — an empty track is honest.
     const fill = el("div", { className: "an-meter-fill" + anQuotaClass(pct) });
-    fill.style.width = Math.max(0, Math.min(100, displayPct)) + "%";
+    fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
     meter.append(fill);
   }
   row.append(meter);
@@ -3548,6 +4999,7 @@ const CHAT_FLAVOR_ORDER = [
 const CHAT_CONFIGURE_ROUTE = "configure";
 const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__";
 const CHAT_HISTORY_POLL_MS = 2000;
+const CHAT_PR_POLL_MS = 15000;   // PR discovery itself runs once a minute
 const CHAT_MODES = ["chat", "diff"];
 const CHAT_TRANSCRIPT_PAGE_TURNS = 20;
 const CHAT_TRANSCRIPT_MAX_PAGES = 5;
@@ -3560,6 +5012,9 @@ let chatHistoryPollTimer = null;
 let chatRenderGeneration = 0;
 let chatPendingSend = null;
 let chatModeController = null;
+// The history pane's "＋ Chat" action (close this chat, start a new one),
+// for the open chat's cold-return notice to offer.
+let chatNewChatAction = null;
 let chatReviewCleanup = null;
 let chatConfigurationPromise = null;
 
@@ -3580,6 +5035,7 @@ function chatLoadConfiguration() {
 }
 
 function chatStopStream() {
+  stopSessionWatch();
   if (chatSource) chatSource.close();
   chatSource = null;
 }
@@ -3919,6 +5375,45 @@ function chatWorkingIndicator() {
   return indicator;
 }
 
+// Live subagents and jobs of the open shell, as the rail's Jobs and Sub Agents
+// drawers last listed them. Between turns they are what the shell waits on.
+let chatRunWaits = { agents: 0, jobs: 0 };
+
+function chatWaitingLabel({ agents, jobs }) {
+  const part = (count, noun) =>
+    count ? `${count > 1 ? `${count} ` : ""}${noun}${count > 1 ? "s" : ""}` : "";
+  const parts = [part(agents, "agent"), part(jobs, "job")].filter(Boolean);
+  return parts.length ? `Waiting on ${parts.join(" and ")}` : "";
+}
+
+// The transcript's tail line: the animated <Working> while a turn runs; a
+// still grey "Waiting on …" between turns while the shell's subagents or jobs
+// are live, so an idle chat that will be woken does not read as stalled.
+function chatPaintTranscriptTail(transcript) {
+  const state = transcript.dataset.conversationState || "idle";
+  const label = state === "running" || state === "closed"
+    ? "" : chatWaitingLabel(chatRunWaits);
+  let working = transcript.querySelector(".chat-working-indicator");
+  if (state === "running" && !working)
+    transcript.append(chatWorkingIndicator());
+  else if (state !== "running" && working)
+    working.remove();
+  let waiting = transcript.querySelector(".chat-waiting-indicator");
+  if (!label) {
+    waiting?.remove();
+    return;
+  }
+  if (!waiting) {
+    waiting = el("div", {
+      className: "chat-waiting-indicator",
+      role: "status",
+      title: "No turn is running. The live runs are in the rail's Jobs and Sub Agents drawers.",
+    });
+    transcript.append(waiting);
+  }
+  waiting.textContent = label;
+}
+
 const CHAT_SHELL_STATE_CLASSES = [
   "active-chat", "state-idle", "state-queued", "state-running",
   "state-waiting", "state-error",
@@ -3987,12 +5482,71 @@ async function chatCloseForSwitch(conversation) {
   }
 }
 
-function chatContextTokenLabel(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? `${fmt(value)} tok` : "";
+// Feature #95 — the context meter and the compaction marker. Every figure
+// here is one the harness reported. A size or a window that was not
+// reported is null and renders as nothing: no figure is ever guessed.
+// Every percentage is of the chat's auto-compact window (decision #451), not
+// of the model's full window: 100% is where the harness compacts. A chat
+// with no auto-compact window gets no percentage.
+// A reply's label: "84k · 70%" with a compact window, "84k tok" without one.
+function chatContextTokenLabel(value, windowTokens = null) {
+  const size = chatTokenCount(value);
+  if (size === null) return "";
+  const percent = chatContextPercent(size, windowTokens);
+  return percent
+    ? `${chatShortTokens(size)} · ${percent}`
+    : `${chatShortTokens(size)} tok`;
 }
 
-function chatUpdateContextTokens(node, value) {
-  const text = chatContextTokenLabel(value);
+function chatTokenCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function chatShortTokens(value) {
+  return value >= 1000 ? `${Math.round(value / 1000)}k` : String(value);
+}
+
+// The share of the window in use, or "" when the window is unknown. Not
+// capped: a context past the compact window reads above 100%, which says
+// the harness has not compacted at the size the engine asked for.
+function chatContextPercent(value, windowTokens) {
+  const size = chatTokenCount(value);
+  const total = chatTokenCount(windowTokens);
+  if (size === null || !total) return "";
+  return `${Math.round((size / total) * 100)}%`;
+}
+
+// `measured` is true only for a figure an adapter reported as the input side
+// of one model request. Any other figure (a reply recorded before that
+// existed, or a harness that reports a turn total) is a token count of
+// another meaning: it gets no percentage and its tooltip says what it is.
+function chatContextTokenTitle(value, windowTokens = null, measured = false) {
+  const size = chatTokenCount(value);
+  if (size === null) return "";
+  if (!measured)
+    return `${fmt(size)} tokens reported for this reply; `
+      + "not a measured context size";
+  const total = chatTokenCount(windowTokens);
+  return total
+    ? `${fmt(size)} tokens in context on this reply's last model request, `
+      + `${chatContextPercent(size, total)} of the ${fmt(total)}-token `
+      + "auto-compact window"
+    : `${fmt(size)} tokens in context on this reply's last model request; `
+      + "no auto-compact window applies to this chat";
+}
+
+// The window the percentages are of: the auto-compact window the engine
+// applies to this chat, or null when it applies none (Kimi, OpenCode, a
+// setting of off, or a model whose window is smaller than the setting).
+function chatContextBasis(context) {
+  return chatTokenCount(context?.compact_window) || null;
+}
+
+function chatUpdateContextTokens(
+  node, value, windowTokens = null, measured = false,
+) {
+  if (!measured) windowTokens = null;
+  const text = chatContextTokenLabel(value, windowTokens);
   let label = node.querySelector(".chat-context-tokens");
   if (!text) {
     if (label) label.remove();
@@ -4003,6 +5557,271 @@ function chatUpdateContextTokens(node, value) {
     node.append(label);
   }
   label.textContent = text;
+  label.title = chatContextTokenTitle(value, windowTokens, measured);
+}
+
+// When the harness compacts against the window. Claude's figure is the
+// window it compacts within, so it fires somewhat below 100%.
+function chatCompactWindowNote(context, harness) {
+  if (!chatContextBasis(context)) return "";
+  return harness === "claude"
+    ? "Claude compacts within this window, so it fires somewhat below 100%."
+    : "The harness compacts when the context reaches 100%.";
+}
+
+// The chat-level meter beside the composer: the latest size, and its share
+// of the chat's auto-compact window when the engine applies one.
+function chatContextMeterText(context) {
+  const size = chatTokenCount(context?.context_tokens);
+  if (size === null) return "";
+  const basis = chatContextBasis(context);
+  const percent = chatContextPercent(size, basis);
+  return percent
+    ? `Context ${chatShortTokens(size)} · ${percent} of ${chatShortTokens(basis)} compact window`
+    : `Context ${chatShortTokens(size)}`;
+}
+
+function chatPaintContextMeter(node, context, harness = null) {
+  const text = chatContextMeterText(context);
+  node.hidden = !text;
+  node.textContent = text;
+  const size = chatTokenCount(context?.context_tokens);
+  const basis = chatContextBasis(context);
+  const model = chatTokenCount(context?.context_window);
+  const parts = [];
+  if (text && basis) {
+    parts.push(`${fmt(size)} tokens in context on the latest model request, `
+      + `${chatContextPercent(size, basis)} of the ${fmt(basis)}-token `
+      + "auto-compact window the engine applies to this chat.");
+    parts.push(chatCompactWindowNote(context, harness));
+    if (size > basis)
+      parts.push("Above 100%: the context is past the window and has not "
+        + "been compacted yet.");
+  } else if (text) {
+    parts.push(`${fmt(size)} tokens in context on the latest model request. `
+      + "No auto-compact window applies to this chat, so no percentage is shown.");
+  }
+  if (text && model) parts.push(`The model's full window is ${fmt(model)} tokens.`);
+  node.title = parts.join(" ");
+  const share = basis ? size / basis : 0;
+  node.classList.toggle("chat-context-high", share >= 0.8);
+}
+
+// The marker's wording, shared by the live event and the loaded transcript:
+// "Context compacted · 123k → 28k · automatic". A figure the harness did not
+// state is left out, and an unknown trigger is not named.
+// Claude's figure after is the summary alone: the next request also carries
+// the system prompt and tools and is several times larger, so its marker
+// says "summary". The stored event is the same for every harness.
+// A figure after that is not lower than the figure before is not shown as a
+// reduction: "Context compacted · 21k, nothing to drop · manual".
+// The opening names why the chat compacted (spec #275): the button
+// ("compacted"), the trigger, an idle chat, or the harness on its own. A
+// marker recorded before causes existed keeps "automatic" / "manual".
+const CHAT_COMPACTION_HARNESS_NAMES = {
+  claude: "Claude", codex: "Codex", kimi: "Kimi", opencode: "OpenCode",
+};
+const CHAT_COMPACTION_CAUSES = ["operator", "threshold", "idle", "harness"];
+
+function chatCompactionCausePhrase(cause, harness) {
+  if (cause === "threshold") return "Context compacted at the trigger";
+  if (cause === "idle") return "Context compacted while idle";
+  if (cause === "harness")
+    return `Context compacted by ${
+      CHAT_COMPACTION_HARNESS_NAMES[harness] || harness || "the harness"}`;
+  return "Context compacted";
+}
+
+function chatCompactionLabel(payload, harness = null) {
+  const before = chatTokenCount(payload?.tokens_before);
+  const after = chatTokenCount(payload?.tokens_after);
+  const summary = harness === "claude" ? " summary" : "";
+  const cause = CHAT_COMPACTION_CAUSES.includes(payload?.cause)
+    ? payload.cause : null;
+  const parts = [chatCompactionCausePhrase(cause, harness)];
+  if (before !== null && after !== null && after >= before)
+    parts.push(`${chatShortTokens(before)}, nothing to drop`);
+  else if (before !== null && after !== null)
+    parts.push(
+      `${chatShortTokens(before)} → ${chatShortTokens(after)}${summary}`);
+  else if (before !== null) parts.push(`from ${chatShortTokens(before)}`);
+  else if (after !== null)
+    parts.push(summary
+      ? `${chatShortTokens(after)} summary` : `now ${chatShortTokens(after)}`);
+  if (cause === null) {
+    if (payload?.trigger === "auto") parts.push("automatic");
+    else if (payload?.trigger === "manual") parts.push("manual");
+  } else if (cause === "threshold") {
+    const trigger = chatTokenCount(payload?.trigger_tokens);
+    if (trigger !== null && after !== null && after >= trigger)
+      parts.push("still at or above the trigger");
+  }
+  return parts.join(" · ");
+}
+
+function chatCompactionMarkerTitle(harness = null) {
+  const base = "The harness compacted this chat's context here. "
+    + "The figures are the ones it reported.";
+  return harness === "claude"
+    ? `${base} For Claude the figure after is the summary alone; `
+      + "the next request is larger."
+    : base;
+}
+
+function chatRegroundLabel() {
+  return "Re-ground line added to this message (context was compacted)";
+}
+
+// The manual compact button (spec #272). Every press ends in exactly one of
+// three lines in the chat: the marker above, this error, or this notice.
+function chatCompactionFailedLabel(payload) {
+  if (payload?.outcome === "cancelled")
+    return "Compaction stopped — the context was not compacted";
+  const raw = payload?.detail || payload?.error;
+  const reason = raw ? String(raw).split(/\s+/).filter(Boolean).join(" ") : "";
+  return reason
+    ? `Compaction failed — ${reason}`
+    : "Compaction failed — the context was not compacted";
+}
+
+function chatCompactionNotReportedLabel() {
+  return "Compaction not reported — the harness finished without reporting "
+    + "a compaction";
+}
+
+const CHAT_COMPACT_TOOLTIP = "Compact this chat's context now. "
+  + "The harness reads the whole context once to summarise it, "
+  + "which costs one model request.";
+
+// What the button shows. `compaction` is the server's reading (supported
+// harness, a stored session to compact, a request already in flight); the
+// chat's live state is laid over it. Hidden for a harness with no manual
+// trigger and for a chat with no session; greyed out and inert during a
+// turn and while a requested compaction is still running.
+function chatCompactButtonState(conversation, requesting = false) {
+  const controls = conversation?.compaction || {};
+  const closed = conversation?.state === "closed";
+  const visible = Boolean(controls.supported && controls.available) && !closed;
+  const pending = Boolean(controls.pending) || Boolean(requesting);
+  const working = ["queued", "running", "waiting"].includes(conversation?.state)
+    || conversation?.active_run_id != null;
+  const closing = Boolean(conversation?.close_requested_at);
+  const disabled = !visible || pending || working || closing;
+  return {
+    visible,
+    disabled,
+    pending,
+    label: pending ? "Compacting…" : "Compact",
+    title: !visible ? ""
+      : pending ? "A compaction is in progress."
+      : working ? "Available when the current turn has finished."
+      : closing ? "This chat is closing."
+      : CHAT_COMPACT_TOOLTIP,
+  };
+}
+
+// The cold-return notice (spec #272): a large chat that has sat idle long
+// enough to lose its provider cache re-reads its whole context, uncached, on
+// the next message. Both thresholds are engine settings the server reports.
+const CHAT_COLD_RETURN_TOKENS = 60000;
+const CHAT_COLD_RETURN_IDLE_MINUTES = 60;
+
+// Engine timestamps are UTC, written without an offset.
+function chatEngineTime(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const text = value.trim().replace(" ", "T");
+  const stamp = Date.parse(/(Z|[+-]\d\d:?\d\d)$/.test(text) ? text : `${text}Z`);
+  return Number.isFinite(stamp) ? stamp : null;
+}
+
+// The server's cold-return reading, with how far this page's clock is from
+// the server's. The rule is then always read on the server's clock, so a
+// browser whose clock is wrong does not move it.
+function chatColdReturnClock(coldReturn, nowMs, previous = null) {
+  if (!coldReturn) return previous;
+  const serverNow = chatEngineTime(coldReturn.server_time);
+  return {
+    ...coldReturn,
+    clock_offset_ms: serverNow === null
+      ? (previous?.clock_offset_ms ?? 0) : nowMs - serverNow,
+  };
+}
+
+// A chat the operator can come back to and send into: an idle one, or a
+// closed one that a message reopens onto its stored session (opening another
+// chat on the shell closes this one, so that is the usual way back).
+function chatColdReturnable(conversation) {
+  const state = conversation?.state;
+  return ["idle", "error"].includes(state)
+    || (state === "closed" && conversation?.scope === "normal");
+}
+
+// True when the chat is at or above the token setting and its last model
+// activity is more than the minute setting ago, on the server's clock.
+// Never during a turn or a pending compaction, never for a closing chat,
+// and never for a managed participant. A closed chat with no session has no
+// recorded context size, so it is never due.
+function chatColdReturnDue(conversation, nowMs) {
+  const limits = conversation?.cold_return || {};
+  const tokens = chatTokenCount(limits.threshold_tokens)
+    || CHAT_COLD_RETURN_TOKENS;
+  const minutes = chatTokenCount(limits.threshold_minutes)
+    || CHAT_COLD_RETURN_IDLE_MINUTES;
+  if (!chatColdReturnable(conversation)) return false;
+  if (conversation?.active_run_id != null) return false;
+  if (conversation?.close_requested_at) return false;
+  if (conversation?.sprint_managed) return false;
+  if (conversation?.compaction?.pending) return false;
+  const size = chatTokenCount(conversation?.context?.context_tokens);
+  const last = chatEngineTime(limits.last_model_activity_at);
+  if (size === null || last === null || !Number.isFinite(nowMs)) return false;
+  if (size < tokens) return false;
+  const offset = Number.isFinite(limits.clock_offset_ms)
+    ? limits.clock_offset_ms : 0;
+  return nowMs - offset - last > minutes * 60000;
+}
+
+// The server's button state, keeping the last compact request's id when the
+// new reading no longer names one: a late event of that request's run is
+// then still recognised as its own, not shown as a failed turn.
+function chatKeepCompactionRequest(next, previous) {
+  if (!next) return previous;
+  const requestId = previous?.message_id ?? null;
+  return next.message_id == null && requestId != null
+    ? { ...next, message_id: requestId } : { ...next };
+}
+
+function chatColdReturnText(conversation) {
+  const size = chatTokenCount(conversation?.context?.context_tokens);
+  const about = size === null ? "its whole context"
+    : `about ${chatShortTokens(size)} tokens`;
+  return "This chat is large and its cache has likely expired, "
+    + `so the next message re-reads ${about} at full price.`;
+}
+
+// What a live usage or compaction event does to the chat's meter. Returns
+// true when the window changed, so every reply's percentage is repainted.
+function chatApplyContextEvent(context, event) {
+  const payload = event.payload || {};
+  if (event.event_type === "context.compacted") {
+    // A compaction that states no size after leaves the size unknown until
+    // the next request: the larger figure from before it is no longer true.
+    context.context_tokens = chatTokenCount(payload.tokens_after);
+    context.measured_at = event.created_at || null;
+    return false;
+  }
+  if (event.event_type !== "usage") return false;
+  const size = chatTokenCount(payload.context_tokens);
+  if (payload.scope === "request" && size !== null) {
+    context.context_tokens = size;
+    context.measured_at = event.created_at || null;
+  }
+  const total = chatTokenCount(payload.context_window);
+  if (!total || total === context.context_window) return false;
+  context.context_window = total;
+  // A model window below the setting keeps the harness default.
+  if (chatTokenCount(context.compact_window) > total) context.compact_window = null;
+  return true;
 }
 
 function chatCollapseOtherReasoning(disclosure) {
@@ -4088,7 +5907,7 @@ function chatWireLocalFileLinks(content, conversation) {
 
 function chatBubble(
   kind, body, meta = "", conversation = null, createdAt = "", contextTokens = null,
-  segment = "answer",
+  segment = "answer", contextMeasured = false,
 ) {
   const bubble = el("article", { className: `chat-bubble chat-${kind}` });
   const isReasoning = kind === "assistant" && segment === "reasoning";
@@ -4123,9 +5942,15 @@ function chatBubble(
   }
   if (meta) bubble.append(el("div", { className: "chat-meta" }, meta));
   if (kind === "assistant") {
-    const tokenLabel = chatContextTokenLabel(contextTokens);
+    const windowTokens = contextMeasured
+      ? chatContextBasis(conversation?.context) : null;
+    const tokenLabel = chatContextTokenLabel(contextTokens, windowTokens);
     if (tokenLabel)
-      bubble.append(el("div", { className: "chat-context-tokens" }, tokenLabel));
+      bubble.append(el("div", {
+        className: "chat-context-tokens",
+        title: chatContextTokenTitle(
+          contextTokens, windowTokens, contextMeasured),
+      }, tokenLabel));
   }
   return bubble;
 }
@@ -4145,28 +5970,51 @@ async function chatRefreshConversation(conversationId, generation, onUpdate) {
 }
 
 function chatOpenStream(
-  conversationId, generation, afterSequence, onEvent, onState,
+  conversationId, generation, afterSequence, onEvent, onState, resumed = {},
 ) {
   chatStopStream();
   const source = new EventSource(
     `/api/conversations/${conversationId}/events?after=${afterSequence}`);
   chatSource = source;
-  source.onopen = () => onState("connected");
-  source.onerror = () => onState("reconnecting");
+  // Events carry their sequence; a reopened stream resumes after the last
+  // one seen here rather than replaying from where this one started.
+  let resumeAfter = afterSequence;
+  // The browser retries a dropped connection by itself, but closes the
+  // stream for good when the server refuses it. The watch is this stream's
+  // alone: chatStopStream() cancels it with the stream.
+  const watch = startSessionWatch({
+    ...resumed,
+    closed: () => source.readyState === 2,
+    reopen: (carried) => {
+      if (chatSource === source && generation === chatRenderGeneration)
+        chatOpenStream(conversationId, generation, resumeAfter, onEvent, onState, carried);
+    },
+  });
+  source.onopen = () => { watch.opened(); onState("connected"); };
+  source.onerror = () => { onState("reconnecting"); watch.errored(); };
+  // The gate names the reason on the stream before it closes it.
+  source.addEventListener("sign_in_required", () => watch.signedOut());
   const types = [
     "conversation.created", "conversation.updated", "conversation.renamed",
     "conversation.close.requested", "conversation.closed",
     "conversation.reopened",
     "message.accepted", "session.started", "run.started",
     "assistant.delta", "tool.started", "tool.completed", "permission.requested",
-    "input.requested", "usage", "run.completed", "run.resumed", "run.failed",
+    "input.requested", "usage", "context.compacted", "message.reground",
+    "compaction.requested", "compaction.failed", "compaction.not_reported",
+    "run.completed", "run.resumed", "run.failed",
     "run.interrupt.requested", "run.interrupted", "run.unknown",
     "run.deferred", "run.reaped", "run.process.snapshot", "run.process.ended",
   ];
   for (const type of types) {
     source.addEventListener(type, (raw) => {
       if (generation !== chatRenderGeneration) return;
-      try { onEvent(JSON.parse(raw.data)); } catch { /* malformed frames reconnect */ }
+      try {
+        const event = JSON.parse(raw.data);
+        const sequence = Number(event.sequence);
+        if (Number.isFinite(sequence) && sequence > resumeAfter) resumeAfter = sequence;
+        onEvent(event);
+      } catch { /* malformed frames reconnect */ }
     });
   }
   return source;
@@ -4372,7 +6220,7 @@ async function reviewObservationApi(path, { method = "GET", key = "" } = {}) {
   const headers = key ? { "Idempotency-Key": key } : {};
   let response;
   try {
-    response = await fetch("/api" + path, { method, headers });
+    response = await sessionFetch("/api" + path, { method, headers });
   } catch (cause) {
     const error = new Error("Diff observation could not be reached.");
     error.code = "REVIEW_TARGET_UNAVAILABLE";
@@ -5085,6 +6933,41 @@ async function chatRenderNew(host, shell, defaults, catalog) {
   modelSelect.onchange = () => paintEfforts();
   effortSelect.onchange = () => paintEfforts(effortSelect.value);
   paintModels();
+  // Refresh models: fetch a new catalogue and repaint the pickers in place.
+  // The harness and title are untouched; the model and thinking level are
+  // kept when the refreshed catalogue still offers them, else they fall back
+  // to the defaults a first paint would choose.
+  const refreshModels = el("button", {
+    className: "chat-refresh-models",
+    type: "button",
+    textContent: "Refresh models",
+  });
+  const refreshNote = el("span", { className: "chat-refresh-note", role: "status" });
+  refreshModels.onclick = async () => {
+    refreshModels.disabled = true;
+    refreshModels.textContent = "Refreshing…";
+    refreshNote.textContent = "";
+    try {
+      const refreshed = currentCatalogue(await loadModelCatalogue(true));
+      const keptModel = modelSelect.value;
+      const keptEffort = effortSelect.value;
+      catalog = refreshed;
+      chatModelOptions(modelSelect, catalog, harness, byHarness[harness]?.model);
+      const modelKept = [...modelSelect.options].some(
+        (option) => option.value === keptModel);
+      if (modelKept) modelSelect.value = keptModel;
+      modelDropdown.refresh();
+      paintEfforts(modelKept && keptEffort ? keptEffort : undefined);
+      refreshNote.textContent = refreshed.stale
+        ? "The refresh did not complete; showing the last catalogue."
+        : modelKept ? "Models refreshed."
+          : "Models refreshed — the selected model is no longer offered.";
+    } catch (error) {
+      refreshNote.textContent = "Refresh failed: " + error.message;
+    }
+    refreshModels.disabled = false;
+    refreshModels.textContent = "Refresh models";
+  };
   form.append(
     el("div", { className: "chat-new-copy" },
       el("h2", {}, `Start a chat with ${shell.display_name}`),
@@ -5092,6 +6975,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
         "This prepares the shell through its normal CLI path, then runs each turn headlessly.")),
     el("label", { className: "k" }, "Harness"), harnessSelect,
     el("label", { className: "k" }, "Model"), modelDropdown.root,
+    el("div", { className: "chat-refresh-row" }, refreshModels, refreshNote),
     el("label", { className: "k" }, "Thinking level"), effortSelect,
     routeNote,
     el("label", { className: "k" }, "Title"), title,
@@ -5274,8 +7158,30 @@ function chatTrackLiveTranscriptItem(state, itemId, startsTurn = false) {
 }
 
 function chatTranscriptItemNode(item, conversation, retry) {
-  if (item.kind === "activity")
-    return chatBubble("activity", item.label || item.activity_type);
+  if (item.kind === "activity") {
+    const activity = chatBubble("activity", item.label || item.activity_type);
+    if (item.activity_type === "context.compacted") {
+      // The marker: a full-width rule in the transcript, so a compaction is
+      // never mistaken for an ordinary activity line.
+      activity.classList.add("chat-compaction-marker");
+      activity.setAttribute("role", "separator");
+      activity.title = chatCompactionMarkerTitle(conversation?.route?.harness);
+    } else if (item.activity_type === "compaction.failed") {
+      activity.classList.add("chat-compaction-failed");
+      activity.title = "The manual compaction did not happen; "
+        + "the session is as it was.";
+    } else if (item.activity_type === "compaction.not_reported") {
+      activity.classList.add("chat-compaction-unreported");
+      activity.title = "The harness accepted the request and finished "
+        + "without reporting a compaction; the context meter shows "
+        + "whether anything changed.";
+    } else if (item.activity_type === "message.reground") {
+      activity.classList.add("chat-reground-note");
+      activity.title = "Added by the engine to the text sent to the shell; "
+        + "your stored message is unchanged.";
+    }
+    return activity;
+  }
   const node = chatBubble(
     item.kind,
     item.text || "",
@@ -5284,6 +7190,7 @@ function chatTranscriptItemNode(item, conversation, retry) {
     item.created_at,
     item.context_tokens,
     item.segment,
+    Boolean(item.context_measured),
   );
   if (item.kind === "user" && item.state === "failed") {
     const button = el("button", {
@@ -5303,7 +7210,9 @@ function chatUpdateTranscriptNode(node, item, retry, conversation) {
     const rendered = mdBlock(item.text || "");
     body.replaceChildren(...rendered.childNodes);
     chatWireLocalFileLinks(body, conversation);
-    chatUpdateContextTokens(node, item.context_tokens);
+    chatUpdateContextTokens(
+      node, item.context_tokens, chatContextBasis(conversation?.context),
+      Boolean(item.context_measured));
     return;
   }
   if (item.kind !== "user") return;
@@ -5460,8 +7369,9 @@ function chatFlushTranscript(
           .slice(index + 1)
           .map((nextId) => state.nodes.get(nextId))
           .find(Boolean);
-        const working = transcript.querySelector(".chat-working-indicator");
-        transcript.insertBefore(node, next || working || null);
+        const tail = transcript.querySelector(
+          ".chat-working-indicator, .chat-waiting-indicator");
+        transcript.insertBefore(node, next || tail || null);
       } else {
         chatUpdateTranscriptNode(node, item, retry, conversation);
       }
@@ -5470,11 +7380,8 @@ function chatFlushTranscript(
   }
   chatUpdateTranscriptHistoryControl(transcript, state, loadOlder);
   chatUpdateTranscriptWindowGap(transcript, state);
-  const working = transcript.querySelector(".chat-working-indicator");
-  if (conversation.state === "running" && !working)
-    transcript.append(chatWorkingIndicator());
-  else if (conversation.state !== "running" && working)
-    working.remove();
+  transcript.dataset.conversationState = conversation.state || "idle";
+  chatPaintTranscriptTail(transcript);
   transcript.scrollTop = followTail
     ? transcript.scrollHeight
     : anchor?.isConnected ? anchor.offsetTop - anchorOffset : previousTop;
@@ -5508,9 +7415,38 @@ async function chatRenderOpen(
     state: initialSnapshot.controls.conversation_state,
     close_requested_at: initialSnapshot.controls.close_requested_at,
     active_run_id: initialSnapshot.controls.active_run_id,
+    // The snapshot is the single-chat read: it carries the meter, the
+    // compact button's state and the cold-return settings, which a
+    // conversation taken from the history list does not.
+    context: initialSnapshot.context
+      ? { ...initialSnapshot.context } : conversation.context,
+    compaction: initialSnapshot.controls.compaction || conversation.compaction,
+    cold_return: chatColdReturnClock(
+      initialSnapshot.cold_return, Date.now(), conversation.cold_return),
+  };
+  // The page keeps what only the transcript snapshot and the live stream
+  // report (the meter, the last model activity and the server's clock) when
+  // a conversation read replaces the object.
+  const adoptConversation = (next) => {
+    const previous = conversation;
+    conversation = {
+      ...next,
+      context: previous.context,
+      compaction: chatKeepCompactionRequest(
+        next.compaction, previous.compaction),
+      cold_return: {
+        ...(previous.cold_return || {}),
+        ...(next.cold_return || {}),
+      },
+    };
   };
   let streamStatus = "connecting";
   let stopRequest = null;
+  let compactRequest = null;
+  // The cold-return notice is latched when the operator opens or returns to
+  // the chat, and dismissed by sending, compacting or "Continue here".
+  let coldReturnShown = false;
+  let coldReturnDismissedFor = null;
   let uploading = 0;
   let reconcilePromise = null;
   let reconcileFailures = 0;
@@ -5614,6 +7550,37 @@ async function chatRenderOpen(
     hidden: true,
   });
   const pending = el("div", { className: "chat-pending", hidden: true });
+  // Bottom left of the composer: the context meter. The left group is also
+  // where the manual compact button belongs (spec #272).
+  const contextMeter = el("div", {
+    className: "chat-context-meter", hidden: true, role: "status",
+  });
+  const composeLeft = el("div", { className: "chat-compose-left" }, contextMeter);
+  // The manual compact button, beside the meter. Hidden until the chat has
+  // a session a supported harness can compact.
+  const compact = el("button", {
+    className: "act chat-compact", type: "button", textContent: "Compact",
+    hidden: true, disabled: true,
+  });
+  composeLeft.append(compact);
+  // The cold-return notice: one line above the composer, never in its way.
+  const coldReturnText = el("span", { className: "chat-cold-return-text" });
+  const coldCompact = el("button", {
+    className: "act", type: "button", textContent: "Compact now",
+    title: CHAT_COMPACT_TOOLTIP,
+  });
+  const coldContinue = el("button", {
+    className: "act", type: "button", textContent: "Continue here",
+    title: "Keep this chat and dismiss this notice.",
+  });
+  const coldNewChat = el("button", {
+    className: "act", type: "button", textContent: "New chat",
+    title: "Close this chat and start a new one. "
+      + "Only control-plane state carries over.",
+  });
+  const coldReturn = el("div", {
+    className: "chat-cold-return", hidden: true, role: "status",
+  }, coldReturnText, coldCompact, coldContinue, coldNewChat);
   const unavailable = el("div", {
     className: "chat-harness-unavailable",
     hidden: true,
@@ -5625,9 +7592,10 @@ async function chatRenderOpen(
     hidden: true,
   });
   const composerRow = el("div", { className: "chat-composer" },
-    unavailable, availabilityRetry,
+    unavailable, availabilityRetry, coldReturn,
     el("div", { className: "chat-composer-field" }, composer, attachmentChips),
-    el("div", { className: "chat-compose-actions" }, pending, send, stop));
+    el("div", { className: "chat-compose-actions" },
+      composeLeft, pending, send, stop));
   const reviewWorkspace = chatReviewWorkspace(reviewHost, conversation);
   const updateStreamStatus = () => {
     const connected = streamStatus === "connected";
@@ -5721,6 +7689,12 @@ async function chatRenderOpen(
     conversation.state = snapshot.controls.conversation_state;
     conversation.close_requested_at = snapshot.controls.close_requested_at;
     conversation.active_run_id = snapshot.controls.active_run_id;
+    conversation.compaction = chatKeepCompactionRequest(
+      snapshot.controls.compaction, conversation.compaction);
+    // Only the newest page carries the meter; an older page leaves it be.
+    if (snapshot.context) conversation.context = { ...snapshot.context };
+    conversation.cold_return = chatColdReturnClock(
+      snapshot.cold_return, Date.now(), conversation.cold_return);
   };
   const reconcileTranscript = async (manual = false) => {
     if (manual) reconcileFailures = 0;
@@ -5783,10 +7757,26 @@ async function chatRenderOpen(
     const value = (prompt("Conversation title", conversation.title || "") || "").trim();
     if (!value) return;
     try {
-      conversation = await chatApi(`/conversations/${conversation.conversation_id}`,
-        "PATCH", { version: conversation.version, title: value });
+      adoptConversation(
+        await chatApi(`/conversations/${conversation.conversation_id}`,
+          "PATCH", { version: conversation.version, title: value }));
       paint();
     } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
+  };
+  // Latch the cold-return notice when the operator opens or returns to a
+  // large idle chat. It stays until it is dismissed; it never blocks a send.
+  const checkColdReturn = () => {
+    if (coldReturnShown || document.hidden) return;
+    const lastActivity = conversation.cold_return?.last_model_activity_at;
+    if (lastActivity && coldReturnDismissedFor === lastActivity) return;
+    if (!chatColdReturnDue(conversation, Date.now())) return;
+    coldReturnShown = true;
+    paint();
+  };
+  const dismissColdReturn = () => {
+    coldReturnShown = false;
+    coldReturnDismissedFor
+      = conversation.cold_return?.last_model_activity_at || null;
   };
   const paint = () => {
     const rename = el("button", {
@@ -5805,10 +7795,31 @@ async function chatRenderOpen(
     const queued = chatQueuedCount(messages);
     queueState.hidden = queued === 0;
     queueState.textContent = `${queued} queued`;
+    chatPaintContextMeter(
+      contextMeter, conversation.context, conversation.route?.harness);
+    const compactState = chatCompactButtonState(
+      conversation, Boolean(compactRequest));
+    compact.hidden = !compactState.visible;
+    compact.disabled = compactState.disabled;
+    compact.textContent = compactState.label;
+    compact.title = compactState.title;
+    // The notice is a suggestion for an idle chat. Sending a message or
+    // requesting a compaction puts the chat to work, and that dismisses it.
+    if (coldReturnShown && (
+      !chatColdReturnable(conversation) || compactState.pending))
+      dismissColdReturn();
+    coldReturn.hidden = !coldReturnShown;
+    if (coldReturnShown) {
+      coldReturnText.textContent = chatColdReturnText(conversation);
+      coldCompact.hidden = !compactState.visible;
+      coldCompact.disabled = compactState.disabled;
+    }
     updateStreamStatus();
     const closed = conversation.state === "closed";
     const closing = !closed && Boolean(conversation.close_requested_at);
     const sprintScoped = conversation.scope === "sprint";
+    // An engine-managed chat is not the operator's to close and replace.
+    coldNewChat.hidden = sprintScoped || !chatNewChatAction;
     // Managed = the owning sprint is still armed/paused; close stays engine-
     // owned only for that window. Reopen is scope-blocked server-side forever.
     const sprintManaged = Boolean(conversation.sprint_managed);
@@ -5872,7 +7883,7 @@ async function chatRenderOpen(
     conversation.conversation_id,
     generation,
     (next, nextMessages) => {
-      conversation = next;
+      adoptConversation(next);
       messages = nextMessages;
       for (const message of nextMessages) {
         const item = transcriptState.items.get(
@@ -5968,6 +7979,7 @@ async function chatRenderOpen(
       conversation.close_requested_at = null;
       paint();
       refresh();
+      wakeSessionWatch();   // a closed event stream is retried now, not at its next slot
     } catch (error) {
       pending.hidden = false;
       pending.textContent = `${error.code} — retry keeps this exact send`;
@@ -5992,6 +8004,52 @@ async function chatRenderOpen(
     }
   };
   headerStop.onclick = () => stop.click();
+  // The manual compact request. One press is one request: further clicks
+  // are ignored until the server answers, and the server refuses a second
+  // request while one is pending. The result arrives on the event stream as
+  // the marker, an error line or the not-reported notice; a refusal of the
+  // request itself is told at once.
+  const requestCompaction = async () => {
+    if (compactRequest
+        || chatCompactButtonState(conversation, false).disabled) return;
+    compactRequest = { key: requestKey() };
+    paint();
+    try {
+      const result = await chatApi(
+        `/conversations/${conversation.conversation_id}/compactions`,
+        "POST", {}, compactRequest.key);
+      conversation.compaction = {
+        ...(conversation.compaction || {}),
+        pending: true,
+        message_id: result.compaction?.message_id ?? null,
+      };
+      if (conversation.state !== "running") conversation.state = "queued";
+      refresh();
+      wakeSessionWatch();
+    } catch (error) {
+      toast(`${error.code}: ${error.message}`);
+      refresh();
+    } finally {
+      compactRequest = null;
+      paint();
+    }
+  };
+  compact.onclick = requestCompaction;
+  coldCompact.onclick = requestCompaction;
+  coldContinue.onclick = () => {
+    dismissColdReturn();
+    paint();
+    composer.focus();
+  };
+  coldNewChat.onclick = () => {
+    if (!chatNewChatAction) return;
+    if (!confirm("Close this chat and start a new one? "
+        + "Only control-plane state carries over: anything that exists "
+        + "only in this chat is left behind.")) return;
+    dismissColdReturn();
+    paint();
+    chatNewChatAction();
+  };
   // Dropped or pasted files upload to the engine host's shared/chat-uploads
   // and enter the sent message as a plain path, so every harness reads them alike
   // and the bytes ride whatever origin serves this page (tunnel included).
@@ -6072,6 +8130,13 @@ async function chatRenderOpen(
   paint();
   const activityLabel = (event) => {
     const payload = event.payload || {};
+    if (event.event_type === "context.compacted")
+      return chatCompactionLabel(payload, conversation.route?.harness);
+    if (event.event_type === "compaction.failed")
+      return chatCompactionFailedLabel(payload);
+    if (event.event_type === "compaction.not_reported")
+      return chatCompactionNotReportedLabel();
+    if (event.event_type === "message.reground") return chatRegroundLabel();
     if (event.event_type === "run.process.ended") return payload.label || "Turn process ended";
     if (event.event_type === "permission.requested")
       return "Waiting for permission";
@@ -6103,6 +8168,11 @@ async function chatRenderOpen(
       "permission.requested",
       "input.requested",
     ].includes(type);
+    // Events of the manual compact request's own run. It is not a turn: it
+    // drives the chat's state like one, but shows nothing of its own. Its
+    // result is the marker, the error line or the not-reported notice.
+    const compactionRun = event.message_id != null
+      && event.message_id === conversation.compaction?.message_id;
 
     if (boundary && event.run_id != null) {
       const previousAnchor = transcriptState.assistantAnchors.get(event.run_id)
@@ -6187,8 +8257,18 @@ async function chatRenderOpen(
       const contextTokens = event.payload?.context_tokens;
       if (assistant && Number.isSafeInteger(contextTokens) && contextTokens >= 0) {
         assistant.context_tokens = contextTokens;
+        assistant.context_measured = event.payload?.scope === "request";
         transcriptState.dirty.add(assistant.item_id);
       }
+    } else if (type === "compaction.requested") {
+      conversation.compaction = {
+        ...(conversation.compaction || {}),
+        pending: true,
+        message_id: event.message_id ?? null,
+      };
+      if (conversation.state !== "running") conversation.state = "queued";
+    } else if (compactionRun) {
+      // Nothing of the request's own run is shown.
     } else if ([
       "permission.requested",
       "input.requested",
@@ -6196,9 +8276,13 @@ async function chatRenderOpen(
       "run.interrupted",
       "run.unknown",
       "run.process.ended",
+      "context.compacted",
+      "compaction.failed",
+      "compaction.not_reported",
+      "message.reground",
     ].includes(type)) {
       const itemId = `event:${sequence}`;
-      transcriptState.items.set(itemId, {
+      const activity = {
         item_id: itemId,
         kind: "activity",
         order_sequence: sequence,
@@ -6208,9 +8292,36 @@ async function chatRenderOpen(
         activity_type: type,
         label: activityLabel(event),
         sequence,
-      });
+      };
+      if (type === "context.compacted")
+        activity.compaction = {
+          trigger: ["auto", "manual"].includes(event.payload?.trigger)
+            ? event.payload.trigger : "unknown",
+          cause: CHAT_COMPACTION_CAUSES.includes(event.payload?.cause)
+            ? event.payload.cause : null,
+          tokens_before: chatTokenCount(event.payload?.tokens_before),
+          tokens_after: chatTokenCount(event.payload?.tokens_after),
+          // The trigger a threshold compaction was made at, as the server's
+          // projection carries it.
+          trigger_tokens: chatTokenCount(event.payload?.trigger_tokens),
+        };
+      transcriptState.items.set(itemId, activity);
       chatTrackLiveTranscriptItem(transcriptState, itemId);
       transcriptState.dirty.add(itemId);
+    }
+
+    if (type === "usage" || type === "context.compacted") {
+      // The model answered: this is the chat's last model activity.
+      if (conversation.cold_return && event.created_at)
+        conversation.cold_return.last_model_activity_at = event.created_at;
+      conversation.context ||= {
+        context_tokens: null, context_window: null, measured_at: null,
+      };
+      // A model window learned mid-chat can rule out the compact window
+      // (a smaller model keeps the harness default): repaint every reply.
+      if (chatApplyContextEvent(conversation.context, event))
+        for (const item of transcriptState.items.values())
+          if (item.kind === "assistant") transcriptState.dirty.add(item.item_id);
     }
 
     transcriptState.lastSequence = sequence;
@@ -6252,7 +8363,14 @@ async function chatRenderOpen(
     if (["run.completed", "run.interrupted"].includes(type))
       conversation.state = chatQueuedCount(messages) ? "queued" : "idle";
     if (["run.failed", "run.unknown"].includes(type))
-      conversation.state = "error";
+      // A manual compaction that failed leaves the chat as it was.
+      conversation.state = compactionRun
+        ? (chatQueuedCount(messages) ? "queued" : "idle") : "error";
+    if (conversation.compaction?.pending && (
+      ["compaction.failed", "compaction.not_reported"].includes(type)
+      || (compactionRun && ["run.completed", "run.failed", "run.interrupted",
+        "run.unknown"].includes(type))))
+      conversation.compaction = { ...conversation.compaction, pending: false };
     if (type === "conversation.closed") {
       conversation.state = "closed";
       clearImageAttachments();
@@ -6279,6 +8397,8 @@ async function chatRenderOpen(
     paint();
     if (["message.accepted", "run.completed", "run.failed",
          "run.interrupted", "run.unknown",
+         "compaction.requested", "compaction.failed",
+         "compaction.not_reported",
          "conversation.updated", "conversation.renamed",
          "conversation.close.requested",
          "conversation.closed", "conversation.reopened"].includes(type))
@@ -6295,6 +8415,13 @@ async function chatRenderOpen(
     },
   );
   checkHarnessAvailability();
+  // "Returns to a chat" is opening it, coming back to a tab that was left
+  // open on it, and putting the cursor back in its composer. The document
+  // listener ends with this chat's view.
+  document.addEventListener(
+    "visibilitychange", checkColdReturn, { signal: readSignal });
+  composer.onfocus = checkColdReturn;
+  checkColdReturn();
 }
 
 async function renderInterface(root) {
@@ -6306,6 +8433,8 @@ async function renderInterface(root) {
   chatStopHistoryPoll();
   chatStopReview();
   chatModeController = null;
+  chatNewChatAction = null;
+  chatRunWaits = { agents: 0, jobs: 0 };
   const generation = ++chatRenderGeneration;
   root.replaceChildren(
     el("div", { className: "chat-loading" }, "Loading conversations…"));
@@ -6437,16 +8566,31 @@ async function renderInterface(root) {
   const prList = el("div", { className: "chat-pr-list" });
   const prSummary = el("summary", {}, "Pull requests");
   prPanel.append(prSummary, prList);
+  // Open PRs only. The card's left bar is its GitHub state: green, red, or
+  // amber for anything not yet settled (pending, created, unobserved). The
+  // state stays in the tooltip; the card itself opens the PR.
+  let prsRefreshedAt = 0;
   const refreshPRs = async () => {
+    prsRefreshedAt = Date.now();
     try {
       const { prs, total } = await api(`/runs/prs?shell_id=${shell.shell_id}`);
       if (generation !== chatRenderGeneration) return;
       prSummary.textContent = `Pull requests (${countLabel(prs.length, total)})`;
-      prList.replaceChildren(...(prs || []).map((pr) => el("article", { className: "chat-pr-row" },
-        el("a", { href: `https://github.com/${pr.repository}/pull/${pr.pr_number}`, target: "_blank", rel: "noopener" }, `${pr.repository}#${pr.pr_number}`),
-        el("div", {}, `GitHub: ${pr.normalized_state || "unobserved"} · ${(pr.observed_head_sha || "unknown head").slice(0, 12)}`),
-        el("div", { className: "muted" }, `Observed: ${pr.observed_at || "not yet"}`), receiptRows(pr.receipts))));
-      if (!prs?.length) prList.append(el("div", { className: "muted" }, "No registered PRs."));
+      prList.replaceChildren(...(prs || []).map((pr) => {
+        const state = pr.normalized_state || "unobserved";
+        const tone = { green: "green", red: "red" }[state] || "amber";
+        return el("article", { className: `chat-pr-row pr-${tone}` },
+          el("a", {
+            className: "chat-pr-link", href: `https://github.com/${pr.repository}/pull/${pr.pr_number}`,
+            target: "_blank", rel: "noopener",
+            title: `${pr.repository}#${pr.pr_number} · ${state}`
+              + (pr.observed_head_sha ? ` at ${pr.observed_head_sha.slice(0, 12)}` : ""),
+          },
+          el("span", { className: "chat-pr-number" }, `#${pr.pr_number}`),
+          el("span", { className: "chat-pr-title" }, pr.title || pr.repository)),
+          ...(pr.receipts?.length ? [receiptRows(pr.receipts)] : []));
+      }));
+      if (!prs?.length) prList.append(el("div", { className: "muted" }, "No open PRs."));
     } catch (error) { if (generation === chatRenderGeneration) prList.replaceChildren(el("div", { className: "error" }, error.message)); }
   };
   const refreshPRButton = el("button", { className: "act", type: "button" }, "Refresh PRs");
@@ -6454,34 +8598,60 @@ async function renderInterface(root) {
   prPanel.append(refreshPRButton);
   rail.append(prPanel);
   refreshPRs();
-  const runsDrawer = el("details", { className: "runs-drawer" });
-  const runsSummary = el("summary", {}, "Runs");
-  const runsList = el("div", { className: "run-list" });
+  // Jobs (jobs, watchers, dev-kit runs) and Sub Agents each list and count
+  // their own kind, so neither crowds the other out of the newest LIST_LIMIT.
+  const runDrawers = [
+    { label: "Jobs", className: "jobs-drawer", filter: "exclude_kind=agent", part: "watchers", empty: "No jobs." },
+    { label: "Sub Agents", className: "subagents-drawer", filter: "kind=agent", part: "agents", empty: "No subagents." },
+  ].map((drawer) => ({
+    ...drawer,
+    node: el("details", { className: `runs-drawer ${drawer.className}` }),
+    summary: el("summary", {}, drawer.label),
+    list: el("div", { className: "run-list" }),
+  }));
   const processTile = el("section", { className: "process-tile" });
   let runsRefreshInFlight = false;
   const refreshRuns = async () => {
     if (runsRefreshInFlight) return;
     runsRefreshInFlight = true;
     try {
-      const { runs, total } = await api(`/runs?shell_id=${shell.shell_id}&limit=${LIST_LIMIT}`);
+      const listed = await Promise.all(runDrawers.map((drawer) =>
+        api(`/runs?shell_id=${shell.shell_id}&${drawer.filter}&limit=${LIST_LIMIT}`)));
       if (generation !== chatRenderGeneration) return;
-      runsSummary.textContent = `Runs (${countLabel(runs.length, total)})`;
-      renderRunRows(runsList, runs, shells, async () => { await refreshRuns(); await refreshPRs(); });
+      const liveRuns = (index) => listed[index].runs
+        .filter((run) => RUN_LIVE.includes(run.state)).length;
+      chatRunWaits = { jobs: liveRuns(0), agents: liveRuns(1) };
+      const transcript = root.querySelector(".chat-pane .chat-transcript");
+      if (transcript) {
+        const atTail = transcript.scrollHeight - transcript.scrollTop
+          - transcript.clientHeight < 8;
+        chatPaintTranscriptTail(transcript);
+        if (atTail) transcript.scrollTop = transcript.scrollHeight;
+      }
+      runDrawers.forEach((drawer, index) => {
+        const { runs, total, limits } = listed[index];
+        drawer.summary.textContent = `${drawer.label} (${countLabel(runs.length, total)})`;
+        renderRunRows(drawer.list, runs, shells, async () => { await refreshRuns(); await refreshPRs(); },
+          { limits, shell, part: drawer.part, empty: drawer.empty });
+      });
       if (selectedConversation && (selectedConversation.state === "running" || selectedConversation.process?.alive)) {
         const snapshot = await api(`/runs/processes?conversation_id=${encodeURIComponent(selectedConversation.conversation_id)}`);
         if (generation === chatRenderGeneration) renderProcessTile(processTile, snapshot);
       } else processTile.replaceChildren();
     } catch (error) {
       if (generation === chatRenderGeneration) {
-        runsList.replaceChildren(el("div", { className: "error" }, error.message));
+        for (const drawer of runDrawers) drawer.list.replaceChildren(el("div", { className: "error" }, error.message));
         processTile.replaceChildren(el("div", { className: "muted" }, "Process observation unavailable."));
       }
     } finally { runsRefreshInFlight = false; }
   };
-  const refreshRunsButton = el("button", { className: "act", type: "button" }, "Refresh");
-  refreshRunsButton.onclick = refreshRuns;
-  runsDrawer.append(runsSummary, refreshRunsButton, runsList);
-  rail.append(runsDrawer, processTile);
+  for (const drawer of runDrawers) {
+    const refreshButton = el("button", { className: "act", type: "button" }, "Refresh");
+    refreshButton.onclick = refreshRuns;
+    drawer.node.append(drawer.summary, refreshButton, drawer.list);
+    rail.append(drawer.node);
+  }
+  rail.append(processTile);
   refreshRuns();
 
   const paintShellIndicators = (nextShells) => {
@@ -6513,8 +8683,10 @@ async function renderInterface(root) {
     textContent: "Configure",
     disabled: adminCliOnly,
   });
+  chatNewChatAction = adminCliOnly ? null : () => newChat.click();
   newChat.onclick = async () => {
     if (!await chatCloseForSwitch(selectedConversation)) return;
+    watchCatalogueOnNewChat();  // fire-and-forget: creation never waits on it
     newChat.disabled = true;
     configure.disabled = true;
     newChat.textContent = "Starting…";
@@ -6815,6 +8987,7 @@ async function renderInterface(root) {
         chatPaintShellState(button, nextOpenByShell.get(shellId));
       paintShellIndicators(nextShells);
       await refreshRuns();
+      if (Date.now() - prsRefreshedAt >= CHAT_PR_POLL_MS) await refreshPRs();
     } catch { /* The next poll retries without disrupting the open chat. */ }
     finally { historyPollInFlight = false; }
   };
@@ -7959,10 +10132,16 @@ function setDocumentTitle(tab) {
 }
 function show(tab) {
   activeTab = tab;
-  for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b.dataset.tab === tab);
+  for (const b of document.querySelectorAll("nav button")) {
+    const on = b.dataset.tab === tab;
+    b.classList.toggle("active", on);
+    // Where the nav scrolls sideways (narrower windows), keep the active tab in view.
+    if (on) b.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "interface") {
+    stopCatalogueWatch();
     chatStopReads();
     chatStopStream();
     chatStopHistoryPoll();
@@ -7978,8 +10157,8 @@ function show(tab) {
 // hash; hashchange drives show — back/forward and deep links work too. The
 // roadmap tab carries its sub-view in the hash: #roadmap (board) | #roadmap-flow.
 // The analytics tab does the same: #analytics (token) | #analytics-quota.
-// Shells: #shells (Harness) | #shells-skills | #shells-skill-assignments |
-// #shells-default-models.
+// Shells: #shells (Harness) | #shells-skill-assignments |
+// #shells-default-models | #shells-runs.
 let lastRoutedHash = null;
 function routeFromHash() {
   const hash = location.hash;
@@ -8041,6 +10220,10 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) sprintStopPolling();
   else if (activeTab === "sprints") load("sprints");
 });
+// A tab coming back, or the network returning, is a good moment to retry a
+// closed event stream: both bring the stream watch's next attempt forward.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) wakeSessionWatch(); });
+window.addEventListener("online", () => wakeSessionWatch());
 // Close any open popover menu on an outside click (one handler for all .gmenu).
 document.addEventListener("mousedown", (e) => {
   for (const m of document.querySelectorAll(".gmenu:not([hidden])"))
@@ -8063,6 +10246,22 @@ $("#snapshot").onclick = async () => {
   }
   catch (e) { toast("error: " + e.message); }
 };
+// In a window too narrow for all ten tabs the nav scrolls sideways with no
+// scrollbar; a plain mouse wheel has no sideways axis, so turn it into one
+// there. Everything else is left to the browser: ctrl+wheel and trackpad pinch
+// (zoom), a gesture that is already sideways, a nav that fits, and a nav
+// already at the end the wheel is heading for — so the page still scrolls.
+function navWheel(e) {
+  const nav = e.currentTarget;
+  const room = nav.scrollWidth - nav.clientWidth;
+  if (e.ctrlKey || room <= 0 || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+  if (e.deltaY < 0 ? nav.scrollLeft <= 0 : nav.scrollLeft >= room - 1) return;
+  nav.scrollLeft += e.deltaY;
+  e.preventDefault();
+}
+document.querySelector("nav").addEventListener("wheel", navWheel, { passive: false });
+// Header chrome (spec #270): the settings drawer button.
+$("#drawer-open").onclick = openSettingsDrawer;
 (async () => {
   try {
     const h = await api("/health");

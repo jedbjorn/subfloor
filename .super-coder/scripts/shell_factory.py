@@ -221,6 +221,20 @@ def create_shell(con, *, flavor: str | None, name: str,
     # the caller (GUI / init) need not supply one.
     abbr = tpl.get("abbr") or (flavor or "bsp")[:3]
     shortname = shortname.strip() if shortname else _auto_shortname(con, abbr)
+    # `flavor:<name>` addresses a flavor pack on the `sc skill` surface.
+    if shortname.lower().startswith("flavor:"):
+        raise ValueError(
+            "a shortname cannot start with 'flavor:' — that prefix addresses "
+            "a flavor pack in `sc skill grant|revoke`")
+    # `.sc-worktrees/agent-<run_id>` is a subagent's worktree (spec #273); a
+    # shell named that way would have a run's worktree read as its own. The
+    # pattern and the confusion are the ones subagent admission refuses on.
+    from runs import _RESERVED_SHELL_NAME, RESERVED_NAME_CONFUSION
+    if _RESERVED_SHELL_NAME.fullmatch(shortname.lower()):
+        raise ValueError(
+            f"refused — {RESERVED_NAME_CONFUSION}: a shortname of the form "
+            "agent-<number> names the worktree of `sc job` subagent run <number>, "
+            "never a shell. Choose another shortname.")
 
     api_key = secrets.token_urlsafe(32)
     lineage_seed = LINEAGE_SEED if seed_identity else None

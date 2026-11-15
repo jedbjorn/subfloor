@@ -1,6 +1,6 @@
 ---
 name: git
-description: Git events for a Subfloor shell — GitHub capability recovery, merging a stack the FnB hands you, after-merge cleanup, and what never enters Git. The every-session rules (sync, branch, PR, merge gate, finish) live in your boot.
+description: Git event procedures beyond the boot rules; load on a GitHub auth failure, a stack merge, after-merge cleanup, or doubt about what to commit. Also holds the run-receipt rules and which repo and worktree you are in. Sync, branch, PR, merge gate, and finish stay in boot.
 category: substrate
 common: false
 ---

@@ -16,6 +16,13 @@ sys.path.insert(0, str(ENGINE / "api"))
 import vm
 import vm_broker
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import seat_seam_guard  # noqa: E402
+
+# Every test in this module: no real ssh/scp/virsh/tailscale/dispatcher child
+# process and no call on a real broker socket. See tests/seat_seam_guard.py.
+seat_seam_guard.install(globals())
+
 SAVED = {
     "domain": "win-test",
     "ssh_host": "127.0.0.1",
@@ -830,7 +837,8 @@ class PublicClientTests(unittest.TestCase):
         self.assertEqual(result, GOLDEN["reset_unknown"])
 
     def test_reset_connection_failure_before_send_is_not_uncertain(self):
-        with mock.patch.object(
+        with mock.patch.object(vm, "read", return_value=dict(SAVED)), \
+             mock.patch.object(
             vm,
             "broker_call",
             side_effect=vm.BrokerConnectionError("absent", request_sent=False),
@@ -841,7 +849,8 @@ class PublicClientTests(unittest.TestCase):
         self.assertEqual(result["error"]["details"], {})
 
     def test_reset_timeout_before_send_is_not_uncertain(self):
-        with mock.patch.object(
+        with mock.patch.object(vm, "read", return_value=dict(SAVED)), \
+             mock.patch.object(
             vm,
             "broker_call",
             side_effect=vm.BrokerTimeoutError("slow", request_sent=False),
@@ -1008,7 +1017,302 @@ class PublicClientTests(unittest.TestCase):
                 self.assertIn(field, help_text)
 
 
+class LinkTruthTests(unittest.TestCase):
+    """Link commands test the link; status says WHICH thing is missing."""
+
+    def setUp(self):
+        # No test here may start a real broker or run virsh/ssh.
+        for name in ("_dispatch_broker_up", "_run"):
+            patcher = mock.patch.object(
+                vm, name, side_effect=AssertionError(f"unexpected real {name}")
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(vm.os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        vm.os.environ.pop("SC_SANDBOX", None)
+        self.power = mock.patch.object(
+            vm, "_domain_state", return_value=(True, "running"))
+        self.domain_state = self.power.start()
+        self.addCleanup(self.power.stop)
+
+    @staticmethod
+    def _checks(failing=()):
+        def fake(check, config):
+            return {"ok": check not in failing, "check": check,
+                    "output": f"{check} output"}
+        return mock.patch.object(vm, "validate", side_effect=fake)
+
+    # -- status -------------------------------------------------------------
+
+    def test_status_with_no_vm_linked_is_not_reported_as_a_broker_problem(self):
+        with mock.patch.object(vm, "read", return_value=None), \
+             mock.patch.object(
+                 vm, "broker_call",
+                 side_effect=vm.BrokerConnectionError("absent", request_sent=False)):
+            result = vm.run_operation("status")
+        self.assertEqual(result["error"]["code"], "vm_not_linked")
+        self.assertIn("./sc vm adopt", result["error"]["message"])
+        self.assertNotIn("vm-broker-up", result["error"]["message"])
+
+    def test_status_with_a_linked_vm_and_no_broker_names_the_start_command(self):
+        with mock.patch.object(vm, "read", return_value=dict(SAVED)), \
+             mock.patch.object(
+                 vm, "broker_call",
+                 side_effect=vm.BrokerConnectionError("absent", request_sent=False)):
+            result = vm.run_operation("status")
+        self.assertEqual(result["error"]["code"], "broker_unreachable")
+        self.assertIn("./sc vm-broker-up", result["error"]["message"])
+
+    def test_a_broker_serving_only_remotes_says_no_vm_is_linked(self):
+        # The broker is up for `remotes`; the vm block is absent.
+        with mock.patch.object(vm, "read", return_value=None):
+            served = vm.do_status()
+        self.assertEqual(served["error"], "vm_not_linked")
+        with mock.patch.object(vm, "broker_call", return_value=served):
+            result = vm.run_operation("status")
+        self.assertEqual(result["error"]["code"], "vm_not_linked")
+
+    def test_mcp_with_no_vm_linked_says_so(self):
+        with mock.patch.object(vm, "read", return_value=None), \
+             mock.patch.object(
+                 vm, "broker_call",
+                 side_effect=vm.BrokerConnectionError("absent", request_sent=False)):
+            response, error = vm._mcp_broker_call("GET", "/mcp/status")
+        self.assertIsNone(response)
+        self.assertEqual(error["error"]["code"], "vm_not_linked")
+
+    # -- init ---------------------------------------------------------------
+
+    def _init(self, *extra):
+        output = io.StringIO()
+        with mock.patch.object(vm, "read", return_value=None), \
+             mock.patch.object(vm, "write_block_and_confirm", return_value=False), \
+             mock.patch.object(sys, "stdout", output), \
+             mock.patch.object(sys, "stderr", output):
+            code = vm.client_main([
+                "init", "--domain", "win-test", "--snapshot", "clean",
+                "--ssh-host", "127.0.0.1", "--ssh-user", "tester",
+                "--ssh-key-path", "/host/key", *extra,
+            ])
+        return code, output.getvalue()
+
+    def test_init_runs_every_check_and_reports_each(self):
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             self._checks() as validate:
+            code, text = self._init("--json")
+        value = json.loads(text)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [call.args[0] for call in validate.call_args_list], list(vm.CHECKS))
+        self.assertTrue(value["result"]["verify"]["passed"])
+        self.assertTrue(value["result"]["broker"]["ready"])
+
+    def test_a_failed_check_fails_init_and_names_the_next_command(self):
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             self._checks(failing=("snapshot",)):
+            code, text = self._init("--json")
+        value = json.loads(text)
+        self.assertEqual(code, 1)
+        self.assertEqual(value["error"]["code"], "init_verify_failed")
+        self.assertIn("IS saved", value["error"]["message"])
+        self.assertTrue(value["error"]["details"]["saved"])
+        by_name = {c["check"]: c for c in value["error"]["details"]["checks"]}
+        self.assertTrue(by_name["domain"]["ok"])
+        self.assertFalse(by_name["snapshot"]["ok"])
+        self.assertIn("./sc vm bake", by_name["snapshot"]["next"])
+
+    def test_the_human_report_prints_one_line_per_check(self):
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             self._checks(failing=("ssh",)):
+            code, text = self._init()
+        self.assertEqual(code, 1)
+        self.assertIn("✓ domain", text)
+        self.assertIn("✗ ssh: ssh output", text)
+        self.assertIn("next: ", text)
+        # The toolchain check needs ssh, so it is skipped rather than re-failed.
+        self.assertIn("- toolchain", text)
+
+    def test_a_powered_off_guest_is_not_reported_as_a_wrong_link(self):
+        # `./sc vm bake` leaves the seat off; re-linking it must say so
+        # instead of blaming host, user or key.
+        self.domain_state.return_value = (True, "powered_off")
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             self._checks() as validate:
+            code, text = self._init("--json")
+        value = json.loads(text)
+        self.assertEqual(code, 1)  # SSH was not proven, so still non-zero
+        self.assertEqual(value["error"]["code"], "init_guest_powered_off")
+        self.assertIn("powered off", value["error"]["message"])
+        self.assertIn("not a wrong link", value["error"]["message"])
+        self.assertIn("--no-verify", value["error"]["message"])
+        self.assertIn("./sc vm start", value["error"]["message"])
+        self.assertTrue(value["error"]["details"]["guest_powered_off"])
+        # Only the checks that work with the guest off were run.
+        self.assertEqual(
+            [call.args[0] for call in validate.call_args_list],
+            ["domain", "snapshot"],
+        )
+        by_name = {c["check"]: c for c in value["error"]["details"]["checks"]}
+        self.assertTrue(by_name["domain"]["ok"])
+        self.assertTrue(by_name["snapshot"]["ok"])
+        self.assertTrue(by_name["ssh"]["powered_off"])
+        self.assertIn("--no-verify", by_name["ssh"]["next"])
+
+    def test_a_powered_off_guest_with_a_wrong_snapshot_is_still_a_wrong_link(self):
+        self.domain_state.return_value = (True, "powered_off")
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             self._checks(failing=("snapshot",)):
+            code, text = self._init()
+        self.assertEqual(code, 1)
+        self.assertIn("init_verify_failed", text)
+        self.assertIn("✗ snapshot", text)
+        self.assertIn("guest is powered off", text)
+
+    def test_a_running_guest_that_refuses_ssh_is_a_wrong_link(self):
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             self._checks(failing=("ssh",)):
+            code, text = self._init("--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            json.loads(text)["error"]["code"], "init_verify_failed")
+
+    def test_power_state_is_not_probed_for_a_domain_libvirt_does_not_know(self):
+        with mock.patch.object(vm, "broker_call", return_value={"ok": True}), \
+             self._checks(failing=("domain",)):
+            self._init("--json")
+        self.domain_state.assert_not_called()
+
+    def test_init_starts_a_down_broker_the_way_adopt_does(self):
+        started = []
+
+        def broker(method, path, body=None, timeout=130):
+            if not started:
+                raise vm.BrokerConnectionError("absent", request_sent=False)
+            return {"ok": True}
+
+        def start():
+            started.append(True)
+            return True, "up"
+
+        with mock.patch.object(vm, "broker_call", side_effect=broker), \
+             mock.patch.object(vm, "_dispatch_broker_up", side_effect=start) as up, \
+             self._checks():
+            code, text = self._init("--json")
+        self.assertEqual(code, 0)
+        up.assert_called_once_with()
+        self.assertTrue(json.loads(text)["result"]["broker"]["started"])
+
+    def test_a_broker_that_cannot_start_gets_the_exact_command(self):
+        with mock.patch.object(
+            vm, "broker_call",
+            side_effect=vm.BrokerConnectionError("absent", request_sent=False),
+        ), mock.patch.object(
+            vm, "_dispatch_broker_up", return_value=(False, "run/ is not writable")
+        ), self._checks():
+            code, text = self._init()
+        self.assertEqual(code, 0)  # the link itself verified
+        self.assertIn("broker not running; start: ./sc vm-broker-up", text)
+        self.assertIn("not writable", text)
+
+    def test_no_verify_saves_without_testing_or_starting_anything(self):
+        with mock.patch.object(
+            vm, "broker_call",
+            side_effect=vm.BrokerConnectionError("absent", request_sent=False),
+        ), mock.patch.object(vm, "validate") as validate:
+            code, text = self._init("--no-verify")
+        self.assertEqual(code, 0)
+        validate.assert_not_called()
+        self.assertIn("not verified", text)
+        self.assertIn("./sc vm-broker-up", text)
+
+    def test_a_sandboxed_init_verifies_through_the_broker(self):
+        vm.os.environ["SC_SANDBOX"] = "1"
+        seen = []
+
+        def broker(method, path, body=None, timeout=130):
+            seen.append(path)
+            return {"ok": True, "output": "fine", "domain_state": "running"}
+
+        with mock.patch.object(vm, "broker_call", side_effect=broker), \
+             mock.patch.object(vm, "validate") as direct:
+            code, _ = self._init("--json")
+        self.assertEqual(code, 0)
+        direct.assert_not_called()
+        self.domain_state.assert_not_called()  # the broker is asked instead
+        self.assertIn("/status", seen)
+        for check in vm.CHECKS:
+            self.assertIn(f"/validate/{check}", seen)
+
+    def test_a_sandboxed_init_with_no_broker_reports_unverified_not_passed(self):
+        vm.os.environ["SC_SANDBOX"] = "1"
+        with mock.patch.object(
+            vm, "broker_call",
+            side_effect=vm.BrokerConnectionError("absent", request_sent=False),
+        ):
+            code, text = self._init("--json")
+        value = json.loads(text)
+        self.assertEqual(code, 1)
+        self.assertEqual(value["error"]["code"], "init_verify_failed")
+        self.assertTrue(
+            all(c["skipped"] for c in value["error"]["details"]["checks"]))
+
+
+class SeamGuardTests(unittest.TestCase):
+    """The module-level guard itself: an unmocked seam fails loudly."""
+
+    def tearDown(self):
+        # These tests trip the guard on purpose; do not fail the module.
+        seat_seam_guard._violations.clear()
+
+    def test_an_unmocked_virsh_or_ssh_never_starts(self):
+        for argv in (["virsh", "dominfo", "x"], ["ssh", "h", "true"],
+                     ["/usr/bin/tailscale", "status"],
+                     ["sh", "/x/.super-coder/scripts/dispatch.sh", "vm-broker-up"]):
+            with self.subTest(argv=argv), self.assertRaises(AssertionError):
+                vm.subprocess.run(argv, capture_output=True)
+
+    def test_engine_seams_are_covered_without_a_per_test_patch(self):
+        with self.assertRaises(AssertionError):
+            vm._run(["virsh", "list"])
+        with self.assertRaises(AssertionError):
+            vm._domain_state({"domain": "x"})
+        with self.assertRaises(AssertionError):
+            vm._dispatch_broker_up()
+        with self.assertRaises(AssertionError):
+            vm.broker_call("GET", "/health", None, timeout=1)
+
+    def test_other_child_processes_still_run(self):
+        done = vm.subprocess.run(
+            [sys.executable, "-c", "print('ok')"], capture_output=True, text=True)
+        self.assertEqual(done.stdout.strip(), "ok")
+
+    def test_a_swallowed_violation_still_fails_the_module(self):
+        try:
+            vm.subprocess.run(["virsh", "list"])
+        except AssertionError:
+            pass  # what a broad `except` at an engine boundary would do
+        self.assertTrue(seat_seam_guard._violations)
+
+
 class LifecycleClientTests(unittest.TestCase):
+    def setUp(self):
+        # These cover how `init` BUILDS the block. The link test that follows
+        # a save has its own class (LinkTruthTests); here it is a pass-through
+        # so nothing real is started or probed.
+        patcher = mock.patch.object(
+            vm, "verify_init",
+            side_effect=lambda config: vm.operation_success("init", {
+                "vm": config,
+                "broker": {"ready": True, "started": False,
+                           "start_command": "./sc vm-broker-up"},
+                "verify": {"passed": True, "checks": []},
+            }),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_stop_force_and_restart_use_bounded_broker_routes(self):
         with mock.patch.object(vm, "broker_call", return_value={
             "ok": True,

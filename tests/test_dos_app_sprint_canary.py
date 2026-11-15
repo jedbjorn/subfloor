@@ -1295,5 +1295,51 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertTrue((root / "maintainer" / "dos_app_sprint_canary.py").is_file())
 
 
+class ReservedPortTests(unittest.TestCase):
+    """The canary never takes a real engine's review port, free or not."""
+
+    def reserve(self, busy):
+        bound: list[int] = []
+
+        class FakeSocket:
+            def __init__(self, *_args) -> None:
+                self.port = None
+
+            def setsockopt(self, *_args) -> None:
+                pass
+
+            def bind(self, address) -> None:
+                bound.append(address[1])
+                if address[1] in busy:
+                    raise OSError(98, "Address already in use")
+
+            def close(self) -> None:
+                pass
+
+        backend = canary.HostBackend(canary.Deadline(30, 30))
+        with mock.patch.object(canary.socket, "socket", FakeSocket):
+            try:
+                return backend._reserve_ports(), bound
+            finally:
+                backend._release_ports()
+
+    def test_8837_is_skipped_when_every_port_before_it_is_busy(self) -> None:
+        self.assertEqual(canary.RESERVED_PORTS, frozenset({8837}))
+        selected, bound = self.reserve(set(range(8800, 8837)))
+        self.assertEqual(selected, (8838, 8839))
+        self.assertNotIn(8837, bound)               # not even tried
+        # And when it would have been the second of the pair.
+        selected, bound = self.reserve(set(range(8800, 8836)))
+        self.assertEqual(selected, (8836, 8838))
+        self.assertNotIn(8837, bound)
+        # The ordinary case is unchanged.
+        self.assertEqual(self.reserve(set())[0], (8800, 8801))
+
+    def test_no_capacity_is_still_the_capacity_failure(self) -> None:
+        with self.assertRaises(canary.CanaryError) as raised:
+            self.reserve(set(range(8800, 8900)) - {8837})
+        self.assertEqual(raised.exception.code, "CANARY_CAPACITY_FAILED")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

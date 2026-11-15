@@ -24,6 +24,7 @@ import review_routes
 import server
 from github_pull_requests import GitHubReadError, PullRequest
 from review_fixtures import ReviewRepository
+from signin_fixture import sign_in
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -76,18 +77,23 @@ class ReviewDispatchTest(unittest.TestCase):
             ("POST", f"/api/conversations/{conversation_id}/review-observations"),
             ("GET", "/api/review-observations/" + "a" * 64 + "/patch?file=rf_a"),
         )
-        with patch.object(server.review_routes, "handle", return_value=expected) as call:
+        browser = sign_in(self, host="127.0.0.1")
+        with patch.object(server.review_routes, "handle", return_value=expected) as call, \
+                patch.object(server, "_active_user", return_value=True):
             for method, path in routes:
                 with self.subTest(path=path):
                     self.assertEqual(
-                        server.dispatch_http(
-                            method,
-                            path,
-                            "Host: 127.0.0.1\r\n\r\n",
-                            b"",
-                        ),
+                        server.dispatch_http(method, path, browser.raw(), b""),
                         expected,
                     )
+            self.assertEqual(call.call_count, 4)
+            # Signed out, the gate answers and the review module is not reached.
+            browser.revoke()
+            for method, path in routes:
+                with self.subTest(path=path, signed_out=True):
+                    status, _headers, _body = server.dispatch_http(
+                        method, path, browser.raw(), b"")
+                    self.assertEqual(status, 401)
             self.assertEqual(call.call_count, 4)
 
 
@@ -137,6 +143,8 @@ class ConversationReviewApiTest(unittest.TestCase):
         FakeReader.pull_requests = []
         FakeReader.available = True
         self.addCleanup(self._restore)
+        # The operator is a signed-in browser (Feature #94).
+        self.browser = sign_in(self, host="127.0.0.1")
 
     def _restore(self) -> None:
         review_routes.DB_PATH = self.original_db_path
@@ -161,7 +169,7 @@ class ConversationReviewApiTest(unittest.TestCase):
         status, response_headers, body = review_routes.handle(
             method,
             path,
-            headers or self.headers,
+            self.browser.with_cookie(headers or self.headers),
             body,
         )
         value = json.loads(body) if body else None

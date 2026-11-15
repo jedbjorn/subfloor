@@ -24,6 +24,14 @@ ambiguity stays NULL — visible, flagged unattributed,
 never guessed. cwd is transient (attribution runs within the sweep batch);
 rows that stay NULL keep their spend visible in the totals regardless.
 
+Subagents (spec #273 "Usage"): a session whose cwd is the worktree of an
+`sc job agent` run, `.sc-worktrees/agent-<run_id>`, belongs to the shell that
+launched that run. Its rows carry that shell and the run id, and the archive
+is the launching shell's session at the time, whatever harness the subagent
+ran on. A continued subagent works in the first run's worktree, so its usage
+is tagged with that first run. The run's own row then shows the totals
+(`run_agents.usage_json`), as of the sweep that read them.
+
 ended_at backfill: run.py execs the harness, so nothing can write the
 archive's end time at exit — the sweep sets it to the last attributed
 harness activity (refreshed while a session is still live).
@@ -31,6 +39,7 @@ harness activity (refreshed while a session is still live).
 from __future__ import annotations
 
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +55,9 @@ import token_parsers  # noqa: E402
 DB_PATH = instance_state.active_database_path(ENGINE)
 
 WORKTREES = ".sc-worktrees"
+AGENT_WORKTREE = re.compile(r"agent-([0-9]+)")
+USAGE_TOTALS = ("input_tokens", "output_tokens", "cache_read_tokens",
+                "cache_write_tokens", "reasoning_tokens")
 
 UPSERT_COLS = ["provider", "model", "title", "started_at", "ended_at",
                "input_tokens", "output_tokens", "cache_read_tokens",
@@ -173,6 +185,51 @@ def _shell_for_cwd(cwd: str, by_wt: dict, admins: list) -> list[int]:
     return []
 
 
+def _agent_run(con, cwd: str) -> "tuple[int, int] | None":
+    """(run_id, owner shell_id) when cwd is inside a subagent run's worktree."""
+    wt_prefix = f"{str(REPO_ROOT).rstrip('/')}/{WORKTREES}/"
+    if not cwd.startswith(wt_prefix):
+        return None
+    name = AGENT_WORKTREE.fullmatch(cwd[len(wt_prefix):].split("/", 1)[0])
+    if name is None:
+        return None
+    try:
+        run = con.execute(
+            "SELECT run_id, owner_shell_id FROM runs WHERE run_id=? AND kind='agent'",
+            (int(name.group(1)),)).fetchone()
+    except db_driver.OperationalError:
+        return None  # a DB that predates the runs ledger has no subagents
+    return (run["run_id"], run["owner_shell_id"]) if run else None
+
+
+def _attribute_agent(con, r: dict, run_id: int, owner: int, windows: dict) -> None:
+    """Tag one subagent usage row with its run and its launching shell."""
+    t = _iso_epoch(r.get("started_at") or r.get("ended_at"))
+    archives = [aid for aid, _harness, start, end in windows.get(owner, [])
+                if t is not None and start is not None and start <= t
+                and (end is None or t < end)]
+    con.execute(
+        "UPDATE session_token_usage SET shell_id=?, run_id=?, "
+        "archive_id=COALESCE(archive_id, ?) "
+        "WHERE harness=? AND harness_session_ref=? AND model IS ?",
+        (owner, run_id, archives[0] if len(archives) == 1 else None,
+         r["harness"], r["harness_session_ref"], r["model"]))
+
+
+def _record_run_usage(con, run_ids: set) -> None:
+    """Show each subagent run's tokens on its run row."""
+    for run_id in sorted(run_ids):
+        total = con.execute(
+            "SELECT " + ", ".join(f"SUM({c}) AS {c}" for c in USAGE_TOTALS)
+            + ", GROUP_CONCAT(DISTINCT model) AS models, MAX(captured_at) AS swept_at "
+            "FROM session_token_usage WHERE run_id=?", (run_id,)).fetchone()
+        usage = {c: total[c] or 0 for c in USAGE_TOTALS}
+        usage["models"] = sorted(m for m in (total["models"] or "").split(",") if m)
+        usage["swept_at"] = total["swept_at"]
+        con.execute("UPDATE run_agents SET usage_json=? WHERE run_id=?",
+                    (json.dumps(usage, sort_keys=True), run_id))
+
+
 def _windows(con) -> dict[int, list]:
     """shell_id → [(archive_id, harness, start_epoch, end_epoch|None)],
     end = the same shell's next started_at (open-ended for the latest)."""
@@ -192,8 +249,15 @@ def _attribute(con, batch: list[dict], log) -> "tuple[int, int]":
     by_wt, admins = _cwd_shells(con)
     windows = _windows(con)
     attributed = shell_only = 0
+    agent_runs: set = set()
     for r in batch:
         if not r.get("cwd"):
+            continue
+        agent = _agent_run(con, r["cwd"])
+        if agent is not None:
+            _attribute_agent(con, r, *agent, windows)
+            agent_runs.add(agent[0])
+            attributed += 1
             continue
         sids = _shell_for_cwd(r["cwd"], by_wt, admins)
         t = _iso_epoch(r.get("started_at") or r.get("ended_at"))
@@ -225,6 +289,7 @@ def _attribute(con, batch: list[dict], log) -> "tuple[int, int]":
                 (sids[0], r["harness"], r["harness_session_ref"], r["model"]))
             shell_only += cur.rowcount
         # else: cwd ambiguous (multiple admin shells) or off-repo — stays NULL
+    _record_run_usage(con, agent_runs)
     return attributed, shell_only
 
 
