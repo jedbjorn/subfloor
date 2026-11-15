@@ -1250,6 +1250,7 @@ globalThis.fetch = async (url, init = {}) => {
   if (url === "/api/health") return json(200, {ok: true});
   if (url === "/api/engine-ops")
     return server.route ? json(200, server.discovery) : json(404, {error: "not found"});
+  if (url === "/api/engine-ops/update-check") return json(200, {state: "unknown"});
   if (url === "/api/flavor-defaults") return json(200, {harness_status: {
     claude: {installed: true, enabled: true, healthy: true},
     kimi: {installed: false, enabled: false, healthy: false}}});
@@ -1304,7 +1305,8 @@ def test_engine_section_shows_facts_and_enables_controls_when_the_service_answer
     assert result["serviceRequests"] == [
         {"path": "/auth/status", "method": "GET", "credentials": "include", "headers": [], "body": None},
         {"path": "/status", "method": "GET", "credentials": "include", "headers": [], "body": None}]
-    assert result["apiRequests"] == ["/api/engine-ops", "/api/flavor-defaults"]
+    assert result["apiRequests"] == [
+        "/api/engine-ops", "/api/engine-ops/update-check", "/api/flavor-defaults"]
 
 
 @needs_node
