@@ -17,8 +17,8 @@ import seed_skills
 import server
 import skill
 
-from tests.test_web_search import _build_file_db
 from tests.signin_fixture import sign_in
+from tests.test_web_search import _build_file_db
 
 
 @pytest.fixture
@@ -54,7 +54,8 @@ def api(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(
     "action",
-    ["arm", "disarm", "up", "down", "doctor", "link", "disable", "validate", "setup"],
+    ["arm", "disarm", "up", "down", "doctor", "link", "disable", "validate", "setup",
+     "token-set", "token-remove"],
 )
 def test_shell_cannot_mutate_browser(api, action):
     with (
@@ -155,6 +156,17 @@ def test_browser_skill_seed_matches_migration(tmp_path):
     )
     assert row[0].strip() == spec["content"].strip()
     assert row[1] == 0
+    skill_id = con.execute("SELECT skill_id FROM skills WHERE name='drive_browser'").fetchone()[0]
+    con.execute("UPDATE skills SET content='old manual-only guidance' WHERE skill_id=?", (skill_id,))
+    con.execute("INSERT OR IGNORE INTO flavor_skills(flavor,skill_id) VALUES ('dev',?)", (skill_id,))
+    con.execute("INSERT INTO skills(name,description,category,common,content,is_deleted) VALUES ('fixture_local','local','fork',0,'keep',0)")
+    con.commit()
+    migration = (ROOT / ".super-coder/migrations/0293_browser_token_guidance.sql").read_text()
+    for _ in range(2):
+        con.executescript(migration)
+        assert con.execute("SELECT content FROM skills WHERE skill_id=?", (skill_id,)).fetchone()[0] == spec["content"]
+        assert con.execute("SELECT 1 FROM flavor_skills WHERE flavor='dev' AND skill_id=?", (skill_id,)).fetchone()
+        assert con.execute("SELECT content FROM skills WHERE name='fixture_local'").fetchone()[0] == 'keep'
     con.close()
 
 
@@ -183,6 +195,9 @@ async function api(path, method, body) {
         + functions
         + r"""
 (async () => {
+  const status = browserStatusText({state:'ready', approval:'Automatic connections', connection_errors:['Check profile token']});
+  assert(status.includes('Automatic connections'));
+  assert(status.includes('Check profile token'));
   await openBrowserModal(() => {});
   function walk(node) { return [node, ...(node.children || []).flatMap(x => typeof x === 'object' ? walk(x) : [])]; }
   const nodes = walk(modal.bodyNode);

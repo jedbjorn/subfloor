@@ -3157,7 +3157,9 @@ function serviceRow(s, hostLifecycle) {
 
 function browserStatusText(st) {
   if (st.supported === false) return st.detail || "unsupported seat";
-  return `${st.state} · server ${st.server ? "up" : "down"} · extension ${st.extension || "not connected"} · active shells: ${(st.active_shells || []).join(", ") || "none"}`;
+  return `${st.state} · server ${st.server ? "up" : "down"} · extension ${st.extension || "not connected"} · active shells: ${(st.active_shells || []).join(", ") || "none"}`
+    + (st.approval ? `\n${st.approval}` : "")
+    + (st.connection_errors?.length ? `\n${st.connection_errors.join("\n")}` : "");
 }
 
 async function openBrowserModal(onChange) {
@@ -3176,7 +3178,8 @@ async function openBrowserModal(onChange) {
       + "re-run ./sc launch there before linking a profile."
     : "1. Create a Chromium profile named Subfloor. 2. Install the Playwright Extension in it. " +
     "3. Sign in to the accounts you intend shells to use. 4. Check and link below. " +
-    "Paths are detected automatically. Agents can open Subfloor; approve each new connection yourself.");
+    "Paths are detected automatically. Agents can open Subfloor. Approve each new connection, " +
+    "or opt in once with sc browser token-set in your host terminal. Use token-remove to return to manual approval.");
   const extension = el("a", { href: "https://chromewebstore.google.com/detail/mmlmfjhmonkocbjadbfplnigmagldckm", target: "_blank", rel: "noopener noreferrer" }, "Playwright Extension");
   const form = el("div", { className: "modal-form" },
     el("span", { className: "k" }, "Profile display name"), profile,
