@@ -9,6 +9,7 @@
     "engine_database",
     "engine_migrations",
     "self_update",
-    "snapshot"
+    "snapshot",
+    "wake"
   ]
 }

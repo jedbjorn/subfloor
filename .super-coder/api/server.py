@@ -84,6 +84,7 @@ def _narrative_is_stub(narrative: "str | None") -> bool:
 _LOG_LOCK = threading.Lock()
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import active_chat_registry  # noqa: E402  (one-active-chat lookup for shell wakes)
 import artifact_policy  # noqa: E402
 import run_seat
 import seat_conversion
@@ -5023,6 +5024,46 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             con.close()
 
+    def _send_shell_wake(self, con, sid: int, to_sid: int, msg: str,
+                         kind: str, dk: "str | None"):
+        """`sc mem message send --wake`: an FnB-directed wake into the
+        recipient's ACTIVE chat. It never opens a chat — no active chat is a
+        refusal — and it writes no inbox row, so nothing echoes back to the
+        sender. A repeat dedupe_key returns the original wake."""
+        if kind != "shell":
+            return self._send(400, {"error": "a wake carries no kind; drop --kind"})
+        if dk is None:
+            return self._send(400, {"error": "a wake needs a dedupe_key"})
+        key = f"shell-wake:{sid}:{dk}"
+        repeat = con.execute(
+            "SELECT 1 FROM wake_message WHERE idempotency_key=?", (key,)
+        ).fetchone()
+        if repeat is None and active_chat_registry.get(con, to_sid) is None:
+            to_name = con.execute(
+                "SELECT shortname FROM shells WHERE shell_id=?", (to_sid,)
+            ).fetchone()[0]
+            return self._send(409, {"error": (
+                f"{to_name} has no active chat — a wake delivers to an active "
+                "chat only; send a normal message instead (drop --wake)")})
+        sender = con.execute(
+            "SELECT shortname FROM shells WHERE shell_id=?", (sid,)
+        ).fetchone()[0]
+        receipt = sprint_message_delivery.SprintMessageStore(con).send_to_shell(
+            to_sid,
+            message_kind="notification",
+            body=(f"Wake from {sender}, sent on the FnB's direction. Act on it; "
+                  f"do not reply just to acknowledge.\n\n{msg}"),
+            idempotency_key=key,
+            sender_shell_id=sid,
+            declared_type="re-enter",
+        )
+        return self._send(201 if receipt.created else 200, {
+            "message_id": receipt.message_id,
+            "wake_id": receipt.wake_id,
+            "wake": True,
+            "duplicate": not receipt.created,
+        })
+
     def _mem_post(self, path: str, body: dict):
         sid = self._require_shell_auth()
         if sid is None:
@@ -5330,7 +5371,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/_sc/mem/messages":
                 unknown = sorted(
                     set(body)
-                    - {"to", "to_shell_id", "body", "kind", "dedupe_key"}
+                    - {"to", "to_shell_id", "body", "kind", "dedupe_key", "wake"}
                 )
                 if unknown:
                     return self._send(400, {
@@ -5365,6 +5406,11 @@ class Handler(BaseHTTPRequestHandler):
                 if to_sid is None or not msg:
                     return self._send(400, {"error": "to (shortname) or to_shell_id, and body, required"})
                 dk = (body.get("dedupe_key") or "").strip() or None
+                wake = body.get("wake", False)
+                if not isinstance(wake, bool):
+                    return self._send(400, {"error": "wake must be a boolean"})
+                if wake:
+                    return self._send_shell_wake(con, sid, int(to_sid), msg, kind, dk)
                 # Idempotent send (#333): a client timeout after the server-side
                 # write left the sender unable to tell delivered from lost, and
                 # blind resends duplicated fleet-wide. The client stamps each

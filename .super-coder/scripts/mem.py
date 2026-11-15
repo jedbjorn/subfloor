@@ -95,6 +95,7 @@ Run from the repo root, like every engine command:
     ./sc mem delivery-audit          [--json]      # Planner-only bounded delivery reconciliation
     ./sc mem message check [N]                         # your unread inbox, newest N (read-only; N ≥ 1); sender shown by shortname
     ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result] [--body-file PATH|-]
+    ./sc mem message send <to-shortname> "<body>" --wake    # FnB-directed only: wake its active chat (`wake` skill)
     ./sc mem message sent                              # outbound view — verify delivery
     ./sc mem message mark-read <message_id> [<message_id> …]
 
@@ -1449,10 +1450,17 @@ def cmd_message(args) -> int:
         # dedupe_key makes the send idempotent (#333): the server returns the
         # original row for a repeat key, so _api may safely retry an ambiguous
         # timeout — the failure mode that used to duplicate messages fleet-wide.
-        r = _api("POST", "/_sc/mem/messages",
-                 {"to": args.to, "body": body, "kind": args.kind,
-                  "dedupe_key": uuid.uuid4().hex},
-                 idempotent=True)
+        payload = {"to": args.to, "body": body, "kind": args.kind,
+                   "dedupe_key": uuid.uuid4().hex}
+        if args.wake:
+            payload["wake"] = True
+        r = _api("POST", "/_sc/mem/messages", payload, idempotent=True)
+        if args.wake:
+            dup = " (already sent — deduped)" if r.get("duplicate") else ""
+            return _finish_api(
+                f"mem: wake #{r.get('message_id', '')} queued for {args.to}'s active chat{dup}",
+                message_id=r.get("message_id"), wake_id=r.get("wake_id"),
+                to=args.to, wake=True, duplicate=bool(r.get("duplicate")))
         tag = f" ({args.kind})" if args.kind != "shell" else ""
         dup = " (already delivered — deduped, no twin written)" if r.get("duplicate") else ""
         return _finish_api(f"mem: message #{r.get('message_id', '')} sent to {args.to}{tag}{dup}",
@@ -1723,6 +1731,9 @@ def build_parser() -> argparse.ArgumentParser:
     ms.add_argument("--body-file", dest="body_file", metavar="PATH|-", help=body_file_help)
     ms.add_argument("--kind", default="shell", choices=["shell", "task", "result"],
                     help="message kind: shell (default) | task (planner→worker) | result (worker→planner)")
+    ms.add_argument("--wake", action="store_true",
+                    help="only when the FnB directs it: deliver into the recipient's "
+                         "active chat instead of its inbox; refused if it has none")
     mm = msub.add_parser("mark-read", help="mark a message read — only after you have acted on it")
     mm.add_argument("message_id", type=int, nargs="+",
                     help="one or more message ids")
