@@ -110,7 +110,9 @@ Old releases can recreate pointers, including after rollback.
 Opt in with `./sc feature enable browser`, then use **Scripts → Browser** to
 link a dedicated Chromium profile named **Subfloor** with the Playwright
 Extension. You create the profile, sign in to the intended accounts, and
-approve each new shell connection. Agents can launch it with `sc browser open`. Claude, Codex, and OpenCode
+approve each new shell connection, or opt in to automatic connections with
+`sc browser token-set` in your host terminal. Agents can launch it with
+`sc browser open`. Claude, Codex, and OpenCode
 on bare metal can then use `drive_browser` for a named task or logged-in preview
 check. Kimi, Vibe, and container seats are unsupported.
 

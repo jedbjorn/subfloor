@@ -198,7 +198,8 @@
     ".super-coder/migrations/0287_seed_delegation_skill.sql",
     "tests/test_delegation_skill.py",
     ".super-coder/migrations/0289_chat_compaction_settings.sql",
-    ".super-coder/migrations/0290_pr_discovery_watermarks.sql"
+    ".super-coder/migrations/0290_pr_discovery_watermarks.sql",
+    ".super-coder/migrations/0293_browser_token_guidance.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,

@@ -18,7 +18,12 @@ import browser
 MAX_BODY = 4 * 1024 * 1024
 DISARMED = "Browser is disarmed; ask the FnB to arm it in Scripts → Browser."
 DISCONNECTED = (
-    "extension not connected: run sc browser open and ask the FnB to approve this connection"
+    "extension not connected: run sc browser status; the FnB may need to approve "
+    "a manual connection or replace the provisioned token"
+)
+TOKEN_CONNECTION_FAILED = (
+    "Token connection failed: the extension is unavailable or its token does not match; "
+    "ask the FnB to check the linked profile and replace its token."
 )
 def rpc_result(body: bytes) -> dict:
     """Extract the response from JSON or the finite SSE response to an RPC POST."""
@@ -129,11 +134,16 @@ class Handler(BaseHTTPRequestHandler):
                     for s in self.server.sessions.values()
                     if s.get("protocol_error")
                 ]
+                connection_errors = sorted({
+                    s["connection_error"] for s in self.server.sessions.values()
+                    if s.get("connection_error")
+                })
             return self.send_json(
                 {
                     "active_shells": active,
                     "extension": "connected" if active else "not connected",
                     "protocol_errors": errors,
+                    "connection_errors": connection_errors,
                 }
             )
         shell = self.identity()
@@ -370,6 +380,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Action failure alone says nothing about extension connectivity.
                 if success:
                     session["connected"] = True
+                    session.pop("connection_error", None)
                 elif response.status >= 400:
                     session["connected"] = False
                 session.pop("protocol_error", None)
@@ -380,6 +391,12 @@ class Handler(BaseHTTPRequestHandler):
                     if isinstance(item, dict)
                 )
                 for text in texts:
+                    if not success and re.search(
+                        r"^(?:Error: )?Playwright extension did not connect within\b",
+                        text, re.IGNORECASE | re.MULTILINE,
+                    ):
+                        session["connection_error"] = TOKEN_CONNECTION_FAILED
+                        session["connected"] = False
                     if not success and "unsupported protocol version" in text.lower():
                         session["protocol_error"] = text
                         session["connected"] = False

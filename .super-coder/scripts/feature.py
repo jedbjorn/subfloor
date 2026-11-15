@@ -32,10 +32,10 @@ INSTANCE = ENGINE / "instance.json"
 # `link` describes the supported boundary for operator-linked infrastructure.
 FEATURES: dict[str, dict] = {
     "browser": {
-        "title": "Browser driving (bare metal, approval per connection)",
+        "title": "Browser driving (bare metal, operator-controlled access)",
         "block": "browser", "block_auto": False,
         "link": ["Create the Chromium Subfloor profile, install Playwright Extension, then link GUI → Scripts → Browser",
-                 "Run sc browser setup to detect and link; agents can use sc browser open; approve each new extension connection"],
+                 "Run sc browser setup to detect and link; agents can use sc browser open; approve each new connection or opt in with sc browser token-set"],
     },
     "pg": {
         "title": "Postgres sidecar (app-only)",
