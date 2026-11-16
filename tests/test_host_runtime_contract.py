@@ -570,7 +570,7 @@ class Python314SourceContractTest(unittest.TestCase):
             selectors,
             {
                 ".github/workflows/render-check.yml": ["3.14"],
-                ".github/workflows/tests.yml": ["3.14", "3.14", "3.14", "3.14"],
+                ".github/workflows/tests.yml": ["3.14", "3.14", "3.14", "3.14", "3.14"],
                 ".github/workflows/trusted-main.yml": ["3.14"],
             },
         )
