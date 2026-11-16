@@ -1,61 +1,23 @@
 #!/usr/bin/env python3
-"""Host db-broker — read-only diagnostic access to the fork's LIVE app DB.
+"""Host application-DB broker and socket client.
 
-Link-only, read-only, host-side by design. A sandbox shell diagnosing live app
-behaviour cannot reach the fork's live Postgres: `./sc launch` gives it an
-*empty* private sidecar (dev/test target), the host DSN is never mounted, and
-the live stack sits on a network the container has no route to. So a shell must
-hand the operator a SQL block and wait for a paste-back. This broker closes that
-loop for confirmation-grade reads — telemetry/ops tables a shell needs to
-confirm a diagnosis it has already reasoned out — without ever handing the
-sandbox a credential or a route.
-
-It is the fourth sibling of the pm2 / VM-and-remotes / tailnet brokers
-(api/pm2_broker.py, api/vm_broker.py, api/ts_broker.py): one host process holds
-the capability so nothing downstream needs it. The broker (api/db_broker.py)
-runs ON THE HOST, shells out to `psql` where the DSN + route resolve, and
-exposes one narrow verb over a unix socket in the bind-mounted engine dir
-(`.super-coder/run/db-broker.sock`). Callers use the socket client in this
-module (or curl the socket directly); no global `db_query` skill exists.
-Doc: .super-coder/docs/db-broker.md.
-
-The config lives under the `db` key of `.super-coder/instance.json`. Because the
-whole repo is bind-mounted into the sandbox (`-v $here:$here`), instance.json is
-sandbox-readable — so the block holds NO secret. It names an *env var*; the
-broker (host-side) resolves the DSN from that var at query time. Non-secret
-policy that IS safe to be sandbox-readable lives in the block:
-
-    dsn_env               name of the host env var holding the read-only DSN
-                          (default SC_RO_DSN) — the DSN itself never touches disk
-    allow_tables          fail-closed allowlist of tables a query may touch
-                          (default: ops/telemetry only — content tables are gated)
-    row_cap               max rows returned (default 1000; truncation is flagged)
-    statement_timeout_ms  server-side statement timeout (default 5000)
-    psql_bin              path/name of the psql CLI (default "psql")
-
-Read-only is enforced TWICE: (1) the DSN must point at a dedicated read-only
-Postgres role (GRANT SELECT only) — DB-enforced, the backstop; the broker also
-sets default_transaction_read_only=on on the session; and (2) the broker rejects
-any statement that is not a single SELECT/WITH before psql ever runs. The
-allowlist is likewise belt-and-suspenders: the RO role should GRANT SELECT only
-on the allowlisted tables (DB-authoritative), and the broker additionally
-rejects a query whose FROM/JOIN targets a table outside `allow_tables`.
-
-Run on the HOST (never in the sandbox):
-    ./sc db-broker        foreground
-    ./sc db-broker-up     background (pidfile) ; ./sc db-broker-down to stop
+The host owns the DSN; shells submit SQL over the shared unix socket. Config
+selects read_only (legacy default) or read_write access. Read/write mode executes
+SQL unchanged, including diagnostics, DDL, repairs, and transaction scripts.
+A request commits on success and rolls back on failure unless the SQL explicitly
+controls its own transactions or autocommit is requested for maintenance.
+Persistent host env-file settings take precedence over inherited environment.
 """
 from __future__ import annotations
 
-import csv
-import io
+import argparse
 import json
 import os
 import re
 import socket
-import subprocess
+import shlex
 import sys
-import urllib.parse
+from pathlib import Path
 
 import ports
 
@@ -96,15 +58,21 @@ def _policy(cfg: dict) -> dict:
         "allow_tables": [t.lower() for t in (cfg.get("allow_tables") or DEFAULT_ALLOW_TABLES)],
         "row_cap": int(cfg.get("row_cap") or DEFAULT_ROW_CAP),
         "statement_timeout_ms": int(cfg.get("statement_timeout_ms") or DEFAULT_TIMEOUT_MS),
-        "psql_bin": cfg.get("psql_bin") or "psql",
+        "access_mode": cfg.get("access_mode", "read_only"),
+        "dsn_env_file": cfg.get("dsn_env_file"),
     }
 
 
-# -- SELECT-only + allowlist validation (runs BEFORE psql) --------------------
+# -- Optional legacy read-only policy ---------------------------------------
 
-_STRING_LIT = re.compile(r"'(?:[^']|'')*'")          # 'single-quoted', '' escapes
-_LINE_COMMENT = re.compile(r"--[^\n]*")
-_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+# Match tokens in one pass: comment markers inside a literal are data, and
+# quote characters inside a comment do not begin a literal. This text is only
+# for the policy scan; PostgreSQL always receives the original SQL.
+_IGNORED_SQL = re.compile(
+    r"[eE]'(?:[^'\\]|\\.|'')*'|'(?:[^']|'')*'|"
+    r"\$(?P<tag>[A-Za-z_][A-Za-z_0-9]*|)\$.*?\$(?P=tag)\$|"
+    r"--[^\n]*|/\*.*?\*/", re.S,
+)
 # Mutating / DDL / session- and transaction-control verbs. A read path must
 # reject every one of these, including inside a CTE (WITH x AS (INSERT ...)).
 _FORBIDDEN = re.compile(
@@ -124,10 +92,7 @@ _CTE_NAME = re.compile(r"\b([a-zA-Z_]\w*)\s+as\s*\(", re.I)
 def _strip(sql: str) -> str:
     """Remove string literals + comments so keyword/table scans don't trip on
     them (a column value 'please update the row' is not an UPDATE statement)."""
-    sql = _BLOCK_COMMENT.sub(" ", sql)
-    sql = _LINE_COMMENT.sub(" ", sql)
-    sql = _STRING_LIT.sub("''", sql)
-    return sql
+    return _IGNORED_SQL.sub(" ", sql)
 
 
 def _tables(stripped: str) -> list[str]:
@@ -144,26 +109,28 @@ def _tables(stripped: str) -> list[str]:
 
 
 def check(sql: str, cfg: dict) -> tuple[bool, str]:
-    """Validate a candidate query against the read-only + allowlist rules.
-    Returns (ok, reason). Fail-closed: anything not provably a single, read-only,
-    allowlisted SELECT is rejected."""
+    """Apply the configured SQL policy without changing the executed text."""
     raw = (sql or "").strip()
     if not raw:
         return False, "empty query"
+    pol = _policy(cfg)
+    if pol["access_mode"] == "read_write":
+        return True, "ok"
+    if pol["access_mode"] != "read_only":
+        return False, "access_mode must be read_only or read_write"
     stripped = _strip(raw)
     # Single statement only — no stacked statements. A trailing ';' is fine; any
     # ';' with more query after it is a second statement → reject.
     body = stripped.rstrip().rstrip(";")
     if ";" in body:
         return False, "only a single statement is allowed (no stacked statements)"
-    if not re.match(r"^\s*(select|with)\b", body, re.I):
-        return False, "only SELECT (or WITH … SELECT) queries are allowed"
+    if not re.match(r"^\s*(select|with|explain|show)\b", body, re.I):
+        return False, "read_only mode accepts SELECT, WITH, EXPLAIN, and SHOW"
     if _FORBIDDEN.search(body):
         bad = _FORBIDDEN.search(body).group(1).upper()
         return False, f"disallowed keyword '{bad}' — this is a read-only surface"
-    pol = _policy(cfg)
     tables = _tables(body)
-    unlisted = [t for t in tables if t not in pol["allow_tables"]]
+    unlisted = [] if "*" in pol["allow_tables"] else [t for t in tables if t not in pol["allow_tables"]]
     if unlisted:
         return False, (f"table(s) {unlisted} not in the allowlist "
                        f"{pol['allow_tables']} — ask the operator to widen the "
@@ -174,97 +141,119 @@ def check(sql: str, cfg: dict) -> tuple[bool, str]:
 # -- DSN resolution (host-side only; never on argv) ---------------------------
 
 def resolve_dsn(pol: dict) -> tuple[str | None, dict, str | None]:
-    """Read the DSN from the host env var named by the block. Returns
-    (dsn, libpq_env, error). The DSN is parsed into libpq PG* env vars so the
-    password never lands on a process argv (visible in `ps`)."""
+    """Resolve the chosen credential without executing shell code or using argv."""
     var = pol["dsn_env"]
+    env_file = Path(pol.get("dsn_env_file") or os.environ.get("SC_RO_ENVFILE")
+                    or Path.home() / ".config" / ports.REPO_ROOT.name / "db-broker.env")
     dsn = os.environ.get(var)
+    try:
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                key, sep, value = line.strip().removeprefix("export ").partition("=")
+                if sep and key.strip() == var:
+                    # Both single/double quoted systemd assignments are accepted;
+                    # interpolation and command substitution are never performed.
+                    parts = shlex.split(value, comments=True)
+                    dsn = " ".join(parts)
+    except (OSError, ValueError):
+        return None, {}, f"cannot read {var} from the broker host env file"
     if not dsn:
-        return None, {}, (f"the read-only DSN is not set: export ${var} in the "
-                          "broker's host environment (it is never mounted into "
-                          "the sandbox). See `./sc db-init`.")
-    env: dict[str, str] = {}
-    u = urllib.parse.urlparse(dsn)
-    if u.scheme in ("postgres", "postgresql") and (u.hostname or u.path):
-        if u.hostname:
-            env["PGHOST"] = u.hostname
-        if u.port:
-            env["PGPORT"] = str(u.port)
-        if u.username:
-            env["PGUSER"] = urllib.parse.unquote(u.username)
-        if u.password:
-            env["PGPASSWORD"] = urllib.parse.unquote(u.password)
-        db = (u.path or "").lstrip("/")
-        if db:
-            env["PGDATABASE"] = db
-        return dsn, env, None
-    # Not a URI (libpq key=value conninfo). We can't split it into PG* vars
-    # cleanly; fall back to passing it on argv (host-side, trusted — the sandbox
-    # has its own pid namespace and cannot see the host's `ps`).
+        return None, {}, f"{var} is not set in the broker host env file or environment"
     return dsn, {}, None
 
 
-# -- the query verb (host-side; the broker exposes this over the socket) ------
-
-def _run(argv: list[str], env: dict, timeout: int) -> tuple[int, str, str]:
-    """Run psql with an augmented environment. The mock seam for tests (no live
-    Postgres in CI) — sibling brokers mock their own `_run` the same way."""
-    full = dict(os.environ)
-    full.update(env)
-    try:
-        p = subprocess.run(argv, capture_output=True, text=True,
-                           timeout=timeout, env=full)
-        return p.returncode, p.stdout, p.stderr
-    except FileNotFoundError as e:
-        return 127, "", f"command not found: {e.filename} — is psql installed on the host?"
-    except subprocess.TimeoutExpired:
-        return 124, "", f"psql timed out (>{timeout}s)"
+def _cell(value):
+    """Keep the existing string-cell protocol while preserving SQL NULL."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "t" if value else "f"
+    if isinstance(value, bytes):
+        return "\\x" + value.hex()
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, default=str)
+    return str(value)
 
 
-def _parse_csv(out: str, cap: int) -> tuple[list[str], list[list[str]], bool]:
-    """Split psql --csv output into (columns, rows, truncated). The wrap query
-    fetches cap+1 rows so a full cap+1 signals there was more."""
-    reader = list(csv.reader(io.StringIO(out)))
-    if not reader:
-        return [], [], False
-    columns, data = reader[0], reader[1:]
-    truncated = len(data) > cap
-    return columns, data[:cap], truncated
+def do_query(sql: str, *, autocommit: bool = False) -> dict:
+    """Execute the original SQL; return each statement's result and commit status.
 
-
-def do_query(sql: str) -> dict:
-    """Validate → run one SELECT against the live DB host-side → capped rows.
-    Returns {ok, columns, rows, truncated} or {ok:false, error}."""
+    PostgreSQL parses SQL, so strings, comments, dollar quotes and WITH clauses
+    retain their meaning. Requests own separate connections. A failed ordinary
+    request rolls back all its statements, and is never retried automatically.
+    """
     cfg = read()
     if cfg is None:
         return {"ok": False, "error": "no `db` block in instance.json — run `./sc db-init`"}
-    pol = _policy(cfg)
-    ok, reason = check(sql, cfg)
+    if not isinstance(sql, str) or not isinstance(autocommit, bool):
+        return {"ok": False, "error": "sql must be a string and autocommit must be a boolean"}
+    try:
+        pol = _policy(cfg)
+        ok, reason = check(sql, cfg)
+    except (TypeError, ValueError, AttributeError):
+        return {"ok": False, "error": "invalid database broker policy"}
     if not ok:
         return {"ok": False, "error": reason}
-    dsn, pgenv, err = resolve_dsn(pol)
-    if err:
-        return {"ok": False, "error": err}
-    cap = pol["row_cap"]
-    inner = _strip(sql).strip().rstrip(";")  # already validated single-statement
-    # Wrap to enforce the row cap in the DB; cap+1 so we can detect truncation.
-    wrapped = f"SELECT * FROM ({inner}) AS _sc_q LIMIT {cap + 1}"
-    # Session options via PGOPTIONS (applied at connect): a hard statement
-    # timeout and a read-only transaction default — belt to the RO role's braces.
-    pgenv = dict(pgenv)
-    pgenv["PGOPTIONS"] = (f"-c statement_timeout={pol['statement_timeout_ms']} "
-                          "-c default_transaction_read_only=on")
-    argv = [pol["psql_bin"], "--csv", "-v", "ON_ERROR_STOP=1", "-w"]
-    if not pgenv.get("PGHOST") and not pgenv.get("PGDATABASE") and dsn:
-        argv += ["-d", dsn]  # non-URI conninfo fallback
-    argv += ["-c", wrapped]
-    timeout_s = max(2, pol["statement_timeout_ms"] // 1000 + 5)
-    code, stdout, stderr = _run(argv, pgenv, timeout_s)
-    if code != 0:
-        return {"ok": False, "error": (stderr or stdout or "psql failed").strip()}
-    columns, rows, truncated = _parse_csv(stdout, cap)
-    return {"ok": True, "columns": columns, "rows": rows,
-            "row_count": len(rows), "truncated": truncated}
+    dsn, _, error = resolve_dsn(pol)
+    if error:
+        return {"ok": False, "error": error}
+    try:
+        import psycopg
+    except ImportError:
+        return {"ok": False, "error": "broker driver missing; run ./sc db-broker-install on the host"}
+    cap = max(1, pol["row_cap"])
+    options = (f"-c statement_timeout={max(1, pol['statement_timeout_ms'])} "
+               f"-c lock_timeout={min(5000, max(1, pol['statement_timeout_ms']))} "
+               "-c idle_in_transaction_session_timeout=30000 "
+               f"-c default_transaction_read_only={'on' if pol['access_mode'] == 'read_only' else 'off'}")
+    try:
+        results = []
+        with psycopg.connect(dsn, connect_timeout=3, options=options,
+                             application_name="subfloor-db-broker",
+                             autocommit=autocommit) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                while True:
+                    columns = [c.name for c in cur.description] if cur.description else []
+                    rows = cur.fetchmany(cap + 1) if cur.description else []
+                    results.append({
+                        "columns": columns,
+                        "rows": [[_cell(v) for v in row] for row in rows[:cap]],
+                        "row_count": min(len(rows), cap),
+                        "truncated": len(rows) > cap,
+                        "affected_rows": cur.rowcount,
+                        "status": cur.statusmessage,
+                    })
+                    if not cur.nextset():
+                        break
+        result = {"ok": True, **results[-1], "autocommit": autocommit}
+        if len(results) > 1:
+            result["results"] = results
+        return result
+    except psycopg.Error as exc:
+        # Primary server errors describe SQL failures without echoing credentials.
+        message = exc.diag.message_primary or str(exc)
+        message = message.replace(dsn, "[connection redacted]")
+        try:
+            password = psycopg.conninfo.conninfo_to_dict(dsn).get("password")
+            if password:
+                message = message.replace(password, "[redacted]")
+        except psycopg.Error:
+            message = "invalid database connection configuration"
+        return {"ok": False, "error": message, "sqlstate": exc.sqlstate,
+                "autocommit": autocommit}
+    except (ValueError, TypeError):
+        return {"ok": False, "error": "invalid database connection configuration"}
+
+
+def health() -> dict:
+    result = do_query("SELECT current_database(), current_user, current_setting('transaction_read_only')")
+    if not result.get("ok"):
+        return {"ok": False, "service": "db-broker", "error": result.get("error")}
+    database, role, read_only = result["rows"][0]
+    return {"ok": True, "service": "db-broker", "database": database, "role": role,
+            "access_mode": _policy(read() or {})["access_mode"],
+            "transaction_read_only": read_only}
 
 
 # -- client: HTTP over the broker's unix socket -------------------------------
@@ -306,21 +295,32 @@ def broker_call(method: str, path: str, body: dict | None = None,
 # -- host CLI (path lookup for `sc`; verbs for manual no-broker testing) -------
 
 def main(argv: list[str]) -> int:
-    mode = argv[0] if argv else "sock"
-    if mode == "sock":
+    parser = argparse.ArgumentParser(description="Query the live application DB through its host broker")
+    parser.add_argument("mode", choices=("sock", "configured", "check", "query", "health"), nargs="?", default="sock")
+    parser.add_argument("sql", nargs="?", help="SQL text, or - to read stdin")
+    parser.add_argument("--file", help="read SQL from this file")
+    parser.add_argument("--autocommit", action="store_true", help="allow commands such as VACUUM outside a transaction")
+    args = parser.parse_intermixed_args(argv)
+    if args.mode == "sock":
         print(SOCKET)
-    elif mode == "configured":
-        # exit 0 if this fork has linked a live DB (so the launch hook self-skips)
+        return 0
+    if args.mode == "configured":
         return 0 if read() else 1
-    elif mode == "check":
-        # dbq.py check "<sql>" — validate only, no DB round-trip
-        ok, reason = check(argv[1] if len(argv) > 1 else "", read() or {})
-        print(json.dumps({"ok": ok, "reason": reason}))
-    elif mode == "query":
-        print(json.dumps(do_query(argv[1] if len(argv) > 1 else "")))
-    else:
-        sys.exit("usage: dbq.py [sock|configured|check <sql>|query <sql>]")
-    return 0
+    if args.sql is not None and args.file:
+        parser.error("use SQL text or --file, not both")
+    try:
+        sql = Path(args.file).read_text() if args.file else sys.stdin.read() if args.sql == "-" else args.sql or ""
+        if args.mode == "health":
+            result = broker_call("GET", "/health")
+        elif args.mode == "check":
+            ok, reason = check(sql, read() or {})
+            result = {"ok": ok, "reason": reason}
+        else:
+            result = broker_call("POST", "/query", {"sql": sql, "autocommit": args.autocommit})
+    except (OSError, ConnectionError) as exc:
+        result = {"ok": False, "error": str(exc)}
+    print(json.dumps(result))
+    return 0 if result.get("ok") else 1
 
 
 if __name__ == "__main__":

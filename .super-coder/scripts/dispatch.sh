@@ -963,39 +963,58 @@ sc_engine_ops_up() { sc_engine_ops up; }
 # this service existed.
 sc_engine_ops_down() { sc_engine_ops down || true; }
 
-# ── db broker (HOST-side; read-only diagnostic access to the LIVE app DB) ─────
-# A host-side broker that shells out to `psql` where the live DSN + route
-# resolve, exposing ONE narrow verb (a single allowlisted, capped, read-only
-# SELECT) over a unix socket in the bind-mounted engine dir so a shell (in the
-# container) can reach it through dbq.py's socket client — there is no global
-# `db_query` skill. The sandbox holds no DSN and no route.
-# Read-only twice: the DSN must point at a read-only PG role AND dbq.py rejects
-# any non-SELECT before psql runs. Refuses to run in the sandbox (db_broker.py
-# guards on SC_SANDBOX). Same lifecycle model as its siblings: `up` no-ops when
-# the socket already answers; `down` only stops what IT started.
+# ── db broker (HOST-side application database access) ──────────────────────
+# Credentials and the driver stay on the host. Clients use the shared socket;
+# read_only is the default, with operator-configured read_write repair access.
+sc_db_broker_python() { "$PY" "$S/db_broker_runtime.py"; }
 DB_BROKER_PID="$ENGINE/run/db-broker.pid"
-DB_BROKER_UNIT="sc-db-broker-$(basename "$here").service"
+DB_BROKER_UNIT="sc-db-broker-$(basename "$ROOT").service"
 
 sc_db_broker_alive() {
   sock="$("$PY" "$S/dbq.py" sock)"
   [ -S "$sock" ] || return 1
-  curl -s --unix-socket "$sock" http://db/health 2>/dev/null | grep -q '"ok": true'
+  curl -s --max-time 5 --unix-socket "$sock" http://db/health 2>/dev/null | grep -q '"ok": true'
 }
 sc_db_broker_up() {
   if ! "$PY" "$S/dbq.py" configured; then
     echo "→ db-broker: no live DB linked (instance.json has no \`db\` block) — nothing to serve"; return 0
   fi
   if sc_db_broker_alive; then echo "→ db-broker already serving $("$PY" "$S/dbq.py" sock)"; return 0; fi
-  sc_broker_preflight db-broker "$DB_BROKER_PID" "$ENGINE/run/db-broker.log" "$("$PY" "$S/dbq.py" sock)" || return 1
-  nohup "$PY" "$ENGINE/api/db_broker.py" >"$ENGINE/run/db-broker.log" 2>&1 &
-  echo $! > "$DB_BROKER_PID"
-  echo "→ db-broker up (pid $!) · socket $("$PY" "$S/dbq.py" sock) · log $ENGINE/run/db-broker.log"
+  if systemctl --user is-active --quiet "$DB_BROKER_UNIT" 2>/dev/null; then
+    echo "✗ db-broker process is running but its database is not ready" >&2
+    "$PY" "$S/dbq.py" health
+    return 1
+  fi
+  # A listening unhealthy pidfile broker must not be replaced with a competitor.
+  if [ -S "$("$PY" "$S/dbq.py" sock)" ] && curl -s --max-time 5 --unix-socket "$("$PY" "$S/dbq.py" sock)" http://db/health >/dev/null 2>&1; then
+    echo "✗ db-broker is listening but its database is not ready" >&2
+    "$PY" "$S/dbq.py" health
+    return 1
+  fi
+  if systemctl --user cat "$DB_BROKER_UNIT" >/dev/null 2>&1; then
+    systemctl --user start "$DB_BROKER_UNIT" || return 1
+  else
+    sc_broker_preflight db-broker "$DB_BROKER_PID" "$ENGINE/run/db-broker.log" "$("$PY" "$S/dbq.py" sock)" || return 1
+    broker_python="$(sc_db_broker_python)" || return 1
+    nohup "$broker_python" "$ENGINE/api/db_broker.py" >"$ENGINE/run/db-broker.log" 2>&1 &
+    echo $! > "$DB_BROKER_PID"
+  fi
+  if sc_wait_until sc_db_broker_alive; then
+    echo "→ db-broker ready · socket $("$PY" "$S/dbq.py" sock)"
+  else
+    echo "✗ db-broker started but its database is not ready" >&2
+    "$PY" "$S/dbq.py" health
+    return 1
+  fi
 }
 sc_db_broker_down() {
-  if [ -f "$DB_BROKER_PID" ] && kill -0 "$(cat "$DB_BROKER_PID" 2>/dev/null)" 2>/dev/null; then
+  if systemctl --user is-active --quiet "$DB_BROKER_UNIT" 2>/dev/null; then
+    systemctl --user stop "$DB_BROKER_UNIT"
+    echo "→ db-broker stopped (systemd)"
+  elif [ -f "$DB_BROKER_PID" ] && kill -0 "$(cat "$DB_BROKER_PID" 2>/dev/null)" 2>/dev/null; then
     kill "$(cat "$DB_BROKER_PID")" && echo "→ db-broker stopped"
   elif sc_db_broker_alive; then
-    echo "→ db-broker is running but not from \`db-broker-up\` (systemd?) — leaving it; use db-broker-uninstall"
+    echo "→ db-broker has no recognized supervisor — leaving it running"
   else
     echo "→ db-broker not running"
   fi
@@ -1003,20 +1022,21 @@ sc_db_broker_down() {
 }
 sc_db_broker_install() {
   command -v systemctl >/dev/null 2>&1 || { echo "✗ db-broker-install: systemd (systemctl) not found on this host" >&2; return 1; }
+  broker_python="$(sc_db_broker_python)" || return 1
   unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
   mkdir -p "$unit_dir"
   # The DSN is read from the host env at query time; a systemd unit has no login
   # shell, so point it at an EnvironmentFile the operator controls (host-side,
   # never mounted). SC_RO_ENVFILE overrides the default path.
-  envfile="${SC_RO_ENVFILE:-$HOME/.config/$(basename "$here")/db-broker.env}"
+  envfile="${SC_RO_ENVFILE:-$HOME/.config/$(basename "$ROOT")/db-broker.env}"
   cat > "$unit_dir/$DB_BROKER_UNIT" <<UNIT
 [Unit]
-Description=super-coder db-broker ($(basename "$here")) — host-side read-only DB broker
+Description=super-coder db-broker ($(basename "$ROOT")) — host-side application DB broker
 After=network.target
 
 [Service]
 EnvironmentFile=-$envfile
-ExecStart=$PY $ENGINE/api/db_broker.py
+ExecStart="$broker_python" "$ENGINE/api/db_broker.py"
 Restart=on-failure
 RestartSec=2
 
@@ -1028,8 +1048,9 @@ UNIT
   sc_db_broker_down >/dev/null 2>&1 || true
   systemctl --user enable "$DB_BROKER_UNIT"
   systemctl --user restart "$DB_BROKER_UNIT"
+  sc_wait_until sc_db_broker_alive || { "$PY" "$S/dbq.py" health; return 1; }
   echo "→ db-broker installed as systemd --user unit: $DB_BROKER_UNIT (enabled, started, linger on)"
-  echo "  DSN env-file: $envfile (create it host-side with: SC_RO_DSN=postgresql://…)"
+  echo "  DSN env-file: $envfile (set the variable named by db.dsn_env)"
   echo "  status: systemctl --user status $DB_BROKER_UNIT   ·   logs: journalctl --user -u $DB_BROKER_UNIT"
 }
 sc_db_broker_uninstall() {
@@ -1297,7 +1318,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|engine-ops|engine-ops-up|engine-ops-down|engine-ops-port|engine-ops-pin|auth|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|engine-ops|engine-ops-up|engine-ops-down|engine-ops-port|engine-ops-pin|auth|db|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1586,7 +1607,9 @@ case "$cmd" in
                       sc_help_form "$@" || sc_refuse_sandbox auth
                       exec "$PY" "$ENGINE/api/host_auth.py" "$@" ;;
   # ── db broker (HOST-side primitive — runs where the live DSN + route live) ──
-  db-broker)         exec "$PY" "$ENGINE/api/db_broker.py" "$@" ;;
+  db)                cd "$sc_invocation_cwd"; exec "$PY" "$S/dbq.py" "$@" ;;
+  db-broker)         broker_python="$(sc_db_broker_python)" || exit 1
+                     exec "$broker_python" "$ENGINE/api/db_broker.py" "$@" ;;
   db-broker-up)      sc_db_broker_up ;;
   db-broker-down)    sc_db_broker_down ;;
   db-broker-sock)    exec "$PY" "$S/dbq.py" sock ;;
@@ -2347,10 +2370,13 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc auth origin         confirm the ONE GUI origin the host accepts (asks you to
                            type the review port; or: auth origin <port> · --show)
 
-  db broker (run on the HOST — read-only diagnostic reads of the fork's LIVE app
-  DB for a sandboxed shell, without handing it a DSN or a route. Shells out to
-  psql host-side; SELECT-only + table allowlist + row cap; the DSN must be a
-  read-only role. One-time: ./sc db-init. See .super-coder/docs/db-broker.md.
+  db broker (host-side application DB access; credentials stay on the host).
+  Configured read_write mode supports diagnosis, repairs, and schema changes.
+  ./sc db health          check the database connection and active role
+  ./sc db query "SQL"     execute SQL through the shared broker socket
+  ./sc db query --file FILE  execute a transaction script (commits on success)
+  ./sc db query --autocommit "VACUUM table_name"  maintenance outside a transaction
+  See .super-coder/docs/db-broker.md.
   ./sc db-init             add the "db" block to instance.json + print host setup steps
   ./sc db-broker           run the broker in the foreground (unix socket)
   ./sc db-broker-up        start it in the background (nohup + pidfile); self-skips if unlinked/already up

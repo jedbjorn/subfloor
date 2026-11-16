@@ -1,32 +1,9 @@
 #!/usr/bin/env python3
-"""db-broker — the host-side authority for read-only diagnostic reads of the
-fork's LIVE app Postgres.
+"""Host broker for application-DB diagnosis and repair.
 
-A fork's shells run in a sandbox that has an *empty* private pg sidecar (the
-dev/test target), no mounted host DSN, and no route to the host's live app DB.
-This broker runs ON THE HOST, where the DSN + route resolve, and exposes ONE
-narrow verb — a single SELECT, allowlisted + capped + timed — over a unix socket
-in the bind-mounted engine dir (`.super-coder/run/db-broker.sock`). A shell
-reaches that socket through the client in scripts/dbq.py (no global `db_query`
-skill exists); the sandbox names a query and holds nothing.
-It is the fourth sibling of the pm2 / VM-and-remotes / tailnet brokers
-(api/pm2_broker.py, api/vm_broker.py, api/ts_broker.py). Config + validation +
-the query verb live in scripts/dbq.py. Doc: .super-coder/docs/db-broker.md.
-
-Routes (all JSON `{ok, ...}`):
-
-    GET  /health              liveness of the broker (not the DB)
-    POST /query   {sql}       one read-only SELECT → {ok, columns, rows, truncated}
-
-Every query is fail-closed: rejected unless it is a single SELECT/WITH touching
-only allowlisted tables (scripts/dbq.check), and the DSN must point at a
-read-only Postgres role (the DB-enforced backstop). The socket is fs-perm gated
-(0600) — reachable only by processes sharing the bind mount; no network surface,
-no auth token.
-
-Run on the HOST (never in the sandbox):
-    ./sc db-broker        foreground
-    ./sc db-broker-up     background (pidfile) ; ./sc db-broker-down to stop
+GET /health tests the actual DB connection. POST /query accepts SQL and an
+optional autocommit boolean. Credentials stay on the host; SQL permissions are
+selected by instance configuration and the connected PostgreSQL role.
 """
 from __future__ import annotations
 
@@ -67,20 +44,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            return self._send(200, {"ok": True, "service": "db-broker"})
+            result = dbq.health()
+            return self._send(200 if result["ok"] else 503, result)
         return self._send(404, {"ok": False, "error": "no such route"})
 
     def do_POST(self) -> None:
         try:
             if self.path == "/query":
-                sql = self._body().get("sql", "")
+                body = self._body()
+                if not isinstance(body, dict):
+                    return self._send(400, {"ok": False, "error": "body must be a JSON object"})
+                sql = body.get("sql", "")
                 if not isinstance(sql, str):
                     return self._send(400, {"ok": False, "error": "sql must be a string"})
-                result = dbq.do_query(sql)
+                autocommit = body.get("autocommit", False)
+                if not isinstance(autocommit, bool):
+                    return self._send(400, {"ok": False, "error": "autocommit must be a boolean"})
+                result = dbq.do_query(sql, autocommit=autocommit)
                 _audit(sql, result)
                 return self._send(200, result)
-        except Exception as e:  # never let one bad call kill a worker thread
-            return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+        except Exception:  # unexpected driver errors must not expose credentials
+            return self._send(500, {"ok": False, "error": "internal database broker error"})
         return self._send(404, {"ok": False, "error": "no such route"})
 
 
@@ -96,7 +80,10 @@ def _audit(sql: str, result: dict) -> None:
             "rows": result.get("row_count"),
             "truncated": result.get("truncated"),
             "error": result.get("error"),
-            "sql": " ".join(sql.split()),
+            "sql": sql,
+            "autocommit": result.get("autocommit"),
+            "status": result.get("status"),
+            "affected_rows": result.get("affected_rows"),
         }
         with open(dbq.RUN_DIR / "db-broker.audit.log", "a") as f:
             f.write(json.dumps(row) + "\n")

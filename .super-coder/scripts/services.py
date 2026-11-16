@@ -94,9 +94,9 @@ SERVICES: dict[str, dict] = {
             "3. Switch the broker on here. See .super-coder/docs/pm2-broker.md."),
     },
     "db": {
-        "name": "Read-only DB broker",
-        "desc": "Runs SELECT-only, table-allowlisted reads of the fork's live "
-                "app database for sandboxed shells; the DSN never leaves the host.",
+        "name": "Application DB broker",
+        "desc": "Runs SQL against the fork's live app database with configured "
+                "read or repair access; the DSN stays on the host.",
         "kind": "broker", "block": "db", "verb": "db-broker", "module": dbq,
         "unit": "sc-db-broker-{repo}.service",
         "onboarding": (
