@@ -1,132 +1,124 @@
-# db broker
+# Application database broker
 
-**Posture: current operator runbook.** Applies to a fork with this optional
-host broker configured. Host setup and lifecycle belong to its authorized
-operator; Planner supplies fork-local shell guidance. Example names, ports and
-application tables below are illustrative and do not grant access to another
-fork. Exact CLI syntax remains in `sc help --all` and verb help.
+Shells can diagnose the live application PostgreSQL database through the host
+broker. Operators can opt into repair access with `db.access_mode: read_write`.
+The default remains `read_only`; the configured PostgreSQL role determines the
+database privileges. Credentials stay on the host.
+Subfloor's own SQLite memory and repository map use their existing `sc mem`
+and `sc map-*` interfaces.
 
-> [!NOTE]
-> Reading this because the file is missing? A fork pinned at a ref that
-> contains this runbook can still be short of it on disk — see
-> `engine-integrity.md` in this directory (also viewable upstream at
-> `jedbjorn/subfloor` under `.super-coder/docs/`) for the detect-and-recover
-> procedure.
+## Shell commands
 
+These commands work from the root checkout and shell worktrees, including
+sandboxed shells that share the broker socket:
 
-Read-only diagnostic access to the fork's **live app Postgres** for a sandboxed
-shell — without handing that shell a credential or a network route. The fourth
-sibling of the [pm2](pm2-broker.md), [VM and remotes](remote-seats.md), and
-[tailnet](tailscale-broker.md) brokers: one host process holds the capability
-so nothing downstream needs it.
+```sh
+./sc db health
+./sc db query "SELECT count(*) FROM example_table"
+./sc db query "SELECT table_schema, table_name FROM information_schema.tables"
+./sc db query "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM example_table LIMIT 10"
+./sc db query "SHOW server_version"
+./sc db query --file /path/to/repair.sql
+./sc db query - < /path/to/repair.sql
+./sc db query --autocommit "VACUUM ANALYZE example_table"
+```
 
-Code: `.super-coder/api/db_broker.py` (the HTTP-over-unix-socket server) +
-`.super-coder/scripts/dbq.py` (config, validation, the query verb, the socket
-client). Fork-local guidance uses the supplied socket client; no global `db_query`
-skill is implied.
+SQL is executed unchanged: string literals, comments, dollar quotes, and CTEs
+retain PostgreSQL semantics. Read/write mode also permits DDL and multiple
+statements. Every request has
+its own connection. By default it commits on success and rolls back on failure.
+Keep all steps of a transaction in one request. SQL containing explicit
+`COMMIT` or `ROLLBACK` controls its own boundaries. `--autocommit` supports
+commands such as `VACUUM` and `CREATE INDEX CONCURRENTLY`; earlier committed
+work will remain if a later command fails. For a rollback rehearsal, send
+`BEGIN; ...; ROLLBACK;` as one request. The interface takes SQL, not psql
+backslash commands or COPY STDIN/STDOUT streams.
 
-## Why a broker, not the DSN in the container
+Results are JSON. Existing `columns`, `rows`, `row_count`, and `truncated`
+fields remain; non-null cells are strings and SQL NULL is JSON null. Writes
+report `affected_rows` and PostgreSQL's `status`. Multiple statements return a
+`results` array; top-level result fields describe the last statement. SQL
+errors include `sqlstate`. The CLI exits nonzero on failure. Requests are never
+automatically retried; after a client disconnect, establish the outcome before
+repeating a write.
 
-A fork's shells run in a sandbox with an **empty private pg sidecar**
-(`sc-pg-<fork>`, the dev/test target — see the dev_kit skill). That isolation is
-correct: dev/test writes must never touch live data. But it also means the
-live app DB — where the runtime/telemetry a shell needs to *confirm* a diagnosis
-lives — is unreachable:
+The existing HTTP socket client remains compatible:
 
-- the sidecar DSN resolves to the empty sidecar, not the live stack;
-- the host env file carrying the real DSN is not mounted in;
-- the live app Postgres sits on a host network the container has no route to.
+```python
+import dbq
+result = dbq.broker_call("POST", "/query", {"sql": "SELECT count(*) FROM example_table"})
+```
 
-The two cruder ways to close that gap both widen the blast radius:
+`POST /query` also accepts `autocommit: true`. `GET /health` tests PostgreSQL
+and returns database, role, access mode, and transaction-read-only status.
+A failed connection returns `ok: false` with HTTP 503.
 
-- **mount the host DSN + open a route** → full SQL + host networking from
-  inside the sandbox;
-- **a read-only role whose DSN is mounted** → still needs a route, and leaks a
-  live credential into the sandbox — which is `-v $here:$here` bind-mounted, so
-  anything under the repo (`instance.json` included) is sandbox-readable.
+## Host configuration
 
-The broker keeps the credential and the route entirely host-side and hands the
-sandbox one narrow verb, exactly as pm2-broker does for `pm2` + the host app.
-
-## Read-only, enforced twice
-
-1. **The DSN points at a read-only Postgres role** (`GRANT SELECT` only) — the
-   DB-enforced backstop. The broker also connects with
-   `default_transaction_read_only=on`.
-2. **The broker rejects any statement that is not a single `SELECT`/`WITH`**
-   before `psql` ever runs — no stacked statements, no data-modifying CTEs, no
-   DDL/DML/session-or-transaction control.
-
-Table scoping is likewise belt-and-suspenders: the RO role should `GRANT SELECT`
-only on the allowlisted tables (DB-authoritative), and the broker additionally
-rejects a query whose `FROM`/`JOIN` targets a table outside `allow_tables`. The
-default allowlist is **ops/telemetry only** (`skill_runs`, `tool_call_attempts`,
-`models`); content/tenant tables (contacts, emails, chat bodies) are gated —
-added only by explicit operator scope. Every query also gets a
-`statement_timeout` and a row cap, and every call is logged to
-`.super-coder/run/db-broker.audit.log`.
-
-## Link config — the `db` block
-
-Held under the `db` key of `.super-coder/instance.json`. It carries **no secret**
-— instance.json is sandbox-readable, so the block names an *env var*, and the
-broker (host-side) resolves the DSN from it at query time:
+The `db` block in `.super-coder/instance.json` selects access policy:
 
 ```json
-"db": {
-  "dsn_env": "SC_RO_DSN",
-  "allow_tables": ["skill_runs", "tool_call_attempts", "models"],
+{
+  "dsn_env": "SC_DB_DSN",
+  "access_mode": "read_write",
+  "allow_tables": ["*"],
   "row_cap": 1000,
-  "statement_timeout_ms": 5000,
-  "psql_bin": "psql"
+  "statement_timeout_ms": 30000
 }
 ```
 
-`./sc db-init` scaffolds the block and prints the one-time host steps (create the
-RO role, `GRANT SELECT` on the allowlisted tables, export `SC_RO_DSN`). The DSN
-is parsed into libpq `PG*` env vars for the `psql` subprocess, so the password
-never lands on a process argv.
+In `read_write` mode, the broker imposes no table allowlist or SQL-verb filter;
+PostgreSQL role permissions apply. An omitted `access_mode` retains `read_only`
+mode with SQL validation and a read-only transaction default. Use a dedicated PostgreSQL role with SELECT
+grants for that mode. It accepts SELECT/WITH plus EXPLAIN and SHOW diagnostics;
+mutating statements and stacked SQL remain rejected. In read-only mode, `['*']`
+disables the table allowlist. Returned rows are capped per result set; the cap
+does not limit how many rows a repair changes or the server work performed.
 
-## Routes
+Store the DSN in the host's `~/.config/<repo>/db-broker.env` with mode 0600.
+The broker reads the selected variable from this file on each request, ahead
+of inherited environment, so a stale login-shell export cannot override it.
+`dsn_env_file` in config or `SC_RO_ENVFILE` can override the path. Values are
+parsed without shell execution. When the file does not define the variable,
+the broker falls back to its process environment. Never put credentials in
+instance.json or client SQL/arguments.
 
-All JSON `{ok, ...}`, over the unix socket at `.super-coder/run/db-broker.sock`
-(`0600`; path from `./sc db-broker-sock`):
+The broker executes through psycopg instead of the former psql subprocess.
+`db-broker`, `db-broker-up` (without a systemd unit), and `db-broker-install`
+provision a dedicated virtual environment with `psycopg[binary]==3.3.5` under
+`$XDG_DATA_HOME/subfloor/db-broker-venvs/` (default `~/.local/share`). This leaves
+the engine's Python and the application's environment untouched. Updates reuse
+the environment when its Python and driver versions match; new versions get a
+separate directory. First provisioning requires access to the Python package
+index. Clients only use the socket and need no driver installed.
 
-| Verb | Call |
-|---|---|
-| **health** | `curl -s --unix-socket "$SOCK" http://db/health` → `{ok, service}` |
-| **query** | `curl -s --unix-socket "$SOCK" http://db/query -d '{"sql":"SELECT …"}'` → `{ok, columns, rows, row_count, truncated}` or `{ok:false, error}` |
+For a managed interpreter of your own, persist an absolute `db.broker_python`
+path in instance.json, or set `SC_DB_BROKER_PYTHON` during installation. It must
+already contain the pinned psycopg version. A systemd drop-in still takes
+precedence over the generated unit: remove a prior `ExecStart` workaround when
+adopting the engine-managed interpreter, then rerun `./sc db-broker-install`.
+The existing `psql_bin` option is no longer used.
 
-## Running it (on the HOST — never in the sandbox)
+The statement timeout defaults to 5 seconds (30 seconds in the example), the
+lock timeout is at most 5 seconds, and the connect timeout is 3 seconds.
+Connection settings apply to each request. The socket client waits up to
+70 seconds by default; Python callers can pass `timeout` for longer scripts.
 
+## Host lifecycle
+
+```sh
+./sc db-broker-up
+./sc db-broker-down
+./sc db-broker-install
+systemctl --user restart sc-db-broker-example.service
+./sc db health
 ```
-./sc db-init             scaffold the `db` block + print host setup steps
-export SC_RO_DSN=postgresql://sc_ro:…@<host>:5432/<db>
-./sc db-broker           foreground (unix socket)
-./sc db-broker-up        background (nohup + pidfile); self-skips if unlinked/up
-./sc db-broker-down      stop the backgrounded broker
-./sc db-broker-sock      print the socket path
-./sc db-broker-install   supervise via a systemd --user unit (EnvironmentFile
-                         carries SC_RO_DSN — a unit has no login shell)
-./sc db-broker-uninstall remove the systemd unit
-```
 
-The unit's env file is `~/.config/<fork>/db-broker.env` (`SC_RO_ENVFILE`
-overrides it); `db-broker-install` prints the path and the operator creates it
-host-side with `SC_RO_DSN=postgresql://…`.
+`up` uses the installed systemd service when present. It reports success only
+when the database responds; an unhealthy existing service produces an error
+instead of launching a competing broker. `down` stops a supervised broker
+through systemd. The enabled user unit survives host restarts. Existing shells
+can use the fixed broker without restarting their sessions.
 
-`db_broker.py` guards on `SC_SANDBOX` and refuses to start inside the container.
-`db-broker-up` self-skips when no `db` block is linked and no-ops when the socket
-already answers; `db-broker-down` only stops what it started (a systemd-managed
-broker is left alone — use `db-broker-uninstall`).
-
-## Limits
-
-- **Any write path.** Read-only forever; a write broker is a different tool with
-  a different threat model.
-- **Query builders / pagination beyond the row cap / result streaming.** The
-  verb takes raw `SELECT` text and returns capped rows.
-- **A review-GUI panel.** The surface is the supplied query client with fork-local guidance (CLI over the
-  socket); no `/api/db/*` route on the review server.
-- **Cross-fork / cross-host access.** One broker serves one fork's live DB on
-  its own host.
+Every SQL request is recorded in `.super-coder/run/db-broker.audit.log` with
+its result status. The socket is `.super-coder/run/db-broker.sock` (0600).
