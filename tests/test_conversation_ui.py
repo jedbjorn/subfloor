@@ -2793,7 +2793,7 @@ const holders = [{pid: 4242, start_ticks: 990, orphaned: "client-gone", claimed:
 def test_dropped_images_upload_raw_and_enter_the_message_as_paths():
     helpers = APP[
         APP.index("// ── Session loss (spec #271)"):
-        APP.index("function toast(msg)")
+        APP.index("function toast(msg")
     ]
     script = helpers + r"""
 const el = () => { throw new Error("small images must not be re-encoded"); };
