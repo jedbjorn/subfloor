@@ -1539,3 +1539,35 @@ server.post = () => {
         "second": {"banner": "Loading…", "harnesses": []},
         "cleanupIsAFunction": True,
     }
+
+
+TOAST = between("// A sticky toast stays until", "function setStatus(")
+
+
+@needs_node
+def test_new_models_notice_stays_until_its_close_button_is_clicked():
+    # The announcement is too valuable to time out: it asks for a sticky toast.
+    assert 'toast(`New models available!\\n${added.join("\\n")}`, { sticky: true })' in CATALOGUE
+    script = FAKE_DOM + TOAST + r"""
+const timers = [];
+globalThis.setTimeout = (fn, ms) => { timers.push(ms); return timers.length; };
+FakeElement.prototype.prepend = function (node) { this.children.unshift(node); node.parentElement = this; };
+FakeElement.prototype.classList = null;
+const body = new FakeElement("body");
+globalThis.document = {body};
+const withClassList = (node) => { node.classList = {add: (c) => { node.className += " " + c; }}; return node; };
+const realEl = el;
+el = (...args) => withClassList(realEl(...args));
+toast("plain notice");
+toast("New models available!\ncodex: b", {sticky: true});
+const [plain, sticky] = body.children;
+const close = sticky.children.find((node) => node.className === "toast-close");
+const before = body.children.length;
+close.onclick();
+console.log(JSON.stringify({timers: timers.length, before, after: body.children.length,
+  left: body.children.map(text), stickyClass: sticky.className, label: close.ariaLabel}));
+"""
+    result = run_js(script.replace("function el(", "let el = function (", 1))
+    assert result == {"timers": 1, "before": 2, "after": 1, "left": ["plain notice"],
+                      "stickyClass": "toast toast-sticky", "label": "Dismiss"}
+    assert ".toast-close:hover" in STYLE
