@@ -351,9 +351,18 @@ async function chatFitImage(file) {
   return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
 }
 
-function toast(msg) {
+// A sticky toast stays until its ✕ is clicked: for news too valuable to miss.
+function toast(msg, { sticky = false } = {}) {
   const t = el("div", { className: "toast" }, msg);
   document.body.append(t);
+  if (sticky) {
+    t.classList.add("toast-sticky");
+    const x = el("button", { className: "toast-close", type: "button", textContent: "✕",
+      title: "Dismiss", ariaLabel: "Dismiss" });
+    x.onclick = () => t.remove();
+    t.prepend(x);
+    return;
+  }
   // Multi-line maintenance traces need longer than one-liners.
   setTimeout(() => t.remove(), Math.min(12000, Math.max(4000, String(msg).length * 30)));
 }
@@ -1769,7 +1778,7 @@ async function loadModelCatalogue(refresh = false, { announce = () => true } = {
         .filter((model) => model.availability === "available"
           && !known.has(`${harness}/${model.id}`))
         .map((model) => `${harness}: ${model.id}`));
-    if (added.length && announce()) toast(`New models available!\n${added.join("\n")}`);
+    if (added.length && announce()) toast(`New models available!\n${added.join("\n")}`, { sticky: true });
   }
   // A failed refresh must not consume the baseline for the next successful read.
   if (!catalog.stale || !modelCatalogue) {
