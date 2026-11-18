@@ -349,7 +349,7 @@ under `~/.config/subfloor` or `~/.ssh` is mounted.
               [--password-file P] [--bootstrap-url URL] [--no-provision] [--wait SECONDS] [--json]
 ./sc vm init [--no-verify]|status|start|stop [--force]|restart|snapshot list|create NAME|delete NAME|bake [NAME]|reset [NAME] (--off|--running)|push SRC [DEST]|pull SRC DEST|exec -- CMD|capture|mcp status|up|down
 ./sc remote add NAME --host H --user U --key-path /abs [--port N] [--known-hosts-path /abs] [--no-verify] | remove NAME | list | status NAME | exec NAME -- CMD | push NAME SRC DEST | pull NAME SRC DEST
-./sc vm-mcp-relay up|down|status      in-sandbox TCP 127.0.0.1:18000 → the broker's vm-mcp.sock (run by `./sc vm mcp up`)
+./sc vm-mcp-relay up|down|status      TCP 127.0.0.1:<vm_mcp_port> → the broker's vm-mcp.sock (run by `./sc vm mcp up`)
 ```
 
 `./sc vm bake [NAME]` is the broker route and the one shells use.

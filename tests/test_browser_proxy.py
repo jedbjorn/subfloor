@@ -519,15 +519,16 @@ def test_guard_refusal_does_not_reach_upstream(gates):
 def test_both_managed_servers_and_container_exclusion(harness, monkeypatch):
     config = {"vm": {"domain": "windows"}, "browser": {"proxy_port": 8860}}
     monkeypatch.setattr(run.ports_mod, "resolve", lambda **kwargs: config)
+    monkeypatch.setattr(run.ports_mod, "ensure_vm_mcp_port", lambda: 8877)
     adapter = json.loads((Path(run.ADAPTERS) / harness / "adapter.json").read_text())
     first = run.managed_mcp_injection(adapter, "DEV5", sandbox=False)
     again = run.managed_mcp_injection(adapter, "DEV5", sandbox=False)
     assert first == again
     assert "127.0.0.1:8860/mcp/DEV5" in json.dumps(first)
-    assert "127.0.0.1:18000/mcp" in json.dumps(first)
+    assert "127.0.0.1:8877/mcp" in json.dumps(first)
     container = run.managed_mcp_injection(adapter, "DEV5", sandbox=True)
     assert "8860" not in json.dumps(container)
-    assert "18000" in json.dumps(container)
+    assert "127.0.0.1:8877/mcp" in json.dumps(container)
 
 
 def test_concurrent_shells_and_no_same_session_queue(gates):

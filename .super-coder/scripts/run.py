@@ -637,20 +637,27 @@ def managed_mcp_injection(adapter: dict, shortname: str | None = None, *, sandbo
         if not recipe.get("name") or not recipe.get("url") or not (recipe.get("launch_args") or recipe.get("merge_json")):
             raise ValueError("incomplete managed MCP recipe")
         item = json.loads(json.dumps({key: value for key, value in recipe.items() if key != "requires"}))
+        identity = ""
         if required == "browser":
             identity = shortname or os.environ.get("SC_SHELL_SHORTNAME", "")
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", identity):
                 raise ValueError("browser MCP injection requires the launched shell shortname")
             port = config['browser']['proxy_port']
-            def expand(value, port=port, identity=identity):
-                if isinstance(value, str):
-                    return value.replace("{port}", str(port)).replace("{shortname}", identity.upper())
-                if isinstance(value, list):
-                    return [expand(x) for x in value]
-                if isinstance(value, dict):
-                    return {key: expand(val) for key, val in value.items()}
-                return value
-            item = expand(item)
+        elif required == "vm":
+            # Per-instance relay port: forks on one host share a loopback (#1836).
+            port = ports_mod.ensure_vm_mcp_port()
+        else:
+            raise ValueError(f"unknown managed MCP requirement: {required}")
+
+        def expand(value, port=port, identity=identity):
+            if isinstance(value, str):
+                return value.replace("{port}", str(port)).replace("{shortname}", identity.upper())
+            if isinstance(value, list):
+                return [expand(x) for x in value]
+            if isinstance(value, dict):
+                return {key: expand(val) for key, val in value.items()}
+            return value
+        item = expand(item)
         if result is None:
             result = item
             continue

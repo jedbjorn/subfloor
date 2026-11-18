@@ -1,6 +1,7 @@
 """Golden contracts for adapter-owned Windows MCP injection declarations."""
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import tempfile
@@ -21,11 +22,16 @@ class WindowsMcpAdapterContractTest(unittest.TestCase):
         return json.loads((ADAPTERS / harness / "adapter.json").read_text())
 
     def linked_vm(self):
-        return mock.patch.object(
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(
             run.ports_mod,
             "resolve",
             return_value={"vm": {"domain": "win-test"}},
-        )
+        ))
+        stack.enter_context(mock.patch.object(
+            run.ports_mod, "ensure_vm_mcp_port", return_value=8877,
+        ))
+        return stack
 
     def test_capability_matrix_is_explicit(self) -> None:
         supported = {}
@@ -37,10 +43,11 @@ class WindowsMcpAdapterContractTest(unittest.TestCase):
             else:
                 unsupported[harness] = streamable["reason"]
 
+        # The manifest carries a template; the port is per instance (#1836).
         self.assertEqual(supported, {
-            "claude": "http://127.0.0.1:18000/mcp",
-            "codex": "http://127.0.0.1:18000/mcp",
-            "opencode": "http://127.0.0.1:18000/mcp",
+            "claude": "http://127.0.0.1:{port}/mcp",
+            "codex": "http://127.0.0.1:{port}/mcp",
+            "opencode": "http://127.0.0.1:{port}/mcp",
         })
         self.assertEqual(set(unsupported), {"kimi", "vibe"})
         self.assertTrue(all(unsupported.values()))
@@ -49,32 +56,32 @@ class WindowsMcpAdapterContractTest(unittest.TestCase):
         expected = {
             "claude": {
                 "name": "windows-mcp",
-                "url": "http://127.0.0.1:18000/mcp",
+                "url": "http://127.0.0.1:8877/mcp",
                 "launch_args": [
                     "--mcp-config",
                     (
                         '{"mcpServers":{"windows-mcp":{"type":"http",'
-                        '"url":"http://127.0.0.1:18000/mcp"}}}'
+                        '"url":"http://127.0.0.1:8877/mcp"}}}'
                     ),
                 ],
             },
             "codex": {
                 "name": "windows-mcp",
-                "url": "http://127.0.0.1:18000/mcp",
+                "url": "http://127.0.0.1:8877/mcp",
                 "launch_args": [
                     "-c",
-                    'mcp_servers.windows-mcp.url="http://127.0.0.1:18000/mcp"',
+                    'mcp_servers.windows-mcp.url="http://127.0.0.1:8877/mcp"',
                 ],
             },
             "opencode": {
                 "name": "windows-mcp",
-                "url": "http://127.0.0.1:18000/mcp",
+                "url": "http://127.0.0.1:8877/mcp",
                 "merge_json": {
                     "opencode.json": {
                         "mcp": {
                             "windows-mcp": {
                                 "type": "remote",
-                                "url": "http://127.0.0.1:18000/mcp",
+                                "url": "http://127.0.0.1:8877/mcp",
                                 "enabled": True,
                                 "oauth": False,
                             }
@@ -175,7 +182,7 @@ class WindowsMcpAdapterContractTest(unittest.TestCase):
             self.assertEqual(set(merged["mcp"]), {"sibling", "windows-mcp"})
             self.assertEqual(merged["mcp"]["windows-mcp"], {
                 "type": "remote",
-                "url": "http://127.0.0.1:18000/mcp",
+                "url": "http://127.0.0.1:8877/mcp",
                 "enabled": True,
                 "oauth": False,
             })

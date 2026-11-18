@@ -16,10 +16,10 @@
       "managed_servers": [
         {
           "name": "windows-mcp",
-          "url": "http://127.0.0.1:18000/mcp",
+          "url": "http://127.0.0.1:{port}/mcp",
           "launch_args": [
             "--mcp-config",
-            "{\"mcpServers\":{\"windows-mcp\":{\"type\":\"http\",\"url\":\"http://127.0.0.1:18000/mcp\"}}}"
+            "{\"mcpServers\":{\"windows-mcp\":{\"type\":\"http\",\"url\":\"http://127.0.0.1:{port}/mcp\"}}}"
           ],
           "requires": "vm"
         },

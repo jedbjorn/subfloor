@@ -2299,7 +2299,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc vm-broker-install   supervise via a systemd --user unit (survives logout/reboot)
   ./sc vm-broker-uninstall remove the systemd unit
   ./sc vm-mcp-relay        in-SANDBOX half of the GUI seam: up [port] / down / status —
-                             TCP 127.0.0.1:18000 → the broker's vm-mcp.sock tunnel;
+                             TCP 127.0.0.1:<vm_mcp_port> → the broker's vm-mcp.sock tunnel;
                              managed adapter injection supplies the harness definition and
                              `./sc vm mcp up` brings the endpoint online
 

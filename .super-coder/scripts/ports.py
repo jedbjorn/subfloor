@@ -62,6 +62,7 @@ MANAGED_KEYS = frozenset({
     "browser_port",
     "browser_proxy_port",
     "engine_ops_port",
+    "vm_mcp_port",
 })
 PORT_KEYS = frozenset({"repo", "port", "dev_port"})
 
@@ -123,7 +124,7 @@ def _sibling_ports() -> set[int]:
         except (OSError, json.JSONDecodeError):
             continue
         for key in ("port", "dev_port", "browser_port", "browser_proxy_port",
-                    "engine_ops_port"):
+                    "engine_ops_port", "vm_mcp_port"):
             value = sibling.get(key)
             if isinstance(value, int):
                 occupied.add(value)
@@ -188,7 +189,7 @@ def resolve(persist: bool = False) -> dict:
     occupied = _sibling_ports()
     loaded = _load_config()
     occupied.update(loaded[key] for key in ("browser_port", "browser_proxy_port",
-                                            "engine_ops_port")
+                                            "engine_ops_port", "vm_mcp_port")
                     if type(loaded.get(key)) is int)
     if "port" in loaded:
         cfg = _runtime_view(loaded)
@@ -222,8 +223,9 @@ def ensure_browser_ports() -> dict:
     """Allocate the opt-in server and gate without moving existing assignments."""
     cfg = resolve()
     occupied = _sibling_ports() | {cfg['port'], cfg['dev_port']}
-    if type(cfg.get('engine_ops_port')) is int:
-        occupied.add(cfg['engine_ops_port'])
+    for key in ('engine_ops_port', 'vm_mcp_port'):
+        if type(cfg.get(key)) is int:
+            occupied.add(cfg[key])
     changes = {}
     for key, suffix in (('browser_port', ':browser'), ('browser_proxy_port', ':browser-proxy')):
         value = cfg.get(key)
@@ -233,6 +235,27 @@ def ensure_browser_ports() -> dict:
         changes[key] = value
     update(changes)
     return {**cfg, **changes}
+
+
+def ensure_vm_mcp_port() -> int:
+    """This fork's Windows-MCP relay port, allocated once and then kept.
+
+    On host runtime every fork shares one loopback, so a fixed relay port let
+    one fork's harness reach another fork's guest (#1836). The port is stored
+    beside the other instance ports; it moves only off a sibling's assignment.
+    """
+    cfg = resolve()
+    value = cfg.get('vm_mcp_port')
+    occupied = _sibling_ports() | {cfg['port'], cfg['dev_port']}
+    if type(value) is int and PORT_BASE <= value < PORT_BASE + SPAN \
+            and value not in occupied:
+        return value
+    occupied.update(cfg[key] for key in ('browser_port', 'browser_proxy_port',
+                                         'engine_ops_port')
+                    if type(cfg.get(key)) is int)
+    value = _resolve_offset(_offset(str(REPO_ROOT) + ':vm-mcp'), occupied)
+    update({'vm_mcp_port': value})
+    return value
 
 
 def stored_engine_ops_port() -> int | None:

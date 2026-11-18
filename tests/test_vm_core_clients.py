@@ -19,9 +19,23 @@ import vm_broker
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import seat_seam_guard  # noqa: E402
 
+# The relay port is per instance (instance.json vm_mcp_port); pin it so no test
+# allocates into the real instance config. Goldens use 18000.
+_RELAY_PORT = mock.patch.object(vm, "mcp_relay_port", return_value=18000)
+
+
 # Every test in this module: no real ssh/scp/virsh/tailscale/dispatcher child
 # process and no call on a real broker socket. See tests/seat_seam_guard.py.
-seat_seam_guard.install(globals())
+# Chained by hand (not seat_seam_guard.install) to also pin the relay port.
+def setUpModule():
+    seat_seam_guard.start()
+    _RELAY_PORT.start()
+
+
+def tearDownModule():
+    _RELAY_PORT.stop()
+    seat_seam_guard.stop()
+
 
 SAVED = {
     "domain": "win-test",
@@ -1620,7 +1634,7 @@ class PublicMcpClientTests(unittest.TestCase):
         with mock.patch.object(
             vm.http.client, "HTTPConnection", side_effect=connections
         ):
-            result = vm.mcp_endpoint_status()
+            result = vm.mcp_endpoint_status(18000)
 
         self.assertEqual(result, {
             "url": "http://127.0.0.1:18000/mcp",
@@ -1671,7 +1685,7 @@ class PublicMcpClientTests(unittest.TestCase):
         with mock.patch.object(
             vm.http.client, "HTTPConnection", side_effect=connections
         ):
-            result = vm.mcp_endpoint_status()
+            result = vm.mcp_endpoint_status(18000)
 
         self.assertTrue(result["ready"])
         self.assertIsNone(result["error"])
@@ -1698,7 +1712,7 @@ class PublicMcpClientTests(unittest.TestCase):
         with mock.patch.object(
             vm.http.client, "HTTPConnection", return_value=connection
         ):
-            result = vm.mcp_endpoint_status()
+            result = vm.mcp_endpoint_status(18000)
 
         self.assertTrue(result["ready"])
         self.assertIsNone(result["error"])
@@ -1719,7 +1733,7 @@ class PublicMcpClientTests(unittest.TestCase):
         with mock.patch.object(
             vm.http.client, "HTTPConnection", return_value=connection
         ):
-            result = vm.mcp_endpoint_status()
+            result = vm.mcp_endpoint_status(18000)
 
         self.assertFalse(result["ready"])
         self.assertEqual(
@@ -1748,6 +1762,7 @@ class PublicMcpClientTests(unittest.TestCase):
             side_effect=[unavailable, ready],
         ) as probe:
             result = vm.wait_for_mcp_endpoint(
+                18000,
                 timeout=1.0,
                 interval=0.25,
                 clock=lambda: next(clock),
@@ -1777,6 +1792,7 @@ class PublicMcpClientTests(unittest.TestCase):
             return_value=unavailable,
         ) as probe:
             result = vm.wait_for_mcp_endpoint(
+                18000,
                 timeout=1.0,
                 interval=0.5,
                 clock=lambda: next(clock),
@@ -1840,6 +1856,36 @@ class PublicMcpClientTests(unittest.TestCase):
         })
         broker.assert_not_called()
         relay.assert_not_called()
+
+    def test_up_and_down_use_this_instance_relay_port(self):
+        # #1836: host-runtime forks share one loopback, so the relay port is
+        # the instance's own vm_mcp_port, never a constant.
+        tunnel = {"ok": True, "running": True, "listening": True,
+                  "unverified": False}
+        relay = mock.Mock()
+        relay.up.return_value = {"ok": True, "running": True,
+                                 "listening": True, "unverified": False}
+        relay.down.return_value = {"ok": True, "output": "relay stopped"}
+        endpoint = {"url": "http://127.0.0.1:8877/mcp", "ready": True}
+        with mock.patch.object(vm, "mcp_relay_port", return_value=8877), \
+             mock.patch.object(vm, "active_mcp_adapter", return_value=self.SUPPORTED), \
+             mock.patch.object(vm, "_mcp_broker_call", return_value=(tunnel, None)), \
+             mock.patch.object(vm, "_relay_module", return_value=relay), \
+             mock.patch.object(
+                 vm, "wait_for_mcp_endpoint", return_value=endpoint
+             ) as wait:
+            up = vm.run_mcp_operation("up")
+            down = vm.run_mcp_operation("down")
+
+        self.assertTrue(up["ok"])
+        relay.up.assert_called_once_with(8877)
+        wait.assert_called_once_with(8877)
+        self.assertEqual(up["result"]["relay"]["port"], 8877)
+        self.assertTrue(down["ok"])
+        relay.down.assert_called_once_with(8877)
+        self.assertEqual(
+            down["result"]["endpoint"]["url"], "http://127.0.0.1:8877/mcp"
+        )
 
     def test_up_verifies_tunnel_relay_and_endpoint(self):
         tunnel = {
