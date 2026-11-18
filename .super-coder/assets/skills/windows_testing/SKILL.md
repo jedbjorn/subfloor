@@ -131,7 +131,7 @@ a GUI step and after any timeout.
 
 Supported harnesses receive a managed `windows-mcp` adapter definition;
 `mcp up` is what brings that endpoint online (in a sandbox it also runs the
-in-container relay on 127.0.0.1:18000). Do not add an MCP server by hand or
+in-container relay on this fork's `vm_mcp_port`). Do not add an MCP server by hand or
 edit harness configuration. Drive the GUI through the MCP tools by element,
 verify each step with a capture, and `mcp down` before `reset`.
 

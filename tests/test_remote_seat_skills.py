@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SKILLS = ENGINE / "assets" / "skills"
 SEED = ENGINE / "migrations" / "0001_seed_skills.sql"
-RESEED = ENGINE / "migrations" / "0282_skills_dedupe_posture.sql"
+RESEED = ENGINE / "migrations" / "0294_vm_mcp_instance_port.sql"
 README = ROOT / "docs" / "README.md"
 REMOTE_SEATS_DOC = ENGINE / "docs" / "remote-seats.md"
 TAILNET_DOC = ENGINE / "docs" / "tailscale-broker.md"
@@ -27,7 +27,7 @@ RETIRED_DOCS = (
 )
 NEW_SKILLS = ("remote_seats", "tailscale_diagnostics", "windows_testing")
 # The trailing reseed carries only the skills the latest reseed rewrote.
-RESEED_SKILLS = NEW_SKILLS
+RESEED_SKILLS = ("windows_testing",)
 # `0001_seed_skills.sql` is regenerated only when the skill *set* changes, so a
 # body-only edit deliberately leaves 0001 carrying the previous text and the
 # trailing reseed carries the current one. Only skills no later reseed has

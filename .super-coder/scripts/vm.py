@@ -62,7 +62,6 @@ MCP_SOCKET = RUN_DIR / "vm-mcp.sock"
 MCP_PIDFILE = RUN_DIR / "vm-mcp-tunnel.pid"
 MCP_LOCKFILE = RUN_DIR / "vm-mcp-tunnel.lock"
 MCP_LOG = RUN_DIR / "vm-mcp-tunnel.log"
-MCP_RELAY_PORT = 18000
 MCP_ENDPOINT_PATH = "/mcp"
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_PROBE_LIMIT = 8192
@@ -2215,8 +2214,16 @@ def _close_mcp_probe_session(
         connection.close()
 
 
+def mcp_relay_port() -> int:
+    """This fork's managed Windows-MCP relay port (instance.json ``vm_mcp_port``).
+
+    Per instance, never a constant: host-runtime forks share one loopback (#1836).
+    """
+    return ports.ensure_vm_mcp_port()
+
+
 def mcp_endpoint_status(
-    port: int = MCP_RELAY_PORT,
+    port: int,
     *,
     timeout: float = MCP_ENDPOINT_PROBE_TIMEOUT,
 ) -> dict:
@@ -2312,17 +2319,17 @@ def _public_tunnel(response: dict) -> dict:
     }
 
 
-def _public_relay(response: dict) -> dict:
+def _public_relay(response: dict, port: int) -> dict:
     return {
         "running": bool(response.get("running")),
         "listening": bool(response.get("listening")),
         "unverified": bool(response.get("unverified")),
-        "port": response.get("port", MCP_RELAY_PORT),
+        "port": response.get("port", port),
     }
 
 
 def wait_for_mcp_endpoint(
-    port: int = MCP_RELAY_PORT,
+    port: int,
     *,
     timeout: float = MCP_ENDPOINT_WAIT_TIMEOUT,
     interval: float = MCP_ENDPOINT_WAIT_INTERVAL,
@@ -2358,11 +2365,12 @@ def wait_for_mcp_endpoint(
 
 
 def _mcp_snapshot(tunnel_response: dict) -> dict:
-    relay = _relay_module().status(MCP_RELAY_PORT)
+    port = mcp_relay_port()
+    relay = _relay_module().status(port)
     tunnel = _public_tunnel(tunnel_response)
-    public_relay = _public_relay(relay)
+    public_relay = _public_relay(relay, port)
     endpoint = (
-        mcp_endpoint_status(MCP_RELAY_PORT)
+        mcp_endpoint_status(port)
         if tunnel["running"]
         and tunnel["listening"]
         and not tunnel["unverified"]
@@ -2370,7 +2378,7 @@ def _mcp_snapshot(tunnel_response: dict) -> dict:
         and public_relay["listening"]
         and not public_relay["unverified"]
         else {
-            "url": f"http://127.0.0.1:{MCP_RELAY_PORT}{MCP_ENDPOINT_PATH}",
+            "url": f"http://127.0.0.1:{port}{MCP_ENDPOINT_PATH}",
             "ready": False,
             "http_status": None,
             "error": "tunnel and relay are not both verified",
@@ -2459,6 +2467,7 @@ def run_mcp_operation(action: str) -> dict:
         return operation_success(operation, _mcp_snapshot(tunnel_response))
 
     relay_module = _relay_module()
+    port = mcp_relay_port()
     if action == "up":
         tunnel_response, error = _mcp_broker_call("POST", "/mcp/up")
         if error:
@@ -2467,7 +2476,7 @@ def run_mcp_operation(action: str) -> dict:
         if not tunnel_response or not tunnel_response.get("ok"):
             return _broker_failure(operation, tunnel_response or {})
 
-        relay_response = relay_module.up(MCP_RELAY_PORT)
+        relay_response = relay_module.up(port)
         if not relay_response.get("ok"):
             tunnel_cleanup = _rollback_mcp_tunnel()
             return operation_error(
@@ -2475,14 +2484,14 @@ def run_mcp_operation(action: str) -> dict:
                 "mcp_relay_failed",
                 str(relay_response.get("output") or "the MCP relay did not start"),
                 {
-                    "relay": _public_relay(relay_response),
+                    "relay": _public_relay(relay_response, port),
                     "tunnel_cleanup": tunnel_cleanup,
                 },
             )
 
-        endpoint = wait_for_mcp_endpoint(MCP_RELAY_PORT)
+        endpoint = wait_for_mcp_endpoint(port)
         if not endpoint["ready"]:
-            relay_cleanup = relay_module.down(MCP_RELAY_PORT)
+            relay_cleanup = relay_module.down(port)
             tunnel_cleanup = _rollback_mcp_tunnel()
             return operation_error(
                 operation,
@@ -2498,11 +2507,11 @@ def run_mcp_operation(action: str) -> dict:
         return operation_success(operation, {
             "adapter": adapter,
             "tunnel": _public_tunnel(tunnel_response),
-            "relay": _public_relay(relay_response),
+            "relay": _public_relay(relay_response, port),
             "endpoint": endpoint,
         })
 
-    relay_response = relay_module.down(MCP_RELAY_PORT)
+    relay_response = relay_module.down(port)
     tunnel_response, error = _mcp_broker_call("POST", "/mcp/down")
     if error:
         error["operation"] = operation
@@ -2525,7 +2534,7 @@ def run_mcp_operation(action: str) -> dict:
         "relay_cleanup": relay_response,
         "tunnel_cleanup": tunnel_response,
         "endpoint": {
-            "url": f"http://127.0.0.1:{MCP_RELAY_PORT}{MCP_ENDPOINT_PATH}",
+            "url": f"http://127.0.0.1:{port}{MCP_ENDPOINT_PATH}",
             "ready": False,
             "http_status": None,
             "error": "transport stopped",

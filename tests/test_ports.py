@@ -85,6 +85,62 @@ class GlobalPortNamespaceTest(unittest.TestCase):
             {resolved["port"], resolved["dev_port"]}.isdisjoint({8800, 8801})
         )
 
+    def ensure_vm_mcp_port(self, offset: int = 0) -> int:
+        with (
+            mock.patch.object(ports, "REPO_ROOT", self.current),
+            mock.patch.object(ports, "CONFIG", self.current_config),
+            mock.patch.object(ports, "_offset", return_value=offset),
+            mock.patch.object(ports, "_free", return_value=True),
+        ):
+            return ports.ensure_vm_mcp_port()
+
+    def test_vm_mcp_port_is_per_instance_persisted_and_stable(self) -> None:
+        # #1836: a fixed relay port let host-runtime forks reach each
+        # other's guests. Each fork gets its own, clear of every sibling port.
+        self.sibling_config.write_text(json.dumps({
+            "repo": "sibling", "port": 8800, "dev_port": 8801,
+            "vm_mcp_port": 8802,
+        }))
+        self.current_config.write_text(json.dumps({
+            "repo": "ami", "port": 8803, "dev_port": 8804,
+            "browser_port": 8805,
+        }))
+
+        first = self.ensure_vm_mcp_port()
+        self.assertEqual(first, 8806)
+        self.assertEqual(
+            json.loads(self.current_config.read_text())["vm_mcp_port"], 8806
+        )
+        self.assertEqual(self.ensure_vm_mcp_port(offset=40), 8806)
+
+    def test_vm_mcp_port_moves_off_a_sibling_assignment(self) -> None:
+        self.sibling_config.write_text(json.dumps({
+            "repo": "sibling", "port": 8800, "dev_port": 8801,
+            "vm_mcp_port": 8850,
+        }))
+        self.current_config.write_text(json.dumps({
+            "repo": "ami", "port": 8803, "dev_port": 8804,
+            "vm_mcp_port": 8850,
+        }))
+
+        self.assertEqual(self.ensure_vm_mcp_port(offset=50), 8851)
+
+    def test_browser_ports_avoid_the_vm_mcp_port(self) -> None:
+        self.current_config.write_text(json.dumps({
+            "repo": "ami", "port": 8803, "dev_port": 8804,
+            "vm_mcp_port": 8810,
+        }))
+        with (
+            mock.patch.object(ports, "REPO_ROOT", self.current),
+            mock.patch.object(ports, "CONFIG", self.current_config),
+            mock.patch.object(ports, "_offset", return_value=10),
+            mock.patch.object(ports, "_free", return_value=True),
+        ):
+            allocated = ports.ensure_browser_ports()
+
+        self.assertNotIn(8810, {allocated["browser_port"],
+                                allocated["browser_proxy_port"]})
+
     def test_exhausted_global_namespace_fails_instead_of_colliding(self) -> None:
         with mock.patch.object(ports, "_free", return_value=False):
             with self.assertRaisesRegex(RuntimeError, "no free Subfloor port"):

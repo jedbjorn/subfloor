@@ -7,7 +7,8 @@ adapter injection supplies the harness definition before launch, and
 `./sc vm mcp up` brings this relay and the endpoint online. A host-side TCP
 tunnel would be invisible to the container (and was rejected by the broker
 spec as a network surface), so this relay runs INSIDE the container: it listens
-on 127.0.0.1:<port> (default 18000) and pipes each connection's bytes to the
+on 127.0.0.1:<port> (this fork's `vm_mcp_port` in instance.json — per
+instance, because host-runtime forks share one loopback) and pipes each connection's bytes to the
 socket, both directions. A raw byte pipe — SSE/chunked streaming pass through
 untouched, no HTTP parsing anywhere.
 
@@ -34,7 +35,6 @@ from pathlib import Path
 
 import vm  # single source for RUN_DIR / MCP_SOCKET
 
-DEFAULT_PORT = 18000
 PIDFILE = vm.RUN_DIR / "vm-mcp-relay.pid"
 # Kept only so new commands remove pre-hardening split state safely.
 PORTFILE = vm.RUN_DIR / "vm-mcp-relay.port"
@@ -145,7 +145,7 @@ def _cleanup_state() -> None:
     PORTFILE.unlink(missing_ok=True)
 
 
-def _last_known_port(fallback: int) -> int:
+def _last_known_port(fallback: int | None) -> int:
     raw_state = vm._read_process_state(PIDFILE)
     try:
         legacy_port = PORTFILE.read_text().strip()
@@ -163,10 +163,10 @@ def _last_known_port(fallback: int) -> int:
             continue
         if 1 <= port <= 65535:
             return port
-    return fallback
+    return vm.mcp_relay_port()
 
 
-def status(port: int = DEFAULT_PORT) -> dict:
+def status(port: int | None = None) -> dict:
     state = _relay_process()
     port = state.get("port") if state else _last_known_port(port)
     listening = isinstance(port, int) and _listener_ready(port)
@@ -319,7 +319,7 @@ def up(port: int, wait: float = READY_TIMEOUT) -> dict:
         }
 
 
-def down(port: int = DEFAULT_PORT) -> dict:
+def down(port: int | None = None) -> dict:
     with vm._process_state_lock(LOCKFILE):
         state = _relay_process()
         stale = (PIDFILE.exists() or PORTFILE.exists()) and state is None
@@ -360,7 +360,7 @@ def down(port: int = DEFAULT_PORT) -> dict:
 
 def main(argv: list[str]) -> int:
     mode = argv[0] if argv else "status"
-    port = int(argv[1]) if len(argv) > 1 else DEFAULT_PORT
+    port = int(argv[1]) if len(argv) > 1 else vm.mcp_relay_port()
     if mode == "fg":
         srv = make_server(port)
         sys.stderr.write(f"[vm-mcp-relay] 127.0.0.1:{port} -> {vm.MCP_SOCKET}\n")

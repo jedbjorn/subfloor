@@ -933,6 +933,10 @@ class ConversationAdapterTest(unittest.TestCase):
             "run.linked_vm_configured", return_value=True
         )
         self.linked_vm.start()
+        self.vm_mcp_port = mock.patch(
+            "run.ports_mod.ensure_vm_mcp_port", return_value=8877
+        )
+        self.vm_mcp_port.start()
         global WORKTREE
         WORKTREE = self.root
         self.context = ConversationContext(
@@ -966,6 +970,7 @@ class ConversationAdapterTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.linked_vm.stop()
+        self.vm_mcp_port.stop()
         self.temp.cleanup()
 
     def test_declared_compatibility_ranges_enforce_floor_and_flag_newer(self) -> None:
@@ -2521,7 +2526,7 @@ class ConversationAdapterTest(unittest.TestCase):
             "--mcp-config",
             (
                 '{"mcpServers":{"windows-mcp":{"type":"http",'
-                '"url":"http://127.0.0.1:18000/mcp"}}}'
+                '"url":"http://127.0.0.1:8877/mcp"}}}'
             ),
         ]
         self.assertEqual(argv[1:3], injection)
@@ -3262,7 +3267,7 @@ class ConversationAdapterTest(unittest.TestCase):
             [
                 "codex",
                 "-c",
-                'mcp_servers.windows-mcp.url="http://127.0.0.1:18000/mcp"',
+                'mcp_servers.windows-mcp.url="http://127.0.0.1:8877/mcp"',
                 "app-server",
                 "--stdio",
             ],

@@ -17,13 +17,13 @@
       "managed_servers": [
         {
           "name": "windows-mcp",
-          "url": "http://127.0.0.1:18000/mcp",
+          "url": "http://127.0.0.1:{port}/mcp",
           "merge_json": {
             "opencode.json": {
               "mcp": {
                 "windows-mcp": {
                   "type": "remote",
-                  "url": "http://127.0.0.1:18000/mcp",
+                  "url": "http://127.0.0.1:{port}/mcp",
                   "enabled": true,
                   "oauth": false
                 }
