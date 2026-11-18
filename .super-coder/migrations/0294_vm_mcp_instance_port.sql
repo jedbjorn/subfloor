@@ -1,7 +1,15 @@
 -- 0294 — the Windows-MCP relay port is per instance (issue #1836).
--- Refresh the windows_testing skill text that named the old fixed port.
+-- Reseeds windows_testing, whose body named the old fixed port. No schema
+-- change; a full-body UPSERT by name keeps skill_id and grants. Idempotent.
 BEGIN;
-UPDATE skills SET content='# windows_testing — the Windows add-on
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'windows_testing',
+  'Windows-only add-on to remote_seats — two-command guest adoption, the shell''s authority over the box, PowerShell exec conventions, capture, and the managed Windows-MCP GUI transport for a posture 1 Windows VM. Opt-in; load with remote_seats.',
+  'substrate',
+  'sc vm',
+  0,
+  '# windows_testing — the Windows add-on
 
 `remote_seats` owns the posture, setup, the session shape, sharing, snapshots,
 and errors. This skill adds only what a Windows guest changes. Linux guests
@@ -151,5 +159,12 @@ you did.
 Finish as `remote_seats` says: `./sc vm mcp down` if you brought it up, then
 `./sc vm reset --off`, and report test results separately from the reset
 result. A `reset_result_unknown` answer is reported as-is; run `./sc vm status`
-and stop rather than retrying the reset.' WHERE name='windows_testing' AND is_deleted=0;
+and stop rather than retrying the reset.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
 COMMIT;
