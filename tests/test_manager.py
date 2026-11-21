@@ -151,6 +151,47 @@ def rows_port(repo):
     return json.loads((repo / ".super-coder/instance.json").read_text())["port"]
 
 
+def stage_package(repo):
+    package = repo / ".super-coder/manager"
+    shutil.copytree(PACKAGE, package)
+    scripts = package.parent / "scripts"
+    scripts.mkdir()
+    shutil.copy2(PACKAGE.parent / "scripts/instance_state.py", scripts)
+    return package
+
+
+def fixture_analytics(package):
+    module = package / "token_analytics"
+    assets = module / "static"
+    assets.mkdir(parents=True, exist_ok=True)
+    (assets / "index.html").write_text('<title>Token Analytics fixture</title><script src="/analytics/app.js"></script>')
+    (assets / "app.js").write_text('document.title = "Token Analytics fixture"')
+    (module / "__init__.py").write_text("""
+from pathlib import Path
+
+class Analytics:
+    def __init__(self, state_dir, repositories, *, engine_repo=None):
+        self.state = state_dir
+        self.repos = repositories
+        self.engine = engine_repo
+
+    def start(self):
+        (self.state / 'started').touch()
+
+    def close(self):
+        (self.state / 'closed').touch()
+
+    def read(self, name, query):
+        import instance_state
+        return dict(name=name, query=query, repos=[str(p) for p in self.repos()],
+                    engine=str(self.engine), resolver=instance_state.__file__)
+
+    def refresh(self):
+        (self.state / 'refreshed').touch()
+        return {'ok': True}
+""")
+
+
 def test_enable_update_reuse_and_remove_from_disposable_user(tmp_path, modules, monkeypatch):
     _, manage = modules
     for name in ("STATE", "DATA", "CONFIG"):
@@ -184,8 +225,7 @@ def test_enable_update_reuse_and_remove_from_disposable_user(tmp_path, modules, 
 
     monkeypatch.setattr(manage, "systemctl", systemctl)
     try:
-        shutil.copytree(PACKAGE, first / ".super-coder/manager")
-        monkeypatch.setattr(manage, "SOURCE", first / ".super-coder/manager")
+        monkeypatch.setattr(manage, "SOURCE", stage_package(first))
         manage.main(["install", "--root", str(root), "--port", str(port)])
         cfg = manager.config()
         assert manager.settings.stat().st_mode & 0o077 == 0
@@ -205,15 +245,37 @@ def test_enable_update_reuse_and_remove_from_disposable_user(tmp_path, modules, 
         status, body = request(port, "/api/inventory", signed)
         assert status == 200
         assert {r["name"] for r in json.loads(body)["installations"]} == {"first", "second"}
-        shutil.copytree(PACKAGE, second / ".super-coder/manager")
-        monkeypatch.setattr(manage, "SOURCE", second / ".super-coder/manager")
+        source = stage_package(second)
+        fixture_analytics(source)
+        monkeypatch.setattr(manage, "SOURCE", source)
         manage.main(["install", "--port", str(free_port())])
         assert len(starts) == 1
         assert manager.config() == cfg
         manage.main(["update"])
         assert len(starts) == 2 and not first_release.exists()
         assert manager.config() == cfg
+        current = (manager.data / "current").resolve()
+        assert (manager.state / "started").exists()
+        # Remove the supplier copy and add a launcher-only neighbor. The
+        # collector still sees the two primary installs and its own resolver.
+        shutil.rmtree(source)
+        (root / "launcher-only").mkdir()
+        (root / "launcher-only/sc").touch()
+        for name in ("status", "filters", "sessions", "usage", "activity", "engine-updates"):
+            status, body = request(port, f"/api/analytics/{name}?project=one&project=two", signed)
+            assert status == 200
+            assert json.loads(body) == {"name": name, "query": {"project": ["one", "two"]},
+                                        "repos": [str(first), str(second)], "engine": str(second),
+                                        "resolver": str(current / "instance_state.py")}
+        assert request(port, "/analytics/app.js")[0] == 401
+        assert request(port, "/analytics/app.js", signed)[0] == 200
+        assert request(port, "/api/analytics/refresh", signed)[0] == 404
+        assert request(port, "/api/analytics/refresh", signed, "POST")[0] == 403
+        assert not (manager.state / "refreshed").exists()
+        assert request(port, "/api/analytics/refresh", signed | {"Origin": f"http://127.0.0.1:{port}"}, "POST")[0] == 200
+        assert (manager.state / "refreshed").exists()
         manage.main(["remove"])
+        assert (manager.state / "closed").exists()
         assert not manager.unit.exists() and not manager.data.exists()
         assert not manager.settings.exists()
         for repo in (first, second):
@@ -292,9 +354,7 @@ def test_manager_browser_refresh_and_navigation(tmp_path, modules, monkeypatch):
     stopped = checkout(root, "offline", free_port())
     static = tmp_path / "package"
     shutil.copytree(PACKAGE, static)
-    page = static / "static/analytics/index.html"
-    page.parent.mkdir()
-    page.write_text("<title>Token Analytics fixture</title>")
+    fixture_analytics(static)
     settings = tmp_path / "settings.json"
     cfg = {"root": str(root), "port": port, "listing": str(tmp_path / "listing/urls.json"),
            "password": "disposable", "service_id": "fixture"}

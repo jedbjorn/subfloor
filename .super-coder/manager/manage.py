@@ -164,12 +164,15 @@ class Manager:
         # Only the distributed package is copied. Persistent data lives in state.
         shutil.copytree(SOURCE, release, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        # Import the resolver shipped alongside this manager, even if its
+        # source checkout is later removed. Never import from inventory rows.
+        shutil.copyfile(SOURCE.parent / "scripts/instance_state.py", release / "instance_state.py")
         link = self.data / "current.new"
         link.unlink(missing_ok=True)
         link.symlink_to(release.name)
         link.replace(current)
         self.unit.parent.mkdir(parents=True, exist_ok=True)
-        argv = [Path(sys.executable).resolve(), "-E", "-s", current / "server.py", self.settings]
+        argv = [Path(sys.executable).resolve(), "-E", "-s", current / "server.py", self.settings, SOURCE.parents[1]]
         atomic(self.unit, "[Unit]\nDescription=Subfloor Manager\n\n[Service]\nType=exec\nExecStart=" +
                " ".join(map(unit_arg, argv)) + "\nRestart=on-failure\nRestartSec=2\nUMask=0077\n"
                "\n[Install]\nWantedBy=default.target\n")

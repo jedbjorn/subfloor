@@ -142,10 +142,13 @@ def published_routes(listing, enabled):
     return routes, "pending", tailnet_name() if routes else None
 
 
+def installations(root):
+    return [(repo, cfg) for repo in sorted(root.iterdir())
+            if (cfg := install_config(root, repo)) is not None]
+
+
 def inventory(root, listing, published=False):
     routes, default_publication, dns = published_routes(listing, published)
-    installs = [(repo, cfg) for repo in sorted(root.iterdir())
-                if (cfg := install_config(root, repo)) is not None]
 
     def observe(item):
         repo, cfg = item
@@ -172,4 +175,4 @@ def inventory(root, listing, published=False):
                 "open_url": url if publication == "verified" else None}
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        return list(pool.map(observe, installs))
+        return list(pool.map(observe, installations(root)))
