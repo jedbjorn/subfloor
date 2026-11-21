@@ -39,27 +39,182 @@ function installationRow(installation) {
     open.textContent = "Open";
     actions.append(open);
   }
+  const controls = document.createElement("div");
+  controls.className = "controls";
+  const lifecycle = installation.state === "stopped" ? ["start"] :
+    installation.state === "running" ? ["stop", "restart"] : [];
+  for (const action of [...lifecycle, "remove"]) {
+    controls.append(button(titles[action], () => preview({name: installation.name, action})));
+  }
+  actions.append(controls);
   return row;
 }
 
-async function load() {
+const titles = {start: "Start", stop: "Stop", restart: "Restart", remove: "Remove Subfloor from this repo",
+  create: "Create repository", install: "Install Subfloor"};
+const setup = document.querySelector("#setup");
+const review = document.querySelector("#review");
+const phrase = document.querySelector("#phrase");
+const confirmation = phrase.querySelector("input");
+const applyButton = document.querySelector("#apply");
+let pending;
+let refreshTimer;
+let loading;
+let refreshQueued = false;
+let results = [];
+const accepted = new Set();
+
+function button(label, handle) {
+  const el = document.createElement("button");
+  el.textContent = label;
+  el.type = "button";
+  el.addEventListener("click", handle);
+  return el;
+}
+
+async function request(url, payload) {
+  const options = payload ? {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)} : {cache: "no-store"};
+  const response = await fetch(url, options);
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  return data;
+}
+
+async function preview(data) {
+  try {
+    status.textContent = "Checking target…";
+    pending = await request("/api/actions/preview", data);
+    if (pending.existing) {
+      if (setup.open) setup.close();
+      await load();
+      const row = [...table.rows].find(row => row.dataset.repo === pending.existing);
+      const open = row?.querySelector("a");
+      if (open) location.assign(open.href);
+      else status.textContent = `${pending.existing} is installed. Check its service and publication status.`;
+      return;
+    }
+    document.querySelector("#review-title").textContent = titles[pending.action];
+    document.querySelector("#plan").textContent = pending.detail;
+    phrase.hidden = !pending.phrase;
+    phrase.querySelector("span").textContent = `Type ${pending.phrase} to confirm removal`;
+    confirmation.value = "";
+    applyButton.disabled = Boolean(pending.phrase);
+    if (setup.open) setup.close();
+    review.showModal();
+    status.textContent = "";
+  } catch (error) {
+    if (setup.open) setup.close();
+    status.textContent = error.message;
+  }
+}
+
+document.querySelector("#provision").onclick = () => setup.showModal();
+for (const el of document.querySelectorAll("[data-close]")) el.onclick = () => el.closest("dialog").close();
+document.querySelector("#setup-form").onsubmit = event => {
+  event.preventDefault();
+  preview(Object.fromEntries(new FormData(event.target)));
+};
+confirmation.oninput = () => { applyButton.disabled = confirmation.value !== pending.phrase; };
+document.querySelector("#apply-form").onsubmit = async event => {
+  event.preventDefault();
+  applyButton.disabled = true;
+  try {
+    const receipt = await request("/api/actions/apply", {name: pending.name, id: pending.id, confirmation: confirmation.value});
+    accepted.add(receipt.id);
+    review.close();
+    await load();
+  } catch (error) {
+    review.close();
+    await load();
+    status.textContent = error.message;
+  }
+};
+
+function showResults(results) {
+  document.querySelector("#history").hidden = !results.length;
+  const list = document.querySelector("#results");
+  list.replaceChildren(...results.map(record => {
+    const item = document.createElement("article");
+    const name = document.createElement("strong");
+    name.textContent = `${titles[record.action]} · ${record.status}`;
+    const detail = document.createElement("small");
+    detail.textContent = [record.path, record.stage, record.detail].filter(Boolean).join(" · ");
+    item.append(name, detail);
+    for (const line of record.recovery || []) {
+      const recovery = document.createElement("small");
+      recovery.textContent = line;
+      item.append(recovery);
+    }
+    item.append(button("View output", async () => {
+      try {
+        const data = await request("/api/actions/output/" + record.id);
+        const log = document.querySelector("#log");
+        log.querySelector("pre").textContent = data.output || record.detail || "No command output yet.";
+        log.showModal();
+      } catch (error) { status.textContent = error.message; }
+    }));
+    return item;
+  }));
+}
+
+// Allow several 30-second publisher scans after each completed provision.
+function awaitingPublication(installations) {
+  const cutoff = Date.now() / 1000 - 120;
+  const byPath = new Map(installations.map(row => [row.path, row.publication]));
+  const seen = new Set();
+  for (const record of results) {
+    if (!["create", "install", "remove"].includes(record.action) || record.status !== "succeeded") continue;
+    if (seen.has(record.path)) continue;
+    seen.add(record.path);
+    if (record.action !== "remove" && (record.finished ?? record.created) >= cutoff &&
+        !["verified", "not configured"].includes(byPath.get(record.path))) return true;
+  }
+  return false;
+}
+
+async function loadOnce() {
+  clearTimeout(refreshTimer);
   refresh.disabled = true;
   status.textContent = "Checking installations…";
+  let installations = [];
   try {
-    const response = await fetch("/api/inventory", {cache: "no-store"});
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || `Inventory request failed (${response.status})`);
+    results = await request("/api/actions");
+    showResults(results);
+    const data = await request("/api/inventory");
+    installations = data.installations;
     document.querySelector("#root").textContent = data.root;
     document.querySelector("#analytics").hidden = !data.analytics_available;
-    table.tBodies[0].replaceChildren(...data.installations.map(installationRow));
-    table.hidden = !data.installations.length;
+    table.tBodies[0].replaceChildren(...installations.map(installationRow));
+    table.hidden = !installations.length;
     status.textContent = table.hidden ? "No installations found." : "";
+    for (const record of results) {
+      if (record.status !== "running") accepted.delete(record.id);
+    }
   } catch (error) {
     table.hidden = true;
     status.textContent = error.message;
   } finally {
     refresh.disabled = false;
+    if (accepted.size || results.some(record => record.status === "running") || awaitingPublication(installations)) {
+      refreshTimer = setTimeout(load, 3000);
+    }
   }
+}
+
+function load() {
+  if (loading) {
+    refreshQueued = true;
+    return loading;
+  }
+  loading = (async () => {
+    do {
+      refreshQueued = false;
+      await loadOnce();
+    } while (refreshQueued);
+    loading = null;
+  })();
+  return loading;
 }
 refresh.addEventListener("click", load);
 load();

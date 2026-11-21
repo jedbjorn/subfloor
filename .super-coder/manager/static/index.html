@@ -8,8 +8,23 @@
 <body>
   <header><strong>Subfloor Manager</strong><nav aria-label="Manager pages"><a href="/" aria-current="page">Installations</a> <a id="analytics" href="/analytics/" hidden>Token Analytics</a></nav></header>
   <main>
-    <section class="title"><div><h1>Installations</h1><p id="root"></p></div><button id="refresh">Refresh</button></section>
+    <section class="title"><div><h1>Installations</h1><p id="root"></p></div><div class="controls"><button id="provision">Add repository</button><button id="refresh">Refresh</button></div></section>
     <p role="status" id="status">Loading installations…</p>
     <div class="table-scroll"><table hidden><thead><tr><th>Repository</th><th>Runtime</th><th>Service</th><th>GUI health</th><th>Publication</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+    <section id="history" hidden><h2>Repository operations</h2><div id="results"></div></section>
+    <dialog id="setup"><form id="setup-form">
+      <h2>Add repository</h2>
+      <label>Destination <select name="action"><option value="install">Existing Git checkout</option><option value="create">New local repository</option></select></label>
+      <label>Repository name <input required name="name" autocomplete="off"></label>
+      <label>Runtime <select name="runtime"><option value="host">Host</option><option value="sandbox">Docker</option></select></label>
+      <label>Subfloor operator username <input required name="username" autocomplete="off"></label>
+      <footer><button type="button" data-close>Cancel</button><button>Preview installation</button></footer>
+    </form></dialog>
+    <dialog id="review"><h2 id="review-title"></h2><pre id="plan"></pre>
+      <form id="apply-form"><label id="phrase" hidden><span></span><input autocomplete="off"></label>
+        <footer><button type="button" data-close>Cancel</button><button id="apply">Confirm</button></footer>
+      </form>
+    </dialog>
+    <dialog id="log"><h2>Command output</h2><pre></pre><button data-close>Close</button></dialog>
   </main>
 </body></html>

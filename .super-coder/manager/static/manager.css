@@ -16,3 +16,17 @@ table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: .8rem; border-bottom: 1px solid var(--line); }
 th { font-size: .85rem; }
 .good { color: light-dark(#11674f, #86d8bc); }
+.controls, footer { display: flex; flex-wrap: wrap; gap: .4rem; }
+.actions .controls { margin-top: .3rem; }
+.actions button { font-size: .85rem; }
+dialog { max-width: min(48rem, 90vw); max-height: 85vh; border: 1px solid var(--line); border-radius: .5rem; }
+dialog::backdrop { background: #16191db0; }
+dialog h2 { margin-top: 0; }
+label { display: grid; gap: .3rem; margin: .75rem 0; }
+input, select { font: inherit; padding: .4rem; }
+pre, #status { white-space: pre-wrap; overflow-wrap: anywhere; }
+footer { justify-content: end; margin-top: 1rem; }
+#history { margin-top: 2rem; }
+article { padding: .6rem 0; border-top: 1px solid var(--line); }
+article button { margin-top: .4rem; }
+[hidden] { display: none !important; }

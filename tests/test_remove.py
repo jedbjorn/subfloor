@@ -131,6 +131,7 @@ class RemoveFixture(unittest.TestCase):
 
 class EndToEndRemoveTest(RemoveFixture):
     def test_verified_wal_backup_and_repo_cleanup(self) -> None:
+        (self.repo / ".sc-worktrees").mkdir()
         backup_impl = remove_mod.db_backup.backup_database
         with (
             mock.patch.object(
@@ -204,6 +205,33 @@ class EndToEndRemoveTest(RemoveFixture):
         self.assertNotIn("super-coder", git(self.repo, "remote").stdout.splitlines())
         self.assertIn("mirror", git(self.repo, "remote").stdout.splitlines())
         remove_mod.sc_wrapper.unregister_install.assert_called_once_with(self.repo)
+
+    def test_removal_preserves_project_placeholder_and_removes_only_installer_scaffold(self):
+        shared = self.repo / "shared"
+        (shared / "user-notes.txt").unlink()
+        keep = shared / ".gitkeep"
+        for tracked in (False, True):
+            with self.subTest(tracked=tracked):
+                keep.write_text("project placeholder" if tracked else "")
+                if tracked:
+                    git(self.repo, "add", "-f", "shared/.gitkeep")
+                    git(self.repo, "commit", "-m", "project placeholder")
+                install.create_shared_scaffolds(self.repo)
+                install.create_shared_scaffolds(self.repo)
+                self.assertEqual(remove_mod.cleanup_shared_scaffolds(self.repo), ["shared/redlines"])
+                self.assertEqual(keep.read_text(), "project placeholder" if tracked else "")
+        self.assertEqual(git(self.repo, "diff", "--", "shared").stdout, "")
+
+    def test_removal_preserves_legacy_and_modified_scaffold(self):
+        shared = self.repo / "shared"
+        (shared / "user-notes.txt").unlink()
+        (shared / ".gitkeep").touch()
+        self.assertEqual(remove_mod.cleanup_shared_scaffolds(self.repo), [])
+        install.create_shared_scaffolds(self.repo)
+        keep = shared / "redlines/.gitkeep"
+        keep.write_text("project notes")
+        self.assertEqual(remove_mod.cleanup_shared_scaffolds(self.repo), [])
+        self.assertEqual(keep.read_text(), "project notes")
 
     def test_no_database_is_reported_truthfully(self) -> None:
         self.writer.close()

@@ -819,6 +819,35 @@ def _write_gitignore(path: Path, text: str) -> None:
     path.write_bytes(text.encode("utf-8", errors="surrogateescape"))
 
 
+SHARED_SCAFFOLDS = (Path("shared"), Path("shared/redlines"))
+SCAFFOLD_RECEIPT = Path(".sc-state/local/install-scaffolds")
+
+
+def scaffold_identity(repo_root: Path, relative: Path) -> str:
+    stat = (repo_root / relative / ".gitkeep").lstat()
+    return f"{relative}\t{stat.st_dev}:{stat.st_ino}:{stat.st_ctime_ns}"
+
+
+def create_shared_scaffolds(repo_root: Path) -> None:
+    for relative in SHARED_SCAFFOLDS:
+        directory = repo_root / relative
+        if directory.resolve() != directory or (directory.exists() and not directory.is_dir()):
+            raise ValueError(f"Expected a project directory at {directory}")
+        if directory.exists():
+            continue
+        directory.mkdir()
+        (directory / ".gitkeep").touch(exist_ok=False)
+        # Append after creation so retries keep prior ownership and legacy
+        # installations without a receipt conservatively retain their files.
+        receipt = repo_root / SCAFFOLD_RECEIPT
+        if receipt.resolve() != receipt:
+            raise ValueError(f"Unexpected scaffold receipt path: {receipt}")
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        with receipt.open("a") as stream:
+            stream.write(scaffold_identity(repo_root, relative) + "\n")
+        print(f"  created {relative}/")
+
+
 def validate_gitignore(repo_root: Path = REPO_ROOT) -> None:
     """Fail closed on malformed ownership without changing the host file."""
     path = repo_root / ".gitignore"
@@ -849,10 +878,11 @@ def sc_remote() -> str | None:
     named = None
     for line in sh("git", "-C", str(REPO_ROOT), "remote", "-v").stdout.splitlines():
         parts = line.split()
-        if len(parts) < 2:
+        if len(parts) < 3 or parts[-1] != "(fetch)":
             continue
         name, url = parts[0], parts[1]
-        if any(n in url for n in SOURCE_REPO_NAMES):
+        basename = url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git")
+        if basename in SOURCE_REPO_NAMES:
             return name
         if name in SOURCE_REPO_NAMES:
             named = name
@@ -872,30 +902,29 @@ def untrack_engine() -> bool:
     return True
 
 
-def resolve_engine_ref() -> str | None:
-    """Resolve the materialized upstream SHA without publishing a pin."""
+def install_provenance() -> tuple[str | None, str | None]:
+    """Use the materialized bootstrap revision, or discover a legacy checkout's remote."""
+    state = REPO_ROOT / ".sc-state"
+    source_file = state / "engine.source"
+    if source_file.exists():
+        source = source_file.read_text().strip()
+        pinned = callable_floor.read_engine_ref(REPO_ROOT)
+        if not pinned or pinned != pinned.lower() or not valid_engine_source(source):
+            sys.exit("install: invalid bootstrap engine.ref or engine.source")
+        return pinned, source
+
     remote = sc_remote()
     if not remote:
-        return None
+        return None, None
     # rev-parse on an unfetched ref echoes the ref name and exits non-zero — guard
     # on BOTH (a clean exit AND a 40-hex SHA) so a miss leaves the pin for update.
     r = sh("git", "-C", str(REPO_ROOT), "rev-parse", f"{remote}/main")
     sha = r.stdout.strip()
-    if r.returncode != 0 or len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha):
-        return None
-    return sha
-
-
-def resolve_engine_source() -> str | None:
-    """Return the explicit Git locator used to obtain the installed engine."""
-    remote = sc_remote()
-    if not remote:
-        return None
+    if r.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return None, None
     result = sh("git", "-C", str(REPO_ROOT), "remote", "get-url", remote)
     source = result.stdout.strip()
-    if result.returncode != 0 or not valid_engine_source(source):
-        return None
-    return source
+    return sha, source if result.returncode == 0 and valid_engine_source(source) else None
 
 
 def valid_engine_source(source: str) -> bool:
@@ -1021,6 +1050,7 @@ def main(argv: list[str]) -> int:
         validate_gitignore(REPO_ROOT)
     except GitignoreError as exc:
         sys.exit(f"install: {exc}")
+    pinned, source = install_provenance()
 
     # Bind this installation before creating any database, snapshot, map, or
     # other per-instance artifact. Retries and --force validate and retain the
@@ -1087,8 +1117,6 @@ def main(argv: list[str]) -> int:
     step("Making the engine a dependency (untrack + pin)")
     print("  git rm -r --cached .super-coder (files kept on disk)" if untrack_engine()
           else "  (engine already untracked)")
-    pinned = resolve_engine_ref()
-    source = resolve_engine_source()
     callable_floor.require_callable_floor(
         REPO_ROOT,
         expected_ref=pinned,
@@ -1115,20 +1143,7 @@ def main(argv: list[str]) -> int:
     # boot block states its path by convention (<repo_root>/shared) — create it
     # so the path it points at exists.
     step("Creating shared/ (scratch + handoff dir)")
-    shared = REPO_ROOT / "shared"
-    if shared.exists():
-        print("  (already present)")
-    else:
-        shared.mkdir()
-        (shared / ".gitkeep").write_text("")
-        print(f"  created {shared.relative_to(REPO_ROOT)}/")
-    # redline_review's documented drop dir — create it so the skill's Step 1
-    # ("list shared/redlines/") works as written on a fresh fork.
-    redlines = shared / "redlines"
-    if not redlines.exists():
-        redlines.mkdir()
-        (redlines / ".gitkeep").write_text("")
-        print(f"  created {redlines.relative_to(REPO_ROOT)}/")
+    create_shared_scaffolds(REPO_ROOT)
 
     # 4. Strip super-coder's per-instance content -----------------------------
     step("Stripping Subfloor's per-instance content (a fork inherits the system, not the memory)")
