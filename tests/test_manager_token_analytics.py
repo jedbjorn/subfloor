@@ -3,10 +3,13 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
+import urllib.request
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,7 +19,8 @@ import pytest
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path[:0] = [str(ENGINE / "manager"), str(ENGINE / "scripts")]
-from token_analytics import INTERVAL, RETRY, STATIC_DIR, Analytics
+from operator_password import make_verifier  # type: ignore[import-not-found]
+from token_analytics import INTERVAL, RETRY, Analytics
 
 del sys.path[:2]
 
@@ -78,7 +82,9 @@ def history(tmp_path, monkeypatch):
     for index, name in enumerate(("alpha", "beta"), 1):
         repo = tmp_path / "Repos" / name
         engine = repo / ".super-coder"
-        engine.mkdir(parents=True)
+        (engine / "api").mkdir(parents=True)
+        (engine / "api/server.py").touch()
+        (repo / "sc").touch()
         git(repo, "init", "-q")
         pin(repo, refs[0], times[0])
         config = engine / "instance.json"
@@ -323,57 +329,85 @@ def test_reference_parity(history, reference):
                 p["project"]: r["ref"] for p in payload["projects"] for r in p["engine_refs"] if r["current"]}
 
 
-def test_dashboard_project_switch_and_refresh(history):
-    """Exercise the packaged page and its JSON boundary in a disposable browser."""
-    from urllib.parse import parse_qs, urlsplit
-
-    playwright = pytest.importorskip("playwright.sync_api")
-
+def test_dashboard_project_switch_and_refresh(history, tmp_path):
+    """Navigate from inventory to the real packaged dashboard in a clean browser."""
+    playwright = ENGINE / "browser/node_modules/playwright"
+    chromium = shutil.which("chromium")
+    if not (playwright.is_dir() and chromium and shutil.which("node")):
+        pytest.skip("optional local Chromium seat")
     h = history
     assert h.manager.refresh()["ok"]
-    refreshes = []
-
-    def dispatch(route):
-        url = urlsplit(route.request.url)
-        if url.path.startswith("/analytics/"):
-            name = url.path.removeprefix("/analytics/") or "index.html"
-            assert name in {"index.html", "theme.js", "style.css", "app.js"}
-            route.fulfill(path=STATIC_DIR / name)
-            return
-        name = url.path.removeprefix("/api/analytics/")
-        if route.request.method == "POST":
-            assert name == "refresh"
-            refreshes.append(name)
-            body = h.manager.refresh()
+    release = tmp_path / "release"
+    shutil.copytree(ENGINE / "manager", release)
+    shutil.copy2(ENGINE / "scripts/instance_state.py", release / "instance_state.py")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    settings = h.cache / "settings.json"
+    settings.write_text(json.dumps({
+        "root": str(h.repos[0].parent), "port": port, "listing": str(h.cache / "urls.json"),
+        "operator_verifier": make_verifier("disposable"), "service_id": "fixture",
+    }))
+    script = """
+    const assert = require('node:assert/strict');
+    const {chromium} = require(process.argv[1]);
+    (async () => {
+      const browser = await chromium.launch({executablePath:process.argv[2], headless:true});
+      try {
+        const page = await browser.newPage({httpCredentials:{username:'operator', password:'disposable'}});
+        await page.goto(`http://127.0.0.1:${process.argv[3]}/`);
+        await page.getByRole('link', {name:'Token Analytics'}).click();
+        await page.locator('.sess').first().waitFor();
+        assert.equal(await page.locator('.sess').count(), 2);
+        assert(await page.locator('.sess-head .pill').getByText('alpha', {exact:true}).isVisible());
+        assert.match(await page.locator('.an-card').first().innerText(), /30/);
+        assert.match(await page.locator('.ht-mark-hit title').first().textContent(), /Engine/);
+        await page.getByLabel('Project', {exact:true}).selectOption('beta');
+        await page.waitForFunction(() => document.querySelectorAll('.sess').length === 1);
+        assert.match(await page.locator('.an-card').first().innerText(), /20/);
+        assert.equal(await page.locator('.ht-mark-hit title').textContent(),
+          'engine update\\nbeta: ' + process.argv[4] + ' Engine one');
+        await page.getByRole('button', {name:'Shell Hours', exact:true}).click();
+        await page.waitForFunction(() => document.querySelector('.an-chart-title').textContent.includes('per shell hour'));
+        await page.getByRole('button', {name:'Refresh', exact:true}).click();
+        await page.waitForFunction(() => document.querySelector('#collection-errors').textContent.includes(
+          'beta: engine database missing'));
+        assert.equal(await page.locator('.sess').count(), 1);
+        assert.equal(await page.getByLabel('Project', {exact:true}).inputValue(), 'beta');
+      } finally { await browser.close(); }
+    })().catch(error => {console.error(error); process.exitCode = 1;});
+    """
+    process = subprocess.Popen(
+        [sys.executable, "-E", "-s", str(release / "server.py"), str(settings), str(h.upstream)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                _, stderr = process.communicate()
+                pytest.fail(f"Manager exited before the browser check: {stderr}")
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=.2) as response:
+                    if response.read() == b"fixture":
+                        break
+            except OSError:
+                time.sleep(.05)
         else:
-            body = h.manager.read(name, parse_qs(url.query))
-        route.fulfill(json=body)
-
-    with playwright.sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, executable_path=shutil.which("chromium"))
-        page = browser.new_page()
+            pytest.fail("Manager did not become ready")
+        h.dbs[1].rename(h.dbs[1].with_suffix(".offline"))
+        result = subprocess.run(
+            ["node", "-e", script, str(playwright), chromium, str(port), h.refs[0]],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+    finally:
+        process.terminate()
         try:
-            page.route("http://manager.test/**", dispatch)
-            page.goto("http://manager.test/analytics/")
-            expect = playwright.expect
-            expect(page.locator(".sess")).to_have_count(2)
-            expect(page.locator(".sess-head .pill").get_by_text("alpha", exact=True)).to_be_visible()
-            expect(page.locator(".an-card").first).to_contain_text("30")
-            expect(page.locator(".ht-mark-hit title").first).to_contain_text("Engine")
-            page.get_by_label("Project", exact=True).select_option("beta")
-            expect(page.locator(".sess")).to_have_count(1)
-            expect(page.locator(".an-card").first).to_contain_text("20")
-            expect(page.locator(".ht-mark-hit title")).to_have_text("engine update\nbeta: " + h.refs[0] + " Engine one")
-            page.get_by_role("button", name="Shell Hours", exact=True).click()
-            expect(page.locator(".an-chart-title")).to_contain_text("per shell hour")
-            h.dbs[1].rename(h.dbs[1].with_suffix(".offline"))
-            page.get_by_role("button", name="Refresh").click()
-            expect(page.locator("#collection-errors")).to_contain_text("beta: engine database missing")
-            expect(page.locator(".sess")).to_have_count(1)
-            expect(page.get_by_label("Project", exact=True)).to_have_value("beta")
-            assert refreshes == ["refresh"]
-        finally:
-            browser.close()
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
 
 
 def test_stopped_and_live_wal_collection(history):
