@@ -61,6 +61,7 @@ ENGINE_PATHS = [
     ".super-coder/browser",
     ".super-coder/api",
     ".super-coder/ui",
+    ".super-coder/manager",
     ".super-coder/assets/github_known_hosts",
     ".super-coder/assets/skill_tombstones.json",
     ".super-coder/assets/legacy-global-pointers.json",
