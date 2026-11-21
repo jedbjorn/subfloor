@@ -166,6 +166,32 @@ def rows_port(repo):
     return json.loads((repo / ".super-coder/instance.json").read_text())["port"]
 
 
+def test_inventory_without_docker_cli(tmp_path, modules, monkeypatch):
+    inv, _ = modules
+    root = tmp_path / "repos"
+    checkout(root, "host", free_port())
+    checkout(root, "sandbox", free_port(), "sandbox")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "git").symlink_to(shutil.which("git"))
+    systemctl = bin_dir / "systemctl"
+    systemctl.write_text("#!/bin/sh\necho LoadState=not-found\nexit 4\n")
+    systemctl.chmod(0o700)
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    def observations():
+        return {row["name"]: (row["runtime"], row["state"], row["health"])
+                for row in inv.inventory(root, tmp_path / "publisher/urls.json")}
+
+    assert observations() == {"host": ("host", "stopped", "no listener"),
+                              "sandbox": ("docker", "unknown", "no listener")}
+
+    docker = bin_dir / "docker"
+    docker.write_text("#!/bin/sh\necho 'Cannot connect to the Docker daemon' >&2\nexit 1\n")
+    docker.chmod(0o700)
+    assert observations()["host"] == ("host", "unknown", "no listener")
+
+
 def test_supervisor_attributes_live_backends_to_checkout(tmp_path, modules, monkeypatch):
     inv, _ = modules
     repo = checkout(tmp_path, "service", runtime="sandbox")

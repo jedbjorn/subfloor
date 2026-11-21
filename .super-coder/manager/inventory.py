@@ -3,6 +3,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -84,11 +85,15 @@ def host_state(repo):
             "activating": "starting", "deactivating": "stopping"}.get(fields.get("ActiveState"), "unknown")
 
 
-def docker_state(repo):
+def docker_state(repo, *, optional=False):
     result = command("docker", "container", "inspect", "--format",
                      '{{range .Mounts}}{{if and (eq .Type "bind") (eq .Destination $.Config.WorkingDir)}}'
                      '{{.Source}}{{end}}{{end}}\n{{.Config.WorkingDir}}\n{{.State.Status}}', f"sc-{repo.name}")
     if not result:
+        # A host-only install can run without a Docker CLI. An installed CLI
+        # that failed to execute still leaves the supervisor state unknown.
+        if optional and shutil.which("docker", mode=os.F_OK) is None:
+            return "absent"
         return "unknown"
     if result.returncode:
         error = result.stderr.strip().lower()
@@ -112,7 +117,7 @@ def configured_runtime(repo, config):
 
 
 def supervisor(repo, configured):
-    states = {"host": host_state(repo), "docker": docker_state(repo)}
+    states = {"host": host_state(repo), "docker": docker_state(repo, optional=configured == "host")}
     active = [(name, state) for name, state in states.items()
               if state in ("running", "starting", "stopping", "paused")]
     if len(active) == 2:
