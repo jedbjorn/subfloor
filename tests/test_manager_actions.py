@@ -105,6 +105,7 @@ def test_removal_preview_revalidation_and_recovery(operations, monkeypatch):
     operations.apply({**preview, "confirmation": preview["phrase"]})
     record = wait_result(operations, preview["id"])
     assert record["status"] == "failed"
+    assert record["recovery"] == [f"backup manifest: {repo}/backup/manifest.json"]
     assert str(repo / "backup/manifest.json") in operations.output(record["id"])
     assert operations.history()[0]["path"] == str(repo)
     with pytest.raises(ValueError, match="already used"):
@@ -270,7 +271,7 @@ def test_browser_provisions_and_confirms_selected_removal(operations, installer,
             await confirm.click();
             const failed=page.locator("article").filter({hasText:"Remove Subfloor from this repo · failed"});
             await failed.getByRole("button",{name:"View output"}).click();
-            await page.getByText(/backup manifest:.*selected/).waitFor();
+            await page.getByRole("dialog").getByText(/backup manifest:.*selected/).waitFor();
             await page.getByRole("button",{name:"Close",exact:true}).click();
             await page.reload();
             await failed.waitFor();

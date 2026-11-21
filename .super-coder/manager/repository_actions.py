@@ -112,10 +112,21 @@ class Actions:
             record = json.loads(path.read_text())
             if record["status"] == "running":
                 record["status"] = "interrupted"
-                self.save(record)
+                self.finish(record)
 
     def save(self, record):
         atomic(self.directory / (record["id"] + ".result"), json.dumps(record))
+
+    def finish(self, record):
+        log = self.directory / (record["id"] + ".log")
+        if record["action"] == "remove" and log.is_file():
+            # Keep engine-reported destinations even if long output rolls out
+            # of the viewer or interruption precedes the final manifest line.
+            markers = ("→ backup destination ready:", "→ verified WAL-safe DB backup:",
+                       "preserved backup:", "backup manifest:", "remove interrupted; backup manifest:")
+            with log.open(errors="replace") as stream:
+                record["recovery"] = [line.strip() for line in stream if line.strip().startswith(markers)]
+        self.save(record)
 
     def history(self):
         records = [json.loads(path.read_text()) for path in self.directory.glob("*.result")]
@@ -265,7 +276,7 @@ class Actions:
             record.update(status="failed", detail=str(exc))
         finally:
             try:
-                self.save(record)
+                self.finish(record)
             finally:
                 leases.close()
 

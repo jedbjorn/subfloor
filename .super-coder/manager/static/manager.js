@@ -136,7 +136,13 @@ function showResults(results) {
     name.textContent = `${titles[record.action]} · ${record.status}`;
     const detail = document.createElement("small");
     detail.textContent = [record.path, record.stage, record.detail].filter(Boolean).join(" · ");
-    item.append(name, detail, button("View output", async () => {
+    item.append(name, detail);
+    for (const line of record.recovery || []) {
+      const recovery = document.createElement("small");
+      recovery.textContent = line;
+      item.append(recovery);
+    }
+    item.append(button("View output", async () => {
       try {
         const data = await request("/api/actions/output/" + record.id);
         const log = document.querySelector("#log");

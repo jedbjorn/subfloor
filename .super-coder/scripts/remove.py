@@ -22,7 +22,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import shutil
 import signal
 import socket
@@ -43,9 +42,9 @@ import engine_manifest
 import install
 import instance_state
 import make_cleanup
-import state_relocation
 import sandbox_devkit
 import sc_wrapper
+import state_relocation
 
 BACKUP_IGNORE = "/.sc-state/db_backups/"
 BACKUP_IGNORE_COMMENT = "# subfloor removal backup — preserved after make dos-remove"
