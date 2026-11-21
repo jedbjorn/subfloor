@@ -192,28 +192,38 @@ class Analytics:
 """)
 
 
-def test_password_reveal_requires_an_interactive_host_terminal(tmp_path, modules, monkeypatch):
+def test_password_setup_and_reset(tmp_path, modules, monkeypatch, capsys):
     _, manage = modules
+    from operator_password import matches
+
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     manager = manage.Manager()
     with manager.locked():
-        manager.save({"password": "fixture-only"})
+        manager.save({})
     argv = [sys.executable, str(PACKAGE / "manage.py"), "password"]
     batch = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                            start_new_session=True, check=False)
     assert batch.returncode != 0 and batch.stdout == ""
-    assert "interactive host terminal" in batch.stderr and "fixture-only" not in batch.stderr
+    assert "interactive host terminal" in batch.stderr
+    assert manager.config() == {}
 
-    # util-linux script provides the child with an isolated controlling terminal.
-    terminal = subprocess.run(["script", "-qec", shlex.join(argv), "/dev/null"],
-                              stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
-    assert terminal.stdout.strip() == "fixture-only"
-    redirected = tmp_path / "redirected"
-    command = shlex.join(argv) + " > " + shlex.quote(str(redirected))
-    refused = subprocess.run(["script", "-qec", command, "/dev/null"], stdin=subprocess.DEVNULL,
-                             capture_output=True, text=True, check=False)
-    assert refused.returncode != 0 and redirected.read_bytes() == b""
-    assert "fixture-only" not in refused.stdout + refused.stderr
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    answers = iter(["fixture-only", "mismatch", "fixture-only", "fixture-only", "new-fixture", "new-fixture"])
+    monkeypatch.setattr(manage.getpass, "getpass", lambda _: next(answers))
+    with pytest.raises(SystemExit):
+        manage.main(["password"])
+    assert manager.config() == {}
+
+    credential = "Basic " + base64.b64encode(b"operator:fixture-only").decode()
+    assert manage.main(["password"]) == 0
+    assert matches(credential, manager.config()["operator_verifier"])
+    assert manage.main(["password"]) == 0
+    assert not matches(credential, manager.config()["operator_verifier"])
+    assert "password" not in manager.config()
+    output = capsys.readouterr()
+    for supplied in ("fixture-only", "new-fixture"):
+        assert supplied not in output.out + output.err + manager.settings.read_text()
 
 
 def test_enable_update_reuse_and_remove_from_disposable_user(tmp_path, modules, monkeypatch):
@@ -256,9 +266,12 @@ def test_enable_update_reuse_and_remove_from_disposable_user(tmp_path, modules, 
         first_release = (manager.data / "current").resolve()
         # The running service remains usable when its source disappears.
         shutil.rmtree(first / ".super-coder/manager")
-        secret = base64.b64encode(("operator:" + cfg["password"]).encode()).decode()
+        secret = base64.b64encode(b"operator:fixture-login").decode()
         signed = {"Authorization": "Basic " + secret}
         assert request(port, "/")[0] == 401
+        assert request(port, "/", signed)[0] == 401
+        cfg["operator_verifier"] = manage.make_verifier("fixture-login")
+        manager.save(cfg)
         assert request(port, "/api/inventory", signed | {"Host": "other.test"})[0] == 403
         assert request(port, "/api/inventory", signed | {"Origin": "https://other.test"})[0] == 403
         assert request(port, "/api/inventory", signed, "POST")[0] == 403
@@ -275,9 +288,14 @@ def test_enable_update_reuse_and_remove_from_disposable_user(tmp_path, modules, 
         manage.main(["install", "--port", str(free_port())])
         assert len(starts) == 1
         assert manager.config() == cfg
+        # A preview release stored its generated credential in the settings.
+        # Update retains that login and removes the recoverable secret.
+        legacy = dict(cfg, password="fixture-login")
+        del legacy["operator_verifier"]
+        manager.save(legacy)
         manage.main(["update"])
         assert len(starts) == 2 and not first_release.exists()
-        assert manager.config() == cfg
+        assert "password" not in manager.config() and "fixture-login" not in manager.settings.read_text()
         current = (manager.data / "current").resolve()
         assert (manager.state / "started").exists()
         # Remove the supplier copy and add a launcher-only neighbor. The
@@ -381,7 +399,7 @@ def test_manager_browser_refresh_and_navigation(tmp_path, modules, monkeypatch):
     fixture_analytics(static)
     settings = tmp_path / "settings.json"
     cfg = {"root": str(root), "port": port, "listing": str(tmp_path / "listing/urls.json"),
-           "password": "disposable", "service_id": "fixture"}
+           "operator_verifier": manage.make_verifier("disposable"), "service_id": "fixture"}
     settings.write_text(json.dumps(cfg))
     script = """
     const {chromium} = require(process.argv[1]);

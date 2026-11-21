@@ -2,6 +2,7 @@
 import argparse
 import contextlib
 import fcntl
+import getpass
 import http.client
 import json
 import os
@@ -12,9 +13,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from pathlib import Path
 
 from inventory import install_config, tailnet_name
+from operator_password import make_verifier
 
 UNIT = "subfloor-manager.service"
 SOURCE = Path(__file__).resolve().parent
@@ -116,6 +119,22 @@ class Manager:
             raise ValueError("manager is not installed; run ./sc manager install")
         return json.loads(self.settings.read_text())
 
+    def set_password(self, cfg):
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise ValueError("run ./sc manager password in an interactive host terminal")
+        if "password" in cfg:
+            raise ValueError("run ./sc manager update before changing the password")
+        # getpass normally falls back to echoed input on a broken terminal.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            password = getpass.getpass("New manager password: ")
+            if not 8 <= len(password) <= 256:
+                raise ValueError("choose a password of 8 to 256 characters")
+            if password != getpass.getpass("Confirm manager password: "):
+                raise ValueError("passwords differ")
+        cfg["operator_verifier"] = make_verifier(password)
+        self.save(cfg)
+
     def ready(self, cfg):
         # Never send the operator password to an unverified listener.
         for _ in range(30):
@@ -152,7 +171,7 @@ class Manager:
                 probe.bind(("127.0.0.1", port))
             cfg = {"root": str(root), "port": port, "service_id": secrets.token_hex(16),
                    "listing": str((args.urls or self.listing).expanduser().resolve()),
-                   "publisher_configured": bool(args.urls), "password": secrets.token_urlsafe(32)}
+                   "publisher_configured": bool(args.urls)}
             self.save(cfg)
         self.deploy(cfg)
         return cfg
@@ -178,6 +197,10 @@ class Manager:
                "\n[Install]\nWantedBy=default.target\n")
         systemctl("daemon-reload")
         systemctl("enable", UNIT)
+        if "password" in cfg:
+            # Upgrade preview installations without making the operator re-enroll.
+            cfg["operator_verifier"] = make_verifier(cfg.pop("password"))
+            self.save(cfg)
         systemctl("restart", UNIT)
         self.ready(cfg)
         for old in self.data.glob("release-*"):
@@ -242,7 +265,7 @@ def main(argv=None):
     install.add_argument("--urls", type=Path, help="existing publisher's urls.json")
     subs.add_parser("update", help="install the manager payload from this engine revision")
     subs.add_parser("url", help="print the local and configured private URLs")
-    subs.add_parser("password", help="show the manager password in an interactive host terminal")
+    subs.add_parser("password", help="set or reset the operator password in the host terminal")
     publish = subs.add_parser("publish", help="add a dedicated private Tailscale Serve mapping")
     publish.add_argument("--https-port", type=checked_port, required=True)
     subs.add_parser("unpublish", help="remove the manager's exact Serve mapping")
@@ -262,17 +285,18 @@ def main(argv=None):
                 manager.remove(cfg)
                 return 0
             elif args.action == "password":
-                if not (sys.stdin.isatty() and sys.stdout.isatty()):
-                    raise ValueError("run ./sc manager password in an interactive host terminal")
-                with open("/dev/tty", "w", encoding="utf-8") as terminal:
-                    terminal.write(cfg["password"] + "\n")
+                manager.set_password(cfg)
+                print("Manager password updated.")
                 return 0
             print(f"Subfloor Manager: http://127.0.0.1:{cfg['port']}/")
             if cfg.get("publication"):
                 print(f"Private manager: https://{cfg['publication']}/")
-            print("Sign in as operator. Show the password with ./sc manager password")
+            if cfg.get("operator_verifier"):
+                print("Sign in as operator.")
+            else:
+                print("Set the operator password in a host terminal with ./sc manager password")
         return 0
-    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+    except (OSError, ValueError, EOFError, getpass.GetPassWarning, subprocess.TimeoutExpired) as exc:
         parser.exit(1, f"manager {args.action}: {exc}\n")
 
 

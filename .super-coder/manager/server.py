@@ -1,6 +1,4 @@
 """Per-user manager HTTP service. All application handlers share the access gate."""
-import base64
-import hmac
 import json
 import mimetypes
 import os
@@ -12,6 +10,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from inventory import installations, inventory
+from operator_password import matches
 
 STATIC = Path(__file__).resolve().parent / "static"
 ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
@@ -59,11 +58,10 @@ class Handler(BaseHTTPRequestHandler):
                     (self.command != "GET" or self.path.startswith("/api/")))):
             self.reply(403, b'{"error":"Unexpected request origin"}')
             return False
-        expected = "Basic " + base64.b64encode(("operator:" + config["password"]).encode()).decode()
         values = self.headers.get_all("Authorization", [])
-        if len(values) != 1 or not hmac.compare_digest(values[0].encode(), expected.encode()):
+        if len(values) != 1 or not matches(values[0], config.get("operator_verifier")):
             self.reply(401, b'{"error":"Operator sign-in required"}',
-                       headers=[("WWW-Authenticate", 'Basic realm="Subfloor Manager"')])
+                       headers=[("WWW-Authenticate", 'Basic realm="Subfloor Manager", charset="UTF-8"')])
             return False
         return True
 
