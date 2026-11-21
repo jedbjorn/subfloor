@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from urllib.parse import urlsplit
 
 
@@ -12,7 +13,7 @@ def command(*args):
     try:
         return subprocess.run(args, check=False, capture_output=True, text=True, timeout=3,
                               stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
         return None
 
 
@@ -34,25 +35,32 @@ def install_config(root, repo):
     """Validate a direct, owner-held primary checkout each time it is selected."""
     engine = repo / ".super-coder"
     config = engine / "instance.json"
+    marker = repo / ".git"
     try:
         if (repo.parent != root or repo.resolve() != repo or repo.stat().st_uid != os.getuid()
-                or not (repo / ".git").is_dir() or (repo / ".git").is_symlink()):
+                or marker.is_symlink() or not (marker.is_dir() or marker.is_file())):
             return None
         for file in (config, engine / "api/server.py", repo / "sc"):
             if not file.is_file() or file.resolve() != file or file.stat().st_uid != os.getuid():
                 return None
-        raw = config.read_text()
+        git = command("git", "-C", str(repo), "--git-dir=.git", "rev-parse", "--path-format=absolute",
+                      "--git-dir", "--git-common-dir")
+        if not git or git.returncode:
+            return None
+        dirs = git.stdout.splitlines()
+        if len(dirs) != 2 or not Path(dirs[0]).samefile(dirs[1]):
+            return None
     except (OSError, RuntimeError):
         return None
     try:
-        data = json.loads(raw)
-    except ValueError:
+        data = json.loads(config.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
 def host_state(repo):
-    result = command("systemctl", "--user", "show", "--property=LoadState,ActiveState",
+    result = command("systemctl", "--user", "show", "--property=LoadState,ActiveState,MainPID",
                      "--", f"sc-review-{repo.name}.service")
     if not result:
         return "unknown"
@@ -61,13 +69,25 @@ def host_state(repo):
         return "absent"
     if result.returncode or fields.get("LoadState") != "loaded":
         return "unknown"
+    # The transient unit is named by basename. Its main process execs the
+    # Python interpreter with this installation's absolute server path.
+    pid = fields.get("MainPID", "")
+    if not pid.isdecimal() or int(pid) <= 0:
+        return "unknown"
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return "unknown"
+    if argv[1:2] != [os.fsencode(repo / ".super-coder/api/server.py")]:
+        return "unknown"
     return {"active": "running", "inactive": "stopped", "failed": "failed",
             "activating": "starting", "deactivating": "stopping"}.get(fields.get("ActiveState"), "unknown")
 
 
 def docker_state(repo):
     result = command("docker", "container", "inspect", "--format",
-                     "{{.Config.WorkingDir}}\n{{.State.Status}}", f"sc-{repo.name}")
+                     '{{range .Mounts}}{{if and (eq .Type "bind") (eq .Destination $.Config.WorkingDir)}}'
+                     '{{.Source}}{{end}}{{end}}\n{{.Config.WorkingDir}}\n{{.State.Status}}', f"sc-{repo.name}")
     if not result:
         return "unknown"
     if result.returncode:
@@ -76,29 +96,35 @@ def docker_state(repo):
                    f"no such object: sc-{repo.name}".lower())
         return "absent" if error.endswith(missing) else "unknown"
     parts = result.stdout.strip().splitlines()
-    if len(parts) != 2 or parts[0] != str(repo):
+    if len(parts) != 3 or parts[:2] != [str(repo), str(repo)]:
         return "unknown"
     return {"running": "running", "created": "stopped", "exited": "stopped",
-            "dead": "failed", "paused": "paused", "restarting": "starting"}.get(parts[1], "unknown")
+            "dead": "failed", "paused": "paused", "restarting": "starting"}.get(parts[2], "unknown")
 
 
-def supervisor(repo, config):
+def configured_runtime(repo, config):
     mode = config.get("runtime")
     if mode == "host":
-        return "host", host_state(repo)
-    if mode == "sandbox":
-        return "docker", docker_state(repo)
-    if mode is not None:
+        return "host"
+    if mode == "sandbox" or (mode is None and config and (repo / ".super-coder/scripts/runtime.py").is_file()):
+        return "docker"
+    return "unknown"
+
+
+def supervisor(repo, configured):
+    states = {"host": host_state(repo), "docker": docker_state(repo)}
+    active = [(name, state) for name, state in states.items()
+              if state in ("running", "starting", "stopping", "paused")]
+    if len(active) == 2:
         return "unknown", "unknown"
-    host, docker = host_state(repo), docker_state(repo)
-    observed = [(runtime, state) for runtime, state in (("host", host), ("docker", docker))
-                if state not in ("absent", "unknown")]
-    if len(observed) == 1:
-        return observed[0]
-    # Engines with the runtime selector default to sandbox when the key is absent.
-    if not observed and (repo / ".super-coder/scripts/runtime.py").is_file():
-        return "docker", docker
-    return "unknown", "unknown"
+    if active:
+        return active[0]
+    if "unknown" in states.values():
+        return configured, "unknown"
+    if configured in states:
+        return configured, states[configured]
+    observed = [(name, state) for name, state in states.items() if state != "absent"]
+    return observed[0] if len(observed) == 1 else ("unknown", "unknown")
 
 
 def gui_health(url, repo, config):
@@ -118,6 +144,10 @@ def gui_health(url, repo, config):
         if (data.get("repo") != expected or data.get("repo_root") != str(repo)
                 or data.get("port") != config.get("port")):
             return "identity mismatch"
+        connection.request("GET", "/")
+        page = connection.getresponse()
+        if page.status != 200 or page.headers.get_content_type() != "text/html" or not page.read(1):
+            return "unavailable"
         return "healthy"
     except ConnectionRefusedError:
         return "no listener"
@@ -152,7 +182,8 @@ def inventory(root, listing, published=False):
 
     def observe(item):
         repo, cfg = item
-        runtime, state = supervisor(repo, cfg)
+        configured = configured_runtime(repo, cfg)
+        runtime, state = supervisor(repo, configured)
         port = cfg.get("port")
         valid = type(port) is int and 1024 <= port <= 65535
         local = f"http://127.0.0.1:{port}" if valid else None
@@ -169,7 +200,8 @@ def inventory(root, listing, published=False):
                 publication = "verified" if status == "healthy" else status
             else:
                 url, publication = None, "unverified"
-        return {"name": repo.name, "path": str(repo), "runtime": runtime, "state": state,
+        return {"name": repo.name, "path": str(repo), "runtime": runtime, "configured_runtime": configured,
+                "state": state,
                 "health": health, "publication": publication, "published_url": url,
                 "local_url": local if health == "healthy" else None,
                 "open_url": url if publication == "verified" else None}

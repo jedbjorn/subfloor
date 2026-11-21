@@ -14,7 +14,7 @@ For fresh setup, `./sc install --manager` enables the manager after the repo ins
 
 ## Inventory
 
-Each row shows the canonical checkout path, runtime, supervisor observation, GUI health and publication state. Open becomes available when the destination's health response identifies the checkout. A local browser can use a verified loopback GUI without Tailscale. From a remote browser, Open uses the verified private URL.
+Each row shows the canonical checkout path, runtime, supervisor observation, GUI health and publication state. After a runtime switch, the row shows the backend still running and the configured backend for the next launch. If both backends are active, the runtime is ambiguous. Open becomes available when the destination identifies the checkout at `/api/health` and serves an HTML page at `/`. A local browser can use a verified loopback GUI without Tailscale. From a remote browser, Open uses the verified private URL.
 
 The manager reads the publisher's `~/.local/state/subfloor-tailnet/urls.json`. Supply `--urls /path/to/urls.json` at initial manager setup for a different listing. If the list disappears or a published URL stops answering, the repo still appears. An inactive or absent supervisor and a refused local connection identify a stopped service. An inaccessible supervisor leaves service state unknown.
 

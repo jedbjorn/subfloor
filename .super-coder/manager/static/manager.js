@@ -19,6 +19,11 @@ function installationRow(installation) {
     const td = cell(row, value === "docker" ? "Docker" : value[0].toUpperCase() + value.slice(1));
     if (["running", "healthy", "verified"].includes(value)) td.classList.add("good");
   }
+  if (installation.configured_runtime !== "unknown" && installation.configured_runtime !== installation.runtime) {
+    const selection = document.createElement("small");
+    selection.textContent = `Configured for ${installation.configured_runtime === "host" ? "Host" : "Docker"}`;
+    row.cells[1].append(selection);
+  }
   if (installation.published_url) {
     const address = document.createElement("small");
     address.textContent = installation.published_url;

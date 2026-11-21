@@ -26,11 +26,11 @@ def modules(monkeypatch):
     return importlib.import_module("inventory"), importlib.import_module("manage")
 
 
-def checkout(root, name, port=8765, runtime="host"):
+def checkout(root, name, port=8765, runtime="host", git_options=()):
     repo = root / name
     api = repo / ".super-coder/api"
     api.mkdir(parents=True)
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "init", "-q", *git_options, str(repo)], check=True)
     (api / "server.py").write_text("")
     shutil.copy2(ROOT / "sc", repo / "sc")
     config = {"port": port, "repo": name}
@@ -57,13 +57,15 @@ def free_port():
 
 
 @contextlib.contextmanager
-def gui(repo, port):
+def gui(repo, port, root_status=200, *, identity_port=None):
     class Health(BaseHTTPRequestHandler):
         def do_GET(self):
-            data = {"ok": True, "port": port, "repo": repo.name, "repo_root": str(repo)}
-            self.send_response(200 if self.path == "/api/health" else 404)
+            data = {"ok": True, "port": identity_port or port, "repo": repo.name, "repo_root": str(repo)}
+            health = self.path == "/api/health"
+            self.send_response(200 if health else root_status if self.path == "/" else 404)
+            self.send_header("Content-Type", "application/json" if health else "text/html")
             self.end_headers()
-            self.wfile.write(json.dumps(data).encode())
+            self.wfile.write(json.dumps(data).encode() if health else b"<!doctype html><title>Review</title>")
 
         def log_message(self, *_):
             pass
@@ -82,14 +84,20 @@ def test_discovery_and_independent_observations(tmp_path, modules, monkeypatch):
     inv, _ = modules
     port = free_port()
     repos = tmp_path / "repos"
-    running = checkout(repos, "running", port, None)
+    running = checkout(repos, "running", port, "host", ("--separate-git-dir", str(tmp_path / "gitdir")))
+    assert (running / ".git").is_file()
     stranger = checkout(repos, "wrong-target", port)
     stopped = checkout(repos, "stopped", free_port())
     offline = checkout(repos, "docker-offline", free_port(), "sandbox")
     unknown = checkout(repos, "ambiguous", free_port(), None)
-    linked = checkout(repos, "linked")
-    shutil.rmtree(linked / ".git")
-    (linked / ".git").write_text("gitdir: elsewhere")
+    damaged = checkout(repos, "damaged")
+    (damaged / ".super-coder/instance.json").write_bytes(b'{"repo": "\xff"}')
+    subprocess.run(["git", "-C", str(running), "add", ".super-coder", "sc"], check=True)
+    subprocess.run(["git", "-C", str(running), "-c", "user.name=Fixture", "-c", "user.email=test@localhost",
+                    "commit", "-qm", "fixture"], check=True)
+    linked = repos / "linked"
+    subprocess.run(["git", "-C", str(running), "worktree", "add", "-q", "--detach", str(linked)], check=True)
+    assert (linked / ".git").is_file() and (linked / ".super-coder/instance.json").is_file()
     alias = repos / "alias"
     alias.symlink_to(running, target_is_directory=True)
     (repos / "launcher-only").mkdir()
@@ -97,10 +105,14 @@ def test_discovery_and_independent_observations(tmp_path, modules, monkeypatch):
     listing = tmp_path / "publisher/urls.json"
     listing.parent.mkdir()
 
+    real_command = inv.command
+
     def supervisor(*args):
+        if args[0] == "git":
+            return real_command(*args)
         if args[0] == "docker":
             if args[-1] == "sc-running":
-                return subprocess.CompletedProcess(args, 0, f"{running}\nrunning\n", "")
+                return subprocess.CompletedProcess(args, 0, f"{running}\n{running}\nrunning\n", "")
             if args[-1] == "sc-docker-offline":
                 return subprocess.CompletedProcess(args, 1, "", "dial unix /run/docker.sock: no such file or directory")
             return subprocess.CompletedProcess(args, 1, "", f"Error: No such container: {args[-1]}")
@@ -110,7 +122,10 @@ def test_discovery_and_independent_observations(tmp_path, modules, monkeypatch):
     monkeypatch.setattr(inv, "command", supervisor)
     with gui(running, port):
         rows = {row["name"]: row for row in inv.inventory(repos, listing)}
-        assert set(rows) == {r.name for r in (running, stranger, stopped, offline, unknown)}
+        assert set(rows) == {r.name for r in (running, stranger, stopped, offline, unknown, damaged)}
+        assert rows[damaged.name]["health"] == "invalid port"
+        assert rows[damaged.name]["local_url"] is None
+        assert rows[running.name]["configured_runtime"] == "host"
         assert rows[running.name]["runtime"] == "docker"
         assert rows[running.name]["state"] == "running"
         assert rows[running.name]["local_url"] == f"http://127.0.0.1:{port}"
@@ -122,7 +137,7 @@ def test_discovery_and_independent_observations(tmp_path, modules, monkeypatch):
         assert rows[unknown.name]["runtime"] == "unknown"
         (unknown / ".super-coder/scripts").mkdir()
         (unknown / ".super-coder/scripts/runtime.py").touch()
-        assert inv.supervisor(unknown, {}) == ("docker", "absent")
+        assert inv.configured_runtime(unknown, {"port": rows_port(unknown)}) == "docker"
 
         monkeypatch.setattr(inv, "tailnet_name", lambda: "host.test.ts.net")
         health = inv.gui_health
@@ -149,6 +164,62 @@ def test_discovery_and_independent_observations(tmp_path, modules, monkeypatch):
 
 def rows_port(repo):
     return json.loads((repo / ".super-coder/instance.json").read_text())["port"]
+
+
+def test_supervisor_attributes_live_backends_to_checkout(tmp_path, modules, monkeypatch):
+    inv, _ = modules
+    repo = checkout(tmp_path, "service", runtime="sandbox")
+    other = checkout(tmp_path / "elsewhere", "service")
+    server = repo / ".super-coder/api/server.py"
+    server.write_text("import time\ntime.sleep(60)\n")
+    with subprocess.Popen([sys.executable, str(server)]) as process:
+        try:
+            source = other
+
+            def show(*args):
+                if args[0] == "systemctl":
+                    fields = f"LoadState=loaded\nActiveState=active\nMainPID={process.pid}"
+                else:
+                    assert args[0] == "docker"
+                    fields = f"{source}\n{repo}\nrunning"
+                return subprocess.CompletedProcess(args, 0, fields, "")
+
+            monkeypatch.setattr(inv, "command", show)
+            assert inv.supervisor(repo, "docker") == ("host", "running")
+            assert inv.host_state(other) == "unknown"
+            assert inv.docker_state(repo) == "unknown"
+            source = repo
+            assert inv.supervisor(repo, "docker") == ("unknown", "unknown")
+        finally:
+            process.terminate()
+
+
+@pytest.mark.parametrize(("local_status", "public_status"), [(200, 404), (404, 200), (404, 404)])
+def test_open_checks_gui_root_at_each_authority(tmp_path, modules, monkeypatch, local_status, public_status):
+    inv, _ = modules
+    port = free_port()
+    root = tmp_path / "repos"
+    repo = checkout(root, "sample", port)
+    dns = "host.test.ts.net"
+    public_url = f"https://{dns}:{port}"
+    listing = tmp_path / "urls.json"
+    listing.write_text(json.dumps([{"repo": repo.name, "url": public_url}]))
+    monkeypatch.setattr(inv, "tailnet_name", lambda: dns)
+    monkeypatch.setattr(inv, "supervisor", lambda *_: ("host", "unknown"))
+    with gui(repo, port, local_status):
+        public_port = free_port()
+
+        def published_connection(name, target_port, timeout):
+            assert (name, target_port) == (dns, port)
+            return http.client.HTTPConnection("127.0.0.1", public_port, timeout=timeout)
+
+        monkeypatch.setattr(http.client, "HTTPSConnection", published_connection)
+        with gui(repo, public_port, public_status, identity_port=port):
+            row, = inv.inventory(root, listing)
+    assert row["health"] == ("healthy" if local_status == 200 else "unavailable")
+    assert row["local_url"] == (f"http://127.0.0.1:{port}" if local_status == 200 else None)
+    assert row["publication"] == ("verified" if public_status == 200 else "unavailable")
+    assert row["open_url"] == (public_url if public_status == 200 else None)
 
 
 def stage_package(repo):
@@ -384,16 +455,26 @@ def test_manager_browser_refresh_and_navigation(tmp_path, modules, monkeypatch):
         pytest.skip("optional local Chromium seat")
     fixture_bin = tmp_path / "bin"
     fixture_bin.mkdir()
-    for name in ("systemctl", "docker"):
-        cmd = fixture_bin / name
-        cmd.write_text("#!/bin/sh\necho LoadState=not-found\nexit 4\n")
-        cmd.chmod(0o700)
+    systemctl = fixture_bin / "systemctl"
+    systemctl.write_text("#!/bin/sh\necho LoadState=not-found\nexit 4\n")
+    systemctl.chmod(0o700)
     monkeypatch.setenv("PATH", f"{fixture_bin}:{os.environ['PATH']}")
     port = free_port()
     root = tmp_path / "repos"
     gui_port = free_port()
     repo = checkout(root, "sample", gui_port)
     stopped = checkout(root, "offline", free_port())
+    docker = fixture_bin / "docker"
+    docker.write_text(f"""#!/bin/sh
+for name do :; done
+if [ "$name" = sc-sample ]; then
+    printf '%s\\n' {shlex.quote(str(repo))} {shlex.quote(str(repo))} running
+else
+    echo "No such container: $name" >&2
+    exit 1
+fi
+""")
+    docker.chmod(0o700)
     static = tmp_path / "package"
     shutil.copytree(PACKAGE, static)
     fixture_analytics(static)
@@ -412,6 +493,9 @@ def test_manager_browser_refresh_and_navigation(tmp_path, modules, monkeypatch):
         const offline = page.locator('tr[data-repo="offline"]');
         await active.getByRole('link', {name:"Open"}).waitFor();
         if (await active.getByRole('link').getAttribute('href') !== process.argv[4]) throw Error("wrong link");
+        const runtime = await active.getByRole("cell").nth(1).innerText();
+        if (!runtime.startsWith("Docker") || !runtime.includes("Configured for Host"))
+          throw Error("runtime switch lost: " + runtime);
         if (!(await offline.innerText()).includes("Stopped") || await offline.getByRole('link').count())
           throw Error("stopped row lost supervisor state");
         await page.getByRole("button", {name:"Refresh"}).click();
