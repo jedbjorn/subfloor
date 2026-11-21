@@ -352,6 +352,25 @@ class FreshForkInstallTest(unittest.TestCase):
             self.assertTrue((private_root / "database-generation").is_file())
             self.assertFalse((private_root / "relocation.json").exists())
             self.assertFalse((repo / ".super-coder/shell_db.db").exists())
+            manager = repo / ".super-coder/manager"
+            self.assertTrue((manager / "server.py").is_file())
+            self.assertTrue((manager / "token_analytics/static/app.js").is_file())
+            manager_help = subprocess.run(
+                [str(repo / "sc"), "manager", "--help"],
+                cwd=repo,
+                env={**os.environ, "HOME": str(home), "SC_PYTHON": sys.executable},
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(manager_help.returncode, 0, manager_help.stderr)
+            self.assertIn("install", manager_help.stdout)
+            self.assertIn("publish", manager_help.stdout)
+            self.assertFalse((home / ".local/share/subfloor-manager").exists())
+            self.assertFalse(
+                (home / ".config/systemd/user/subfloor-manager.service").exists()
+            )
 
             reinstalled = self.run_install(repo, home)
             self.assertEqual(
