@@ -1318,7 +1318,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|engine-ops|engine-ops-up|engine-ops-down|engine-ops-port|engine-ops-pin|auth|db|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  manager|install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|token|persist|job|visual-qa|actions-artifacts|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|engine-ops|engine-ops-up|engine-ops-down|engine-ops-port|engine-ops-pin|auth|db|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1330,6 +1330,9 @@ case "$cmd" in
 esac
 
 case "$cmd" in
+  manager)         sc_help_form "$@" || sc_refuse_linked manager "the host user's manager"
+                   sc_help_form "$@" || sc_refuse_sandbox manager
+                   exec "$PY" "$ENGINE/manager/manage.py" "$@" ;;
   install)         exec "$PY" "$S/install.py" "$@" ;;
   harness-cleanup) exec "$PY" "$S/global_pointer.py" "$@" ;;
   ensure-harness)  exec "$PY" "$S/install.py" --ensure-harness ;;
@@ -2191,6 +2194,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
 
   Sandbox (docker — the default way to run; allow-everything is safe because the
   container only sees this repo + your harness creds):
+  ./sc manager install     enable the optional per-user GUI; ./sc manager --help lists manager commands
   ./sc runtime [mode]      show or select the lifecycle runtime: sandbox (docker, the default) · host
                              (review server as a transient systemd user service + shells booted on this host;
                              no docker anywhere). launch/enter/down/restart/logs/build/update-harnesses/

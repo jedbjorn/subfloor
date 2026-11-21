@@ -86,6 +86,10 @@ Follow the **[quick start](docs/quick-start.md)** for harness sign-in, the first
 Cartographer and Planner sessions, and your first reviewed PR. Use
 `subfloor admin` from the host checkout for maintenance.
 
+For the optional per-user installation inventory, run `./sc manager install` from
+a primary checkout, or choose `./sc install --manager` during fresh setup.
+[Manager setup and private access](.super-coder/docs/manager.md)
+
 ## Native agent sessions
 
 Native `claude`, `codex`, `opencode`, `kimi` and `vibe` commands from a normal
