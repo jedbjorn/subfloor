@@ -6,6 +6,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
   project TEXT PRIMARY KEY, repo TEXT,
   pulled_at TEXT, error TEXT, warnings TEXT);
+CREATE TABLE IF NOT EXISTS current_pins (project TEXT PRIMARY KEY, ref TEXT);
 CREATE TABLE IF NOT EXISTS usage (
   project TEXT NOT NULL, usage_id INTEGER NOT NULL,
   harness TEXT, harness_session_ref TEXT, provider TEXT, model TEXT, title TEXT,
@@ -63,10 +64,16 @@ def ingest(con, p):
     con.execute("INSERT INTO projects(project) VALUES (?) ON CONFLICT DO NOTHING", (name,))
     con.execute("UPDATE projects SET repo=? WHERE project=?",
                 (p["repo"], name))
+    if "current_ref" in p:
+        con.execute("INSERT INTO current_pins(project,ref) VALUES (?,?) "
+                    "ON CONFLICT(project) DO UPDATE SET ref=excluded.ref", (name, p["current_ref"]))
     for ref in p.get("engine_refs", []):
-        if ref["event"] != ref["ref"]:
-            con.execute("DELETE FROM engine_updates WHERE project=? AND event=?",
-                        (name, ref["ref"]))
+        # A commit can confirm a previously observed file event. Replace
+        # only that dated marker, including markers from older cache versions.
+        sha, landed = ref["ref"], ref["landed_at"]
+        con.execute("DELETE FROM engine_updates WHERE project=? AND event IN (?,?) "
+                    "AND ref=? AND landed_at=? AND event!=?",
+                    (name, sha, f"pin:{sha}:{landed}", sha, landed, ref["event"]))
         con.execute("INSERT INTO engine_updates(project, event, ref, landed_at, subject) "
                     "VALUES (?,?,?,?,?) ON CONFLICT(project,event) DO UPDATE SET "
                     "subject=COALESCE(excluded.subject, subject)",
@@ -224,9 +231,10 @@ def status(con):
     projects = rows(con.execute(
         "SELECT p.project, p.pulled_at, p.error, p.warnings, "
         "(SELECT COUNT(*) FROM usage u WHERE u.project=p.project) AS usage_rows, "
+        "CASE WHEN c.project IS NOT NULL THEN c.ref ELSE "
         "(SELECT e.ref FROM engine_updates e WHERE e.project=p.project "
-        " ORDER BY e.landed_at DESC LIMIT 1) AS engine_ref "
-        "FROM projects p ORDER BY p.project"))
+        " ORDER BY e.landed_at DESC LIMIT 1) END AS engine_ref "
+        "FROM projects p LEFT JOIN current_pins c ON c.project=p.project ORDER BY p.project"))
     last = con.execute("SELECT * FROM pulls ORDER BY pull_id DESC LIMIT 1").fetchone()
     last_ok = con.execute("SELECT finished_at FROM pulls WHERE ok=1 ORDER BY pull_id DESC LIMIT 1").fetchone()
     return {"projects": projects, "last_pull": dict(last) if last else None,

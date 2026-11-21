@@ -43,14 +43,18 @@ def git(repo, *args, date=None):
                                   text=True, env=env).strip()
 
 
-def pin(repo, ref, when):
+def write_pin(repo, ref, when):
     path = repo / ".sc-state" / "engine.ref"
     path.parent.mkdir(exist_ok=True)
     path.write_text(ref + "\n")
-    git(repo, "add", ".sc-state/engine.ref")
-    git(repo, "commit", "-qm", "Pin engine", date=when)
     epoch = datetime.fromisoformat(when).timestamp()
     os.utime(path, (epoch, epoch))
+
+
+def pin(repo, ref, when):
+    write_pin(repo, ref, when)
+    git(repo, "add", ".sc-state/engine.ref")
+    git(repo, "commit", "-qm", "Pin engine", date=when)
 
 
 @pytest.fixture
@@ -124,6 +128,8 @@ def test_project_history_and_retry(history):
     assert {r["subject"] for r in manager.read("engine-updates")["updates"]} == {"Engine one", "Engine two"}
     # Re-pinning a previously used revision is a separate dated event.
     pin(h.repos[0], h.refs[0], h.times[2])
+    pin(h.repos[1], h.refs[1], h.times[2])
+    manager.repositories = lambda: reversed(h.repos)  # collect the failing project first
     h.dbs[1].rename(h.dbs[1].with_suffix(".offline"))
     with closing(sqlite3.connect(h.dbs[0])) as con, con:
         con.execute("UPDATE session_token_usage SET input_tokens=12")
@@ -131,7 +137,10 @@ def test_project_history_and_retry(history):
     assert RETRY - 3 <= manager.seconds_until_due() <= RETRY
     restarted = Analytics(h.cache, lambda: h.repos, engine_repo=h.upstream)
     assert restarted.read("sessions", query)["sessions"][0]["input_tokens"] == 20
-    assert "missing" in restarted.read("status")["projects"][1]["error"]
+    beta = restarted.read("status")["projects"][1]
+    assert "missing" in beta["error"]
+    assert beta["engine_ref"] == h.refs[1]
+    assert restarted.read("engine-updates", query)["updates"][0]["landed_at"] == h.times[2]
     assert len(restarted.read("engine-updates", {"project": ["alpha"]})["updates"]) == 3
     assert restarted.read("sessions", {"project": ["alpha"]})["sessions"][0]["input_tokens"] == 12
     h.dbs[1].with_suffix(".offline").rename(h.dbs[1])
@@ -145,13 +154,47 @@ def test_side_read_failure_and_relocation_hold(history):
     with closing(sqlite3.connect(h.dbs[0])) as con, con:
         con.execute("DROP TABLE runs")
     receipt = h.dbs[1].parent / "relocation.json"
+    pin(h.repos[1], h.refs[1], h.times[2])
     receipt.write_text(json.dumps({"instance_id": "b" * 32, "status": "publishing"}))
     assert not h.manager.refresh()["ok"]
     status = h.manager.read("status")["projects"]
     assert "activity agent" in status[0]["warnings"]
     assert "relocation_incomplete" in status[1]["error"]
+    assert status[1]["engine_ref"] == h.refs[1]
+    assert h.manager.read("engine-updates", {"project": ["beta"]})["updates"][0]["ref"] == h.refs[1]
     assert len(h.manager.read("activity")["activity"]) == 4
     assert [s["usage_rows"] for s in status] == [1, 1]
+
+
+def test_unreadable_database_keeps_sessions_and_collects_new_pin(history):
+    h = history
+    beta = {"project": ["beta"]}
+    assert h.manager.refresh()["ok"]
+    sessions = h.manager.read("sessions", beta)
+    pin(h.repos[1], h.refs[1], h.times[2])
+    h.dbs[1].write_bytes(b"corrupt fixture")
+    assert not h.manager.refresh()["ok"]
+    assert "not a database" in h.manager.read("status")["projects"][1]["error"]
+    assert h.manager.read("sessions", beta) == sessions
+    update = h.manager.read("engine-updates", beta)["updates"][0]
+    assert (update["ref"], update["landed_at"]) == (h.refs[1], h.times[2])
+
+
+def test_working_rollback(history):
+    h = history
+    query = {"project": ["alpha"]}
+    assert h.manager.refresh()["ok"]
+    write_pin(h.repos[0], h.refs[0], h.times[2])
+    expected = [(h.refs[0], h.times[2]), (h.refs[1], h.times[1]), (h.refs[0], h.times[0])]
+    for _ in range(2):
+        assert h.manager.refresh()["ok"]
+        updates = h.manager.read("engine-updates", query)["updates"]
+        assert [(row["ref"], row["landed_at"]) for row in updates] == expected
+        assert h.manager.read("status")["projects"][0]["engine_ref"] == h.refs[0]
+    # Committing the already observed rollback at the same time confirms one event.
+    pin(h.repos[0], h.refs[0], h.times[2])
+    assert h.manager.refresh()["ok"]
+    assert h.manager.read("engine-updates", query)["updates"] == updates
 
 
 def test_schedule_recovers_after_inventory_error(history):
@@ -196,19 +239,34 @@ def test_reference_parity(history, tmp_path, monkeypatch):
     with closing(ref.connect()) as con:
         for fail_beta in (False, True):
             if fail_beta:
+                write_pin(h.repos[0], h.refs[0], h.times[2])
+                pin(h.repos[1], h.refs[1], h.times[2])
                 h.dbs[1].rename(h.dbs[1].with_suffix(".offline"))
+                with closing(sqlite3.connect(h.dbs[0])) as alpha, alpha:
+                    alpha.execute("UPDATE session_token_usage SET input_tokens=12")
             payload = json.loads(subprocess.check_output([sys.executable, "-B", source / "remote_extract.py"]))
             with con:
                 ref.ingest(con, payload)
             assert h.manager.refresh()["ok"] != fail_beta
             for q in ({}, {"project": ["alpha"]}, {"project": ["beta"]}):
-                for route in ("sessions", "usage", "activity", "filters", "engine-updates"):
+                for route in ("sessions", "usage", "activity", "filters"):
                     expected = getattr(ref, route.replace("-", "_"))(con, q)
                     assert h.manager.read(route, q) == expected
+                # The reference extractor retains dated rollbacks to old SHAs.
+                # Its cache keeps only the first marker it sees for each SHA.
+                markers = h.manager.read("engine-updates", q)
+                if not fail_beta or q.get("project") == ["beta"]:
+                    assert markers == ref.engine_updates(con, q)
+                events = {(p["project"], r["ref"], r["landed_at"])
+                          for p in payload["projects"] if not q or p["project"] in q["project"]
+                          for r in p["engine_refs"]}
+                assert sorted((r["project"], r["ref"], r["landed_at"]) for r in markers["updates"]) == sorted(events)
             expected = ref.status(con)["projects"]
             actual = h.manager.read("status")["projects"]
             assert [(p["project"], p["usage_rows"], bool(p["error"])) for p in expected] == [
                 (p["project"], p["usage_rows"], bool(p["error"])) for p in actual]
+            assert {p["project"]: p["engine_ref"] for p in actual} == {
+                p["project"]: r["ref"] for p in payload["projects"] for r in p["engine_refs"] if r["current"]}
 
 
 def test_dashboard_project_switch_and_refresh(history):

@@ -99,17 +99,21 @@ def engine_refs(repo, engine_repo):
         elif line.startswith("+") and SHA.fullmatch(line[1:].strip()):
             landed = datetime.fromtimestamp(int(epoch), timezone.utc)
             refs.append({"event": commit, "ref": line[1:].strip(), "landed_at": iso(landed.isoformat())})
-    known = {r["ref"] for r in refs}
-    # An uncommitted pin or a pre-history install still has a useful marker.
+    known = {(r["ref"], r["landed_at"]) for r in refs}
+    current = None
     for name in ("engine.ref", "engine.ref.prev"):
         path = repo / ".sc-state" / name
         if path.resolve() != path or not path.is_file():
             continue
         ref = path.read_text().strip()
-        if SHA.fullmatch(ref) and ref not in known:
-            landed = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-            refs.append({"event": ref, "ref": ref, "landed_at": iso(landed.isoformat())})
-            known.add(ref)
+        if not SHA.fullmatch(ref):
+            continue
+        if name == "engine.ref":
+            current = ref
+        landed_at = iso(datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat())
+        if (ref, landed_at) not in known:
+            refs.append({"event": f"pin:{ref}:{landed_at}", "ref": ref, "landed_at": landed_at})
+            known.add((ref, landed_at))
     subjects = {}
     for checkout in dict.fromkeys((engine_repo, repo)):
         wanted = {r["ref"] for r in refs} - subjects.keys()
@@ -130,7 +134,7 @@ def engine_refs(repo, engine_repo):
             subjects.update(line.split("\t", 1) for line in log.splitlines() if "\t" in line)
     for row in refs:
         row["subject"] = subjects.get(row["ref"])
-    return refs
+    return refs, current
 
 
 def file_version(path):
@@ -167,9 +171,17 @@ def extract(repo, engine_repo=None):
     if engine.resolve() != engine or repo.stat().st_uid != os.geteuid():
         raise ValueError("expected an owner-local primary checkout")
     try:
-        out["engine_refs"] = engine_refs(repo, engine_repo)
+        out["engine_refs"], out["current_ref"] = engine_refs(repo, engine_repo)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         out["errors"].append(f"pin history: {exc}")
+    try:
+        read_project_database(engine, out)
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        out["fatal"] = str(exc)
+    return out
+
+
+def read_project_database(engine, out):
     path = active_database_path(engine)
     if path.resolve() != path or not path.is_file() or path.stat().st_uid != os.geteuid():
         raise ValueError("engine database missing or outside its owner namespace")
@@ -180,7 +192,6 @@ def extract(repo, engine_repo=None):
             except sqlite3.Error as exc:
                 if key == "usage":
                     out["fatal"] = f"usage read failed: {exc}"
-                    return out
+                    return
                 out["errors"].append(f"{key}: {exc}")
         activity(con, out)
-    return out
