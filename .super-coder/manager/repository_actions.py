@@ -19,7 +19,7 @@ from inventory import (
     installations,
 )
 from manage import atomic
-from provision import COMMIT, SOURCE, identity, prepared, primary, provision
+from provision import COMMIT, SCAFFOLDS, SOURCE, identity, prepared, primary, provision
 
 COMMANDS = {"start": ["launch"], "stop": ["down"], "restart": ["restart", "--yes"]}
 PROVISION = ("install", "create")
@@ -51,28 +51,33 @@ def service_state(repo, cfg):
         raise Conflict("Cannot attribute an idle or running supervisor to this checkout. Refresh inventory.")
     health = gui_health(f"http://127.0.0.1:{port}", repo, cfg)
     if health == "no listener" and own in ("absent", "stopped", "failed"):
-        return "stopped"
+        return "stopped", health
     if own == "running" and health in ("healthy", "no listener", "unavailable"):
-        return "running"
+        return "running", health
     raise Conflict("The GUI listener and supervisor do not identify the selected installation.")
 
 
-def verify_state(repo, expected):
+def verify_state(repo, expected, instance):
     # A supervisor may return before its child has exec'd or its unit has
     # been collected. Retry only the observation.
     deadline = time.monotonic() + 8
     while True:
         cfg = install_config(repo.parent, repo)
-        if not cfg:
-            raise ValueError("The installation disappeared during the operation.")
+        if not cfg or cfg.get("instance_id") != instance:
+            raise ValueError("The selected installation changed during the operation.")
         try:
-            if service_state(repo, cfg) == expected:
+            state, health = service_state(repo, cfg)
+        except Conflict as exc:
+            failure = str(exc)
+        else:
+            if state == expected and (expected == "stopped" or health == "healthy"):
                 return
-        except Conflict:
-            if time.monotonic() >= deadline:
-                raise
+            failure = f"Command returned without a confirmed {expected} service."
+            if expected == "running" and state == "running":
+                failure = (f"Supervisor is running but its GUI reports {health}. "
+                           "Inspect command output, restart the installation, then retry.")
         if time.monotonic() >= deadline:
-            raise ValueError(f"Command returned without a confirmed {expected} service.")
+            raise ValueError(failure)
         time.sleep(.25)
 
 
@@ -94,8 +99,12 @@ def dry_run(repo):
     output = result.stdout + result.stderr
     if result.returncode:
         raise Conflict(output.strip() or "Engine removal preflight refused.")
-    if not any(line.strip() == f"repository : {repo}" for line in output.splitlines()):
+    plan = {line.strip() for line in output.splitlines()}
+    if f"repository : {repo}" not in plan:
         raise Conflict("The engine did not confirm the canonical removal target in its dry-run.")
+    if ("scaffolds  : remove only unchanged installer-owned placeholders" not in plan
+            and any(os.path.lexists(repo / name) for name in SCAFFOLDS)):
+        raise Conflict("Update this checkout’s engine before removal so it can preserve project placeholders.")
     return output
 
 
@@ -118,6 +127,7 @@ class Actions:
         atomic(self.directory / (record["id"] + ".result"), json.dumps(record))
 
     def finish(self, record):
+        record["finished"] = time.time()
         log = self.directory / (record["id"] + ".log")
         if record["action"] == "remove" and log.is_file():
             # Keep engine-reported destinations even if long output rolls out
@@ -165,11 +175,12 @@ class Actions:
         if instance and any(other != repo and config.get("instance_id") == instance
                             for other, config in installations(self.root)):
             raise Conflict("Another checkout uses this installation identity. Resolve the duplicate first.")
-        key = [primary(repo), identity(repo / ".super-coder"), identity(repo / "sc"),
-               cfg.get("instance_id"), cfg.get("installed_at"), cfg.get("runtime"), cfg.get("port")]
+        key = {"primary": primary(repo), "engine": identity(repo / ".super-coder"), "sc": identity(repo / "sc"),
+               "instance": instance, "installed_at": cfg.get("installed_at"), "runtime": cfg.get("runtime"),
+               "port": cfg.get("port")}
         if action == "remove":
             return key, dry_run(repo)
-        state = service_state(repo, cfg)
+        state, _ = service_state(repo, cfg)
         required = "stopped" if action == "start" else "running"
         if state != required:
             raise Conflict(f"This action requires a {required} installation.")
@@ -250,9 +261,12 @@ class Actions:
                 raise ValueError(f"{stage} exited with status {process.returncode}.")
 
         def launch(cfg):
-            if service_state(repo, cfg) == "stopped":
+            record.update(stage="Launch")
+            self.save(record)
+            state, _ = service_state(repo, cfg)
+            if state == "stopped":
                 run("Launch", "./sc", "launch")
-            verify_state(repo, "running")
+            verify_state(repo, "running", cfg.get("instance_id"))
 
         try:
             action = record["action"]
@@ -270,7 +284,7 @@ class Actions:
             else:
                 run(action.capitalize(), "./sc", *COMMANDS[action])
                 expected = "stopped" if action == "stop" else "running"
-                verify_state(repo, expected)
+                verify_state(repo, expected, key["instance"])
             record["status"] = "succeeded"
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             record.update(status="failed", detail=str(exc))

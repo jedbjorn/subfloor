@@ -819,6 +819,35 @@ def _write_gitignore(path: Path, text: str) -> None:
     path.write_bytes(text.encode("utf-8", errors="surrogateescape"))
 
 
+SHARED_SCAFFOLDS = (Path("shared"), Path("shared/redlines"))
+SCAFFOLD_RECEIPT = Path(".sc-state/local/install-scaffolds")
+
+
+def scaffold_identity(repo_root: Path, relative: Path) -> str:
+    stat = (repo_root / relative / ".gitkeep").lstat()
+    return f"{relative}\t{stat.st_dev}:{stat.st_ino}:{stat.st_ctime_ns}"
+
+
+def create_shared_scaffolds(repo_root: Path) -> None:
+    for relative in SHARED_SCAFFOLDS:
+        directory = repo_root / relative
+        if directory.resolve() != directory or (directory.exists() and not directory.is_dir()):
+            raise ValueError(f"Expected a project directory at {directory}")
+        if directory.exists():
+            continue
+        directory.mkdir()
+        (directory / ".gitkeep").touch(exist_ok=False)
+        # Append after creation so retries keep prior ownership and legacy
+        # installations without a receipt conservatively retain their files.
+        receipt = repo_root / SCAFFOLD_RECEIPT
+        if receipt.resolve() != receipt:
+            raise ValueError(f"Unexpected scaffold receipt path: {receipt}")
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        with receipt.open("a") as stream:
+            stream.write(scaffold_identity(repo_root, relative) + "\n")
+        print(f"  created {relative}/")
+
+
 def validate_gitignore(repo_root: Path = REPO_ROOT) -> None:
     """Fail closed on malformed ownership without changing the host file."""
     path = repo_root / ".gitignore"
@@ -1115,20 +1144,7 @@ def main(argv: list[str]) -> int:
     # boot block states its path by convention (<repo_root>/shared) — create it
     # so the path it points at exists.
     step("Creating shared/ (scratch + handoff dir)")
-    shared = REPO_ROOT / "shared"
-    if shared.exists():
-        print("  (already present)")
-    else:
-        shared.mkdir()
-        (shared / ".gitkeep").write_text("")
-        print(f"  created {shared.relative_to(REPO_ROOT)}/")
-    # redline_review's documented drop dir — create it so the skill's Step 1
-    # ("list shared/redlines/") works as written on a fresh fork.
-    redlines = shared / "redlines"
-    if not redlines.exists():
-        redlines.mkdir()
-        (redlines / ".gitkeep").write_text("")
-        print(f"  created {redlines.relative_to(REPO_ROOT)}/")
+    create_shared_scaffolds(REPO_ROOT)
 
     # 4. Strip super-coder's per-instance content -----------------------------
     step("Stripping Subfloor's per-instance content (a fork inherits the system, not the memory)")

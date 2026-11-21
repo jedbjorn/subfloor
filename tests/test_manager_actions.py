@@ -84,7 +84,7 @@ def wait_result(actions, token):
 
 def test_removal_preview_revalidation_and_recovery(operations, monkeypatch):
     mod = sys.modules["repository_actions"]
-    monkeypatch.setattr(mod, "service_state", lambda *_: "stopped")
+    monkeypatch.setattr(mod, "service_state", lambda *_: ("stopped", "no listener"))
     repo = installation(operations.root, "selected")
     neighbor = installation(operations.root, "neighbor")
     request = {"name": repo.name, "action": "remove"}
@@ -119,7 +119,7 @@ def test_interrupted_removal_retains_output_and_requires_a_new_preview(operation
     launcher = repo / "sc"
     launcher.write_text(launcher.read_text().replace(
         "  [ ! -e partial ]", "  kill -TERM $$\n  [ ! -e partial ]"))
-    monkeypatch.setattr(sys.modules["repository_actions"], "service_state", lambda *_: "stopped")
+    monkeypatch.setattr(sys.modules["repository_actions"], "service_state", lambda *_: ("stopped", "no listener"))
     preview = operations.preview({"name": repo.name, "action": "remove"})
     apply = {**preview, "confirmation": preview["phrase"]}
     operations.apply(apply)
@@ -159,7 +159,7 @@ def test_occupied_names_and_ports_leave_checkout_untouched(operations, monkeypat
 def test_lifecycle_serializes_and_recovers_interrupted_record(operations, monkeypatch):
     repo = installation(operations.root, "target")
     mod = sys.modules["repository_actions"]
-    monkeypatch.setattr(mod, "service_state", lambda *_: "running" if (repo / "up").exists() else "stopped")
+    monkeypatch.setattr(mod, "service_state", lambda *_: ("running", "healthy") if (repo / "up").exists() else ("stopped", "no listener"))
     executable(repo / "sc", """
 case "$1" in
  launch) while [ ! -e release ]; do sleep .05; done; touch up ;;
@@ -204,21 +204,32 @@ def installer(tmp_path, monkeypatch):
     executable(source / "sc", """
 case "$1" in
  install)
-  mkdir -p .super-coder/api .super-coder/scripts shared/redlines
-  touch .super-coder/api/server.py shared/.gitkeep shared/redlines/.gitkeep
+  mkdir -p .super-coder/api .super-coder/scripts
+  for dir in shared shared/redlines; do
+    if [ ! -d "$dir" ]; then mkdir "$dir"; touch "$dir/.gitkeep"; fi
+  done
+  touch .super-coder/api/server.py
   echo sc >> .gitignore
-  echo "{\\"runtime\\":\\"$3\\",\\"installed_at\\":\\"now\\",\\"instance_id\\":\\"fixture\\"}" > .super-coder/instance.json
+  echo "{\\"port\\":17833,\\"runtime\\":\\"$3\\",\\"installed_at\\":\\"now\\",\\"instance_id\\":\\"fixture\\"}" > .super-coder/instance.json
   echo install >> calls ;;
  launch)
+  if [ -e retain ]; then touch up; exit 7; fi
   test ! -e deny || exit 7
   touch up; echo launch >> calls ;;
+ restart) test -e up; rm -f retain ;;
 esac
 """)
     git(source, "add", "sc")
     git(source, "commit", "-m", "fixture launcher")
     monkeypatch.setattr(bootstrap, "SOURCE", source.as_uri())
     monkeypatch.setattr(mod, "SOURCE", source.as_uri())
-    monkeypatch.setattr(mod, "service_state", lambda repo, _: "running" if (repo / "up").exists() else "stopped")
+    def state(repo):
+        return "running" if (repo / "up").exists() else "absent"
+
+    monkeypatch.setattr(mod, "host_state", lambda repo: state(repo) if mod.install_config(repo.parent, repo)["runtime"] == "host" else "absent")
+    monkeypatch.setattr(mod, "docker_state", lambda repo, optional: "absent" if optional else state(repo))
+    monkeypatch.setattr(mod, "gui_health", lambda url, repo, cfg:
+                        "healthy" if (repo / "up").exists() and not (repo / "retain").exists() else "no listener")
     return source
 
 
@@ -256,6 +267,59 @@ def test_provision_resumes_and_commits_only_installation(operations, installer):
         assert operations.preview(request) == {"existing": repo.name}
 
 
+@pytest.mark.parametrize("name", ["shared/.gitkeep", "shared/redlines/.gitkeep", "shared/redlines", "shared"])
+def test_provision_refuses_indexed_scaffold_missing_from_worktree(operations, name):
+    repo = operations.root / "project"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    path = repo / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("staged project content")
+    git(repo, "add", name)
+    path.unlink()
+    if path.parent != repo:
+        path.parent.rmdir()
+    with pytest.raises(ValueError, match="Resolve project work"):
+        operations.preview({"action": "install", "name": repo.name, "runtime": "host", "username": "Ada"})
+    assert git(repo, "show", ":" + name) == "staged project content"
+    assert not path.exists() and (path.parent == repo or not path.parent.exists())
+    assert not git(repo, "remote") and not operations.history()
+
+
+def test_retry_requires_a_healthy_gui_after_failed_launch(operations, installer):
+    repo = operations.root / "project"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    (repo / "retain").touch()
+    request = {"action": "install", "name": repo.name, "runtime": "host", "username": "Ada"}
+
+    def submit(data):
+        preview = operations.preview(data)
+        operations.apply(preview)
+        return wait_result(operations, preview["id"])
+
+    failed = submit(request)
+    assert failed["status"] == "failed" and "status 7" in failed["detail"]
+    retry = submit(request)
+    assert retry["status"] == "failed" and retry["stage"] == "Launch"
+    assert "restart" in retry["detail"] and "no listener" in retry["detail"]
+    assert json.loads(operations.checkpoint(repo).read_text())["stage"] == "launch"
+    assert submit({"action": "restart", "name": repo.name})["status"] == "succeeded"
+    assert submit(request)["status"] == "succeeded"
+    assert json.loads(operations.checkpoint(repo).read_text())["stage"] == "done"
+    assert (repo / "calls").read_text().splitlines() == ["install"]
+
+
+def test_legacy_removal_with_project_placeholder_requires_update(operations):
+    repo = installation(operations.root, "legacy")
+    keep = repo / "shared/.gitkeep"
+    keep.parent.mkdir()
+    keep.touch()
+    with pytest.raises(ValueError, match="Update this checkout"):
+        operations.preview({"action": "remove", "name": repo.name})
+    assert keep.exists() and not operations.history()
+
+
 def test_browser_provisions_and_confirms_selected_removal(operations, installer, tmp_path, monkeypatch):
     chromium = shutil.which("chromium")
     playwright = ROOT / ".super-coder/browser/node_modules/playwright"
@@ -267,7 +331,7 @@ def test_browser_provisions_and_confirms_selected_removal(operations, installer,
     selected = installation(operations.root, "selected")
     (selected / "partial").touch()
     monkeypatch.setattr(sys.modules["repository_actions"], "service_state",
-                        lambda repo, cfg: "running" if (repo / "up").exists() else "stopped")
+                        lambda repo, cfg: ("running", "healthy") if (repo / "up").exists() else ("stopped", "no listener"))
     with ThreadingHTTPServer(("127.0.0.1", 0), service.Handler) as server:
         server.settings = tmp_path / "settings.json"
         server.settings.write_text(json.dumps({"root": str(operations.root), "listing": str(tmp_path / "urls"),
@@ -321,3 +385,12 @@ def test_browser_provisions_and_confirms_selected_removal(operations, installer,
             server.shutdown()
             thread.join()
     assert (selected / "calls").read_text() == "invoked\n"
+
+
+def test_browser_refreshes_after_inflight_load_and_delayed_publication():
+    chromium = shutil.which("chromium")
+    playwright = ROOT / ".super-coder/browser/node_modules/playwright"
+    if not (chromium and playwright.is_dir() and shutil.which("node")):
+        pytest.skip("optional local Chromium seat")
+    subprocess.run(["node", str(ROOT / "tests/manager_refresh.cjs"), str(playwright), chromium,
+                    str(PACKAGE / "static")], timeout=40, check=True)

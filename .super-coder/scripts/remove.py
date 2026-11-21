@@ -191,6 +191,7 @@ def show_plan(
             print(f"    added    {path}")
     print("  remove     : repo runtime, engine, generated state, shell worktrees,")
     print("               install-owned extension images/volumes and integration")
+    print("  scaffolds  : remove only unchanged installer-owned placeholders")
     print("  preserve   : project files, branches, unrelated Git config, shared")
     print("               machine tools, harness profiles,")
     print("               credentials, engine-base images, and backups")
@@ -489,13 +490,16 @@ def cleanup_visual_qa(repo_root: Path) -> bool:
 
 def cleanup_shared_scaffolds(repo_root: Path) -> list[str]:
     removed: list[str] = []
-    for relative in (Path("shared/redlines"), Path("shared")):
+    receipt = repo_root / install.SCAFFOLD_RECEIPT
+    if receipt.resolve() != receipt or not receipt.is_file():
+        return removed
+    owned = receipt.read_text().splitlines()
+    for relative in reversed(install.SHARED_SCAFFOLDS):
         directory = repo_root / relative
         keep = directory / ".gitkeep"
-        if not directory.is_dir():
+        if keep.resolve() != keep or not keep.is_file() or keep.stat().st_size:
             continue
-        entries = list(directory.iterdir())
-        if entries == [keep]:
+        if install.scaffold_identity(repo_root, relative) in owned and list(directory.iterdir()) == [keep]:
             keep.unlink()
             directory.rmdir()
             removed.append(str(relative))

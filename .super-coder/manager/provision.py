@@ -8,6 +8,7 @@ from inventory import command, install_config
 SOURCE = "https://github.com/jedbjorn/subfloor.git"
 COMMIT = "chore: install subfloor"
 PINS = ("sc", ".sc-state/engine.source", ".sc-state/engine.ref")
+SCAFFOLDS = ("shared/.gitkeep", "shared/redlines/.gitkeep")
 # Paths the installer creates, removes or renders. Refuse occupied project
 # paths up front, including staged deletions whose worktree path is absent.
 RESERVED = ("sc", ".super-coder", ".sc-state", ".sc-worktrees", "CLAUDE.md", "AGENTS.md",
@@ -40,13 +41,43 @@ def primary(repo):
 
 def bootstrap_files(repo):
     paths = [*PINS, ".gitignore"]
-    for parent in ("shared", "shared/redlines"):
-        if not (repo / parent).exists():
-            paths.append(parent + "/.gitkeep")
+    for name in SCAFFOLDS:
+        if not (repo / name).parent.exists():
+            paths.append(name)
     return paths
 
 
+def check_scaffolds(repo, files, *, committing=False):
+    # A parent directory can still be a staged file in Git (a file/directory
+    # conflict). Adding its children would replace that file in the index.
+    parents = {str(Path(name).parent) for name in SCAFFOLDS}
+    indexed = git(repo, "ls-files", "-z", "--", "shared").split("\0")
+    changed = git(repo, "diff", "--cached", "--name-only", "--no-renames", "-z", "--", "shared").split("\0")
+    if parents.intersection(indexed) or parents.intersection(changed):
+        raise ValueError("Resolve project work on the scaffold directories first.")
+    for name in SCAFFOLDS:
+        path = repo / name
+        if path.parent.resolve() != path.parent:
+            raise ValueError(f"Unexpected scaffold directory: {path.parent}")
+        if name not in files:
+            if not path.parent.is_dir():
+                raise ValueError(f"Project scaffold directory changed: {path.parent}")
+            continue
+        if path.resolve() != path or (path.exists() and (not path.is_file() or path.stat().st_size)):
+            raise ValueError(f"Unexpected bootstrap file: {path}")
+        if committing and not path.is_file():
+            raise ValueError(f"Installer scaffold is missing: {path}")
+        # git add may have completed before a failed bootstrap commit. Only
+        # resume with an indexed ordinary empty file identical to our output.
+        index = git(repo, "ls-files", "--stage", "--", name)
+        if index and committing and index == f"100644 {git(repo, 'hash-object', str(path))} 0\t{name}":
+            continue
+        if index or git(repo, "diff", "--cached", "--name-only", "--", name):
+            raise ValueError(f"Resolve project work on the bootstrap path first: {path}")
+
+
 def preflight(repo):
+    check_scaffolds(repo, bootstrap_files(repo))
     for name in (*RESERVED, ".gitignore", "shared", "shared/redlines"):
         path = repo / name
         if path.resolve() != path:
@@ -124,6 +155,8 @@ def provision(repo, state, save, run, launch):
         if primary(repo) != state["primary"]:
             raise ValueError("Git checkout identity changed.")
         preflight(repo)
+        if bootstrap_files(repo) != state["files"]:
+            raise ValueError("Project scaffold directories changed since confirmation.")
         head = command("git", "-C", str(repo), "rev-parse", "--verify", "HEAD")
         if head is None:
             raise ValueError("Cannot verify the project history.")
@@ -155,6 +188,7 @@ def provision(repo, state, save, run, launch):
                 or (repo / "sc").read_bytes() != subprocess.check_output(["git", "show", state["ref"] + ":sc"], cwd=repo)):
             raise ValueError("The checkout no longer matches the selected bootstrap revision.")
     if state["stage"] == "install":
+        check_scaffolds(repo, state["files"])
         cfg = install_config(repo.parent, repo) or {}
         if not cfg.get("installed_at"):
             run("Install Subfloor", "./sc", "install", "--runtime", state["runtime"],
@@ -166,6 +200,7 @@ def provision(repo, state, save, run, launch):
         advance("commit")
     if state["stage"] == "commit":
         files = state["files"]
+        check_scaffolds(repo, files, committing=True)
         git(repo, "add", "-f", "--", *files)
         if git(repo, "diff", "--cached", "--name-only", "--", *files):
             run("Commit bootstrap files", "git", "-c", "core.hooksPath=/dev/null", "commit",

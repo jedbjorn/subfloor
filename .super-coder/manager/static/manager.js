@@ -59,7 +59,9 @@ const confirmation = phrase.querySelector("input");
 const applyButton = document.querySelector("#apply");
 let pending;
 let refreshTimer;
-let loading = false;
+let loading;
+let refreshQueued = false;
+let results = [];
 
 function button(label, handle) {
   const el = document.createElement("button");
@@ -154,33 +156,60 @@ function showResults(results) {
   }));
 }
 
-async function load() {
-  if (loading) return;
-  loading = true;
+// Allow several 30-second publisher scans after each completed provision.
+function awaitingPublication(installations) {
+  const cutoff = Date.now() / 1000 - 120;
+  const byPath = new Map(installations.map(row => [row.path, row.publication]));
+  const seen = new Set();
+  for (const record of results) {
+    if (!["create", "install", "remove"].includes(record.action) || record.status !== "succeeded") continue;
+    if (seen.has(record.path)) continue;
+    seen.add(record.path);
+    if (record.action !== "remove" && (record.finished ?? record.created) >= cutoff &&
+        !["verified", "not configured"].includes(byPath.get(record.path))) return true;
+  }
+  return false;
+}
+
+async function loadOnce() {
   clearTimeout(refreshTimer);
   refresh.disabled = true;
   status.textContent = "Checking installations…";
+  let installations = [];
   try {
-    const results = await request("/api/actions");
-    const data = await request("/api/inventory");
+    results = await request("/api/actions");
     showResults(results);
-    if (results.some(record => record.status === "running") ||
-        (data.installations.some(row => row.publication === "pending") &&
-         results.some(record => ["create", "install"].includes(record.action) && record.status === "succeeded"))) {
-      refreshTimer = setTimeout(load, 3000);
-    }
+    const data = await request("/api/inventory");
+    installations = data.installations;
     document.querySelector("#root").textContent = data.root;
     document.querySelector("#analytics").hidden = !data.analytics_available;
-    table.tBodies[0].replaceChildren(...data.installations.map(installationRow));
-    table.hidden = !data.installations.length;
+    table.tBodies[0].replaceChildren(...installations.map(installationRow));
+    table.hidden = !installations.length;
     status.textContent = table.hidden ? "No installations found." : "";
   } catch (error) {
     table.hidden = true;
     status.textContent = error.message;
   } finally {
     refresh.disabled = false;
-    loading = false;
+    if (results.some(record => record.status === "running") || awaitingPublication(installations)) {
+      refreshTimer = setTimeout(load, 3000);
+    }
   }
+}
+
+function load() {
+  if (loading) {
+    refreshQueued = true;
+    return loading;
+  }
+  loading = (async () => {
+    do {
+      refreshQueued = false;
+      await loadOnce();
+    } while (refreshQueued);
+    loading = null;
+  })();
+  return loading;
 }
 refresh.addEventListener("click", load);
 load();
