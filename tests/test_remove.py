@@ -131,6 +131,7 @@ class RemoveFixture(unittest.TestCase):
 
 class EndToEndRemoveTest(RemoveFixture):
     def test_verified_wal_backup_and_repo_cleanup(self) -> None:
+        (self.repo / ".sc-worktrees").mkdir()
         backup_impl = remove_mod.db_backup.backup_database
         with (
             mock.patch.object(

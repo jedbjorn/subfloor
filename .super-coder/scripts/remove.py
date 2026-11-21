@@ -531,6 +531,11 @@ def remove_installation(repo_root: Path) -> tuple[list[str], list[str]]:
     elif (repo_root / VISUAL_QA_WORKFLOW).exists():
         preserved.append(str(VISUAL_QA_WORKFLOW))
     removed.extend(cleanup_shared_scaffolds(repo_root))
+    # Git removes each checkout but leaves its enclosing directory behind.
+    parent = repo_root / MANAGED_WORKTREES
+    if not parent.is_symlink() and parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
+        removed.append(MANAGED_WORKTREES)
 
     for relative in install.GENERATED_INSTALL_PATHS:
         if _remove_path(repo_root / relative, repo_root):
