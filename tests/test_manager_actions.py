@@ -114,6 +114,23 @@ def test_removal_preview_revalidation_and_recovery(operations, monkeypatch):
     assert not (neighbor / "calls").exists()
 
 
+def test_interrupted_removal_retains_output_and_requires_a_new_preview(operations, monkeypatch):
+    repo = installation(operations.root, "selected")
+    launcher = repo / "sc"
+    launcher.write_text(launcher.read_text().replace(
+        "  [ ! -e partial ]", "  kill -TERM $$\n  [ ! -e partial ]"))
+    monkeypatch.setattr(sys.modules["repository_actions"], "service_state", lambda *_: "stopped")
+    preview = operations.preview({"name": repo.name, "action": "remove"})
+    apply = {**preview, "confirmation": preview["phrase"]}
+    operations.apply(apply)
+    record = wait_result(operations, preview["id"])
+    assert record["status"] == "failed" and "-15" in record["detail"]
+    assert record["recovery"] == [f"backup manifest: {repo}/backup/manifest.json"]
+    with pytest.raises(ValueError, match="already used"):
+        operations.apply(apply)
+    assert (repo / "calls").read_text() == "invoked\n"
+
+
 def test_refuses_shared_instance_identity_before_dry_run(operations):
     selected = installation(operations.root, "selected")
     other = installation(operations.root, "other")
@@ -121,6 +138,22 @@ def test_refuses_shared_instance_identity_before_dry_run(operations):
     (other / config).write_bytes((selected / config).read_bytes())
     with pytest.raises(ValueError, match="duplicate"):
         operations.preview({"name": selected.name, "action": "remove"})
+
+
+def test_occupied_names_and_ports_leave_checkout_untouched(operations, monkeypatch):
+    mod = sys.modules["repository_actions"]
+    repo = installation(operations.root, "selected")
+    monkeypatch.setattr(mod, "host_state", lambda repo: "absent")
+    monkeypatch.setattr(mod, "docker_state", lambda repo, optional: "absent")
+    monkeypatch.setattr(mod, "gui_health", lambda *_: "identity mismatch")
+    with pytest.raises(ValueError, match="listener"):
+        operations.preview({"action": "start", "name": repo.name})
+    other = operations.root / "occupied"
+    other.mkdir()
+    git(other, "init", "-b", "main")
+    with pytest.raises(ValueError, match="occupied"):
+        operations.preview({"action": "create", "name": other.name, "runtime": "host", "username": "Ada"})
+    assert not operations.history() and not (repo / "calls").exists()
 
 
 def test_lifecycle_serializes_and_recovers_interrupted_record(operations, monkeypatch):
