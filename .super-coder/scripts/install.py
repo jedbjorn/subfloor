@@ -878,10 +878,11 @@ def sc_remote() -> str | None:
     named = None
     for line in sh("git", "-C", str(REPO_ROOT), "remote", "-v").stdout.splitlines():
         parts = line.split()
-        if len(parts) < 2:
+        if len(parts) < 3 or parts[-1] != "(fetch)":
             continue
         name, url = parts[0], parts[1]
-        if any(n in url for n in SOURCE_REPO_NAMES):
+        basename = url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git")
+        if basename in SOURCE_REPO_NAMES:
             return name
         if name in SOURCE_REPO_NAMES:
             named = name
@@ -901,30 +902,29 @@ def untrack_engine() -> bool:
     return True
 
 
-def resolve_engine_ref() -> str | None:
-    """Resolve the materialized upstream SHA without publishing a pin."""
+def install_provenance() -> tuple[str | None, str | None]:
+    """Use the materialized bootstrap revision, or discover a legacy checkout's remote."""
+    state = REPO_ROOT / ".sc-state"
+    source_file = state / "engine.source"
+    if source_file.exists():
+        source = source_file.read_text().strip()
+        pinned = callable_floor.read_engine_ref(REPO_ROOT)
+        if not pinned or pinned != pinned.lower() or not valid_engine_source(source):
+            sys.exit("install: invalid bootstrap engine.ref or engine.source")
+        return pinned, source
+
     remote = sc_remote()
     if not remote:
-        return None
+        return None, None
     # rev-parse on an unfetched ref echoes the ref name and exits non-zero — guard
     # on BOTH (a clean exit AND a 40-hex SHA) so a miss leaves the pin for update.
     r = sh("git", "-C", str(REPO_ROOT), "rev-parse", f"{remote}/main")
     sha = r.stdout.strip()
-    if r.returncode != 0 or len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha):
-        return None
-    return sha
-
-
-def resolve_engine_source() -> str | None:
-    """Return the explicit Git locator used to obtain the installed engine."""
-    remote = sc_remote()
-    if not remote:
-        return None
+    if r.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return None, None
     result = sh("git", "-C", str(REPO_ROOT), "remote", "get-url", remote)
     source = result.stdout.strip()
-    if result.returncode != 0 or not valid_engine_source(source):
-        return None
-    return source
+    return sha, source if result.returncode == 0 and valid_engine_source(source) else None
 
 
 def valid_engine_source(source: str) -> bool:
@@ -1050,6 +1050,7 @@ def main(argv: list[str]) -> int:
         validate_gitignore(REPO_ROOT)
     except GitignoreError as exc:
         sys.exit(f"install: {exc}")
+    pinned, source = install_provenance()
 
     # Bind this installation before creating any database, snapshot, map, or
     # other per-instance artifact. Retries and --force validate and retain the
@@ -1116,8 +1117,6 @@ def main(argv: list[str]) -> int:
     step("Making the engine a dependency (untrack + pin)")
     print("  git rm -r --cached .super-coder (files kept on disk)" if untrack_engine()
           else "  (engine already untracked)")
-    pinned = resolve_engine_ref()
-    source = resolve_engine_source()
     callable_floor.require_callable_floor(
         REPO_ROOT,
         expected_ref=pinned,

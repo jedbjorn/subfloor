@@ -114,6 +114,31 @@ def test_removal_preview_revalidation_and_recovery(operations, monkeypatch):
     assert not (neighbor / "calls").exists()
 
 
+@pytest.mark.parametrize("changed", ["checkout", "instance"])
+def test_removal_worker_refuses_replaced_checkout(operations, monkeypatch, changed):
+    mod = sys.modules["repository_actions"]
+    monkeypatch.setattr(mod, "service_state", lambda *_: ("stopped", "no listener"))
+    repo = installation(operations.root, "selected")
+    original = operations.root / "original"
+    execute = operations.execute
+
+    def swap_then_execute(*args):
+        if changed == "checkout":
+            repo.rename(original)
+            installation(operations.root, "selected")
+        else:
+            config = repo / ".super-coder/instance.json"
+            config.write_text(json.dumps({**json.loads(config.read_text()), "instance_id": "replacement"}))
+        execute(*args)
+
+    monkeypatch.setattr(operations, "execute", swap_then_execute)
+    preview = operations.preview({"name": repo.name, "action": "remove"})
+    record = operations.apply({**preview, "confirmation": preview["phrase"]})
+    assert wait_result(operations, record["id"])["status"] == "failed"
+    assert "confirmed checkout changed" in operations.output(record["id"])
+    assert not (original / "calls").exists() and not (repo / "calls").exists()
+
+
 def test_interrupted_removal_retains_output_and_requires_a_new_preview(operations, monkeypatch):
     repo = installation(operations.root, "selected")
     launcher = repo / "sc"
@@ -265,6 +290,64 @@ def test_provision_resumes_and_commits_only_installation(operations, installer):
         assert (repo / "calls").read_text().splitlines() == ["install", "launch"]
         assert git(repo, "rev-list", "--count", "HEAD") == "2"
         assert operations.preview(request) == {"existing": repo.name}
+
+
+@pytest.mark.parametrize("edit", ["index", "worktree", "both", "history", "none", "already_committed"])
+def test_retry_after_interrupted_bootstrap_commit(operations, installer, monkeypatch, edit):
+    mod = sys.modules["repository_actions"]
+    repo = operations.root / "project"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    ignore = repo / ".gitignore"
+    ignore.write_text("base\n")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-m", "base")
+    head = git(repo, "rev-parse", "HEAD")
+    lock = repo / ".git/index.lock"
+    provision = mod.provision
+
+    def interrupt_commit(repo, state, save, run, launch):
+        def locked(stage, *argv):
+            if stage == "Commit bootstrap files" and edit != "already_committed":
+                lock.touch()
+            run(stage, *argv)
+            if stage == "Commit bootstrap files":
+                raise OSError("interrupted after commit")
+        provision(repo, state, save, locked, launch)
+
+    monkeypatch.setattr(mod, "provision", interrupt_commit)
+    request = {"action": "install", "runtime": "host", "name": repo.name, "username": "Ada"}
+
+    def submit():
+        receipt = operations.apply(operations.preview(request))
+        return wait_result(operations, receipt["id"])
+
+    assert submit()["status"] == "failed"
+    if edit != "already_committed":
+        lock.unlink()
+    monkeypatch.setattr(mod, "provision", provision)
+    installed = ignore.read_bytes()
+    if edit in ("index", "both", "history"):
+        ignore.write_bytes(installed + b"staged project work\n")
+        git(repo, "add", ".gitignore")
+        if edit == "history":
+            git(repo, "commit", "-m", "project change", "--only", "--", ".gitignore")
+            head = git(repo, "rev-parse", "HEAD")
+        ignore.write_bytes(installed)
+    if edit in ("worktree", "both"):
+        ignore.write_bytes(installed + b"unstaged project work\n")
+    index = git(repo, "ls-files", "--stage")
+    worktree = ignore.read_bytes()
+    result = submit()
+    if edit in ("none", "already_committed"):
+        assert result["status"] == "succeeded", result
+        assert git(repo, "show", "HEAD:.gitignore") == installed.decode().strip()
+        assert git(repo, "rev-list", "--count", "HEAD") == "2"
+    else:
+        assert result["status"] == "failed", result
+        assert git(repo, "rev-parse", "HEAD") == head
+        assert git(repo, "ls-files", "--stage") == index
+        assert ignore.read_bytes() == worktree
 
 
 @pytest.mark.parametrize("name", ["shared/.gitkeep", "shared/redlines/.gitkeep", "shared/redlines", "shared"])

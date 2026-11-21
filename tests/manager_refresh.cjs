@@ -9,6 +9,8 @@ async function exercise(page) {
   const verified = "https://sample.test";
   const created = Date.now() / 1000;
   let applied = false;
+  let removalWrites = 0;
+  let removalReads = 0;
   let inventoryReads = 0;
   let publication = "list unavailable";
   let finishFirst;
@@ -17,18 +19,32 @@ async function exercise(page) {
     const url = new URL(route.request().url()).pathname;
     const json = data => route.fulfill({json: data});
     if (url === "/api/actions/preview") {
+      if (route.request().postDataJSON().action === "remove") {
+        return json({name: "sample", action: "remove", id: "rm", detail: "Remove sample", phrase: "REMOVE sample"});
+      }
       return json({name: "sample", action: "create", id: "op", detail: "Create sample", phrase: ""});
     }
     if (url === "/api/actions/apply") {
+      if (route.request().postDataJSON().id === "rm") {
+        removalWrites++;
+        return json({id: "rm", status: "running"});
+      }
       applied = true;
-      return json({});
+      return json({id: "op", status: "running"});
     }
     if (url === "/api/actions") {
+      if (removalWrites) {
+        removalReads++;
+        if (removalReads === 1) return route.fulfill({status: 503, json: {error: "History offline"}});
+        if (removalReads > 2) return json([{id: "rm", action: "remove", status: "succeeded", path: target, created}]);
+      }
       return json(applied ? [{id: "op", action: "create", status: "succeeded",
         path: target, created}] : []);
     }
     if (url === "/api/inventory") {
       inventoryReads++;
+      if (removalReads === 3) return route.fulfill({status: 503, json: {error: "Retry inventory"}});
+      if (removalReads > 3) return json({root: "/repos", installations: []});
       if (inventoryReads === 1) {
         await firstInventory;
         return json({root: "/repos", installations: []});
@@ -73,6 +89,22 @@ async function exercise(page) {
   await page.waitForFunction(() => !document.querySelector("#refresh").disabled);
   await page.clock.fastForward(3100);
   assert.equal(inventoryReads, 7);
+
+  await row.getByRole("button", {name: "Remove Subfloor from this repo"}).click();
+  await page.getByLabel("Type REMOVE sample to confirm removal").fill("REMOVE sample");
+  await page.getByRole("button", {name: "Confirm", exact: true}).click();
+  await page.getByText("History offline").waitFor();
+  // A stale history read, then a terminal result with unavailable inventory.
+  await page.clock.fastForward(3100);
+  await row.waitFor();
+  await page.clock.fastForward(3100);
+  await page.getByText("Retry inventory").waitFor();
+  await page.clock.fastForward(3100);
+  await page.getByText("No installations found.").waitFor();
+  await page.getByText("Remove Subfloor from this repo · succeeded").waitFor();
+  await page.clock.fastForward(3100);
+  assert.equal(removalWrites, 1);
+  assert.equal(removalReads, 4);
 }
 
 (async () => {

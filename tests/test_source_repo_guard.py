@@ -17,6 +17,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
@@ -73,6 +74,13 @@ class SourceRepoGuardTest(unittest.TestCase):
             self.assertEqual(update.super_coder_remote(), "engine")
         finally:
             update.git = orig
+
+    def test_install_discovers_legacy_engine_by_exact_fetch_url(self):
+        remotes = ("origin\thttps://example.com/subfloor-tools.git (fetch)\n"
+                   "origin\thttps://example.com/subfloor.git (push)\n"
+                   "engine\tgit@example.com:subfloor.git (fetch)\n")
+        with mock.patch.object(install, "sh", return_value=SimpleNamespace(stdout=remotes)):
+            self.assertEqual(install.sc_remote(), "engine")
 
     def test_update_remote_matcher_rejects_fork_name_containing_source_name(self):
         orig = update.git

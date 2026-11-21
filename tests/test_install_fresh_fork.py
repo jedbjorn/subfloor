@@ -307,6 +307,22 @@ class FreshForkInstallTest(unittest.TestCase):
     def test_noninteractive_install_reaches_durable_completion_marker(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo, home = self.prepare_repo(raw)
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=repo, text=True).strip()
+
+            engine_sha = git("rev-parse", "HEAD")
+            engine_source = (Path(raw) / "subfloor.git").as_uri()
+            origin = (Path(raw) / "subfloor-tools.git").as_uri()
+            git("remote", "add", "origin", origin)
+            git("remote", "add", "super-coder", engine_source)
+            git("commit", "--allow-empty", "-m", "project history")
+            git("update-ref", "refs/remotes/origin/main", "HEAD")
+            # The engine branch may also advance after materialization.
+            git("update-ref", "refs/remotes/super-coder/main", "HEAD")
+            state = repo / ".sc-state"
+            state.mkdir(exist_ok=True)
+            (state / "engine.ref").write_text(engine_sha + "\n")
+            (state / "engine.source").write_text(engine_source + "\n")
 
             result = self.run_install(repo, home)
 
@@ -315,6 +331,9 @@ class FreshForkInstallTest(unittest.TestCase):
                 0,
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
+            self.assertEqual((state / "engine.ref").read_text().strip(), engine_sha)
+            self.assertEqual((state / "engine.source").read_text().strip(), engine_source)
+            self.assertEqual(git("remote", "get-url", "origin"), origin)
             config = json.loads(
                 (repo / ".super-coder" / "instance.json").read_text()
             )

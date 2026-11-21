@@ -1,4 +1,5 @@
 """Bootstrap one owner-selected checkout from the supported engine remote."""
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -67,8 +68,7 @@ def check_scaffolds(repo, files, *, committing=False):
             raise ValueError(f"Unexpected bootstrap file: {path}")
         if committing and not path.is_file():
             raise ValueError(f"Installer scaffold is missing: {path}")
-        # git add may have completed before a failed bootstrap commit. Only
-        # resume with an indexed ordinary empty file identical to our output.
+        # A retry can see our intent-to-add entry or an already committed scaffold.
         index = git(repo, "ls-files", "--stage", "--", name)
         if index and committing and index == f"100644 {git(repo, 'hash-object', str(path))} 0\t{name}":
             continue
@@ -138,6 +138,16 @@ def seed_file(path, data, *, executable=False):
         path.chmod(0o755)
 
 
+def bootstrap_output(repo, files):
+    output = {}
+    for name in files:
+        path = repo / name
+        if path.resolve() != path or not path.is_file():
+            raise ValueError(f"Installer output is missing or replaced: {path}")
+        output[name] = [path.stat().st_mode, hashlib.sha256(path.read_bytes()).hexdigest()]
+    return output
+
+
 def provision(repo, state, save, run, launch):
     def advance(stage):
         state["stage"] = stage
@@ -197,12 +207,25 @@ def provision(repo, state, save, run, launch):
         if not cfg or not cfg.get("installed_at") or cfg.get("runtime") != state["runtime"]:
             raise ValueError("Installer did not confirm the selected runtime and installation.")
         state["instance"] = cfg.get("instance_id")
+        state["output"] = bootstrap_output(repo, state["files"])
+        state["base"] = git(repo, "rev-parse", "HEAD")
         advance("commit")
     if state["stage"] == "commit":
         files = state["files"]
+        if state.get("output") != bootstrap_output(repo, files):
+            raise ValueError("Cannot verify unchanged installer output. Inspect the bootstrap files before retrying.")
+        if git(repo, "diff", "--cached", "--ita-invisible-in-index", "--name-only", "--", *files):
+            raise ValueError("Resolve staged project work on the bootstrap paths before retrying.")
         check_scaffolds(repo, files, committing=True)
-        git(repo, "add", "-f", "--", *files)
-        if git(repo, "diff", "--cached", "--name-only", "--", *files):
+        if git(repo, "diff", "--name-only", state["base"], "HEAD", "--", *files):
+            # The commit may have landed just before its checkpoint write.
+            committed = git(repo, "ls-tree", "-r", "--name-only", "HEAD", "--", *files).splitlines()
+            if set(committed) != set(files) or git(repo, "diff", "HEAD", "--name-only", "--", *files):
+                raise ValueError("Project history changed on the bootstrap paths. Inspect the checkout before retrying.")
+        # A path-limited commit needs index entries for new files, but no
+        # installer contents need to be staged, even across a failed commit.
+        git(repo, "add", "--intent-to-add", "-f", "--", *files)
+        if git(repo, "diff", "HEAD", "--name-only", "--", *files):
             run("Commit bootstrap files", "git", "-c", "core.hooksPath=/dev/null", "commit",
                 "--only", "-m", COMMIT, "--", *files)
         advance("launch")

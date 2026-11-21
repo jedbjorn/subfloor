@@ -85,6 +85,23 @@ def command_env():
     return {**os.environ, "SC_PYTHON": sys.executable, "PYTHONUNBUFFERED": "1", "GIT_TERMINAL_PROMPT": "0"}
 
 
+def installation_key(repo, cfg):
+    return {"primary": primary(repo), "engine": identity(repo / ".super-coder"), "sc": identity(repo / "sc"),
+            "instance": cfg.get("instance_id"), "installed_at": cfg.get("installed_at"),
+            "runtime": cfg.get("runtime"), "port": cfg.get("port")}
+
+
+def exec_confirmed_removal(repo, expected):
+    # The worker starts this child in the selected directory. Check both
+    # that held directory and the named installation, then exec relative
+    # to the same cwd so a replacement cannot redirect the launch.
+    cfg = install_config(repo.parent, repo)
+    if (not cfg or Path.cwd() != repo or identity(Path(".")) != expected["primary"][:2]
+            or installation_key(repo, cfg) != expected):
+        raise ValueError("The confirmed checkout changed before removal. Preview it again.")
+    os.execl("./sc", "./sc", "remove", "--yes")
+
+
 def dry_run(repo):
     script = repo / ".super-coder/scripts/remove.py"
     if not script.is_file() or script.resolve() != script:
@@ -175,9 +192,7 @@ class Actions:
         if instance and any(other != repo and config.get("instance_id") == instance
                             for other, config in installations(self.root)):
             raise Conflict("Another checkout uses this installation identity. Resolve the duplicate first.")
-        key = {"primary": primary(repo), "engine": identity(repo / ".super-coder"), "sc": identity(repo / "sc"),
-               "instance": instance, "installed_at": cfg.get("installed_at"), "runtime": cfg.get("runtime"),
-               "port": cfg.get("port")}
+        key = installation_key(repo, cfg)
         if action == "remove":
             return key, dry_run(repo)
         state, _ = service_state(repo, cfg)
@@ -279,7 +294,7 @@ class Actions:
                 save(key)
                 provision(repo, key, save, run, launch)
             elif action == "remove":
-                run("Remove Subfloor", "./sc", "remove", "--yes")
+                run("Remove Subfloor", sys.executable, "-E", "-s", "-B", __file__, str(repo), json.dumps(key))
                 self.checkpoint(repo).unlink(missing_ok=True)
             else:
                 run(action.capitalize(), "./sc", *COMMANDS[action])
@@ -305,3 +320,10 @@ class Actions:
         with path.open("rb") as stream:
             stream.seek(max(0, path.stat().st_size - 65536))
             return stream.read().decode(errors="replace")
+
+
+if __name__ == "__main__":
+    try:
+        exec_confirmed_removal(Path(sys.argv[1]), json.loads(sys.argv[2]))
+    except (OSError, ValueError) as exc:
+        sys.exit(str(exc))

@@ -62,6 +62,7 @@ let refreshTimer;
 let loading;
 let refreshQueued = false;
 let results = [];
+const accepted = new Set();
 
 function button(label, handle) {
   const el = document.createElement("button");
@@ -119,7 +120,8 @@ document.querySelector("#apply-form").onsubmit = async event => {
   event.preventDefault();
   applyButton.disabled = true;
   try {
-    await request("/api/actions/apply", {name: pending.name, id: pending.id, confirmation: confirmation.value});
+    const receipt = await request("/api/actions/apply", {name: pending.name, id: pending.id, confirmation: confirmation.value});
+    accepted.add(receipt.id);
     review.close();
     await load();
   } catch (error) {
@@ -186,12 +188,15 @@ async function loadOnce() {
     table.tBodies[0].replaceChildren(...installations.map(installationRow));
     table.hidden = !installations.length;
     status.textContent = table.hidden ? "No installations found." : "";
+    for (const record of results) {
+      if (record.status !== "running") accepted.delete(record.id);
+    }
   } catch (error) {
     table.hidden = true;
     status.textContent = error.message;
   } finally {
     refresh.disabled = false;
-    if (results.some(record => record.status === "running") || awaitingPublication(installations)) {
+    if (accepted.size || results.some(record => record.status === "running") || awaitingPublication(installations)) {
       refreshTimer = setTimeout(load, 3000);
     }
   }
