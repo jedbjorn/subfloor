@@ -350,6 +350,48 @@ def test_retry_after_interrupted_bootstrap_commit(operations, installer, monkeyp
         assert ignore.read_bytes() == worktree
 
 
+def test_retry_after_lost_install_checkpoint_preserves_unstaged_work(operations, installer, monkeypatch):
+    mod = sys.modules["repository_actions"]
+    repo = operations.root / "project"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    ignore = repo / ".gitignore"
+    ignore.write_text("base\n")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-m", "base")
+    provision = mod.provision
+
+    def lose_commit_checkpoint(repo, state, save, run, launch):
+        def persist(current):
+            if current["stage"] == "commit":
+                raise OSError("commit checkpoint lost")
+            save(current)
+        provision(repo, state, persist, run, launch)
+
+    monkeypatch.setattr(mod, "provision", lose_commit_checkpoint)
+    request = {"action": "install", "runtime": "host", "name": repo.name, "username": "Ada"}
+
+    def submit():
+        receipt = operations.apply(operations.preview(request))
+        return wait_result(operations, receipt["id"])
+
+    assert submit()["status"] == "failed"
+    monkeypatch.setattr(mod, "provision", provision)
+    checkpoint = json.loads(operations.checkpoint(repo).read_text())
+    assert checkpoint["stage"] == "install"
+    assert "output" not in checkpoint and "base" not in checkpoint
+    ignore.write_bytes(ignore.read_bytes() + b"unstaged project work\n")
+    head = git(repo, "rev-parse", "HEAD")
+    index = git(repo, "ls-files", "--stage")
+    worktree = ignore.read_bytes()
+    result = submit()
+    assert result["status"] == "failed"
+    assert "interrupted checkpoint" in result["detail"]
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert git(repo, "ls-files", "--stage") == index
+    assert ignore.read_bytes() == worktree
+
+
 @pytest.mark.parametrize("name", ["shared/.gitkeep", "shared/redlines/.gitkeep", "shared/redlines", "shared"])
 def test_provision_refuses_indexed_scaffold_missing_from_worktree(operations, name):
     repo = operations.root / "project"

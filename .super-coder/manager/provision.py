@@ -200,6 +200,8 @@ def provision(repo, state, save, run, launch):
     if state["stage"] == "install":
         check_scaffolds(repo, state["files"])
         cfg = install_config(repo.parent, repo) or {}
+        if cfg.get("installed_at") and ("output" not in state or "base" not in state):
+            raise ValueError("Cannot verify installer output after an interrupted checkpoint. Inspect the checkout before retrying.")
         if not cfg.get("installed_at"):
             run("Install Subfloor", "./sc", "install", "--runtime", state["runtime"],
                 "--username=" + state["username"])
