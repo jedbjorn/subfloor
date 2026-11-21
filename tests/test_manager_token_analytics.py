@@ -53,6 +53,10 @@ def write_pin(repo, ref, when):
 
 def pin(repo, ref, when):
     write_pin(repo, ref, when)
+    commit_pin(repo, when)
+
+
+def commit_pin(repo, when):
     git(repo, "add", ".sc-state/engine.ref")
     git(repo, "commit", "-qm", "Pin engine", date=when)
 
@@ -191,10 +195,31 @@ def test_working_rollback(history):
         updates = h.manager.read("engine-updates", query)["updates"]
         assert [(row["ref"], row["landed_at"]) for row in updates] == expected
         assert h.manager.read("status")["projects"][0]["engine_ref"] == h.refs[0]
-    # Committing the already observed rollback at the same time confirms one event.
-    pin(h.repos[0], h.refs[0], h.times[2])
+    commit_pin(h.repos[0], datetime.now(timezone.utc).isoformat())
     assert h.manager.refresh()["ok"]
     assert h.manager.read("engine-updates", query)["updates"] == updates
+
+
+def publish_beta(h):
+    pinfile = h.repos[1] / ".sc-state" / "engine.ref"
+    shutil.copy2(pinfile, pinfile.with_name("engine.ref.prev"))
+    write_pin(h.repos[1], h.refs[1], h.times[1])
+
+
+def test_delayed_repin(history, tmp_path):
+    h = history
+    publish_beta(h)
+    assert h.manager.refresh()["ok"]
+    beta = {"project": ["beta"]}
+    before = h.manager.read("engine-updates", beta)
+    assert [(r["ref"], r["landed_at"]) for r in before["updates"]] == [
+        (h.refs[1], h.times[1]), (h.refs[0], h.times[0])]
+    commit_pin(h.repos[1], h.times[2])
+    for manager in (h.manager, Analytics(tmp_path / "fresh", lambda: h.repos, engine_repo=h.upstream)):
+        assert manager.refresh()["ok"]
+        assert manager.read("engine-updates", beta) == before
+        assert len(manager.read("engine-updates")["updates"]) == 4
+        assert manager.read("engine-updates", {**beta, "from": [h.times[2]]}) == {"updates": []}
 
 
 def test_schedule_recovers_after_inventory_error(history):
@@ -221,9 +246,11 @@ def test_schedule_recovers_after_inventory_error(history):
     assert INTERVAL - 3 <= service.seconds_until_due() <= INTERVAL
 
 
-@pytest.mark.skipif(not os.environ.get("HALO_TOKENS_REFERENCE"), reason="optional read-only reference checkout")
-def test_reference_parity(history, tmp_path, monkeypatch):
-    """Run the original extractor and store only against this test's installations."""
+@pytest.fixture
+def reference(history, tmp_path, monkeypatch):
+    """Run the original extractor and store only against the disposable installations."""
+    if not os.environ.get("HALO_TOKENS_REFERENCE"):
+        pytest.skip("optional read-only reference checkout")
     h = history
     source = Path(os.environ["HALO_TOKENS_REFERENCE"])
     registry = h.state / "super-coder" / "installs.json"
@@ -236,6 +263,33 @@ def test_reference_parity(history, tmp_path, monkeypatch):
     ref.DB = tmp_path / "reference.sqlite3"
     ref.MAIN_CHECKOUT = h.upstream
 
+    return source, ref
+
+
+@pytest.mark.parametrize("warm_cache", [False, True], ids=["fresh", "previously-refreshed"])
+def test_delayed_repin_reference_parity(history, reference, warm_cache):
+    h = history
+    source, ref = reference
+    publish_beta(h)
+
+    def compare(con):
+        payload = json.loads(subprocess.check_output([sys.executable, "-B", source / "remote_extract.py"]))
+        with con:
+            ref.ingest(con, payload)
+        assert h.manager.refresh()["ok"]
+        for query in ({}, {"project": ["alpha"]}, {"project": ["beta"]}):
+            assert h.manager.read("engine-updates", query) == ref.engine_updates(con, query)
+
+    with closing(ref.connect()) as con:
+        if warm_cache:
+            compare(con)
+        commit_pin(h.repos[1], h.times[2])
+        compare(con)
+
+
+def test_reference_parity(history, reference):
+    h = history
+    source, ref = reference
     with closing(ref.connect()) as con:
         for fail_beta in (False, True):
             if fail_beta:

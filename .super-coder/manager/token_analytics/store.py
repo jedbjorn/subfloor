@@ -1,6 +1,7 @@
 """Manager-owned cache and the cross-project dashboard queries."""
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from itertools import groupby
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -216,15 +217,51 @@ def activity(con, q):
         params))}
 
 
+def project_markers(observations):
+    """Reconcile one checkout's file publications and Git confirmations in time order."""
+    markers = []
+    pending = {}
+    last_is_file = False
+    for row in observations:
+        marker = dict(row)
+        event = marker.pop("event")
+        ref = marker["ref"]
+        is_file = event.startswith("pin:") or event == ref  # legacy file key
+        if is_file:
+            if markers and markers[-1]["ref"] == ref:
+                # A checkout can update the file mtime after its commit.
+                if not last_is_file:
+                    markers[-1]["landed_at"] = marker["landed_at"]
+                    last_is_file = True
+                continue
+            pending[ref] = len(markers)
+        elif ref in pending:
+            # Keep the published marker. A later local transition may still
+            # be waiting for its own commit, even when it returns to an old SHA.
+            confirmed = pending[ref]
+            if not markers[confirmed]["subject"]:
+                markers[confirmed]["subject"] = marker["subject"]
+            pending = {sha: i for sha, i in pending.items() if i > confirmed}
+            continue
+        else:
+            pending.clear()
+        markers.append(marker)
+        last_is_file = is_file
+    return markers
+
+
 def engine_updates(con, q):
     where, params = _where({"project": q.get("project", [""])}, alias="e")
+    observations = con.execute(
+        f"SELECT rowid, e.* FROM engine_updates e WHERE 1=1{where} ORDER BY project, landed_at, rowid DESC", params)
+    # Apply the chart window to publication times, after reconciliation.
     frm = _arg(q, "from")
-    if frm:
-        where += " AND e.landed_at >= ?"
-        params.append(frm)
-    return {"updates": rows(con.execute(
-        f"SELECT e.project, e.ref, e.landed_at, e.subject FROM engine_updates e WHERE 1=1{where} "
-        "ORDER BY e.landed_at DESC", params))}
+    updates = [marker for _, project in groupby(observations, key=lambda row: row["project"])
+               for marker in project_markers(project) if marker["landed_at"] >= frm]
+    updates.sort(key=lambda u: (u["landed_at"], -u["rowid"]), reverse=True)
+    for marker in updates:
+        del marker["rowid"]
+    return {"updates": updates}
 
 
 def status(con):
