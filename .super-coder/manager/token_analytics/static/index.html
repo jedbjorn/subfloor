@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Token Analytics · Subfloor Manager</title>
+  <meta name="color-scheme" content="dark light" />
+  <script src="/analytics/theme.js"></script>
+  <link rel="stylesheet" href="/analytics/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Subfloor Manager<span id="repo">Token Analytics</span></h1>
+    <div class="tools">
+      <span id="status" class="status"></span>
+      <button id="refresh" type="button" title="Collect usage from local installations">Refresh</button>
+    </div>
+  </header>
+  <main>
+    <div id="collection-errors" role="status"></div>
+    <section id="view" class="view"></section>
+  </main>
+  <script src="/analytics/app.js"></script>
+</body>
+</html>
