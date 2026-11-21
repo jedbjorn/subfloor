@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os
 import signal
+import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import import_module
@@ -11,6 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from inventory import installations, inventory
 from operator_password import matches
+from repository_actions import Actions, Conflict
 
 STATIC = Path(__file__).resolve().parent / "static"
 ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
@@ -85,6 +87,29 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, json.dumps(service.refresh()).encode())
         return self.reply(404, b'{"error":"Unknown analytics route"}')
 
+    def action_route(self, path):
+        actions = self.server.actions
+        try:
+            if self.command == "GET" and path == "/api/actions":
+                result = actions.history()
+            elif self.command == "GET" and path.startswith("/api/actions/output/"):
+                result = {"output": actions.output(path.rsplit("/", 1)[1])}
+            elif self.command == "POST" and path in ("/api/actions/preview", "/api/actions/apply"):
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 8192 or self.headers.get_content_type() != "application/json":
+                    raise ValueError("A bounded JSON request is required.")
+                data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict):
+                    raise ValueError("Expected a JSON object.")
+                result = actions.preview(data) if path.endswith("/preview") else actions.apply(data)
+            else:
+                return self.reply(404, b'{"error":"Unknown action route"}')
+        except Conflict as exc:
+            return self.reply(409, json.dumps({"error": str(exc)}).encode())
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            return self.reply(400, json.dumps({"error": str(exc)}).encode())
+        return self.reply(200, json.dumps(result).encode())
+
     def dispatch(self):
         config = json.loads(self.server.settings.read_text())
         if (self.command == "GET" and self.path == "/health" and
@@ -95,6 +120,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         url = urlsplit(self.path)
         path = url.path
+        if path == "/api/actions" or path.startswith("/api/actions/"):
+            return self.action_route(path)
         if path.startswith(("/analytics/", "/api/analytics/")):
             return self.analytics_route(url)
         if self.command == "GET" and path in ASSETS:
@@ -120,6 +147,7 @@ def serve(settings, engine_repo=None):
     config = json.loads(settings.read_text())
     with ThreadingHTTPServer(("127.0.0.1", config["port"]), Handler) as server:
         server.settings = settings
+        server.actions = Actions(Path(config["root"]), settings.parent)
         server.analytics = None
         if ANALYTICS.is_dir():
             # The user-service environment may differ from the installer's.
