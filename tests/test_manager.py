@@ -197,9 +197,11 @@ def test_supervisor_attributes_live_backends_to_checkout(tmp_path, modules, monk
     repo = checkout(tmp_path, "service", runtime="sandbox")
     other = checkout(tmp_path / "elsewhere", "service")
     server = repo / ".super-coder/api/server.py"
-    server.write_text("import time\ntime.sleep(60)\n")
-    with subprocess.Popen([sys.executable, str(server)]) as process:
+    server.write_text("import time\nprint('ready', flush=True)\ntime.sleep(60)\n")
+    with subprocess.Popen([sys.executable, str(server)], stdout=subprocess.PIPE, text=True) as process:
         try:
+            # Wait for exec to finish before inventory reads /proc/<pid>/cmdline.
+            assert process.stdout.readline() == "ready\n"
             source = other
 
             def show(*args):
