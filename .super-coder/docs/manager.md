@@ -8,7 +8,7 @@ From a primary checkout on the Linux host, enable the optional service for the c
 ./sc manager password
 ```
 
-Open the printed loopback URL and sign in as `operator` with the printed password. A working systemd user manager and Python 3.14 are required. The manager serves its own copy of the application while individual repos are stopped. Running setup from a second checkout returns the existing URL and keeps the original root, port and password.
+Open the printed loopback URL and sign in as `operator` with the password shown in your interactive terminal. A working systemd user manager and Python 3.14 are required. The manager serves its own copy of the application while individual repos are stopped. Running setup from a second checkout returns the existing URL and keeps the original root, port and password.
 
 For fresh setup, `./sc install --manager` enables the manager after the repo installation completes, using that repo's parent as the discovery root. Omitting the option leaves the manager alone. If enabling the manager fails, correct the reported error and retry `./sc manager install` from the installed checkout.
 

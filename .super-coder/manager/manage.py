@@ -242,7 +242,7 @@ def main(argv=None):
     install.add_argument("--urls", type=Path, help="existing publisher's urls.json")
     subs.add_parser("update", help="install the manager payload from this engine revision")
     subs.add_parser("url", help="print the local and configured private URLs")
-    subs.add_parser("password", help="show this host user's manager password")
+    subs.add_parser("password", help="show the manager password in an interactive host terminal")
     publish = subs.add_parser("publish", help="add a dedicated private Tailscale Serve mapping")
     publish.add_argument("--https-port", type=checked_port, required=True)
     subs.add_parser("unpublish", help="remove the manager's exact Serve mapping")
@@ -262,7 +262,10 @@ def main(argv=None):
                 manager.remove(cfg)
                 return 0
             elif args.action == "password":
-                print(cfg["password"])
+                if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                    raise ValueError("run ./sc manager password in an interactive host terminal")
+                with open("/dev/tty", "w", encoding="utf-8") as terminal:
+                    terminal.write(cfg["password"] + "\n")
                 return 0
             print(f"Subfloor Manager: http://127.0.0.1:{cfg['port']}/")
             if cfg.get("publication"):

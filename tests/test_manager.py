@@ -192,6 +192,30 @@ class Analytics:
 """)
 
 
+def test_password_reveal_requires_an_interactive_host_terminal(tmp_path, modules, monkeypatch):
+    _, manage = modules
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    manager = manage.Manager()
+    with manager.locked():
+        manager.save({"password": "fixture-only"})
+    argv = [sys.executable, str(PACKAGE / "manage.py"), "password"]
+    batch = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           start_new_session=True, check=False)
+    assert batch.returncode != 0 and batch.stdout == ""
+    assert "interactive host terminal" in batch.stderr and "fixture-only" not in batch.stderr
+
+    # util-linux script provides the child with an isolated controlling terminal.
+    terminal = subprocess.run(["script", "-qec", shlex.join(argv), "/dev/null"],
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
+    assert terminal.stdout.strip() == "fixture-only"
+    redirected = tmp_path / "redirected"
+    command = shlex.join(argv) + " > " + shlex.quote(str(redirected))
+    refused = subprocess.run(["script", "-qec", command, "/dev/null"], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, check=False)
+    assert refused.returncode != 0 and redirected.read_bytes() == b""
+    assert "fixture-only" not in refused.stdout + refused.stderr
+
+
 def test_enable_update_reuse_and_remove_from_disposable_user(tmp_path, modules, monkeypatch):
     _, manage = modules
     for name in ("STATE", "DATA", "CONFIG"):
