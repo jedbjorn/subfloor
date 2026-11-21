@@ -1,0 +1,18 @@
+:root { color-scheme: light dark; font: 1rem/1.5 "Inter", system-ui, sans-serif; --line: #848b923f; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+header, main { padding: 1.2rem clamp(1rem, 4vw, 4rem); }
+header, nav, .title { display: flex; align-items: center; gap: 2rem; }
+header { border-bottom: 1px solid var(--line); }
+header strong { letter-spacing: -.035em; }
+nav a { color: inherit; text-underline-offset: .4em; }
+main { max-width: 100rem; margin: 2rem auto; }
+.title { justify-content: space-between; }
+h1 { margin: 0; font-size: clamp(2rem, 4vw, 3.3rem); letter-spacing: -.055em; }
+#root, small { display: block; font: .83rem/1.5 ui-monospace, monospace; opacity: .8; overflow-wrap: anywhere; }
+button { font: inherit; padding: .4rem .9rem; cursor: pointer; }
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: .8rem; border-bottom: 1px solid var(--line); }
+th { font-size: .85rem; }
+.good { color: light-dark(#11674f, #86d8bc); }

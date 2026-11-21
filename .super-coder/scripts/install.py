@@ -53,6 +53,7 @@ HELP_FLAGS = frozenset(("-h", "--help"))
 INSTALLER_OWN_FLAGS = frozenset((
     *HELP_FLAGS,
     "--force",
+    "--manager",
     "--skip-harness-install",
     "--ensure-harness",
     "--update-harnesses",
@@ -130,6 +131,7 @@ Options:
   -h, --help                  show this help and exit without changing state
   --force                     override source/already-installed safety guards
   --skip-harness-install      detect harnesses without installing them
+  --manager                   enable the optional per-user Subfloor Manager after install
   --runtime MODE              lifecycle runtime: sandbox (default — docker container)
                               or host (systemd-user-supervised process, no docker);
                               recorded in instance.json, later: ./sc runtime <mode>
@@ -1245,6 +1247,10 @@ def main(argv: list[str]) -> int:
         print("  subfloor launch     # starts the sandbox + GUI")
         print("  subfloor enter      # attach + boot your shell")
     print("  (`./sc launch` / `./sc enter` from this directory are the same commands)")
+    if "--manager" in argv:
+        step("Enabling the optional Subfloor Manager")
+        return subprocess.call([str(REPO_ROOT / "sc"), "manager", "install", "--root", str(REPO_ROOT.parent)])
+    print("  ./sc manager install   # optional per-user installation manager")
     return 0
 
 
