@@ -21,7 +21,7 @@ from inventory import (
 from manage import atomic
 from provision import COMMIT, SCAFFOLDS, SOURCE, identity, prepared, primary, provision
 
-COMMANDS = {"start": ["launch"], "stop": ["down"], "restart": ["restart", "--yes"]}
+COMMANDS = {"start": ["launch"], "stop": ["down"], "restart": ["restart", "--yes"], "update": ["update"]}
 PROVISION = ("install", "create")
 
 
@@ -153,6 +153,11 @@ class Actions:
                        "preserved backup:", "backup manifest:", "remove interrupted; backup manifest:")
             with log.open(errors="replace") as stream:
                 record["recovery"] = [line.strip() for line in stream if line.strip().startswith(markers)]
+        elif record["action"] == "update" and log.is_file():
+            markers = ("backed up", "backup", "recover:", "a bad update?", "rollback")
+            with log.open(errors="replace") as stream:
+                record["recovery"] = [line.strip() for line in stream
+                                      if any(marker in line.lower() for marker in markers)]
         self.save(record)
 
     def history(self):
@@ -196,6 +201,13 @@ class Actions:
         if action == "remove":
             return key, dry_run(repo)
         state, _ = service_state(repo, cfg)
+        if action == "update":
+            if state not in ("running", "stopped"):
+                raise Conflict("This action requires a running or stopped installation.")
+            key["running_intent"] = state
+            effect = ("Updates and restores the running installation. Active sessions will be interrupted."
+                      if state == "running" else "Updates the installation and leaves it stopped.")
+            return key, f"{repo}\n./sc update\n{effect}"
         required = "stopped" if action == "start" else "running"
         if state != required:
             raise Conflict(f"This action requires a {required} installation.")
@@ -297,8 +309,8 @@ class Actions:
                 run("Remove Subfloor", sys.executable, "-E", "-s", "-B", __file__, str(repo), json.dumps(key))
                 self.checkpoint(repo).unlink(missing_ok=True)
             else:
-                run(action.capitalize(), "./sc", *COMMANDS[action])
-                expected = "stopped" if action == "stop" else "running"
+                run("Update Subfloor" if action == "update" else action.capitalize(), "./sc", *COMMANDS[action])
+                expected = key["running_intent"] if action == "update" else "stopped" if action == "stop" else "running"
                 verify_state(repo, expected, key["instance"])
             record["status"] = "succeeded"
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="referrer" content="no-referrer">
+  <title>Pair this browser · Subfloor Manager</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/manager.css">
+  <link rel="stylesheet" href="/signin.css">
+</head>
+<body class="signin-page">
+  <header class="app-header signin-header">
+    <strong class="brand">Subfloor Manager</strong>
+    <div class="header-tools"><div class="theme-switch" role="group" aria-label="Theme">
+      <button type="button" data-theme-choice="system" aria-label="System theme" title="System — match this device" aria-pressed="false"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3" y="4" width="18" height="12" rx="2"></rect><path d="M9 20h6m-3-4v4"></path></svg></button>
+      <button type="button" data-theme-choice="light" aria-label="Light theme" title="Light theme" aria-pressed="false"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42m0-14.14-1.42 1.42M6.35 17.65l-1.42 1.42"></path></svg></button>
+      <button type="button" data-theme-choice="dark" aria-label="Dark theme" title="Dark theme" aria-pressed="false"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z"></path></svg></button>
+    </div></div>
+  </header>
+  <main class="signin-layout">
+    <section class="signin-card" aria-labelledby="pair-title">
+      <p class="eyebrow">Subfloor browser access</p>
+      <h1 id="pair-title">Pair this browser</h1>
+      <p class="signin-intro">Use the Manager password once to create a long-lived session for this browser. Each browser can be paired and revoked independently.</p>
+      <p id="pair-setup" class="signin-notice" role="alert" hidden></p>
+      <form id="pair-form" class="signin-form">
+        <label>Username<input name="username" value="operator" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
+        <label>Manager password<input name="password" type="password" autocomplete="current-password" required></label>
+        <label>Device name <span class="field-hint">(optional)</span><input name="device" maxlength="80" autocomplete="off" placeholder="For example: work laptop"></label>
+        <p id="pair-status" class="signin-notice" role="alert"></p>
+        <button id="pair-submit" class="primary" type="submit">Pair browser</button>
+      </form>
+      <details class="pair-details"><summary>How browser pairing works</summary><p>Pairing issues a random session token in an HttpOnly, SameSite=Strict cookie. Manager stores only its hash. The cookie is renewed as you use Manager; no password or token is stored in page storage.</p></details>
+    </section>
+    <noscript><p class="signin-notice">Browser pairing needs JavaScript.</p></noscript>
+  </main>
+  <script src="/signin.js"></script>
+</body>
+</html>

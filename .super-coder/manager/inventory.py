@@ -133,10 +133,29 @@ def supervisor(repo, configured):
 
 
 def gui_health(url, repo, config):
-    """Probe only the named authority, without a proxy, redirects or credentials."""
+    """Probe the named authority and its optional same-origin sign-in page."""
     target = urlsplit(url)
     cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
-    connection = cls(target.hostname, target.port, timeout=2)
+
+    def connect():
+        return cls(target.hostname, target.port, timeout=2)
+
+    def signin_path(location):
+        if not location:
+            return None
+        destination = urlsplit(location)
+        if destination.username or destination.password or destination.path != "/signin.html":
+            return None
+        if destination.netloc:
+            default = 443 if target.scheme == "https" else 80
+            if (destination.scheme != target.scheme or destination.hostname != target.hostname
+                    or (destination.port or default) != (target.port or default)):
+                return None
+        elif destination.scheme:
+            return None
+        return destination.path + (("?" + destination.query) if destination.query else "")
+
+    connection = connect()
     try:
         connection.request("GET", "/api/health")
         response = connection.getresponse()
@@ -151,6 +170,14 @@ def gui_health(url, repo, config):
             return "identity mismatch"
         connection.request("GET", "/")
         page = connection.getresponse()
+        if page.status in (301, 302, 303, 307, 308):
+            destination = signin_path(page.headers.get("Location"))
+            if destination is None:
+                return "unavailable"
+            connection.close()
+            connection = connect()
+            connection.request("GET", destination)
+            page = connection.getresponse()
         if page.status != 200 or page.headers.get_content_type() != "text/html" or not page.read(1):
             return "unavailable"
         return "healthy"

@@ -1,23 +1,128 @@
 const table = document.querySelector("table");
 const status = document.querySelector("#status");
 const refresh = document.querySelector("#refresh");
+let expandedMenu;
+let menuSequence = 0;
 
-function cell(row, value) {
+function cell(row, value, label) {
   const td = row.insertCell();
+  td.dataset.label = label;
   td.textContent = value;
   return td;
 }
 
+function closeMenu(returnFocus = false) {
+  if (!expandedMenu) return;
+  const {trigger, menu} = expandedMenu;
+  menu.hidden = true;
+  trigger.setAttribute("aria-expanded", "false");
+  expandedMenu = null;
+  if (returnFocus) trigger.focus();
+}
+
+function showMenu(trigger, menu, last = false) {
+  closeMenu();
+  expandedMenu = {trigger, menu};
+  menu.hidden = false;
+  trigger.setAttribute("aria-expanded", "true");
+  const items = [...menu.querySelectorAll('[role="menuitem"]')];
+  items[last ? items.length - 1 : 0]?.focus();
+}
+
+function actionMenu(row, installation) {
+  const actions = cell(row, "", "Actions");
+  actions.className = "actions";
+  const trigger = button("⋯", () => {});
+  trigger.className = "menu-trigger";
+  const label = `Actions for ${installation.name}`;
+  trigger.setAttribute("aria-label", label);
+  trigger.setAttribute("aria-haspopup", "menu");
+  trigger.setAttribute("aria-expanded", "false");
+  const id = `repository-menu-${++menuSequence}`;
+  trigger.setAttribute("aria-controls", id);
+  const menu = document.createElement("div");
+  menu.id = id;
+  menu.className = "action-menu";
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", label);
+  menu.hidden = true;
+  const lifecycle = installation.state === "stopped" ? ["start"] :
+    installation.state === "running" ? ["stop", "restart"] : [];
+  const update = ["running", "stopped"].includes(installation.state) ? ["update"] : [];
+  for (const action of [...lifecycle, ...update, "remove"]) {
+    const item = button(titles[action], () => {
+      closeMenu();
+      preview({name: installation.name, action});
+    });
+    item.setAttribute("role", "menuitem");
+    item.tabIndex = -1;
+    if (action === "remove") item.className = "danger";
+    menu.append(item);
+  }
+  trigger.addEventListener("click", event => {
+    event.stopPropagation();
+    if (expandedMenu?.trigger === trigger) closeMenu(true);
+    else showMenu(trigger, menu);
+  });
+  trigger.addEventListener("keydown", event => {
+    if (["ArrowDown", "ArrowUp"].includes(event.key)) {
+      event.preventDefault();
+      showMenu(trigger, menu, event.key === "ArrowUp");
+    }
+  });
+  menu.addEventListener("keydown", event => {
+    const items = [...menu.querySelectorAll('[role="menuitem"]')];
+    const current = items.indexOf(document.activeElement);
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeMenu(true);
+    } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 :
+        (current + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+      items[next]?.focus();
+    } else if (event.key === "Tab") {
+      closeMenu(true);
+    }
+  });
+  actions.append(trigger, menu);
+  return actions;
+}
+
+document.addEventListener("click", event => {
+  if (expandedMenu && !expandedMenu.menu.contains(event.target) && event.target !== expandedMenu.trigger) closeMenu();
+});
+
 function installationRow(installation) {
   const row = document.createElement("tr");
   row.dataset.repo = installation.name;
-  const repo = cell(row, installation.name);
+  const repo = cell(row, "", "Repository");
+  const local = location.hostname === "127.0.0.1";
+  const url = installation.open_url || (local ? installation.local_url : null);
+  const name = document.createElement(url ? "a" : "span");
+  name.className = "repository-name";
+  if (url) {
+    name.classList.add("repository-link");
+    name.href = url;
+    name.target = "_blank";
+    name.rel = "noopener noreferrer";
+  }
+  name.textContent = installation.name;
   const path = document.createElement("small");
+  path.className = "repository-path";
   path.textContent = installation.path;
-  repo.append(path);
-  for (const value of [installation.runtime, installation.state, installation.health, installation.publication]) {
-    const td = cell(row, value === "docker" ? "Docker" : value[0].toUpperCase() + value.slice(1));
-    if (["running", "healthy", "verified"].includes(value)) td.classList.add("good");
+  repo.append(name, path);
+  const observations = [["Runtime", installation.runtime], ["Service", installation.state],
+    ["GUI health", installation.health], ["Publication", installation.publication]];
+  for (const [label, value] of observations) {
+    const td = cell(row, "", label);
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    if (["running", "healthy", "verified"].includes(value)) badge.classList.add("good");
+    if (["failed", "unavailable", "identity mismatch", "invalid port"].includes(value)) badge.classList.add("bad");
+    if (["starting", "stopping", "paused", "pending"].includes(value)) badge.classList.add("warn");
+    badge.textContent = value === "docker" ? "Docker" : value[0].toUpperCase() + value.slice(1);
+    td.append(badge);
   }
   if (installation.configured_runtime !== "unknown" && installation.configured_runtime !== installation.runtime) {
     const selection = document.createElement("small");
@@ -29,29 +134,12 @@ function installationRow(installation) {
     address.textContent = installation.published_url;
     row.cells[4].append(address);
   }
-  const actions = cell(row, "");
-  actions.className = "actions";
-  const local = location.hostname === "127.0.0.1";
-  const url = installation.open_url || (local ? installation.local_url : null);
-  if (url) {
-    const open = document.createElement("a");
-    open.href = url;
-    open.textContent = "Open";
-    actions.append(open);
-  }
-  const controls = document.createElement("div");
-  controls.className = "controls";
-  const lifecycle = installation.state === "stopped" ? ["start"] :
-    installation.state === "running" ? ["stop", "restart"] : [];
-  for (const action of [...lifecycle, "remove"]) {
-    controls.append(button(titles[action], () => preview({name: installation.name, action})));
-  }
-  actions.append(controls);
+  actionMenu(row, installation);
   return row;
 }
 
-const titles = {start: "Start", stop: "Stop", restart: "Restart", remove: "Remove Subfloor from this repo",
-  create: "Create repository", install: "Install Subfloor"};
+const titles = {start: "Start", stop: "Stop", restart: "Restart", update: "Update Subfloor",
+  remove: "Remove Subfloor from this repo", create: "Create repository", install: "Install Subfloor"};
 const setup = document.querySelector("#setup");
 const review = document.querySelector("#review");
 const phrase = document.querySelector("#phrase");
@@ -76,6 +164,10 @@ async function request(url, payload) {
   const options = payload ? {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify(payload)} : {cache: "no-store"};
   const response = await fetch(url, options);
+  if (response.status === 401) {
+    const next = encodeURIComponent(location.pathname + location.search + location.hash);
+    location.replace("/signin.html?next=" + next);
+  }
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
@@ -185,6 +277,7 @@ async function loadOnce() {
     installations = data.installations;
     document.querySelector("#root").textContent = data.root;
     document.querySelector("#analytics").hidden = !data.analytics_available;
+    closeMenu();
     table.tBodies[0].replaceChildren(...installations.map(installationRow));
     table.hidden = !installations.length;
     status.textContent = table.hidden ? "No installations found." : "";

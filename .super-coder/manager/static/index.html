@@ -1,30 +1,53 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Installations · Subfloor Manager</title><link rel="stylesheet" href="/manager.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Installations · Subfloor Manager</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/manager.css">
   <script type="module" src="/manager.js"></script>
+  <script src="/auth.js" defer></script>
 </head>
 <body>
-  <header><strong>Subfloor Manager</strong><nav aria-label="Manager pages"><a href="/" aria-current="page">Installations</a> <a id="analytics" href="/analytics/" hidden>Token Analytics</a></nav></header>
-  <main>
-    <section class="title"><div><h1>Installations</h1><p id="root"></p></div><div class="controls"><button id="provision">Add repository</button><button id="refresh">Refresh</button></div></section>
-    <p role="status" id="status">Loading installations…</p>
-    <div class="table-scroll"><table hidden><thead><tr><th>Repository</th><th>Runtime</th><th>Service</th><th>GUI health</th><th>Publication</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
-    <section id="history" hidden><h2>Repository operations</h2><div id="results"></div></section>
+  <header class="app-header">
+    <strong class="brand">Subfloor Manager</strong>
+    <nav class="app-nav" aria-label="Manager pages">
+      <a href="/" aria-current="page">Installations</a>
+      <a id="analytics" href="/analytics/" hidden>Token Analytics</a>
+      <button id="paired-browsers" class="nav-button" type="button" hidden>Paired browsers</button>
+    </nav>
+    <div class="header-tools">
+      <div class="theme-switch" role="group" aria-label="Theme">
+        <button type="button" data-theme-choice="system" aria-label="System theme" title="System — match this device" aria-pressed="false"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3" y="4" width="18" height="12" rx="2"></rect><path d="M9 20h6m-3-4v4"></path></svg></button>
+        <button type="button" data-theme-choice="light" aria-label="Light theme" title="Light theme" aria-pressed="false"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42m0-14.14-1.42 1.42M6.35 17.65l-1.42 1.42"></path></svg></button>
+        <button type="button" data-theme-choice="dark" aria-label="Dark theme" title="Dark theme" aria-pressed="false"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z"></path></svg></button>
+      </div>
+    </div>
+  </header>
+  <main class="manager-main">
+    <section class="page-title">
+      <div><p class="eyebrow">Workspace</p><h1>Installations</h1><p id="root" class="path"></p></div>
+      <div class="controls"><button id="provision" class="primary" type="button">Add repository</button><button id="refresh" type="button">Refresh</button></div>
+    </section>
+    <p role="status" id="status" class="notice">Loading installations…</p>
+    <div class="table-scroll"><table hidden><thead><tr><th>Repository</th><th>Runtime</th><th>Service</th><th>GUI health</th><th>Publication</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody></tbody></table></div>
+    <section id="history" class="card history" hidden><h2>Repository operations</h2><p class="muted">Confirmed commands, output, and recovery evidence.</p><div id="results"></div></section>
     <dialog id="setup"><form id="setup-form">
-      <h2>Add repository</h2>
+      <p class="eyebrow">New installation</p><h2>Add repository</h2>
       <label>Destination <select name="action"><option value="install">Existing Git checkout</option><option value="create">New local repository</option></select></label>
       <label>Repository name <input required name="name" autocomplete="off"></label>
       <label>Runtime <select name="runtime"><option value="host">Host</option><option value="sandbox">Docker</option></select></label>
       <label>Subfloor operator username <input required name="username" autocomplete="off"></label>
-      <footer><button type="button" data-close>Cancel</button><button>Preview installation</button></footer>
+      <footer><button type="button" data-close>Cancel</button><button class="primary">Preview installation</button></footer>
     </form></dialog>
-    <dialog id="review"><h2 id="review-title"></h2><pre id="plan"></pre>
+    <dialog id="review"><p class="eyebrow">Confirm operation</p><h2 id="review-title"></h2><pre id="plan"></pre>
       <form id="apply-form"><label id="phrase" hidden><span></span><input autocomplete="off"></label>
-        <footer><button type="button" data-close>Cancel</button><button id="apply">Confirm</button></footer>
+        <footer><button type="button" data-close>Cancel</button><button id="apply" class="primary">Confirm</button></footer>
       </form>
     </dialog>
-    <dialog id="log"><h2>Command output</h2><pre></pre><button data-close>Close</button></dialog>
+    <dialog id="log"><h2>Command output</h2><pre></pre><footer><button data-close>Close</button></footer></dialog>
   </main>
-</body></html>
+</body>
+</html>

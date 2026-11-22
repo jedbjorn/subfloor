@@ -174,6 +174,27 @@ def test_side_read_failure_and_relocation_hold(history):
     assert h.manager.read("engine-updates", {"project": ["beta"]})["updates"][0]["ref"] == h.refs[1]
     assert len(h.manager.read("activity")["activity"]) == 4
     assert [s["usage_rows"] for s in status] == [1, 1]
+    freshness = h.manager.read("status")
+    assert freshness["collection_state"] == "partial"
+    assert freshness["last_collection_at"] == freshness["last_pull"]["finished_at"]
+    assert "no such table" not in freshness["projects"][0]["warnings"]
+
+
+def test_legacy_activity_collection_is_partial_and_fresh(history):
+    h = history
+    with closing(sqlite3.connect(h.dbs[0])) as con, con:
+        con.execute("DROP TABLE runs")
+    assert not h.manager.refresh()["ok"]
+    status = h.manager.read("status")
+    alpha = status["projects"][0]
+    assert alpha["usage_rows"] == 1
+    assert "legacy database has no runs table" in alpha["warnings"]
+    assert "no such table" not in alpha["warnings"]
+    assert status["last_ok_at"] is None
+    assert status["last_collection_at"] == status["last_pull"]["finished_at"]
+    assert status["collection_state"] == "partial"
+    assert h.manager.read("sessions", {"project": ["alpha"]})["sessions"][0]["input_tokens"] == 10
+    assert h.manager.read("activity", {"project": ["alpha"]}) == {"activity": []}
 
 
 def test_unreadable_database_keeps_sessions_and_collects_new_pin(history):
@@ -340,6 +361,7 @@ def test_dashboard_project_switch_and_refresh(history, tmp_path):
     release = tmp_path / "release"
     shutil.copytree(ENGINE / "manager", release)
     shutil.copy2(ENGINE / "scripts/instance_state.py", release / "instance_state.py")
+    shutil.copy2(ENGINE / "api/auth_sessions.py", release / "auth_sessions.py")
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -354,8 +376,13 @@ def test_dashboard_project_switch_and_refresh(history, tmp_path):
     (async () => {
       const browser = await chromium.launch({executablePath:process.argv[2], headless:true});
       try {
-        const page = await browser.newPage({httpCredentials:{username:'operator', password:'disposable'}});
-        await page.goto(`http://127.0.0.1:${process.argv[3]}/`);
+        const page = await browser.newPage();
+        const base = 'http://127.0.0.1:' + process.argv[3];
+        const paired = await page.request.post(base + '/api/auth/pair', {
+          headers:{Origin:base}, data:{username:'operator',password:'disposable',device:'Chromium fixture'}
+        });
+        assert(paired.ok(), await paired.text());
+        await page.goto(base + '/');
         await page.getByRole('link', {name:'Token Analytics'}).click();
         await page.locator('.sess').first().waitFor();
         assert.equal(await page.locator('.sess').count(), 2);
@@ -374,6 +401,17 @@ def test_dashboard_project_switch_and_refresh(history, tmp_path):
           'beta: engine database missing'));
         assert.equal(await page.locator('.sess').count(), 1);
         assert.equal(await page.getByLabel('Project', {exact:true}).inputValue(), 'beta');
+        await page.getByRole('button', {name:'Light theme'}).click();
+        await page.waitForFunction(() => document.documentElement.dataset.theme === 'light');
+        await page.getByRole('button', {name:'Dark theme'}).click();
+        await page.waitForFunction(() => document.documentElement.dataset.theme === 'dark');
+        await page.setViewportSize({width:390,height:844});
+        assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'mobile analytics overflow');
+        await page.getByRole('link', {name:'Installations', exact:true}).click();
+        await page.getByRole('heading', {name:'Installations', exact:true}).waitFor();
+        assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'mobile inventory overflow');
+        await page.getByRole('link', {name:'Token Analytics', exact:true}).click();
+        await page.locator('.sess').first().waitFor();
       } finally { await browser.close(); }
     })().catch(error => {console.error(error); process.exitCode = 1;});
     """
@@ -408,6 +446,75 @@ def test_dashboard_project_switch_and_refresh(history, tmp_path):
         except subprocess.TimeoutExpired:
             process.kill()
             process.communicate()
+
+
+def test_dashboard_legacy_activity_has_no_invented_zero_hours(history, tmp_path):
+    playwright = ENGINE / "browser/node_modules/playwright"
+    chromium = shutil.which("chromium")
+    if not (playwright.is_dir() and chromium and shutil.which("node")):
+        pytest.skip("optional local Chromium seat")
+    h = history
+    with closing(sqlite3.connect(h.dbs[0])) as con, con:
+        con.execute("DROP TABLE runs")
+    assert not h.manager.refresh()["ok"]
+
+    def payload(project):
+        query = {"project": [project]} if project else {}
+        return {
+            "filters": h.manager.read("filters", query),
+            "sessions": h.manager.read("sessions", query),
+            "usage": h.manager.read("usage", query),
+            "activity": h.manager.read("activity", query),
+            "engine-updates": h.manager.read("engine-updates", query),
+        }
+
+    payloads = {"status": h.manager.read("status"), "all": payload(None), "alpha": payload("alpha")}
+    script = """
+    const assert = require('node:assert/strict');
+    const path = require('node:path');
+    const {chromium} = require(process.argv[1]);
+    const payloads = JSON.parse(process.argv[4]);
+    (async () => {
+      const browser = await chromium.launch({executablePath:process.argv[2],headless:true});
+      try {
+        const page = await browser.newPage();
+        await page.route('http://manager.test/**', route => {
+          const url = new URL(route.request().url());
+          if (url.pathname.startsWith('/api/analytics/')) {
+            const name = url.pathname.slice('/api/analytics/'.length);
+            const project = url.searchParams.get('project');
+            return route.fulfill({json:name === 'status' ? payloads.status : payloads[project || 'all'][name]});
+          }
+          const files = {
+            '/analytics/':'token_analytics/static/index.html',
+            '/analytics/app.js':'token_analytics/static/app.js',
+            '/analytics/style.css':'token_analytics/static/style.css',
+            '/manager.css':'static/manager.css',
+            '/theme.js':'static/theme.js'
+          };
+          if (files[url.pathname]) return route.fulfill({path:path.join(process.argv[3],files[url.pathname])});
+          return route.fulfill({status:404,body:'not found'});
+        });
+        await page.goto('http://manager.test/analytics/');
+        await page.locator('.sess').first().waitFor();
+        await page.getByLabel('Project', {exact:true}).selectOption('alpha');
+        await page.waitForFunction(() => document.querySelector('.an-card-value')?.textContent === '10');
+        await page.getByRole('button', {name:'Shell Hours',exact:true}).click();
+        await page.locator('.an-chart-empty').waitFor();
+        assert.match(await page.locator('.an-chart-empty').innerText(), /Hourly rates are unavailable/);
+        assert.equal(await page.locator('.an-card-value').first().innerText(), '—');
+        const status = await page.locator('#status').innerText();
+        assert.match(status, /collected .* with warnings/);
+        assert(!status.includes('collected never'));
+        const errors = await page.locator('#collection-errors').innerText();
+        assert.match(errors, /legacy database has no runs table/);
+        assert(!errors.includes('no such table'));
+      } finally {await browser.close();}
+    })().catch(error=>{console.error(error);process.exitCode=1});
+    """
+    result = subprocess.run(["node", "-e", script, str(playwright), chromium, str(ENGINE / "manager"),
+                             json.dumps(payloads)], capture_output=True, text=True, timeout=45, check=False)
+    assert result.returncode == 0, result.stderr
 
 
 def test_stopped_and_live_wal_collection(history):

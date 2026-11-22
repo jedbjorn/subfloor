@@ -134,6 +134,9 @@ class Manager:
                 raise ValueError("passwords differ")
         cfg["operator_verifier"] = make_verifier(password)
         self.save(cfg)
+        if cfg.get("service_id"):
+            from browser_auth import BrowserAuth
+            BrowserAuth(self.settings, cfg["service_id"]).revoke_id(None)
 
     def ready(self, cfg):
         # Never send the operator password to an unverified listener.
@@ -186,6 +189,7 @@ class Manager:
         # Import the resolver shipped alongside this manager, even if its
         # source checkout is later removed. Never import from inventory rows.
         shutil.copyfile(SOURCE.parent / "scripts/instance_state.py", release / "instance_state.py")
+        shutil.copyfile(SOURCE.parent / "api/auth_sessions.py", release / "auth_sessions.py")
         link = self.data / "current.new"
         link.unlink(missing_ok=True)
         link.symlink_to(release.name)
@@ -252,6 +256,9 @@ class Manager:
         systemctl("daemon-reload")
         if self.data.exists():
             shutil.rmtree(self.data)
+        if cfg.get("service_id"):
+            from browser_auth import BrowserAuth
+            BrowserAuth(self.settings, cfg["service_id"]).revoke_id(None)
         self.settings.unlink()
         print(f"Manager removed. Retained manager history: {self.state}")
 
@@ -266,6 +273,9 @@ def main(argv=None):
     subs.add_parser("update", help="install the manager payload from this engine revision")
     subs.add_parser("url", help="print the local and configured private URLs")
     subs.add_parser("password", help="set or reset the operator password in the host terminal")
+    subs.add_parser("sessions", help="list long-lived paired browsers")
+    revoke = subs.add_parser("revoke", help="revoke one paired browser, or --all")
+    revoke.add_argument("id", help="paired-browser session id, or --all")
     publish = subs.add_parser("publish", help="add a dedicated private Tailscale Serve mapping")
     publish.add_argument("--https-port", type=checked_port, required=True)
     subs.add_parser("unpublish", help="remove the manager's exact Serve mapping")
@@ -275,6 +285,17 @@ def main(argv=None):
         manager = Manager()
         with manager.locked():
             cfg = manager.install(args) if args.action == "install" else manager.config()
+            if args.action in ("sessions", "revoke"):
+                from browser_auth import BrowserAuth
+                auth = BrowserAuth(manager.settings, cfg["service_id"])
+                if args.action == "sessions":
+                    for row in auth.all_sessions():
+                        print(f"{row['id']}\t{row['device']}\tlast seen {row['last_seen_at']}\tsince {row['created_at']}")
+                    return 0
+                if not auth.revoke_id(None if args.id == "--all" else args.id):
+                    raise ValueError(f"no paired browser with id {args.id}")
+                print("Paired browser access revoked.")
+                return 0
             if args.action == "update":
                 manager.deploy(cfg)
             elif args.action == "publish":

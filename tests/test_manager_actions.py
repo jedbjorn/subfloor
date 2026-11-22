@@ -213,6 +213,50 @@ esac
     assert restored.history()[0]["status"] == "interrupted"
 
 
+@pytest.mark.parametrize("initial_state", ["running", "stopped"])
+@pytest.mark.parametrize("outcome", ["succeeded", "failed"])
+def test_update_preserves_running_intent_and_retains_recovery(operations, monkeypatch, initial_state, outcome):
+    repo = installation(operations.root, "target")
+    if initial_state == "running":
+        (repo / "up").touch()
+    if outcome == "failed":
+        (repo / "fail-update").touch()
+    monkeypatch.setattr(sys.modules["repository_actions"], "service_state",
+                        lambda *_: ("running", "healthy") if (repo / "up").exists() else ("stopped", "no listener"))
+    executable(repo / "sc", """
+if [ "$1" = update ]; then
+  echo update >> calls
+  echo "migrate: backed up existing DB -> $PWD/backup/preupdate.db"
+  echo "  A bad update? ./sc rollback restores the DB + engine together."
+  [ ! -e fail-update ] || { echo 'recover: ./sc rollback'; exit 9; }
+fi
+""")
+    preview = operations.preview({"name": repo.name, "action": "update"})
+    assert "./sc update" in preview["detail"]
+    assert ("leaves it stopped" in preview["detail"]) == (initial_state == "stopped")
+    operations.apply(preview)
+    record = wait_result(operations, preview["id"])
+    assert record["status"] == outcome, operations.output(record["id"])
+    assert (repo / "up").exists() == (initial_state == "running")
+    assert (repo / "calls").read_text() == "update\n"
+    assert f"migrate: backed up existing DB -> {repo}/backup/preupdate.db" in record["recovery"]
+    assert "recover: ./sc rollback" in record["recovery"] if outcome == "failed" else True
+    output = operations.output(record["id"])
+    assert "backed up existing DB" in output and "rollback" in output
+
+
+def test_update_preview_revalidates_running_intent(operations, monkeypatch):
+    repo = installation(operations.root, "target")
+    (repo / "up").touch()
+    monkeypatch.setattr(sys.modules["repository_actions"], "service_state",
+                        lambda *_: ("running", "healthy") if (repo / "up").exists() else ("stopped", "no listener"))
+    preview = operations.preview({"name": repo.name, "action": "update"})
+    (repo / "up").unlink()
+    with pytest.raises(ValueError, match="plan changed"):
+        operations.apply(preview)
+    assert not (repo / "calls").exists()
+
+
 @pytest.mark.parametrize("name", ["..", "../other", "/tmp/other", "a/b", ""])
 def test_rejects_targets_outside_root(operations, name):
     with pytest.raises(ValueError):
@@ -462,6 +506,7 @@ def test_browser_provisions_and_confirms_selected_removal(operations, installer,
         server.settings.write_text(json.dumps({"root": str(operations.root), "listing": str(tmp_path / "urls"),
                                                "operator_verifier": sys.modules["manage"].make_verifier("disposable")}))
         server.analytics = None
+        server.browser_auth = service.BrowserAuth(server.settings, "fixture")
         server.actions = operations
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -470,7 +515,11 @@ def test_browser_provisions_and_confirms_selected_removal(operations, installer,
         (async()=>{
           const browser=await chromium.launch({executablePath:process.argv[2],headless:true});
           try {
-            const page=await browser.newPage({httpCredentials:{username:"operator",password:"disposable"}});
+            const page=await browser.newPage();
+            const paired=await page.request.post(process.argv[3]+"/api/auth/pair",{
+              headers:{Origin:process.argv[3]},data:{username:"operator",password:"disposable",device:"Chromium fixture"}
+            });
+            if(!paired.ok()) throw Error("pairing failed: "+paired.status()+" "+await paired.text());
             await page.goto(process.argv[3]);
             await page.getByRole("button",{name:"Add repository"}).click();
             await page.getByLabel("Destination").selectOption("create");
@@ -481,11 +530,15 @@ def test_browser_provisions_and_confirms_selected_removal(operations, installer,
             await page.getByRole("button",{name:"Confirm",exact:true}).click();
             await page.getByText("Create repository · succeeded",{exact:true}).waitFor();
             await page.locator('tr[data-repo="new-project"]').waitFor();
-            const remove=page.locator('tr[data-repo="selected"]').getByRole("button",{name:/Remove Subfloor/});
-            await remove.click();
+            const selectedRow=page.locator('tr[data-repo="selected"]');
+            const remove=async()=>{
+              await selectedRow.getByRole("button",{name:"Actions for selected"}).click();
+              await selectedRow.getByRole("menuitem",{name:/Remove Subfloor/}).click();
+            };
+            await remove();
             await page.getByText(/fixture plan/).waitFor();
             await page.getByRole("dialog").getByRole("button",{name:"Cancel"}).click();
-            await remove.click();
+            await remove();
             const confirm=page.getByRole("button",{name:"Confirm",exact:true});
             await page.getByLabel("Type REMOVE selected to confirm removal").fill("REMOVE other");
             if(await confirm.isEnabled()) throw Error("wrong confirmation accepted");
