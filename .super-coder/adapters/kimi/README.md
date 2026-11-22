@@ -24,12 +24,22 @@ billing are provider-owned; they are not part of the adapter contract.
 | `boot_artifact` | the context file this harness reads (`AGENTS.md`, informational) |
 | `emit` | files copied to the repo root at launch (none — kimi reads `~/.kimi-code` + `AGENTS.md`) |
 | `skill_dirs` | extra skill roots this harness reads natively (`.agents/skills` — see Skills); `.claude/skills` is always rendered as the cross-harness default |
-| `mcp.streamable_http` | `supported: false` — no managed streamable-HTTP MCP injection, so the browser and windows-mcp servers claude/codex/opencode get are not wired here |
+| `mcp.streamable_http` | `supported: true` for Windows MCP — the enabled windows-mcp recipe is deep-merged into the project `.kimi-code/mcp.json`; browser driving remains unsupported |
 | `headless.launch` | non-interactive base argv (`kimi`) |
 | `headless.prompt_flag` | `-p`; run.py emits it immediately before the prompt value |
 | `headless.model_flag` | `-m`; the selector must be an alias discovered from `~/.kimi-code/config.toml` |
 | `headless.effort.env` | `KIMI_MODEL_THINKING_EFFORT`; applies an explicitly requested headless effort level |
 | `sandbox.launch_flags` | flags appended ONLY inside the docker sandbox, interactive launches only (`--yolo`) |
+
+**Managed MCP:** URL-only entries in `.kimi-code/mcp.json` use Kimi's native HTTP
+transport. The launch merge preserves unrelated `mcpServers` and other settings.
+`windows-mcp` is written only with a linked VM. Kimi registers project servers at
+session startup, so the first managed write takes effect in a new session.
+
+Headless launches with this managed recipe set `KIMI_CODE_TRUST_WORKSPACE=1` so
+Kimi does not skip the project config. Interactive launches and launches without
+managed MCP retain the normal trust behavior. Kimi's switch applies to every
+project-level MCP entry, not only the managed server.
 
 **`--yolo` (sandbox, interactive only):** auto-approves all actions inside the
 container, where the container itself is the safety boundary (matches how
