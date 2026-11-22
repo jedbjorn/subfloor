@@ -952,9 +952,23 @@ def merged_env(
     manifest: Mapping[str, Any],
     context: ConversationContext,
 ) -> dict[str, str]:
+    streamable = (manifest.get("mcp") or {}).get("streamable_http") or {}
+    managed_env = {}
+    if streamable.get("workspace_trust_env"):
+        from run import managed_mcp_environment, managed_mcp_injection
+
+        managed = managed_mcp_injection(
+            dict(manifest),
+            context.env.get("SC_SHELL_SHORTNAME"),
+            sandbox=bool(context.env.get("SC_SANDBOX")),
+        )
+        managed_env = managed_mcp_environment(
+            dict(manifest), managed, headless=True
+        )
     return {
         **os.environ,
         **{str(k): str(v) for k, v in manifest.get("env", {}).items()},
+        **managed_env,
         **{str(k): str(v) for k, v in context.env.items()},
     }
 

@@ -664,10 +664,11 @@ _GITIGNORE_BLOCK = f"""{_GITIGNORE_BEGIN}
 /.agents/skills/
 /.opencode/skills/
 # Engine-managed harness config re-emitted each launch (per-harness branch-guard
-# hook); kept apart from a fork's own tracked config (claude settings.json /
-# codex config.toml).
+# hook and managed MCP servers); kept apart from a fork's own tracked config
+# (claude settings.json / codex config.toml / Kimi project config).
 /.claude/settings.local.json
 /.codex/hooks.json
+/.kimi-code/mcp.json
 # Shell worktrees — one per shell, linked inside the repo root.
 /.sc-worktrees/
 # The engine pin + source provenance are tracked. Every generated instance

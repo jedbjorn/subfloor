@@ -14,8 +14,26 @@
   "env": {},
   "mcp": {
     "streamable_http": {
-      "supported": false,
-      "reason": "the Kimi adapter has no managed streamable-HTTP MCP injection"
+      "supported": true,
+      "workspace_trust_env": {
+        "KIMI_CODE_TRUST_WORKSPACE": "1"
+      },
+      "managed_servers": [
+        {
+          "name": "windows-mcp",
+          "url": "http://127.0.0.1:{port}/mcp",
+          "merge_json": {
+            ".kimi-code/mcp.json": {
+              "mcpServers": {
+                "windows-mcp": {
+                  "url": "http://127.0.0.1:{port}/mcp"
+                }
+              }
+            }
+          },
+          "requires": "vm"
+        }
+      ]
     }
   },
   "headless": {

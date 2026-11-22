@@ -669,6 +669,19 @@ def managed_mcp_injection(adapter: dict, shortname: str | None = None, *, sandbo
     return result
 
 
+def managed_mcp_environment(
+    adapter: dict, managed: dict | None, *, headless: bool
+) -> dict[str, str]:
+    """Apply an adapter's project-config trust setting only for managed headless MCP."""
+    if not headless or not (managed or {}).get("merge_json"):
+        return {}
+    streamable = (adapter.get("mcp") or {}).get("streamable_http") or {}
+    return {
+        str(key): str(value)
+        for key, value in (streamable.get("workspace_trust_env") or {}).items()
+    }
+
+
 def emit_adapter(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     """Copy the adapter's harness-specific config files (e.g. opencode.json) to
     `root` (the working directory). These are emitted artifacts (gitignored),
@@ -2080,6 +2093,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     if not headless and ncfg.get("flag") and full["display_name"]:
         name_args = [ncfg["flag"], full["display_name"]]
 
+    managed = managed_mcp_injection(adapter, chosen["shortname"])
     if headless:
         argv = headless_command(
             adapter, headless_prompt, session_model,
@@ -2089,7 +2103,6 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
         if argv is None:
             raise LaunchError(f"harness '{harness}' has no headless adapter")
     else:
-        managed = managed_mcp_injection(adapter, chosen["shortname"])
         argv = (
             list(adapter.get("launch") or [harness])
             + list((managed or {}).get("launch_args") or [])
@@ -2105,6 +2118,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     )
     env = shell_view.environment(
         {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
+         **managed_mcp_environment(adapter, managed, headless=headless),
          **sandbox_env, **effort_env}
     )
     env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
@@ -2705,6 +2719,7 @@ def main() -> None:
     effort_env = headless_effort_env(adapter, session_effort) if headless else {}
     env = shell_view.environment(
         {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
+         **managed_mcp_environment(adapter, managed, headless=headless),
          **sandbox_env, **effort_env}
     )
     # The booted shell's flavor, inherited by everything the harness spawns.
