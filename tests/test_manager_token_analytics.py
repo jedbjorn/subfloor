@@ -504,10 +504,12 @@ def test_dashboard_legacy_activity_has_no_invented_zero_hours(history, tmp_path)
         assert.match(await page.locator('.an-chart-empty').innerText(), /Hourly rates are unavailable/);
         assert.equal(await page.locator('.an-card-value').first().innerText(), '—');
         const status = await page.locator('#status').innerText();
-        assert.match(status, /collected .* with warnings/);
+        assert.match(status, /collected /);
         assert(!status.includes('collected never'));
+        assert(!status.includes('with warnings'));
         const errors = await page.locator('#collection-errors').innerText();
-        assert.match(errors, /legacy database has no runs table/);
+        assert(!errors.includes('Collection incomplete'));
+        assert(!errors.includes('legacy database has no runs table'));
         assert(!errors.includes('no such table'));
       } finally {await browser.close();}
     })().catch(error=>{console.error(error);process.exitCode=1});

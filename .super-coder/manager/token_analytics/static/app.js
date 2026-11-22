@@ -383,12 +383,11 @@ function anSessionCard(c) {
 
 async function drawStatus() {
   const s = await api("/status");
-  const errors = s.projects.filter((p) => p.error || p.warnings)
-    .map((p) => p.project + ": " + (p.error || p.warnings));
-  if (s.last_pull?.error) errors.unshift(s.last_pull.error);
-  const partial = s.collection_state === "partial";
+  const errors = s.projects.filter((p) => p.error)
+    .map((p) => p.project + ": " + p.error);
+  if (s.last_pull?.error && s.collection_state !== "partial") errors.unshift(s.last_pull.error);
   const freshness = s.last_collection_at
-    ? `collected ${ago(s.last_collection_at)}${partial ? " with warnings" : ""}`
+    ? `collected ${ago(s.last_collection_at)}`
     : s.projects.some((p) => p.usage_rows) ? "cached token history · collection incomplete" : "collected never";
   $("#status").textContent = `${s.projects.length} projects · ${freshness}`;
   $("#collection-errors").replaceChildren(...errors.map((error) => el("p", { className: "ht-errors" }, error)));
