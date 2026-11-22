@@ -274,5 +274,11 @@ def status(con):
         "FROM projects p LEFT JOIN current_pins c ON c.project=p.project ORDER BY p.project"))
     last = con.execute("SELECT * FROM pulls ORDER BY pull_id DESC LIMIT 1").fetchone()
     last_ok = con.execute("SELECT finished_at FROM pulls WHERE ok=1 ORDER BY pull_id DESC LIMIT 1").fetchone()
+    partial = bool(last and not last["ok"] and (last["error"] or "").startswith("Collection incomplete")
+                   and any(project["usage_rows"] for project in projects))
+    collected = [stamp for stamp in (last_ok[0] if last_ok else None,
+                                    last["finished_at"] if partial else None) if stamp]
     return {"projects": projects, "last_pull": dict(last) if last else None,
-            "last_ok_at": last_ok[0] if last_ok else None}
+            "last_ok_at": last_ok[0] if last_ok else None,
+            "last_collection_at": max(collected) if collected else None,
+            "collection_state": "partial" if partial else "ok" if last_ok else "none"}

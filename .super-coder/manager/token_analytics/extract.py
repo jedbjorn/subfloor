@@ -64,11 +64,16 @@ def iso(ts):
 def activity(con, out):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     spans = []
-    for source, sql, args in (("turn", TURNS_SQL, ()), ("agent", AGENTS_SQL, (now,))):
+    sources = (("turn", "conversation_runs", TURNS_SQL, ()), ("agent", "runs", AGENTS_SQL, (now,)))
+    for source, table, sql, args in sources:
         try:
+            present = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            if present is None:
+                out["errors"].append(f"activity {source}: legacy database has no {table} table")
+                return  # preserve the complete last good activity snapshot
             got = con.execute(sql, args).fetchall()
-        except sqlite3.Error as exc:
-            out["errors"].append(f"activity {source}: {exc}")
+        except sqlite3.Error:
+            out["errors"].append(f"activity {source}: collection failed; cached activity retained")
             return  # preserve the complete last good activity snapshot
         for r in got:
             s, e = iso(r[1]), iso(r[2])

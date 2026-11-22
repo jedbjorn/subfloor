@@ -57,13 +57,20 @@ def free_port():
 
 
 @contextlib.contextmanager
-def gui(repo, port, root_status=200, *, identity_port=None):
+def gui(repo, port, root_status=200, *, identity_port=None, location=None):
+    requests = []
+
     class Health(BaseHTTPRequestHandler):
         def do_GET(self):
+            requests.append(self.path)
             data = {"ok": True, "port": identity_port or port, "repo": repo.name, "repo_root": str(repo)}
             health = self.path == "/api/health"
-            self.send_response(200 if health else root_status if self.path == "/" else 404)
+            signin = self.path.startswith("/signin.html") and (root_status in (301, 302, 303, 307, 308) or location)
+            redirect = self.path == "/" and (root_status in (301, 302, 303, 307, 308) or location)
+            self.send_response(200 if health or signin else 302 if location and self.path == "/" else root_status if self.path == "/" else 404)
             self.send_header("Content-Type", "application/json" if health else "text/html")
+            if redirect:
+                self.send_header("Location", location or "/signin.html")
             self.end_headers()
             self.wfile.write(json.dumps(data).encode() if health else b"<!doctype html><title>Review</title>")
 
@@ -74,7 +81,7 @@ def gui(repo, port, root_status=200, *, identity_port=None):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            yield
+            yield requests
         finally:
             server.shutdown()
             thread.join()
@@ -222,7 +229,9 @@ def test_supervisor_attributes_live_backends_to_checkout(tmp_path, modules, monk
             process.terminate()
 
 
-@pytest.mark.parametrize(("local_status", "public_status"), [(200, 404), (404, 200), (404, 404)])
+@pytest.mark.parametrize(("local_status", "public_status"), [
+    (200, 404), (404, 200), (404, 404), (302, 200), (200, 302), (302, 302), (302, 404),
+])
 def test_open_checks_gui_root_at_each_authority(tmp_path, modules, monkeypatch, local_status, public_status):
     inv, _ = modules
     port = free_port()
@@ -244,10 +253,34 @@ def test_open_checks_gui_root_at_each_authority(tmp_path, modules, monkeypatch, 
         monkeypatch.setattr(http.client, "HTTPSConnection", published_connection)
         with gui(repo, public_port, public_status, identity_port=port):
             row, = inv.inventory(root, listing)
-    assert row["health"] == ("healthy" if local_status == 200 else "unavailable")
-    assert row["local_url"] == (f"http://127.0.0.1:{port}" if local_status == 200 else None)
-    assert row["publication"] == ("verified" if public_status == 200 else "unavailable")
-    assert row["open_url"] == (public_url if public_status == 200 else None)
+    assert row["health"] == ("healthy" if local_status in (200, 302) else "unavailable")
+    assert row["local_url"] == (f"http://127.0.0.1:{port}" if local_status in (200, 302) else None)
+    assert row["publication"] == ("verified" if public_status in (200, 302) else "unavailable")
+    assert row["open_url"] == (public_url if public_status in (200, 302) else None)
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_gui_health_accepts_only_the_same_origin_signin_flow(tmp_path, modules, absolute):
+    inv, _ = modules
+    port = free_port()
+    repo = checkout(tmp_path, "authenticated", port)
+    cfg = {"port": port}
+    location = f"http://127.0.0.1:{port}/signin.html?next=/" if absolute else "/signin.html"
+    with gui(repo, port, location=location) as requests:
+        assert inv.gui_health(f"http://127.0.0.1:{port}", repo, cfg) == "healthy"
+    assert requests == ["/api/health", "/", "/signin.html" + ("?next=/" if absolute else "")]
+
+
+@pytest.mark.parametrize("location", [
+    "https://unexpected.test/signin.html", "//unexpected.test/signin.html", "/account.html",
+])
+def test_gui_health_rejects_other_redirects_without_following(tmp_path, modules, location):
+    inv, _ = modules
+    port = free_port()
+    repo = checkout(tmp_path, "redirected", port)
+    with gui(repo, port, location=location) as requests:
+        assert inv.gui_health(f"http://127.0.0.1:{port}", repo, {"port": port}) == "unavailable"
+    assert requests == ["/api/health", "/"]
 
 
 def stage_package(repo):
@@ -256,10 +289,13 @@ def stage_package(repo):
     scripts = package.parent / "scripts"
     scripts.mkdir()
     shutil.copy2(PACKAGE.parent / "scripts/instance_state.py", scripts)
+    shutil.copy2(PACKAGE.parent / "api/auth_sessions.py", package / "auth_sessions.py")
+    shutil.copy2(PACKAGE.parent / "api/auth_sessions.py", package.parent / "api/auth_sessions.py")
     return package
 
 
 def fixture_analytics(package):
+    shutil.copy2(PACKAGE.parent / "api/auth_sessions.py", package / "auth_sessions.py")
     module = package / "token_analytics"
     assets = module / "static"
     assets.mkdir(parents=True, exist_ok=True)
@@ -367,8 +403,9 @@ def test_enable_update_reuse_and_remove_from_disposable_user(tmp_path, modules, 
         shutil.rmtree(first / ".super-coder/manager")
         secret = base64.b64encode(b"operator:fixture-login").decode()
         signed = {"Authorization": "Basic " + secret}
-        assert request(port, "/")[0] == 401
+        assert request(port, "/")[0] == 302
         assert request(port, "/", signed)[0] == 401
+        assert request(port, "/signin.html")[0] == 200
         cfg["operator_verifier"] = manage.make_verifier("fixture-login")
         manager.save(cfg)
         assert request(port, "/api/inventory", signed | {"Host": "other.test"})[0] == 403
@@ -376,7 +413,7 @@ def test_enable_update_reuse_and_remove_from_disposable_user(tmp_path, modules, 
         assert request(port, "/api/inventory", signed, "POST")[0] == 403
         assert request(port, "/api/unknown", signed | {"Origin": f"http://127.0.0.1:{port}"}, "POST")[0] == 404
         assert b"Installations" in request(port, "/", signed)[1]
-        for path in ("/manager.js", "/manager.css"):
+        for path in ("/manager.js", "/manager.css", "/theme.js"):
             assert request(port, path, signed)[0] == 200
         status, body = request(port, "/api/inventory", signed)
         assert status == 200
@@ -515,17 +552,43 @@ fi
     (async () => {
       const browser = await chromium.launch({executablePath:process.argv[2], headless:true});
       try {
-        const page = await browser.newPage({httpCredentials:{username:"operator",password:"disposable"}});
+        const page = await browser.newPage();
+        const paired = await page.request.post(process.argv[3]+"/api/auth/pair", {
+          headers:{Origin:process.argv[3]},
+          data:{username:"operator",password:"disposable",device:"Chromium fixture"}
+        });
+        if (!paired.ok()) throw Error("pairing failed: "+paired.status()+" "+await paired.text());
         await page.goto(process.argv[3]);
         const active = page.locator('tr[data-repo="sample"]');
         const offline = page.locator('tr[data-repo="offline"]');
-        await active.getByRole('link', {name:"Open"}).waitFor();
+        await active.getByRole('link', {name:"sample",exact:true}).waitFor();
         if (await active.getByRole('link').getAttribute('href') !== process.argv[4]) throw Error("wrong link");
         const runtime = await active.getByRole("cell").nth(1).innerText();
         if (!runtime.startsWith("Docker") || !runtime.includes("Configured for Host"))
           throw Error("runtime switch lost: " + runtime);
         if (!(await offline.innerText()).includes("Stopped") || await offline.getByRole('link').count())
           throw Error("stopped row lost supervisor state");
+        const trigger=active.getByRole("button",{name:"Actions for sample"});
+        await trigger.focus();
+        await page.keyboard.press("ArrowDown");
+        await active.getByRole("menuitem",{name:"Update Subfloor"}).waitFor();
+        await page.keyboard.press("Escape");
+        if(await trigger.getAttribute("aria-expanded") !== "false") throw Error("menu did not close");
+        await page.getByRole("button",{name:"Light theme"}).click();
+        if(await page.locator("html").getAttribute("data-theme") !== "light") throw Error("light theme failed");
+        await page.getByRole("button",{name:"Dark theme"}).click();
+        if(await page.locator("html").getAttribute("data-theme") !== "dark") throw Error("dark theme failed");
+        await page.getByRole("button",{name:"System theme"}).click();
+        if(await page.locator("html").getAttribute("data-theme-choice") !== "system") throw Error("system theme failed");
+        if(await page.getByRole("button",{name:"System theme"}).getAttribute("aria-pressed") !== "true") throw Error("theme state failed");
+        await page.getByRole("button",{name:"Dark theme"}).click();
+        await page.setViewportSize({width:390,height:844});
+        if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth)) throw Error("mobile overflow");
+        await trigger.click();
+        const menuBox=await active.getByRole("menu").boundingBox();
+        if(menuBox.x<0 || menuBox.x+menuBox.width>390) throw Error("mobile menu outside viewport");
+        await page.keyboard.press("Escape");
+        await page.setViewportSize({width:1440,height:1000});
         await page.getByRole("button", {name:"Refresh"}).click();
         await page.waitForFunction(() => !document.querySelector("#refresh").disabled);
         await page.getByRole("link", {name:"Token Analytics"}).click();

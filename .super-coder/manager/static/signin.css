@@ -1,0 +1,20 @@
+.signin-page { min-height: 100dvh; }
+.signin-header { position: static; }
+.signin-layout { display: grid; place-items: start center; width: 100%; padding: clamp(2rem, 8vh, 5rem) 1rem; }
+.signin-card { width: min(27rem, 100%); padding: 1.6rem; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); }
+.signin-card h1 { margin: 0; color: var(--text-strong); font-size: 1.8rem; letter-spacing: -.035em; }
+.signin-intro { margin: .75rem 0 1.2rem; color: var(--text-mid); line-height: 1.55; }
+.signin-form { display: grid; gap: .35rem; }
+.signin-form label { margin: .35rem 0; }
+.signin-form input { width: 100%; margin-top: .15rem; padding: .55rem .65rem; }
+.signin-form button { margin-top: .55rem; padding: .55rem 1rem; }
+.field-hint { color: var(--text-low); font-size: .78rem; }
+.signin-notice { margin: .5rem 0; color: var(--danger); overflow-wrap: anywhere; }
+.signin-notice:empty { display: none; }
+.pair-details { margin-top: 1.2rem; color: var(--text-mid); font-size: .82rem; }
+.pair-details summary { cursor: pointer; color: var(--dim); }
+.pair-details p { line-height: 1.55; }
+@media (max-width: 480px) {
+  .signin-layout { padding-top: 1.5rem; }
+  .signin-card { padding: 1.2rem; }
+}

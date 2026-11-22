@@ -11,6 +11,10 @@ const el = (t, props = {}, ...kids) => {
 };
 async function api(path, method = "GET") {
   const r = await fetch("/api/analytics" + path, { method });
+  if (r.status === 401) {
+    const next = encodeURIComponent(location.pathname + location.search + location.hash);
+    location.replace("/signin.html?next=" + next);
+  }
   const body = await r.json();
   if (!r.ok) throw new Error(body.error || r.statusText);
   return body;
@@ -174,7 +178,7 @@ function anHours(buckets, byKey, cls) {
   }
   for (const b of buckets) {
     b.tokens = b.value;
-    b.value = b.hours ? b.value / b.hours : 0;
+    b.value = b.hours ? b.value / b.hours : null;
   }
   return buckets;
 }
@@ -227,6 +231,13 @@ const svgEl = (t, attrs = {}) => {
 
 function anChart(cls) {
   const buckets = anBuckets(cls);
+  if (perHour() && cls !== "agents" && !buckets.some((b) => b.hours > 0)) {
+    const empty = el("div", { className: "an-chart-wrap" });
+    empty.append(el("div", { className: "an-chart-title" }, anChartLabel()),
+      el("div", { className: "an-chart-empty", role: "status" },
+        "No recorded shell activity in this window. Hourly rates are unavailable."));
+    return empty;
+  }
   const W = 860, H = 180, L = 48, R = 14, T = 10, B = 22;
   const iw = W - L - R, ih = H - T - B;
   const ymax = niceMax(Math.max(...buckets.map((b) => b.value)));
@@ -375,7 +386,11 @@ async function drawStatus() {
   const errors = s.projects.filter((p) => p.error || p.warnings)
     .map((p) => p.project + ": " + (p.error || p.warnings));
   if (s.last_pull?.error) errors.unshift(s.last_pull.error);
-  $("#status").textContent = `${s.projects.length} projects · collected ${ago(s.last_ok_at)}`;
+  const partial = s.collection_state === "partial";
+  const freshness = s.last_collection_at
+    ? `collected ${ago(s.last_collection_at)}${partial ? " with warnings" : ""}`
+    : s.projects.some((p) => p.usage_rows) ? "cached token history · collection incomplete" : "collected never";
+  $("#status").textContent = `${s.projects.length} projects · ${freshness}`;
   $("#collection-errors").replaceChildren(...errors.map((error) => el("p", { className: "ht-errors" }, error)));
 }
 
@@ -449,7 +464,7 @@ async function anTokenSection(root) {
     totals[k] = counted.reduce((t, c) => c[k] == null ? t : (t ?? 0) + c[k], null);
     if (perShell() && totals[k] != null) totals[k] = shells.size ? totals[k] / shells.size : 0;
     if (perHour() && totals[k] != null) totals[k] = hoursTotal
-      ? anBuckets(k).reduce((t, b) => t + b.tokens, 0) / hoursTotal : 0;
+      ? anBuckets(k).reduce((t, b) => t + b.tokens, 0) / hoursTotal : null;
   }
   if (anClass && anClass !== "agents" && totals[anClass] == null) anClass = null;
   const agentDays = anBuckets("agents");
@@ -467,7 +482,7 @@ async function anTokenSection(root) {
             `+ subagent runs; ${anSessions.length - matched} of ${anSessions.length} session(s) have no ` +
             `matching turn time and are left out` } : {}) });
       c.append(el("span", { className: "an-card-label" }, label),
-               el("span", { className: "an-card-value" }, fmtTok(totals[k] ?? 0)));
+               el("span", { className: "an-card-value" }, fmtTok(perHour() ? totals[k] : totals[k] ?? 0)));
       c.onclick = () => {
         anClass = anClass === k ? null : k;
         drawCards();

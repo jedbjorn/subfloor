@@ -18,6 +18,7 @@ async function exercise(page) {
   await page.route("http://manager.test/**", async route => {
     const url = new URL(route.request().url()).pathname;
     const json = data => route.fulfill({json: data});
+    if (url === "/api/auth/status") return json({enrolled: true, signed_in: true, session: null});
     if (url === "/api/actions/preview") {
       if (route.request().postDataJSON().action === "remove") {
         return json({name: "sample", action: "remove", id: "rm", detail: "Remove sample", phrase: "REMOVE sample"});
@@ -78,7 +79,8 @@ async function exercise(page) {
     await page.clock.fastForward(3100);
     await row.getByText(state[0].toUpperCase() + state.slice(1), {exact: true}).waitFor();
   }
-  assert.equal(await row.getByRole("link", {name: "Open"}).getAttribute("href"), verified);
+  assert.equal(await row.getByRole("link", {name: "sample", exact: true}).getAttribute("href"), verified);
+  assert.equal(await row.getByRole("link", {name: "Open", exact: true}).count(), 0);
   await page.clock.fastForward(3100);
   assert.equal(inventoryReads, 5);
   // Reopen the publication window, then jump beyond its deadline.
@@ -90,7 +92,8 @@ async function exercise(page) {
   await page.clock.fastForward(3100);
   assert.equal(inventoryReads, 7);
 
-  await row.getByRole("button", {name: "Remove Subfloor from this repo"}).click();
+  await row.getByRole("button", {name: "Actions for sample"}).click();
+  await row.getByRole("menuitem", {name: "Remove Subfloor from this repo"}).click();
   await page.getByLabel("Type REMOVE sample to confirm removal").fill("REMOVE sample");
   await page.getByRole("button", {name: "Confirm", exact: true}).click();
   await page.getByText("History offline").waitFor();

@@ -1,14 +1,5 @@
-// Theme, applied before first paint (spec #270). Loaded from <head> as a
-// same-origin classic script because the CSP forbids inline script. It sets
-// <html data-theme="light|dark"> — the one hook style.css keys its tokens on —
-// from the operator's saved choice, else the OS `prefers-color-scheme`.
-//
-// window.scTheme is the whole contract for app.js:
-//   choice()        -> "system" | "light" | "dark"   (what the operator picked)
-//   resolved()      -> "light" | "dark"              (what is painted)
-//   set(choice)     -> stores the choice and repaints; returns resolved()
-// localStorage can throw (private mode, blocked site data): every access is
-// guarded, and a choice that cannot be stored still holds for this page.
+// Shared Manager theme, applied before first paint. localStorage can throw,
+// so every access is guarded and an unstored choice still holds for this page.
 (function () {
   var KEY = "sc-theme";
   var root = document.documentElement;
@@ -55,4 +46,21 @@
     if (event.key === KEY || event.key === null) apply();
   });
   window.scTheme = { choice: choice, resolved: resolved, set: set };
+
+  function bind() {
+    var buttons = Array.from(document.querySelectorAll("button[data-theme-choice]"));
+    if (!buttons.length) return;
+    function paint() {
+      var selected = choice();
+      for (var button of buttons) button.setAttribute("aria-pressed", String(button.dataset.themeChoice === selected));
+    }
+    for (const button of buttons) button.addEventListener("click", function () {
+      set(button.dataset.themeChoice);
+      paint();
+    });
+    window.addEventListener("storage", paint);
+    paint();
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", bind);
+  else bind();
 })();

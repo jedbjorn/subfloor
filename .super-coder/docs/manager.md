@@ -21,17 +21,19 @@ Omitting `--manager` leaves ordinary repo installation and lifecycle unchanged. 
 systemctl --user status subfloor-manager.service
 ```
 
-Use the hidden prompts to set the password, then open the printed loopback URL and sign in as `operator`. The service serves its own copy of the application while individual repos are stopped. Repeating `./sc manager install` from another primary checkout reuses the existing root, port, password, and URL. Use `./sc manager password` again in the host terminal to reset the credential.
+Use the hidden prompts to set the password, then open the printed loopback URL and pair the browser as `operator`. Pairing uses the same long-lived session model as Subfloor's GUI: each browser receives an independent HttpOnly, SameSite=Strict cookie carrying a random token, and the Manager stores only its SHA-256 hash. Cookies are renewed with use for as long as the browser allows (about 400 days), including across Manager updates and restarts. Published HTTPS sessions also mark the cookie `Secure`. The password is needed only to pair or re-pair a browser.
+
+The service serves its own copy of the application while individual repos are stopped. Repeating `./sc manager install` from another primary checkout reuses the existing root, port, password, paired browsers, and URL. Use **Paired browsers** in either page to inspect devices, revoke one without affecting the others, or sign out the current browser. On the host, `./sc manager sessions` lists devices and `./sc manager revoke <id>` revokes one (`--all` revokes every browser). Resetting the credential with `./sc manager password` also revokes every paired browser. Explicit Basic authorization remains available for command-line API clients.
 
 A different publisher listing can be selected only at initial setup with `./sc manager install --urls /path/to/urls.json`. Local loopback access remains available without Tailscale.
 
 ## Inventory and repository controls
 
-Each row shows the canonical checkout path, runtime, supervisor observation, GUI health, and publication state. After a runtime switch, the row shows both the backend still running and the configured backend for the next launch. If evidence is ambiguous, runtime is unknown. Open becomes available only when the destination serves an HTML page and identifies the selected checkout at `/api/health`. A local browser can use a verified loopback GUI; a remote browser uses the verified private URL.
+Each row shows the canonical checkout path, runtime, supervisor observation, GUI health, and publication state. After a runtime switch, the row shows both the backend still running and the configured backend for the next launch. If evidence is ambiguous, runtime is unknown. The repository name links to its GUI only when the destination identifies the selected checkout at `/api/health` and serves HTML directly or through its same-origin `/signin.html` flow. Arbitrary redirects are not accepted. Loopback and published authorities are checked independently: a local browser's project name uses the verified loopback GUI; a remote browser's uses the verified private URL. GUI health remains a status indicator rather than a separate link.
 
 The manager reads `~/.local/state/subfloor-tailnet/urls.json` by default. A missing listing or failed publication does not remove an installation. An inactive supervisor and refused local connection identify a stopped service even if its published URL returns 502. An inaccessible supervisor leaves service state unknown.
 
-Use the selected row for **Start**, **Stop**, **Restart**, or **Remove Subfloor from this repo**. Stop and restart previews identify the target and warn that active sessions will be interrupted. Operations are serialized per checkout and the page refreshes observed state after completion.
+Use the selected row's accessible actions menu for **Start**, **Stop**, **Restart**, **Update Subfloor**, or **Remove Subfloor from this repo**. Every operation requires a confirmation preview. Stop, restart, and updates of running repositories warn that active sessions will be interrupted. Update invokes the checkout's own `./sc update`, then verifies that a previously running repository is healthy and running or a previously stopped repository remains stopped. Operations are serialized per checkout and the page refreshes observed state after completion. Update output and engine-reported backup, rollback, and recovery guidance remain available under **Repository operations**.
 
 Use **Add repository** to install into an existing local Git checkout or create a new local repository. Choose Host or Docker runtime and enter the Subfloor operator username. The preview shows the resolved target, engine source, stage, bootstrap files, and commit before Apply. Existing history, staged work, unstaged work, and project files are preserved. A retry resumes the recorded stage; an existing installation is reopened rather than installed again.
 
@@ -39,9 +41,9 @@ Removal first runs the target checkout's own `./sc remove --dry-run`. Cancel is 
 
 ## Token Analytics
 
-Open **Token Analytics** from the manager navigation. It uses the same sign-in and HTTPS bookmark as inventory. The collector reads local primary checkouts, including stopped installations, without SSH and stores aggregate history in manager-owned private state. Collected history remains visible while an instance is stopped.
+Open **Token Analytics** from the manager navigation. It uses the same paired-browser session and HTTPS bookmark as inventory. The collector reads local primary checkouts, including stopped installations, without SSH and stores aggregate history in manager-owned private state. Collected history remains visible while an instance is stopped.
 
-The combined and per-project views include session project labels, usage filters and charts, and engine-update markers with revision details. **Refresh** requests immediate collection. Automatic collection runs every six hours and retries after fifteen minutes following failure. A failed project keeps its last good rows and shows its collection error; healthy projects can still advance.
+The combined and per-project views include session project labels, usage filters and charts, and engine-update markers with revision details. **Refresh** requests immediate collection. Automatic collection runs every six hours and retries after fifteen minutes following failure. A failed project keeps its last good rows and shows its collection error; healthy projects can still advance. A collection that completes with warnings reports its actual collection time and warning state when cached token rows exist. Legacy databases without activity tables produce a readable warning, and Shell Hours reports unavailable hourly rates rather than zero-hour activity when no intervals are recorded.
 
 ## Private tailnet access
 
@@ -56,7 +58,7 @@ tailscale serve status
 ./sc manager url
 ```
 
-Open the printed private URL from the tailnet client, sign in as `operator`, and follow Open on a healthy repo. Check the existing default URL and per-repo mappings against the pre-install listing. To take down only the manager bookmark:
+Open the printed private URL from the tailnet client, pair the browser as `operator`, and follow a healthy repository name to its GUI. Check the existing default URL and per-repo mappings against the pre-install listing. To take down only the manager bookmark:
 
 ```sh
 ./sc manager unpublish
@@ -66,7 +68,7 @@ If the recorded route was repurposed, inspect `tailscale serve status --json` an
 
 ## Update, recovery, and manager removal
 
-After updating a checkout through the normal Subfloor update path, explicitly deploy its manager payload. Configuration, analytics history, and the manager password persist across updates.
+After updating a checkout through the normal Subfloor update path, explicitly deploy its manager payload. Configuration, analytics history, the manager password, and paired-browser sessions persist across updates.
 
 ```sh
 ./sc manager update
@@ -83,7 +85,7 @@ To stop and uninstall the manager itself:
 ./sc manager remove
 ```
 
-This removes its exact Serve mapping, service unit, installed application, and sign-in configuration. It prints the retained manager-history location. Managed Git repos, their Subfloor installations, their data, and the instance publisher remain independent.
+This removes its exact Serve mapping, service unit, installed application, and sign-in configuration, and revokes every paired browser. It prints the retained manager-history location. Managed Git repos, their Subfloor installations, their data, and the instance publisher remain independent.
 
 ## Halo acceptance handoff — pending Jed after Sprint 38
 
@@ -125,7 +127,7 @@ MANAGER_URL="https://${TAILNET_NAME}:18798"
 curl --fail --silent --show-error --user operator "$MANAGER_URL/api/inventory" | python3 -m json.tool
 ```
 
-`curl` prompts for the manager password. From Cachy, open `$MANAGER_URL`, sign in, follow an existing healthy GUI link, and use Token Analytics. Compare the two Serve status listings: the only new mapping should be the dedicated manager route. Open the default dos-arch URL and existing per-instance URLs and confirm their destinations are unchanged. An inability to reach the manager from Cachy leaves published-access acceptance pending.
+`curl` prompts for the manager password. From Cachy, open `$MANAGER_URL`, pair the browser, follow an existing healthy repository name, and use Token Analytics. Compare the two Serve status listings: the only new mapping should be the dedicated manager route. Open the default dos-arch URL and existing per-instance URLs and confirm their destinations are unchanged. An inability to reach the manager from Cachy leaves published-access acceptance pending.
 
 ### 3. Use a sacrificial repo for installation and removal
 
@@ -141,7 +143,7 @@ git -C "$SACRIFICIAL" add project.txt
 git -C "$SACRIFICIAL" -c user.name=Jed -c user.email=jed@localhost commit -m 'Sacrificial project history'
 ```
 
-In the manager, choose **Add repository → Existing Git checkout**, name `manager-removal-check`, Host runtime, and Jed's operator username. Inspect the target, files, and bootstrap commit in the preview, then Confirm. Wait for the operation result and a healthy inventory row, then Open the correct GUI. Allow for the publisher's discovery interval; installation, launch, and publication are separate observations.
+In the manager, choose **Add repository → Existing Git checkout**, name `manager-removal-check`, Host runtime, and Jed's operator username. Inspect the target, files, and bootstrap commit in the preview, then Confirm. Wait for the operation result and a healthy inventory row, then follow its repository name to the correct GUI. Allow for the publisher's discovery interval; installation, launch, and publication are separate observations.
 
 In that new row, choose **Remove Subfloor from this repo**. Inspect the real dry-run plan, canonical target, and recovery information, then Cancel and confirm that nothing changed. Preview again, type `REMOVE manager-removal-check`, and Apply once. Record the engine result and the actual backup or manifest location from **Repository operations → View output**. Then verify the project, Git history, manager, and neighboring installs:
 
