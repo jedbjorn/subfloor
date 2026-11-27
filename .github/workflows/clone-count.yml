@@ -1,0 +1,40 @@
+name: Archive clone counts
+
+on:
+  schedule:
+    - cron: '27 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: subfloor-clone-counts
+
+jobs:
+  archive:
+    if: github.repository == 'jedbjorn/subfloor' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: clone-traffic
+          path: archive
+      - name: Read the last 14 days of clone traffic
+        env:
+          # Fine-grained token for this repository with Administration (read).
+          GH_TOKEN: ${{ secrets.CLONE_TRAFFIC_READ_TOKEN }}
+        run: gh api "repos/$GITHUB_REPOSITORY/traffic/clones?per=day" > "$RUNNER_TEMP/clones.json"
+      - name: Update the public archive
+        working-directory: archive
+        run: |
+          python3 ../.github/scripts/update-clone-counts.py counts.json < "$RUNNER_TEMP/clones.json"
+          if ! git diff --quiet -- counts.json; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add counts.json
+            git commit -m 'Update daily clone counts'
+            git push origin HEAD:refs/heads/clone-traffic
+          fi
