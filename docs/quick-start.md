@@ -22,6 +22,8 @@ For a systemd-user-supervised host process instead, replace `./sc install` below
 with `./sc install --runtime host`. On macOS or Windows, do this inside a Linux VM,
 preferably on guest-owned storage. `SC_PYTHON` can select an absolute Python path.
 
+For a tagged version, follow the bootstrap command on its [release page](https://github.com/jedbjorn/subfloor/releases), then continue with the bootstrap commit below. To install from the development branch instead, use the full sequence.
+
 ```bash
 cd your-repo
 git remote add -t main super-coder https://github.com/jedbjorn/subfloor.git

@@ -8,6 +8,7 @@ purpose: Product overview and installation entry
 
 [![tests](https://img.shields.io/github/actions/workflow/status/jedbjorn/subfloor/tests.yml?style=flat-square&label=tests)](https://github.com/jedbjorn/subfloor/actions/workflows/tests.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-6b46c1?style=flat-square)](LICENSE)
+[![Installer downloads](https://img.shields.io/github/downloads/jedbjorn/subfloor/subfloor-bootstrap.tar.gz?displayAssetName=false&label=installer%20downloads&style=flat-square)](https://github.com/jedbjorn/subfloor/releases)
 
 # Subfloor
 
@@ -61,7 +62,9 @@ Set `SC_PYTHON` to an absolute interpreter path if needed.
 Claude Code 2.1.304 or later is the supported minimum; older versions are not
 supported (and are not blocked).
 
-Run these commands from your own host terminal:
+For a tagged installation, open [Subfloor releases](https://github.com/jedbjorn/subfloor/releases) and follow the install command for your chosen version. GitHub counts downloads of the attached bootstrap.
+
+To install from the development branch, run these commands from your own host terminal:
 
 ```bash
 cd your-repo
