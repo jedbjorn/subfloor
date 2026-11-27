@@ -235,7 +235,7 @@ pre { max-height: 50dvh; overflow: auto; padding: .8rem; border: 1px solid var(-
   .app-header { gap: .55rem .8rem; padding: .7rem 1rem; }
   .brand { flex: 1 1 auto; }
   .header-tools { order: 2; }
-  .app-nav { order: 3; width: 100%; }
+  .app-nav { order: 3; width: 100%; flex-wrap: wrap; }
   .app-nav a, .app-nav .nav-button { flex: 1 1 0; text-align: center; }
   .manager-main { padding: 1.35rem .8rem 2rem; }
   .page-title { align-items: flex-start; flex-direction: column; margin-bottom: 1rem; }
