@@ -8,6 +8,7 @@ purpose: Product overview and installation entry
 
 [![tests](https://img.shields.io/github/actions/workflow/status/jedbjorn/subfloor/tests.yml?style=flat-square&label=tests)](https://github.com/jedbjorn/subfloor/actions/workflows/tests.yml)
 [![Recorded Git clones since Nov 13, 2026](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fjedbjorn%2Fsubfloor%2Fclone-traffic%2Fcounts.json&query=%24.total&label=clones%20since%20Nov%2013%2C%202026&color=blue&style=flat-square)](https://github.com/jedbjorn/subfloor/blob/clone-traffic/counts.json)
+[![Unique cloners in the last 14 days](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fjedbjorn%2Fsubfloor%2Fclone-traffic%2Funique-cloners.json&query=%24%5B%27subfloor%27%5D.unique_cloners_14d&label=unique%20cloners%20%2814d%29&color=blue&style=flat-square)](https://github.com/jedbjorn/subfloor/blob/clone-traffic/unique-cloners.json)
 [![license: MIT](https://img.shields.io/badge/license-MIT-6b46c1?style=flat-square)](LICENSE)
 [![Installer downloads](https://img.shields.io/github/downloads/jedbjorn/subfloor/subfloor-bootstrap.tar.gz?displayAssetName=false&label=installer%20downloads&style=flat-square)](https://github.com/jedbjorn/subfloor/releases)
 
