@@ -1,6 +1,8 @@
 """Bootstrap one owner-selected checkout from the supported engine remote."""
 import hashlib
+import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -22,6 +24,70 @@ def git(repo, *args):
     if not result or result.returncode:
         raise ValueError((result.stderr.strip() if result else "") or f"git {args[0]} failed in {repo}")
     return result.stdout.strip()
+
+
+def github_json(endpoint):
+    try:
+        result = subprocess.run(
+            ["gh", "api", "--hostname", "github.com", endpoint],
+            check=False, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
+            env={**os.environ, "GH_PROMPT_DISABLED": "1"},
+        )
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def github_identity():
+    profile = github_json("user")
+    if not isinstance(profile, dict):
+        return None
+    login, account_id = profile.get("login"), profile.get("id")
+    if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9-]+", login):
+        return None
+    name = profile.get("name")
+    if not isinstance(name, str) or not name.strip() or any(ch in name for ch in "\r\n\0<>"):
+        name = login
+    addresses = github_json("user/emails")
+    emails = ([entry.get("email") for entry in addresses
+               if isinstance(entry, dict) and entry.get("primary") is True and entry.get("verified") is True]
+              if isinstance(addresses, list) else [])
+    emails.append(profile.get("email"))
+    if type(account_id) is int and account_id > 0:
+        emails.append(f"{account_id}+{login}@users.noreply.github.com")
+    for email in emails:
+        if isinstance(email, str) and re.fullmatch(r"[^\s<>@\0]+@[^\s<>@\0]+", email):
+            return name.strip(), email
+    return None
+
+
+def commit_identity(repo):
+    def usable(*config):
+        for role in ("AUTHOR", "COMMITTER"):
+            result = command("git", "-C", str(repo), *config, "var", f"GIT_{role}_IDENT")
+            if not result or result.returncode:
+                return False
+        return True
+
+    if usable("-c", "user.useConfigOnly=true"):
+        return []
+    identity = github_identity()
+    if identity:
+        options = []
+        for field, value in zip(("name", "email"), identity):
+            result = command("git", "-C", str(repo), "config", "--get", f"user.{field}")
+            if result and (result.returncode == 1 or (result.returncode == 0 and not result.stdout.strip())):
+                options.extend(("-c", f"user.{field}={value}"))
+        if usable(*options, "-c", "user.useConfigOnly=true"):
+            return options
+    if usable():
+        return []
+    raise ValueError(
+        "Git needs an author name and email. Set git config user.name and git config user.email "
+        "in this checkout, or sign in to github.com with gh auth login on the Manager host, then retry."
+    )
 
 
 def identity(path):
@@ -149,6 +215,14 @@ def bootstrap_output(repo, files):
 
 
 def provision(repo, state, save, run, launch):
+    identity_options = None
+
+    def commit_options():
+        nonlocal identity_options
+        if identity_options is None:
+            identity_options = commit_identity(repo)
+        return identity_options
+
     def advance(stage):
         state["stage"] = stage
         save(state)
@@ -170,8 +244,9 @@ def provision(repo, state, save, run, launch):
         head = command("git", "-C", str(repo), "rev-parse", "--verify", "HEAD")
         if head is None:
             raise ValueError("Cannot verify the project history.")
+        options = commit_options()
         if head.returncode:
-            run("Initialize history", "git", "-c", "core.hooksPath=/dev/null", "commit",
+            run("Initialize history", "git", *options, "-c", "core.hooksPath=/dev/null", "commit",
                 "--allow-empty", "--only", "-m", "Initialize repository")
         if "super-coder" not in git(repo, "remote").splitlines():
             git(repo, "remote", "add", "-t", "main", "super-coder", SOURCE)
@@ -198,6 +273,7 @@ def provision(repo, state, save, run, launch):
                 or (repo / "sc").read_bytes() != subprocess.check_output(["git", "show", state["ref"] + ":sc"], cwd=repo)):
             raise ValueError("The checkout no longer matches the selected bootstrap revision.")
     if state["stage"] == "install":
+        commit_options()
         check_scaffolds(repo, state["files"])
         cfg = install_config(repo.parent, repo) or {}
         if cfg.get("installed_at") and ("output" not in state or "base" not in state):
@@ -228,7 +304,7 @@ def provision(repo, state, save, run, launch):
         # installer contents need to be staged, even across a failed commit.
         git(repo, "add", "--intent-to-add", "-f", "--", *files)
         if git(repo, "diff", "HEAD", "--name-only", "--", *files):
-            run("Commit bootstrap files", "git", "-c", "core.hooksPath=/dev/null", "commit",
+            run("Commit bootstrap files", "git", *commit_options(), "-c", "core.hooksPath=/dev/null", "commit",
                 "--only", "-m", COMMIT, "--", *files)
         advance("launch")
     if state["stage"] == "launch":

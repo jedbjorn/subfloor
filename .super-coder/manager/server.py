@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 from browser_auth import AuthError, BrowserAuth
 from inventory import installations, inventory
 from operator_password import matches
-from repository_actions import Actions, Conflict
+from repository_actions import Actions, Conflict, UnknownOperation
 
 STATIC = Path(__file__).resolve().parent / "static"
 ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
@@ -209,6 +209,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.command == "GET" and path == "/api/actions":
                 result = actions.history()
+            elif self.command == "GET" and path.startswith("/api/actions/status/"):
+                result = actions.result(path.removeprefix("/api/actions/status/"))
             elif self.command == "GET" and path.startswith("/api/actions/output/"):
                 result = {"output": actions.output(path.rsplit("/", 1)[1])}
             elif self.command == "POST" and path in ("/api/actions/preview", "/api/actions/apply"):
@@ -216,6 +218,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = actions.preview(data) if path.endswith("/preview") else actions.apply(data)
             else:
                 return self.reply(404, b'{"error":"Unknown action route"}')
+        except UnknownOperation as exc:
+            return self.reply(404, json.dumps({"error": str(exc)}).encode())
         except Conflict as exc:
             return self.reply(409, json.dumps({"error": str(exc)}).encode())
         except (ValueError, TypeError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:

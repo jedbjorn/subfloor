@@ -34,18 +34,26 @@
     <p role="status" id="status" class="notice">Loading installations…</p>
     <div class="table-scroll"><table hidden><thead><tr><th>Repository</th><th>Runtime</th><th>Service</th><th>GUI health</th><th>Publication</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody></tbody></table></div>
     <section id="history" class="card history" hidden><h2>Repository operations</h2><p class="muted">Confirmed commands, output, and recovery evidence.</p><div id="results"></div></section>
-    <dialog id="setup"><form id="setup-form">
-      <p class="eyebrow">New installation</p><h2>Add repository</h2>
+    <dialog id="setup" aria-labelledby="setup-title"><form id="setup-form">
+      <p class="eyebrow">New installation</p><h2 id="setup-title">Add repository</h2>
       <label>Destination <select name="action"><option value="install">Existing Git checkout</option><option value="create">New local repository</option></select></label>
       <label>Repository name <input required name="name" autocomplete="off"></label>
       <label>Runtime <select name="runtime"><option value="host">Host</option><option value="sandbox">Docker</option></select></label>
       <label>Subfloor operator username <input required name="username" autocomplete="off"></label>
-      <footer><button type="button" data-close>Cancel</button><button class="primary">Preview installation</button></footer>
+      <p id="setup-status" role="status" hidden></p>
+      <footer><button type="button" data-close>Cancel</button><button id="preview-install" class="primary">Preview installation</button></footer>
     </form></dialog>
-    <dialog id="review"><p class="eyebrow">Confirm operation</p><h2 id="review-title"></h2><pre id="plan"></pre>
+    <dialog id="review" aria-labelledby="review-title"><p class="eyebrow">Confirm operation</p><h2 id="review-title"></h2><pre id="plan"></pre>
       <form id="apply-form"><label id="phrase" hidden><span></span><input autocomplete="off"></label>
         <footer><button type="button" data-close>Cancel</button><button id="apply" class="primary">Confirm</button></footer>
       </form>
+    </dialog>
+    <dialog id="provision-progress" aria-labelledby="provision-title">
+      <h2 id="provision-title"></h2>
+      <p id="provision-status" role="status" tabindex="-1"></p>
+      <progress aria-label="Installation in progress"></progress>
+      <pre id="provision-output" hidden></pre>
+      <footer><button id="provision-close" type="button" data-close>Close</button></footer>
     </dialog>
     <dialog id="log"><h2>Command output</h2><pre></pre><footer><button data-close>Close</button></footer></dialog>
   </main>

@@ -141,7 +141,14 @@ function installationRow(installation) {
 const titles = {start: "Start", stop: "Stop", restart: "Restart", update: "Update Subfloor",
   remove: "Remove Subfloor from this repo", create: "Create repository", install: "Install Subfloor"};
 const setup = document.querySelector("#setup");
+const setupStatus = document.querySelector("#setup-status");
+const previewButton = document.querySelector("#preview-install");
 const review = document.querySelector("#review");
+const provision = document.querySelector("#provision-progress");
+const provisionStatus = document.querySelector("#provision-status");
+const provisionOutput = document.querySelector("#provision-output");
+const provisionIndicator = provision.querySelector("progress");
+const provisionClose = document.querySelector("#provision-close");
 const phrase = document.querySelector("#phrase");
 const confirmation = phrase.querySelector("input");
 const applyButton = document.querySelector("#apply");
@@ -160,23 +167,31 @@ function button(label, handle) {
   return el;
 }
 
-async function request(url, payload) {
+async function request(url, payload, timeout) {
   const options = payload ? {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify(payload)} : {cache: "no-store"};
+  if (timeout) options.signal = AbortSignal.timeout(timeout);
   const response = await fetch(url, options);
   if (response.status === 401) {
     const next = encodeURIComponent(location.pathname + location.search + location.hash);
     location.replace("/signin.html?next=" + next);
   }
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
-  return data;
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    const error = new Error(data.error || `Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
+  }
+  return response.json();
 }
 
-async function preview(data) {
+async function preview(data, installation = false) {
   try {
-    status.textContent = "Checking target…";
+    const message = installation ? setupStatus : status;
+    message.hidden = false;
+    message.textContent = "Checking target…";
     pending = await request("/api/actions/preview", data);
+    if (installation && !setup.open) return;
     if (pending.existing) {
       if (setup.open) setup.close();
       await load();
@@ -196,21 +211,102 @@ async function preview(data) {
     review.showModal();
     status.textContent = "";
   } catch (error) {
-    if (setup.open) setup.close();
-    status.textContent = error.message;
+    (installation ? setupStatus : status).textContent = error.message;
   }
 }
 
-document.querySelector("#provision").onclick = () => setup.showModal();
+document.querySelector("#provision").onclick = () => {
+  setupStatus.hidden = true;
+  setup.showModal();
+};
 for (const el of document.querySelectorAll("[data-close]")) el.onclick = () => el.closest("dialog").close();
-document.querySelector("#setup-form").onsubmit = event => {
+document.querySelector("#setup-form").onsubmit = async event => {
   event.preventDefault();
-  preview(Object.fromEntries(new FormData(event.target)));
+  if (previewButton.disabled) return;
+  previewButton.disabled = true;
+  try {
+    await preview(Object.fromEntries(new FormData(event.target)), true);
+  } finally {
+    previewButton.disabled = false;
+  }
 };
 confirmation.oninput = () => { applyButton.disabled = confirmation.value !== pending.phrase; };
+provision.addEventListener("cancel", event => {
+  if (provisionClose.disabled) event.preventDefault();
+});
+
+async function provisionRepository({name, id, action}) {
+  review.close();
+  document.querySelector("#provision-title").textContent = `${titles[action]} · ${name}`;
+  provisionStatus.textContent = "Starting installation…";
+  provisionOutput.hidden = true;
+  provisionClose.disabled = true;
+  provisionIndicator.hidden = false;
+  provision.showModal();
+  provisionStatus.focus();
+
+  try {
+    let record;
+    let stage = "Starting installation";
+    try {
+      record = await request("/api/actions/apply", {name, id}, 15000);
+      accepted.add(id);
+      load();
+    } catch (error) {
+      if (error.status && error.status < 500) throw error;
+      provisionStatus.textContent = "Checking whether the Manager started the installation…";
+    }
+
+    while (!record || record.status === "running") {
+      if (record) {
+        stage = record.stage || stage;
+        const message = `${stage}…`;
+        if (provisionStatus.textContent !== message) provisionStatus.textContent = message;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      try {
+        record = await request("/api/actions/status/" + id, undefined, 10000);
+      } catch (error) {
+        if (error.status === 404) throw new Error("The Manager could not confirm this operation. Check Repository operations before retrying.");
+        provisionStatus.textContent = `Last step was “${stage}”. Reconnecting to the Manager…`;
+        record = null;
+      }
+    }
+
+    if (record.status === "succeeded") {
+      provisionStatus.textContent = "Subfloor is installed and running.";
+    } else {
+      const outcome = record.status === "interrupted" ? "Installation interrupted" : "Installation failed";
+      provisionStatus.textContent = [outcome, record.stage, record.detail].filter(Boolean).join(" · ");
+      provisionOutput.textContent = "Loading command output…";
+      provisionOutput.hidden = false;
+      provisionIndicator.hidden = true;
+      try {
+        const {output} = await request("/api/actions/output/" + id, undefined, 10000);
+        provisionOutput.textContent = output || "No command output.";
+      } catch {
+        provisionOutput.textContent = "Command output is unavailable. You can try again from Repository operations.";
+      }
+    }
+  } catch (error) {
+    provisionStatus.textContent = error.message;
+  } finally {
+    accepted.delete(id);
+    provisionIndicator.hidden = true;
+    provisionClose.disabled = false;
+    provisionClose.focus();
+    load();
+  }
+}
+
 document.querySelector("#apply-form").onsubmit = async event => {
   event.preventDefault();
+  if (applyButton.disabled) return;
   applyButton.disabled = true;
+  if (["create", "install"].includes(pending.action)) {
+    await provisionRepository(pending);
+    return;
+  }
   try {
     const receipt = await request("/api/actions/apply", {name: pending.name, id: pending.id, confirmation: confirmation.value});
     accepted.add(receipt.id);
