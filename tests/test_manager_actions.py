@@ -336,6 +336,80 @@ def test_provision_resumes_and_commits_only_installation(operations, installer):
         assert operations.preview(request) == {"existing": repo.name}
 
 
+@pytest.mark.parametrize("emails,public,expected", [
+    ([{"email": "primary@example.org", "primary": True, "verified": True}],
+     "public@example.org", "primary@example.org"),
+    ([{"email": "unverified@example.org", "primary": True, "verified": False}],
+     "public@example.org", "public@example.org"),
+    (None, None, "42+octocat@users.noreply.github.com"),
+])
+def test_provision_uses_authenticated_github_identity(operations, installer, monkeypatch, emails, public, expected):
+    for role in ("AUTHOR", "COMMITTER"):
+        for field in ("NAME", "EMAIL"):
+            monkeypatch.delenv(f"GIT_{role}_{field}")
+    repo = operations.root / "new-project"
+    bootstrap = sys.modules["provision"]
+    profile = {"login": "octocat", "id": 42, "name": "Octocat", "email": public}
+    queries = []
+
+    def github(endpoint):
+        queries.append(endpoint)
+        return {"user": profile, "user/emails": emails}[endpoint]
+
+    monkeypatch.setattr(bootstrap, "github_json", github)
+    request = {"action": "create", "runtime": "host", "name": repo.name, "username": "Ada"}
+    receipt = operations.apply(operations.preview(request))
+    result = wait_result(operations, receipt["id"])
+    assert result["status"] == "succeeded", result
+    assert git(repo, "log", "--format=%an <%ae> %cn <%ce>").splitlines() == [
+        f"Octocat <{expected}> Octocat <{expected}>",
+        f"Octocat <{expected}> Octocat <{expected}>",
+    ]
+    assert queries == ["user", "user/emails"]
+    assert "user." not in git(repo, "config", "--local", "--list")
+
+
+def test_missing_git_identity_stops_with_retry_instructions(operations, installer, monkeypatch):
+    for role in ("AUTHOR", "COMMITTER"):
+        for field in ("NAME", "EMAIL"):
+            monkeypatch.delenv(f"GIT_{role}_{field}")
+    repo = operations.root / "new-project"
+    git(operations.root, "config", "--global", "user.useConfigOnly", "true")
+    git(operations.root, "config", "--global", "user.name", "Configured Name")
+    bootstrap = sys.modules["provision"]
+    monkeypatch.setattr(bootstrap, "github_json", lambda endpoint: None)
+    request = {"action": "create", "runtime": "host", "name": repo.name, "username": "Ada"}
+    receipt = operations.apply(operations.preview(request))
+    failed = wait_result(operations, receipt["id"])
+    assert failed["status"] == "failed"
+    assert failed["stage"] == "Prepare Git repository"
+    assert all(item in failed["detail"] for item in ("user.name", "user.email", "gh auth login"))
+    assert not (repo / "sc").exists()
+    assert not git(repo, "remote")
+
+    profile = {"login": "octocat", "id": 42, "name": "Octocat"}
+    monkeypatch.setattr(bootstrap, "github_json", lambda endpoint: profile if endpoint == "user" else None)
+    receipt = operations.apply(operations.preview(request))
+    assert wait_result(operations, receipt["id"])["status"] == "succeeded"
+    assert git(repo, "log", "--format=%an <%ae>").splitlines() == [
+        "Configured Name <42+octocat@users.noreply.github.com>",
+        "Configured Name <42+octocat@users.noreply.github.com>",
+    ]
+
+
+def test_unexpected_worker_exception_leaves_a_terminal_result(operations, monkeypatch, caplog):
+    def broken_provision(*args):
+        raise TypeError("unexpected fixture error")
+
+    monkeypatch.setattr(sys.modules["repository_actions"], "provision", broken_provision)
+    request = {"action": "create", "runtime": "host", "name": "project", "username": "Ada"}
+    receipt = operations.apply(operations.preview(request))
+    result = wait_result(operations, receipt["id"])
+    assert result["status"] == "failed" and result["finished"]
+    assert "Manager service journal" in result["detail"]
+    assert "unexpected fixture error" in caplog.text
+
+
 @pytest.mark.parametrize("edit", ["index", "worktree", "both", "history", "none", "already_committed"])
 def test_retry_after_interrupted_bootstrap_commit(operations, installer, monkeypatch, edit):
     mod = sys.modules["repository_actions"]
@@ -470,7 +544,7 @@ def test_retry_requires_a_healthy_gui_after_failed_launch(operations, installer)
     failed = submit(request)
     assert failed["status"] == "failed" and "status 7" in failed["detail"]
     retry = submit(request)
-    assert retry["status"] == "failed" and retry["stage"] == "Launch"
+    assert retry["status"] == "failed" and retry["stage"] == "Verify running instance"
     assert "restart" in retry["detail"] and "no listener" in retry["detail"]
     assert json.loads(operations.checkpoint(repo).read_text())["stage"] == "launch"
     assert submit({"action": "restart", "name": repo.name})["status"] == "succeeded"
@@ -501,6 +575,15 @@ def test_browser_provisions_and_confirms_selected_removal(operations, installer,
     (selected / "partial").touch()
     monkeypatch.setattr(sys.modules["repository_actions"], "service_state",
                         lambda repo, cfg: ("running", "healthy") if (repo / "up").exists() else ("stopped", "no listener"))
+    bootstrap = sys.modules["provision"]
+    commit_identity = bootstrap.commit_identity
+
+    def require_identity(repo):
+        if repo.name == "cannot-create":
+            raise ValueError("Git author email is missing.")
+        return commit_identity(repo)
+
+    monkeypatch.setattr(bootstrap, "commit_identity", require_identity)
     with ThreadingHTTPServer(("127.0.0.1", 0), service.Handler) as server:
         server.settings = tmp_path / "settings.json"
         server.settings.write_text(json.dumps({"root": str(operations.root), "listing": str(tmp_path / "urls"),
@@ -521,13 +604,23 @@ def test_browser_provisions_and_confirms_selected_removal(operations, installer,
             });
             if(!paired.ok()) throw Error("pairing failed: "+paired.status()+" "+await paired.text());
             await page.goto(process.argv[3]);
-            await page.getByRole("button",{name:"Add repository"}).click();
-            await page.getByLabel("Destination").selectOption("create");
-            await page.getByLabel("Repository name").fill("new-project");
-            await page.getByLabel("Subfloor operator username").fill("Ada");
-            await page.getByRole("button",{name:"Preview installation"}).click();
-            await page.getByText(/Bootstrap commit.*engine.ref/s).waitFor();
-            await page.getByRole("button",{name:"Confirm",exact:true}).click();
+            const create=async name=>{
+              await page.getByRole("button",{name:"Add repository"}).click();
+              await page.getByLabel("Destination").selectOption("create");
+              await page.getByLabel("Repository name").fill(name);
+              await page.getByLabel("Subfloor operator username").fill("Ada");
+              await page.getByRole("button",{name:"Preview installation"}).click();
+              await page.getByText(/Bootstrap commit.*engine.ref/s).waitFor();
+              await page.getByRole("button",{name:"Confirm",exact:true}).click();
+              return page.getByRole("dialog",{name:"Create repository · " + name});
+            };
+            const failedCreate=await create("cannot-create");
+            await failedCreate.getByText(/Installation failed.*Git author email is missing/).waitFor();
+            await failedCreate.getByText(/Initialized empty Git repository/).waitFor();
+            await failedCreate.getByRole("button",{name:"Close"}).click();
+            const successfulCreate=await create("new-project");
+            await successfulCreate.getByText("Subfloor is installed and running.").waitFor();
+            await successfulCreate.getByRole("button",{name:"Close"}).click();
             await page.getByText("Create repository · succeeded",{exact:true}).waitFor();
             await page.locator('tr[data-repo="new-project"]').waitFor();
             const selectedRow=page.locator('tr[data-repo="selected"]');

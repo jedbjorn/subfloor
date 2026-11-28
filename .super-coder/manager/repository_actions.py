@@ -1,6 +1,7 @@
 """Operator-confirmed operations on direct children of the configured root."""
 import hashlib
 import json
+import logging
 import os
 import secrets
 import subprocess
@@ -21,8 +22,22 @@ from inventory import (
 from manage import atomic
 from provision import COMMIT, SCAFFOLDS, SOURCE, identity, prepared, primary, provision
 
+logger = logging.getLogger(__name__)
 COMMANDS = {"start": ["launch"], "stop": ["down"], "restart": ["restart", "--yes"], "update": ["update"]}
 PROVISION = ("install", "create")
+PROVISION_STAGES = {
+    "create": "Create repository directory",
+    "initialize": "Initialize Git",
+    "bootstrap": "Prepare Git repository",
+    "materialize": "Prepare Subfloor files",
+    "install": "Prepare Subfloor installation",
+    "commit": "Verify bootstrap files",
+    "launch": "Launch",
+}
+
+
+class UnknownOperation(ValueError):
+    pass
 
 
 class Conflict(ValueError):
@@ -270,16 +285,19 @@ class Actions:
             except RuntimeError as exc:
                 worker_leases.close()
                 record.update(status="failed", detail=str(exc))
-                self.save(record)
+                self.finish(record)
                 raise ValueError("Could not start the repository operation.") from exc
             return record
 
     def execute(self, repo, key, record, leases):
         log = self.directory / (record["id"] + ".log")
 
-        def run(stage, *argv):
+        def set_stage(stage):
             record.update(stage=stage)
             self.save(record)
+
+        def run(stage, *argv):
+            set_stage(stage)
             with log.open("ab") as stream:
                 process = subprocess.run(argv, cwd=repo, stdin=subprocess.DEVNULL, stdout=stream,
                                          stderr=subprocess.STDOUT, check=False,
@@ -288,11 +306,11 @@ class Actions:
                 raise ValueError(f"{stage} exited with status {process.returncode}.")
 
         def launch(cfg):
-            record.update(stage="Launch")
-            self.save(record)
+            set_stage("Launch")
             state, _ = service_state(repo, cfg)
             if state == "stopped":
                 run("Launch", "./sc", "launch")
+            set_stage("Verify running instance")
             verify_state(repo, "running", cfg.get("instance_id"))
 
         try:
@@ -302,6 +320,8 @@ class Actions:
 
                 def save(state):
                     atomic(checkpoint, json.dumps(state))
+                    if stage := PROVISION_STAGES.get(state["stage"]):
+                        set_stage(stage)
 
                 save(key)
                 provision(repo, key, save, run, launch)
@@ -315,17 +335,25 @@ class Actions:
             record["status"] = "succeeded"
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             record.update(status="failed", detail=str(exc))
+        except Exception:
+            logger.exception("Unexpected repository operation failure for %s", record["id"])
+            record.update(status="failed", detail="Unexpected Manager error. Inspect the Manager service journal.")
         finally:
             try:
                 self.finish(record)
             finally:
                 leases.close()
 
-    def output(self, token):
+    def result(self, token):
         if len(token) != 32 or any(ch not in "0123456789abcdef" for ch in token):
-            raise ValueError("Invalid operation ID.")
-        if not (self.directory / (token + ".result")).is_file():
-            raise ValueError("Unknown operation.")
+            raise UnknownOperation("Invalid operation ID.")
+        try:
+            return json.loads((self.directory / (token + ".result")).read_text())
+        except FileNotFoundError as exc:
+            raise UnknownOperation("Unknown operation.") from exc
+
+    def output(self, token):
+        self.result(token)
         path = self.directory / (token + ".log")
         if not path.exists():
             return ""

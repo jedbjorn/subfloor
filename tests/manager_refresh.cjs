@@ -9,6 +9,8 @@ async function exercise(page) {
   const verified = "https://sample.test";
   const created = Date.now() / 1000;
   let applied = false;
+  let provisionReads = 0;
+  let provisionComplete = false;
   let removalWrites = 0;
   let removalReads = 0;
   let inventoryReads = 0;
@@ -20,8 +22,12 @@ async function exercise(page) {
     const json = data => route.fulfill({json: data});
     if (url === "/api/auth/status") return json({enrolled: true, signed_in: true, session: null});
     if (url === "/api/actions/preview") {
-      if (route.request().postDataJSON().action === "remove") {
+      const {action, name} = route.request().postDataJSON();
+      if (action === "remove") {
         return json({name: "sample", action: "remove", id: "rm", detail: "Remove sample", phrase: "REMOVE sample"});
+      }
+      if (name === "occupied") {
+        return route.fulfill({status: 400, json: {error: "Name already occupied"}});
       }
       return json({name: "sample", action: "create", id: "op", detail: "Create sample", phrase: ""});
     }
@@ -31,7 +37,13 @@ async function exercise(page) {
         return json({id: "rm", status: "running"});
       }
       applied = true;
-      return json({id: "op", status: "running"});
+      return json({id: "op", status: "running", stage: "Confirmed"});
+    }
+    if (url === "/api/actions/status/op") {
+      if (++provisionReads === 2) {
+        return route.fulfill({status: 503, json: {error: "Status offline"}});
+      }
+      return json({id: "op", status: provisionComplete ? "succeeded" : "running", stage: "Install Subfloor"});
     }
     if (url === "/api/actions") {
       if (removalWrites) {
@@ -65,11 +77,28 @@ async function exercise(page) {
   await firstRequest;
   await page.getByRole("button", {name: "Add repository"}).click();
   await page.getByLabel("Destination").selectOption("create");
-  await page.getByLabel("Repository name").fill("sample");
+  await page.getByLabel("Repository name").fill("occupied");
   await page.getByLabel("Subfloor operator username").fill("Ada");
   await page.getByRole("button", {name: "Preview installation"}).click();
+  const setup = page.getByRole("dialog", {name: "Add repository"});
+  await setup.getByText("Name already occupied").waitFor();
+  assert.equal(await setup.getByLabel("Subfloor operator username").inputValue(), "Ada");
+  await page.getByLabel("Repository name").fill("sample");
+  await page.getByRole("button", {name: "Preview installation"}).click();
   await page.getByRole("button", {name: "Confirm", exact: true}).click();
-  await page.getByRole("dialog").waitFor({state: "hidden"});
+  const progress = page.getByRole("dialog", {name: "Create repository · sample"});
+  await progress.getByText("Confirmed…", {exact: true}).waitFor();
+  await page.clock.fastForward(1100);
+  await progress.getByText("Install Subfloor…", {exact: true}).waitFor();
+  await page.keyboard.press("Escape");
+  assert.equal(await progress.isVisible(), true);
+  assert.equal(await progress.getByRole("button", {name: "Close"}).isDisabled(), true);
+  await page.clock.fastForward(1100);
+  await progress.getByText(/Reconnecting to the Manager/).waitFor();
+  provisionComplete = true;
+  await page.clock.fastForward(1100);
+  await progress.getByText("Subfloor is installed and running.").waitFor();
+  await progress.getByRole("button", {name: "Close"}).click();
   finishFirst();
   await page.getByText("Inventory offline").waitFor();
   await page.getByText("Create repository · succeeded").waitFor();
